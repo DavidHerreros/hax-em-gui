@@ -1,0 +1,7 @@
+# Bundle the non-Python assets (served at runtime) into the sdist/wheel.
+recursive-include backend/hax_gui/frontend *
+recursive-include backend/hax_gui/viewer_app *
+include backend/hax_gui/schemas_cache/*.json
+include README.md
+global-exclude __pycache__/*
+global-exclude *.pyc

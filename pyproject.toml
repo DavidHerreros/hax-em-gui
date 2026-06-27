@@ -23,12 +23,21 @@ hax-gui = "hax_gui.cli:main"
 [tool.setuptools.dynamic]
 version = { attr = "hax_gui.__version__" }
 
-# The importable package lives under backend/; the SPA (frontend/) and the
-# WebGL viewer (viewer/) are served from their source locations, so an editable
-# install (`pip install -e .`) is the supported install method.
+# The importable package lives under backend/hax_gui. The SPA (frontend/), the
+# WebGL viewer (viewer_app/) and the seed schema cache (schemas_cache/) are
+# bundled inside the package as data, so editable, wheel and PyPI installs all
+# resolve them via __file__-relative paths.
 [tool.setuptools]
 package-dir = { "" = "backend" }
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["backend"]
 include = ["hax_gui*"]
+
+[tool.setuptools.package-data]
+hax_gui = [
+    "frontend/*", "frontend/**/*",
+    "viewer_app/*", "viewer_app/**/*",
+    "schemas_cache/*.json",
+]

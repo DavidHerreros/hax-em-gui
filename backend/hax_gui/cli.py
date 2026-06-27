@@ -227,6 +227,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0 if healthy else 1
 
 
+def cmd_schemas(args: argparse.Namespace) -> int:
+    from . import genschemas
+    where = "packaged seed" if args.seed else "user cache"
+    print(f"Extracting program schemas (imports JAX, may take a moment) → {where}…")
+    try:
+        result = genschemas.regenerate(seed=args.seed)
+    except Exception as exc:  # noqa: BLE001
+        print(_err(f"schema generation failed: {exc}"))
+        return 1
+    print(_ok(f"Wrote {len(result['programs'])} program schemas") + f" → {result['_target']}")
+    if result.get("errors"):
+        print(_warn("Programs that failed to introspect:"))
+        for name, err in result["errors"].items():
+            print(f"  - {name}: {err}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="hax-gui", description="Control the hax-em GUI server.")
     sub = p.add_subparsers(dest="command", required=True)
@@ -252,6 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("status", help="show whether the server is running")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("schemas", help="regenerate the cached program form-schemas (imports JAX)")
+    sp.add_argument("--seed", action="store_true", help="write the packaged seed cache instead of the user cache")
+    sp.set_defaults(func=cmd_schemas)
     return p
 
 

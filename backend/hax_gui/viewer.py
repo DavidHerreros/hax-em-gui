@@ -1,6 +1,6 @@
 """WebGL viewer manager: spawn a per-session viewer backend and proxy it.
 
-Each session runs ``viewer/server.py`` (in this same hax env) for one
+Each session runs the bundled viewer backend (in this same hax env) for one
 (latents, network) pair on a private port; the FastAPI app reverse-proxies it at
 ``/viewer/<id>/`` (see app.py). The frontend uses relative URLs, so the proxy
 just strips the ``/viewer/<id>`` prefix and forwards the rest to the subprocess
@@ -20,8 +20,8 @@ from typing import Any
 
 import httpx
 
-# viewer/server.py lives next to the backend package: <repo>/viewer/server.py
-_SERVER = Path(__file__).resolve().parent.parent.parent / "viewer" / "server.py"
+# The viewer backend ships inside the package: hax_gui/viewer_app/server.py
+_SERVER = Path(__file__).resolve().parent / "viewer_app" / "server.py"
 
 
 def _free_port() -> int:

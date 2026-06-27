@@ -58,16 +58,22 @@ frontend/                  # pure ES modules + CSS, served statically by the bac
 ## Install
 
 Just the backend — it serves the frontend too. In the conda env that has
-`hax-em` installed, install the GUI from the repo root:
+`hax-em` installed:
 
 ```bash
-pip install -e .                            # installs deps + the `hax-gui` command
-python backend/scripts/generate_schemas.py  # one-time / after any hax CLI change
+pip install hax-em-gui            # from PyPI (installs deps + the `hax-gui` command)
+# or from a clone, for development:
+pip install -e .                  # editable install from the repo root
 ```
 
-An **editable install** (`-e`) is the supported method: the SPA (`frontend/`) and
-the WebGL viewer (`viewer/`) are served from their source locations alongside the
-package.
+The SPA, the WebGL viewer and a seed schema cache are bundled inside the package,
+so plain, editable, and `pip install git+<url>` installs all work. After
+installing, regenerate the schema cache whenever a hax program's CLI changes
+(it imports JAX, so it's not done automatically):
+
+```bash
+hax-gui schemas       # or, from a clone: python backend/scripts/generate_schemas.py
+```
 
 ## Run it
 

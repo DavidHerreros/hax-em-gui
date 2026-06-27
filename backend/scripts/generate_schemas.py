@@ -4,24 +4,28 @@
 Run inside the hax conda env (imports JAX). The backend serves the cached JSON,
 so re-run this whenever a hax program's CLI changes.
 
-    python scripts/generate_schemas.py
+    python scripts/generate_schemas.py          # -> writable user cache (data dir)
+    python scripts/generate_schemas.py --seed    # -> packaged seed (commit before release)
 """
 
-import json
+import argparse
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from hax_gui.config import settings  # noqa: E402
-from hax_gui.introspect import extract_all  # noqa: E402
+from hax_gui import genschemas  # noqa: E402
 
 
 def main() -> int:
-    result = extract_all()
-    settings.schema_cache.parent.mkdir(parents=True, exist_ok=True)
-    settings.schema_cache.write_text(json.dumps(result, indent=2, default=str))
-    print(f"Wrote {len(result['programs'])} program schemas -> {settings.schema_cache}")
+    parser = argparse.ArgumentParser(description="Regenerate cached program form-schemas.")
+    parser.add_argument("--seed", action="store_true",
+                        help="write the schema cache bundled in the package (the shipped default), "
+                             "instead of the per-user cache in the data dir")
+    args = parser.parse_args()
+
+    result = genschemas.regenerate(seed=args.seed)
+    print(f"Wrote {len(result['programs'])} program schemas -> {result['_target']}")
     if result["errors"]:
         print("Programs that failed to introspect:")
         for name, err in result["errors"].items():

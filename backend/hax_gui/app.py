@@ -576,7 +576,7 @@ async def viewer_proxy(vid: str, path: str, request: Request) -> Response:
 # The frontend is plain ES modules + CSS (no build step), so we serve the
 # directory directly. Same-origin => no CORS/proxy needed for production use.
 def mount_spa() -> None:
-    frontend = settings.schema_cache.parent.parent.parent / "frontend"
+    frontend = settings.frontend_dir
     if (frontend / "index.html").exists():
         app.mount("/", StaticFiles(directory=str(frontend), html=True), name="spa")
 

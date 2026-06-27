@@ -35,7 +35,11 @@ def _category(module_path: str) -> str:
 def _load() -> dict[str, Any]:
     if settings.schema_cache.exists():
         return json.loads(settings.schema_cache.read_text())
-    # Cache missing: extract live (imports JAX; slow but correct).
+    # No user cache yet: use the seed shipped inside the package, if present.
+    if settings.packaged_schema_cache.exists():
+        return json.loads(settings.packaged_schema_cache.read_text())
+    # Nothing cached anywhere: extract live (imports JAX; slow but correct) and
+    # persist into the (writable) user cache.
     from .introspect import extract_all
 
     data = extract_all()
