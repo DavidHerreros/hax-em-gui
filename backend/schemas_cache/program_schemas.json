@@ -1,0 +1,1889 @@
+{
+  "programs": {
+    "hetsiren": {
+      "name": "hetsiren",
+      "module": "hax.networks.hetsiren",
+      "description": "Heterogeneous volume reconstruction with HetSIREN neural network",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed. NOTE: If the metadata includes the label subtomo_labels, then TomoSIREN network will be trained (i.e., HetSIREN for tomography data). In this case, the parameter decoupling will not have any effect as pose/CTF decoupling is already handled by TomoSIREN.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "vol",
+          "flags": [
+            "--vol"
+          ],
+          "flag": "--vol",
+          "required": false,
+          "help": "If provided, the neural network will learn how to refine this volume towards the heterogeneous states present in the images",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "mask",
+          "flags": [
+            "--mask"
+          ],
+          "flag": "--mask",
+          "required": false,
+          "help": "HetSIREN reconstruction mask (useful to focus the reconstruction/estimated landscape on a specific region of interest - the mask provided must be binary -  NOTE: since this is a reconstruction mask, it should be defined such that it covers the volume were the motions of interest are expected to happen)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "load_images_to_ram",
+          "flags": [
+            "--load_images_to_ram"
+          ],
+          "flag": "--load_images_to_ram",
+          "required": false,
+          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "lat_dim",
+          "flags": [
+            "--lat_dim"
+          ],
+          "flag": "--lat_dim",
+          "required": false,
+          "help": "Dimensionality of the latent space of the network (set by default to 8)",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "transport_mass",
+          "flags": [
+            "--transport_mass"
+          ],
+          "flag": "--transport_mass",
+          "required": false,
+          "help": "When set, HetSIREN will be able to \"move\" the mass inside the mask instead of just reconstructing the volume. This implies that HetSIREN will estimate the motion to be applied to the points within the provided mask, instead of considering them fixed in space. This approach is useful when working with large box sizes that do not fit in GPU memory, or when a more through analysis of motions is desired. NOTE: When this option is set and a reference volume is provided, we recommend changing the reference mask to a tight mask computed from the reference volume. This mask now tells the program which regions should be moved. Therefore, consider providing a mask that covers all the protein regions you would like to be analyzed by HetSIREN.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "num_gaussians",
+          "flags": [
+            "--num_gaussians"
+          ],
+          "flag": "--num_gaussians",
+          "required": false,
+          "help": "Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians so that the reproduce the reference volume as well as possible.",
+          "default": null,
+          "type": "integer"
+        },
+        {
+          "name": "local_reconstruction",
+          "flags": [
+            "--local_reconstruction"
+          ],
+          "flag": "--local_reconstruction",
+          "required": false,
+          "help": "When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask. WARNING: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED. WARNING: IF PROVIDED, HAVING A REFERENCE VOLUME IS MANDATORY. OTHERWISE, THIS PARAMETER WILL BE NEGLECTED.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "mode",
+          "flags": [
+            "--mode"
+          ],
+          "flag": "--mode",
+          "required": true,
+          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the latent vectors from the input images (reload parameter is mandatory in this case)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "train",
+            "predict",
+            "send_to_pickle"
+          ]
+        },
+        {
+          "name": "epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "flag": "--epochs",
+          "required": false,
+          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
+          "default": 50,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "learning_rate",
+          "flags": [
+            "--learning_rate"
+          ],
+          "flag": "--learning_rate",
+          "required": false,
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "default": 0.0001,
+          "type": "number"
+        },
+        {
+          "name": "dataset_split_fraction",
+          "flags": [
+            "--dataset_split_fraction"
+          ],
+          "flag": "--dataset_split_fraction",
+          "required": false,
+          "help": "Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: training_fraction,validation_fraction. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. NOTE: the sum of training_fraction and validation_fraction must be equal to one.",
+          "default": [
+            0.8,
+            0.2
+          ],
+          "type": "string",
+          "custom_type": "list_of_floats",
+          "widget": "csv"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, new metadata...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "reload",
+          "flags": [
+            "--reload"
+          ],
+          "flag": "--reload",
+          "required": false,
+          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - NOTE: If a reference volume was provided, HetSIREN also learns a gray level adjustment. In this case, reload must be the path to a folder containing two additional folders called: HetSIREN and Gaussian_volume_fitting)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "denoising_strength",
+          "flags": [
+            "--denoising_strength"
+          ],
+          "flag": "--denoising_strength",
+          "required": false,
+          "help": "Determines how strongly HetSIREN will learn to remove noise from the resulting volumes. Increasing the value of this parameter will result in a stronger regularization of the noise, but it may affect the protein signal as well. (NOTE: We recommend setting this parameter in the range 0.0001 to 0.1)",
+          "default": 0.0001,
+          "type": "number"
+        },
+        {
+          "name": "implicit_network",
+          "flags": [
+            "--implicit_network"
+          ],
+          "flag": "--implicit_network",
+          "required": false,
+          "help": "When set, HetSIREN will use an implicit neural network approach to recover conformational states. Implicit neural networks are more memory consuming, but they are also more accurate in the detection of very local motions. If this architecture is selected, we strongly recommend to set as well the parameter total_mass to limit the memory consumption of the network and increase its performance.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "zernike3deep": {
+      "name": "zernike3deep",
+      "module": "hax.networks.zernike3deep",
+      "description": "Estimation of motions using deep learning version of Zernike3Deep",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "vol",
+          "flags": [
+            "--vol"
+          ],
+          "flag": "--vol",
+          "required": true,
+          "help": "Volume to be warped toward the images",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "mask",
+          "flags": [
+            "--mask"
+          ],
+          "flag": "--mask",
+          "required": false,
+          "help": "Binary mask computed from volume enclosing all the mass to be moved. If not provided, the volume will be automatically masked for you",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "load_images_to_ram",
+          "flags": [
+            "--load_images_to_ram"
+          ],
+          "flag": "--load_images_to_ram",
+          "required": false,
+          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "lat_dim",
+          "flags": [
+            "--lat_dim"
+          ],
+          "flag": "--lat_dim",
+          "required": false,
+          "help": "Dimensionality of the latent space of the network (set by default to 8)",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "L1",
+          "flags": [
+            "--L1"
+          ],
+          "flag": "--L1",
+          "required": false,
+          "help": "Degree of Zernike3D radial component (increasing this value might help finding more localized motions at the expense of higher memory consumption)",
+          "default": 7,
+          "type": "integer"
+        },
+        {
+          "name": "L2",
+          "flags": [
+            "--L2"
+          ],
+          "flag": "--L2",
+          "required": false,
+          "help": "Degree of Zernike3D angular component (increasing this value might help finding more localized motions at the expense of higher memory consumption)",
+          "default": 7,
+          "type": "integer"
+        },
+        {
+          "name": "mode",
+          "flags": [
+            "--mode"
+          ],
+          "flag": "--mode",
+          "required": true,
+          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the latent vectors from the input images (reload parameter is mandatory in this case)\nsend_to_pickle: save the network in pickle format. (reload parameter is mandatory in this case - needed by program estimate_latent_covariances)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "train",
+            "predict",
+            "send_to_pickle"
+          ]
+        },
+        {
+          "name": "num_gaussians",
+          "flags": [
+            "--num_gaussians"
+          ],
+          "flag": "--num_gaussians",
+          "required": false,
+          "help": "Before training the network, Zernike3Deep will try to fit a set of Gaussians in the reference volume to recreate it. The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., the number of residues in your protein), you can set this parameter. When set, the Zernike3Deep will fit this fixed number of Gaussians so that the reproduce the reference volume as well as possible.",
+          "default": null,
+          "type": "integer"
+        },
+        {
+          "name": "epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "flag": "--epochs",
+          "required": false,
+          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
+          "default": 50,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "learning_rate",
+          "flags": [
+            "--learning_rate"
+          ],
+          "flag": "--learning_rate",
+          "required": false,
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "default": 0.0001,
+          "type": "number"
+        },
+        {
+          "name": "dataset_split_fraction",
+          "flags": [
+            "--dataset_split_fraction"
+          ],
+          "flag": "--dataset_split_fraction",
+          "required": false,
+          "help": "Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: training_fraction,validation_fraction. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. NOTE: the sum of training_fraction and validation_fraction must be equal to one.",
+          "default": [
+            0.8,
+            0.2
+          ],
+          "type": "string",
+          "custom_type": "list_of_floats",
+          "widget": "csv"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, new metadata...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "reload",
+          "flags": [
+            "--reload"
+          ],
+          "flag": "--reload",
+          "required": false,
+          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - NOTE: Since Zernike3Deep also learns a gray level adjustment, reload must be the path to a folder containing two additional folders called: Zernike3Deep and Gaussian_volume_fitting)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "flexconsensus": {
+      "name": "flexconsensus",
+      "module": "hax.networks.flexconsensus",
+      "description": "Consensus of conformational latent spaces using FlexConsensus neural network",
+      "summary": "",
+      "fields": [
+        {
+          "name": "input_space",
+          "flags": [
+            "--input_space"
+          ],
+          "flag": "--input_space",
+          "required": true,
+          "help": "Paths to a series of .npy files containing the input spaces to be consensuated. NOTE: You can pass multiple times this parameter to specify a different file.NOTE: You can pass either the files directly or with the format \"--input_space NAME:path\" Using this alternative format allows giving identifiers to each input so it is easier to predict with the network later on. If only the file is given, each input will be named as \"Input_#\" based on their command line order.NOTE: If mode parameter is set to predict, we recommend using the NAME:path convention to simplify the prediction process. If not given, the network will attempt to indentify automatically your method.WARNING: The spaces stored in the files MUST have the SAME number of elements and they MUST be ordered (i.e. the first element in the files is the latent vector obtained from the first image and so on).",
+          "default": null,
+          "type": "string",
+          "multiple": true,
+          "nargs": "+"
+        },
+        {
+          "name": "lat_dim",
+          "flags": [
+            "--lat_dim"
+          ],
+          "flag": "--lat_dim",
+          "required": false,
+          "help": "Dimensionality of the latent space of the network (by default, it is set to the minimum dimension of all the provided input spaces)",
+          "default": null,
+          "type": "integer"
+        },
+        {
+          "name": "mode",
+          "flags": [
+            "--mode"
+          ],
+          "flag": "--mode",
+          "required": true,
+          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the latent vectors from the input images (reload parameter is mandatory in this case)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "train",
+            "predict",
+            "send_to_pickle"
+          ]
+        },
+        {
+          "name": "epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "flag": "--epochs",
+          "required": false,
+          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
+          "default": 100,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "default": 1024,
+          "type": "integer"
+        },
+        {
+          "name": "learning_rate",
+          "flags": [
+            "--learning_rate"
+          ],
+          "flag": "--learning_rate",
+          "required": false,
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "default": 1e-05,
+          "type": "number"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, consensus spaces...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "reload",
+          "flags": [
+            "--reload"
+          ],
+          "flag": "--reload",
+          "required": false,
+          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        }
+      ]
+    },
+    "latent_space_deconvolution": {
+      "name": "latent_space_deconvolution",
+      "module": "hax.networks.latent_space_deconvolution",
+      "description": "Deconvolution of conformational latent spaces",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp metadata file with the images (+ alignments / CTF) whose latent vectors will be recovered on the fly from the provided network and then deconvolved",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "nn_path",
+          "flags": [
+            "--nn_path"
+          ],
+          "flag": "--nn_path",
+          "required": true,
+          "help": "Path to folder containing a saved neural network (HetSIREN, Zernike3Deep...). Its encoder is used to recover the latent vectors of the images in md on the fly",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "covariances",
+          "flags": [
+            "--covariances"
+          ],
+          "flag": "--covariances",
+          "required": true,
+          "help": "Path to the .npy file with the covariances needed to estimate the deconvolution (output of estimate_latent_covariances program)",
+          "default": null,
+          "type": "string"
+        },
+        {
+          "name": "lat_dim",
+          "flags": [
+            "--lat_dim"
+          ],
+          "flag": "--lat_dim",
+          "required": false,
+          "help": "Dimensionality of the latent space of the deconvolution network",
+          "default": 3,
+          "type": "integer"
+        },
+        {
+          "name": "mode",
+          "flags": [
+            "--mode"
+          ],
+          "flag": "--mode",
+          "required": true,
+          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the deconvolved latents from the input latents (reload parameter is mandatory in this case)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "train",
+            "predict"
+          ]
+        },
+        {
+          "name": "deconvolution_strength",
+          "flags": [
+            "--deconvolution_strength"
+          ],
+          "flag": "--deconvolution_strength",
+          "required": false,
+          "help": "Determines the deconvolution strength (set to 1.0 by default, meaning that the landscape will be deconvolved as expected from the computed covariances - larger values will yield a stronger deconvolution compared to the default value, while smaller values will be more conservative",
+          "default": 1.0,
+          "type": "number"
+        },
+        {
+          "name": "epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "flag": "--epochs",
+          "required": false,
+          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 100 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
+          "default": 100,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
+          "default": 1024,
+          "type": "integer"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, deconvolved latents...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "reload",
+          "flags": [
+            "--reload"
+          ],
+          "flag": "--reload",
+          "required": false,
+          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "load_images_to_ram",
+          "flags": [
+            "--load_images_to_ram"
+          ],
+          "flag": "--load_images_to_ram",
+          "required": false,
+          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "image_gray_scale_adjustment": {
+      "name": "image_gray_scale_adjustment",
+      "module": "hax.networks.image_gray_scale_adjustment",
+      "description": "Adjustment of volume projections to match a set of images",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "vol",
+          "flags": [
+            "--vol"
+          ],
+          "flag": "--vol",
+          "required": true,
+          "help": "Volume needed to generate the projections to be adjusted",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "mask",
+          "flags": [
+            "--mask"
+          ],
+          "flag": "--mask",
+          "required": false,
+          "help": "This helps focusing the adjustment on a region of interest (if not provided, a inscribed spherical mask will be used)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "load_images_to_ram",
+          "flags": [
+            "--load_images_to_ram"
+          ],
+          "flag": "--load_images_to_ram",
+          "required": false,
+          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "predict_value",
+          "flags": [
+            "--predict_value"
+          ],
+          "flag": "--predict_value",
+          "required": false,
+          "help": "If not provided, the adjustment will be estimated per pixel - otherwise, adjustment will be estimated per projection",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "lat_dim",
+          "flags": [
+            "--lat_dim"
+          ],
+          "flag": "--lat_dim",
+          "required": false,
+          "help": "Dimensionality of the latent space of the network (set by default to 3)",
+          "default": 3,
+          "type": "integer"
+        },
+        {
+          "name": "mode",
+          "flags": [
+            "--mode"
+          ],
+          "flag": "--mode",
+          "required": true,
+          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the adjustment for the input images/volume (reload parameter is mandatory in this case)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "train",
+            "predict"
+          ]
+        },
+        {
+          "name": "epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "flag": "--epochs",
+          "required": false,
+          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
+          "default": 50,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
+          "default": 64,
+          "type": "integer"
+        },
+        {
+          "name": "learning_rate",
+          "flags": [
+            "--learning_rate"
+          ],
+          "flag": "--learning_rate",
+          "required": false,
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "default": 1e-05,
+          "type": "number"
+        },
+        {
+          "name": "dataset_split_fraction",
+          "flags": [
+            "--dataset_split_fraction"
+          ],
+          "flag": "--dataset_split_fraction",
+          "required": false,
+          "help": "Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: training_fraction,validation_fraction. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. NOTE: the sum of training_fraction and validation_fraction must be equal to one.",
+          "default": [
+            0.8,
+            0.2
+          ],
+          "type": "string",
+          "custom_type": "list_of_floats",
+          "widget": "csv"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, new metadata...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "reload",
+          "flags": [
+            "--reload"
+          ],
+          "flag": "--reload",
+          "required": false,
+          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "volume_gray_scale_adjustment": {
+      "name": "volume_gray_scale_adjustment",
+      "module": "hax.networks.volume_gray_scale_adjustment",
+      "description": "Volume gray level adjustment towards a set of images",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": false,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "vol",
+          "flags": [
+            "--vol"
+          ],
+          "flag": "--vol",
+          "required": true,
+          "help": "Volume to be adjusted according to the images",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "mask",
+          "flags": [
+            "--mask"
+          ],
+          "flag": "--mask",
+          "required": false,
+          "help": "This helps focusing the adjustment on a region of interest (if not provided, a inscribed spherical mask will be used)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "load_images_to_ram",
+          "flags": [
+            "--load_images_to_ram"
+          ],
+          "flag": "--load_images_to_ram",
+          "required": false,
+          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "predicts_value",
+          "flags": [
+            "--predicts_value"
+          ],
+          "flag": "--predicts_value",
+          "required": false,
+          "help": "If not provided, the adjustment will be estimated per voxel - otherwise, adjustment will be estimated for the whole volume",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "lat_dim",
+          "flags": [
+            "--lat_dim"
+          ],
+          "flag": "--lat_dim",
+          "required": false,
+          "help": "Dimensionality of the latent space of the network (set by default to 3)",
+          "default": 3,
+          "type": "integer"
+        },
+        {
+          "name": "mode",
+          "flags": [
+            "--mode"
+          ],
+          "flag": "--mode",
+          "required": true,
+          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the adjustment for the input volume (reload parameter is mandatory in this case)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "train",
+            "predict"
+          ]
+        },
+        {
+          "name": "epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "flag": "--epochs",
+          "required": false,
+          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
+          "default": 50,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
+          "default": 64,
+          "type": "integer"
+        },
+        {
+          "name": "learning_rate",
+          "flags": [
+            "--learning_rate"
+          ],
+          "flag": "--learning_rate",
+          "required": false,
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "default": 1e-05,
+          "type": "number"
+        },
+        {
+          "name": "dataset_split_fraction",
+          "flags": [
+            "--dataset_split_fraction"
+          ],
+          "flag": "--dataset_split_fraction",
+          "required": false,
+          "help": "Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: training_fraction,validation_fraction. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. NOTE: the sum of training_fraction and validation_fraction must be equal to one.",
+          "default": [
+            0.8,
+            0.2
+          ],
+          "type": "string",
+          "custom_type": "list_of_floats",
+          "widget": "csv"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, adjusted volume...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "reload",
+          "flags": [
+            "--reload"
+          ],
+          "flag": "--reload",
+          "required": false,
+          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "estimate_latent_covariances": {
+      "name": "estimate_latent_covariances",
+      "module": "hax.programs.estimate_latent_covariances",
+      "description": "Estimate latent space covariances matrices by simulating experimental images - needed by latent_space_deconvolution",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp metadata file with the images (+ alignments / CTF) needed to predict the covariances",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "nn_path",
+          "flags": [
+            "--nn_path"
+          ],
+          "flag": "--nn_path",
+          "required": false,
+          "help": "Path to folder containing a saved neural network (HetSIREN, Zernike3Deep...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
+          "default": 64,
+          "type": "integer"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the estimated covariances",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "load_images_to_ram",
+          "flags": [
+            "--load_images_to_ram"
+          ],
+          "flag": "--load_images_to_ram",
+          "required": false,
+          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "decode_states_from_latents": {
+      "name": "decode_states_from_latents",
+      "module": "hax.programs.decode_states_from_latents",
+      "description": "Decode a set of volumes given a network (Zernike3D or HetSIREN) and a set of latent vectors",
+      "summary": "",
+      "fields": [
+        {
+          "name": "latents_file",
+          "flags": [
+            "--latents_file"
+          ],
+          "flag": "--latents_file",
+          "required": true,
+          "help": "File with the latent vectors needed to decode the volumes. Valid extensions include .txt and .npy",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "reload",
+          "flags": [
+            "--reload"
+          ],
+          "flag": "--reload",
+          "required": true,
+          "help": "Path to a folder containing an already saved neural network (NOTE: Only networks saved in Pickled format can be supplied here.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path were the decoded volumes will be saved.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "filter_latents": {
+      "name": "filter_latents",
+      "module": "hax.programs.filter_latents",
+      "description": "Filtering of latent spaces based on z-scores",
+      "summary": "",
+      "fields": [
+        {
+          "name": "latents",
+          "flags": [
+            "--latents"
+          ],
+          "flag": "--latents",
+          "required": true,
+          "help": "Path to the .npy file with the latent space to be filtered",
+          "default": null,
+          "type": "string"
+        },
+        {
+          "name": "thr",
+          "flags": [
+            "--thr"
+          ],
+          "flag": "--thr",
+          "required": false,
+          "help": "Threshold for the Z-Scores determining which ones will be kept",
+          "default": 1.0,
+          "type": "number"
+        },
+        {
+          "name": "n_neighbours",
+          "flags": [
+            "--n_neighbours"
+          ],
+          "flag": "--n_neighbours",
+          "required": false,
+          "help": "Number of nearest neighbours used to compute the Z-Score for any given latent vector (smaller values are better to capture local features in the latent space)",
+          "default": 10,
+          "type": "integer"
+        },
+        {
+          "name": "return_ids",
+          "flags": [
+            "--return_ids"
+          ],
+          "flag": "--return_ids",
+          "required": false,
+          "help": "If provided, the ids of the latent vectors will be retrieved instead of the filtered space",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 1024 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
+          "default": 1024,
+          "type": "integer"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the filtered latent space",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "display_metrics": {
+      "name": "display_metrics",
+      "module": "hax.metrics.writer",
+      "description": "Display the model metrics (training curves, validation curves...) extracted while training a neural network",
+      "summary": "Launch TensorBoard for a given JAX SummaryWriter log directory",
+      "fields": [
+        {
+          "name": "logdir",
+          "flags": [
+            "--logdir"
+          ],
+          "flag": "--logdir",
+          "required": true,
+          "help": "Path to the TensorBoard log directory",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "annotate_space": {
+      "name": "annotate_space",
+      "module": "hax.viewers.annotate_space.annotate_space",
+      "description": "Interactive latent space analysis with real time map generation",
+      "summary": "",
+      "fields": [
+        {
+          "name": "z_space",
+          "flags": [
+            "--z_space"
+          ],
+          "flag": "--z_space",
+          "required": true,
+          "help": "The latent space estimated by any method and saved in txt or npy format.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "z_space_reduced",
+          "flags": [
+            "--z_space_reduced"
+          ],
+          "flag": "--z_space_reduced",
+          "required": false,
+          "help": "A reduced dimensionality version of your input latent space. If not provided, the viewer will use the original latent space provided through z_space will be displayed. Valid extensions include .txt and .npy",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "path",
+          "flags": [
+            "--path"
+          ],
+          "flag": "--path",
+          "required": true,
+          "help": "Path were viewer outputs will be saved.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "only_view",
+          "flags": [
+            "--only_view"
+          ],
+          "flag": "--only_view",
+          "required": false,
+          "help": "When provided, the viewer will only display the conformational landscape. State generation capabilities are stopped. When neither env_name nor volumes_path are provided, the viewer will always use this mode.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "chimerax_binary",
+          "flags": [
+            "--chimerax_binary"
+          ],
+          "flag": "--chimerax_binary",
+          "required": false,
+          "help": "If you want the viewer to connect with ChimeraX, please, provide here the absolute path to the ChimeraX binary from your installation.",
+          "default": null,
+          "type": "string"
+        },
+        {
+          "name": "env_name",
+          "flags": [
+            "--env_name"
+          ],
+          "flag": "--env_name",
+          "required": false,
+          "help": "When generating conformational states with a given software, you will need to provide here the name of the Conda environment where that software is installed",
+          "default": "hax",
+          "type": "string"
+        },
+        {
+          "name": "server_functions_path",
+          "flags": [
+            "--server_functions_path"
+          ],
+          "flag": "--server_functions_path",
+          "required": false,
+          "help": "When parameter env_name is provided, you must provide as well this parameter. Here, you must specify a path to a Python .py file containing a class with two methods: prepare_heterogeneity_program and decode_state_from_latent. These funcitons allows to setup and execute the heterogeneity method used to estimate the landscape provided through z_space, so that the viewer can generate conformations directly from this method. An example on how this class must be defined ca be found in this package source code available at: hax/viewers/server_loading_functions/load_model.py.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "volumes_path",
+          "flags": [
+            "--volumes_path"
+          ],
+          "flag": "--volumes_path",
+          "required": false,
+          "help": "If env_name is not provided, you can still visualize a set of pre-saved conformation using this parameter. Here you will pass a path to a .txt file containing as many volume paths as points has the landscape provided in z_space. NOTE that the points in your landscape and the volume paths stored in the txt file MUST have the same order.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        }
+      ]
+    },
+    "reconsiren": {
+      "name": "reconsiren",
+      "module": "hax.networks.reconsiren",
+      "description": "Ab initio estimation of particle pose, shifts and initial volume with neural networks",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "vol",
+          "flags": [
+            "--vol"
+          ],
+          "flag": "--vol",
+          "required": false,
+          "help": "If provided, the neural network will start from this volume when assigning the angles and shifts to the images.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "mask",
+          "flags": [
+            "--mask"
+          ],
+          "flag": "--mask",
+          "required": false,
+          "help": "ReconSIREN reconstruction mask (the mask provided must be binary - NOTE: since this is a reconstruction mask, it should be defined such that it covers the volume were the motions of interest are expected to happen)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "load_images_to_ram",
+          "flags": [
+            "--load_images_to_ram"
+          ],
+          "flag": "--load_images_to_ram",
+          "required": false,
+          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "do_not_learn_volume",
+          "flags": [
+            "--do_not_learn_volume"
+          ],
+          "flag": "--do_not_learn_volume",
+          "required": false,
+          "help": "When this parameter is provided, ReconSIREN will just learn an angular assignment with shifts without learning any map. This is usually useful when a reference volume with high resolution is provided (e.g. coming from an atomic model) and no refinement of the map is needed.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "refine_current_assignment",
+          "flags": [
+            "--refine_current_assignment"
+          ],
+          "flag": "--refine_current_assignment",
+          "required": false,
+          "help": "If your input metadata has already and angular assignment and shifts, you can provide this option to refine those angles instead of finding an ab initio alignment.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "symmetry_group",
+          "flags": [
+            "--symmetry_group"
+          ],
+          "flag": "--symmetry_group",
+          "required": false,
+          "help": "If your protein has any kind of symmetry, you may pass it here so that it is considered while learning the angular assignment and the volume (NOTE: only c* and d* symmetry groups are currently supported - the parameter is lower case sensitive - even if symmetry is provided, the network will learn a symmetry broken set of angles in c1. Therefore, the angles can be directly used in a reconstruction/refinement.)",
+          "default": "c1",
+          "type": "string"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "mode",
+          "flags": [
+            "--mode"
+          ],
+          "flag": "--mode",
+          "required": true,
+          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the latent vectors from the input images (reload parameter is mandatory in this case)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "train",
+            "predict",
+            "send_to_pickle"
+          ]
+        },
+        {
+          "name": "epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "flag": "--epochs",
+          "required": false,
+          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
+          "default": 50,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "learning_rate",
+          "flags": [
+            "--learning_rate"
+          ],
+          "flag": "--learning_rate",
+          "required": false,
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "default": 0.0001,
+          "type": "number"
+        },
+        {
+          "name": "dataset_split_fraction",
+          "flags": [
+            "--dataset_split_fraction"
+          ],
+          "flag": "--dataset_split_fraction",
+          "required": false,
+          "help": "Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: training_fraction,validation_fraction. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. NOTE: the sum of training_fraction and validation_fraction must be equal to one.",
+          "default": [
+            0.8,
+            0.2
+          ],
+          "type": "string",
+          "custom_type": "list_of_floats",
+          "widget": "csv"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, new metadata...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "reload",
+          "flags": [
+            "--reload"
+          ],
+          "flag": "--reload",
+          "required": false,
+          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data).",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    },
+    "modart": {
+      "name": "modart",
+      "module": "hax.programs.modart",
+      "description": "ART based volume reconstruction with motion correction to motion blurr artifacts",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "vol",
+          "flags": [
+            "--vol"
+          ],
+          "flag": "--vol",
+          "required": false,
+          "help": "If provided, MoDART will perform a refinement of this volume",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "mask",
+          "flags": [
+            "--mask"
+          ],
+          "flag": "--mask",
+          "required": false,
+          "help": "Determines the initial position of the mass available to MoDART to reconstruct a volume. This mask can be tight to the input volume (if provided). WARNING: The mask provided here MUST be BINARY.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "load_images_to_ram",
+          "flags": [
+            "--load_images_to_ram"
+          ],
+          "flag": "--load_images_to_ram",
+          "required": false,
+          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "symmetry_group",
+          "flags": [
+            "--symmetry_group"
+          ],
+          "flag": "--symmetry_group",
+          "required": false,
+          "help": "If your protein has any kind of symmetry, you may pass it here so that it is considered while learning the angular assignment and the volume (NOTE: only c* and d* symmetry groups are currently supported - the parameter is lower case sensitive - even if symmetry is provided, the network will learn a symmetry broken set of angles in c1. Therefore, the angles can be directly used in a reconstruction/refinement.)",
+          "default": "c1",
+          "type": "string"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "reconstruct_halves",
+          "flags": [
+            "--reconstruct_halves"
+          ],
+          "flag": "--reconstruct_halves",
+          "required": false,
+          "help": "If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "motion_correction",
+          "flags": [
+            "--motion_correction"
+          ],
+          "flag": "--motion_correction",
+          "required": false,
+          "help": "If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed.  NOTE : When providing this parameter, you MUST give the path to a trained  HetSIREN (with transport of mass)  or  Zernike3Deep  neural network.",
+          "default": null,
+          "type": "string"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, new metadata...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        }
+      ]
+    }
+  },
+  "errors": {}
+}

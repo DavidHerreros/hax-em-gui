@@ -1,0 +1,238 @@
+"""Derive one program's input from a previous job's output ("job chaining").
+
+Several hax programs consume a file that an earlier run already produced. For
+example annotate_space / filter_latents / decode_states_from_latents all want a
+latents ``.npy`` of shape ``(N, latent_dim)``, while:
+
+* ``hetsiren`` / ``zernike3deep`` / ``reconsiren`` predict-runs emit those
+  latents *inside* a metadata column (``latent_space``, comma-separated floats);
+* ``filter_latents`` emits them as a ready ``filtered_latents.npy``.
+
+This module knows, per "artifact kind", which jobs can produce it and how to
+materialise the exact file the consumer expects. The GUI uses it to let users
+pick (or drag-and-drop) a job as the input of the next program.
+"""
+
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+from typing import Any
+
+
+class AdapterError(Exception):
+    """A job's output could not be turned into the requested input."""
+
+
+# Form fields that may be fed from a previous job: {program: {field: kind}}.
+# `latents` -> a (N, latent_dim) .npy; the various `*_model` kinds -> a saved
+# network checkpoint directory passed straight to `--reload`.
+BINDABLE_FIELDS: dict[str, dict[str, str]] = {
+    "annotate_space": {"z_space": "latents", "z_space_reduced": "latents", "pickled_nn": "decoder_model"},
+    "filter_latents": {"latents": "latents"},
+    "decode_states_from_latents": {"latents_file": "latents", "reload": "decoder_model"},
+    "hetsiren": {"reload": "hetsiren_model"},
+    "zernike3deep": {"reload": "zernike3deep_model"},
+    "reconsiren": {"reload": "reconsiren_model"},
+    "flexconsensus": {"reload": "flexconsensus_model"},
+    "latent_space_deconvolution": {"reload": "deconvolver_model"},
+    "image_gray_scale_adjustment": {"reload": "image_adjust_model"},
+    "volume_gray_scale_adjustment": {"reload": "volume_adjust_model"},
+}
+
+# The checkpoint subfolder each network program writes inside its run folder.
+# A run only contains this when it actually trained/saved a model (e.g. a
+# hetsiren *predict* run has none), so directory-existence filters sources for us.
+_CHECKPOINT_DIR: dict[str, str] = {
+    "hetsiren": "HetSIREN",
+    "zernike3deep": "Zernike3Deep",
+    "reconsiren": "ReconSIREN",
+    "flexconsensus": "FlexConsensus",
+    "latent_space_deconvolution": "deconvolver",
+    "image_gray_scale_adjustment": "imageAdjustment",
+    "volume_gray_scale_adjustment": "volumeAdjustment",
+}
+
+# Each `*_model` kind -> the producer programs whose checkpoint a consumer can
+# reload, and how that consumer reads `--reload`:
+#   "parent" -> the program does load(join(reload, "<ModelName>")) itself, so it
+#               must be given the *run folder* (the checkpoint's parent);
+#   "dir"    -> the program does load(reload) directly, so it must be given the
+#               *checkpoint folder* itself.
+# Most networks reload only their own type (and append the name); only
+# decode_states_from_latents loads the checkpoint path directly, and it can
+# reload any decoder network (anything exposing decode_volume).
+_MODEL_KINDS: dict[str, dict[str, Any]] = {
+    "hetsiren_model": {"programs": ["hetsiren"], "form": "parent"},
+    "zernike3deep_model": {"programs": ["zernike3deep"], "form": "parent"},
+    "reconsiren_model": {"programs": ["reconsiren"], "form": "parent"},
+    "flexconsensus_model": {"programs": ["flexconsensus"], "form": "parent"},
+    "deconvolver_model": {"programs": ["latent_space_deconvolution"], "form": "parent"},
+    "image_adjust_model": {"programs": ["image_gray_scale_adjustment"], "form": "parent"},
+    "volume_adjust_model": {"programs": ["volume_gray_scale_adjustment"], "form": "parent"},
+    "decoder_model": {"programs": ["hetsiren", "zernike3deep", "reconsiren"], "form": "dir"},
+}
+
+# Latents producers: a predict metadata column, or a ready filtered .npy.
+_LATENT_PRODUCERS: list[dict[str, Any]] = [
+    {
+        "style": "metadata",
+        "programs": {"hetsiren", "zernike3deep", "reconsiren"},
+        "globs": ["predicted_latents.xmd", "predicted_latents.star", "predicted_latents.*"],
+        "column": "latent_space",
+    },
+    {
+        "style": "file",
+        "programs": {"filter_latents"},
+        "globs": ["filtered_latents.npy"],
+    },
+]
+
+
+def bindable_fields(program: str) -> dict[str, str]:
+    """{field_name: kind} for fields of `program` that accept a job as input."""
+    return BINDABLE_FIELDS.get(program, {})
+
+
+def _pretty_kind(kind: str) -> str:
+    if kind == "latents":
+        return "latents"
+    if kind.endswith("_model"):
+        return "a saved network"
+    return kind
+
+
+def _specs_for_kind(kind: str) -> list[dict[str, Any]]:
+    if kind == "latents":
+        return _LATENT_PRODUCERS
+    if kind in _MODEL_KINDS:
+        info = _MODEL_KINDS[kind]
+        return [{"style": "dir", "programs": set(info["programs"]), "form": info["form"]}]
+    return []
+
+
+def producer_programs(kind: str) -> list[str]:
+    """Program names whose output can produce `kind` (for client-side DnD checks)."""
+    progs: set[str] = set()
+    for spec in _specs_for_kind(kind):
+        progs |= spec["programs"]
+    return sorted(progs)
+
+
+def producers_for(program: str) -> dict[str, list[str]]:
+    """{kind: [producer programs]} for every bindable field-kind of `program`."""
+    kinds = set(bindable_fields(program).values())
+    return {kind: producer_programs(kind) for kind in kinds}
+
+
+def _match_producer(kind: str, program: str) -> dict[str, Any] | None:
+    for spec in _specs_for_kind(kind):
+        if program in spec["programs"]:
+            return spec
+    return None
+
+
+def _is_loadable_checkpoint(path: Path) -> bool:
+    """True only for a *complete* checkpoint dir, matching what
+    ``NeuralNetworkCheckpointer.load`` reads: ``<dir>/checkpoints/{config,state}``.
+
+    This is what makes the reload picker honest: a still-training run hasn't
+    committed its final checkpoint yet, and a crashed run may have created the
+    folder but never finished writing it -- neither passes this check, so only
+    runs you can actually reload are offered.
+    """
+    cp = path / "checkpoints"
+    return (cp / "config").is_file() and (cp / "state").exists()
+
+
+def _find_artifact(workdir: Path, spec: dict[str, Any], program: str) -> Path | None:
+    if spec["style"] == "dir":
+        name = _CHECKPOINT_DIR.get(program)
+        if not name:
+            return None
+        path = workdir / name
+        return path if path.is_dir() and _is_loadable_checkpoint(path) else None
+    for pattern in spec["globs"]:
+        hit = next(iter(sorted(workdir.glob(pattern))), None)
+        if hit is not None and hit.is_file():
+            return hit
+    return None
+
+
+def source_file_for(kind: str, job: dict[str, Any]) -> Path | None:
+    """The output file/dir in `job` that can produce `kind`, or None."""
+    workdir = job.get("workdir")
+    if not workdir:
+        return None
+    program = job.get("program", "")
+    spec = _match_producer(kind, program)
+    if spec is None:
+        return None
+    return _find_artifact(Path(workdir), spec, program)
+
+
+def compatible_sources(kind: str, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Finished jobs whose output can feed a `kind` input, newest first."""
+    out = []
+    for job in jobs:
+        src = source_file_for(kind, job)
+        if src is not None:
+            out.append({
+                "id": job["id"],
+                "program": job["program"],
+                "name": job.get("name"),
+                "created_at": job.get("created_at"),
+                "status": job.get("status"),
+                "file": str(src),
+            })
+    return out
+
+
+def produce(kind: str, source_job: dict[str, Any], dest_dir: Path, field: str) -> str:
+    """Materialise the `kind` artifact from `source_job` into `dest_dir`.
+
+    Returns the path of the file the consuming program should read. Raises
+    AdapterError with a user-facing message on any failure.
+    """
+    program = source_job.get("program", "")
+    spec = _match_producer(kind, program)
+    if spec is None:
+        raise AdapterError(f"a '{program}' run cannot provide {_pretty_kind(kind)}")
+    src = source_file_for(kind, source_job)
+    if src is None:
+        hint = "did it finish training?" if spec["style"] == "dir" else "did it finish?"
+        raise AdapterError(f"the selected run hasn't produced {_pretty_kind(kind)} yet ({hint})")
+
+    # Checkpoints are referenced in place (no copy). `src` is the checkpoint
+    # folder (e.g. <run>/HetSIREN); "parent"-form consumers append the model
+    # name themselves, so hand them the run folder instead to avoid <run>/X/X.
+    if spec["style"] == "dir":
+        return str(src.parent if spec.get("form") == "parent" else src)
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out = dest_dir / f"{field}.npy"
+    if spec["style"] == "file":
+        shutil.copyfile(src, out)
+    else:
+        _extract_latents_column(src, spec["column"], out)
+    return str(out)
+
+
+def _extract_latents_column(md_path: Path, column: str, out: Path) -> None:
+    """Parse a string-encoded latents column from a metadata file into a .npy."""
+    import numpy as np
+    from xmipp_metadata.metadata import XmippMetaData
+
+    md = XmippMetaData(str(md_path))
+    if not md.isMetaDataLabel(column):
+        raise AdapterError(f"'{column}' column not found in {md_path.name}")
+    col = md.getMetaDataColumns(column)
+    try:
+        rows = [np.fromstring(str(s), sep=",") for s in col]
+    except Exception as exc:  # noqa: BLE001
+        raise AdapterError(f"could not parse the latents column: {exc}")
+    widths = {r.size for r in rows}
+    if not rows or widths == {0} or len(widths) != 1:
+        raise AdapterError("the latents column is empty or has inconsistent dimensions")
+    arr = np.asarray(rows, dtype=np.float32)
+    np.save(out, arr)

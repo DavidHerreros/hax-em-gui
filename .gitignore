@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+
+# Runtime data (jobs DB, logs)
+.hax_gui/
+backend/.hax_gui/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

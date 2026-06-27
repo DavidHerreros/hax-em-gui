@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hax — conformational landscape</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <strong id="title">Conformational landscape</strong>
+      <span id="meta" class="muted"></span>
+    </div>
+    <div class="topright">
+      <label class="muted">export
+        <select id="dpi" title="Image scale / DPI">
+          <option value="1">1×</option>
+          <option value="2" selected>2×</option>
+          <option value="3">3×</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+      <label class="muted"><input id="transparent" type="checkbox" /> transparent</label>
+      <span id="status" class="status" title="">Loading…</span>
+    </div>
+  </header>
+
+  <main class="split">
+    <!-- ───────────────── Landscape ───────────────── -->
+    <section class="pane" id="landPane">
+      <div class="pane-head">
+        <div class="pane-title">Latent space <span id="axisinfo" class="muted"></span></div>
+        <div class="toolbar">
+          <label>dims <select id="dims"><option value="2" selected>2D</option><option value="3">3D</option></select></label>
+          <label>view <select id="embed"><option value="pca" selected>PCA</option><option value="umap">UMAP</option><option value="latent">Latent (raw)</option></select></label>
+          <label>X <select id="xaxis"></select></label>
+          <label>Y <select id="yaxis"></select></label>
+          <label id="zwrap" style="display:none">Z <select id="zaxis"></select></label>
+          <label>color
+            <select id="colorby">
+              <option value="none" selected>none</option>
+              <option value="cluster">cluster</option>
+              <option value="density">density</option>
+              <option value="layers">layers</option>
+            </select>
+          </label>
+          <label>points <input id="ptsalpha" type="range" min="0" max="1" step="0.05" value="1" title="Point opacity (0 = hide, to see the density)" /></label>
+          <span id="kwrap" class="kwrap" style="display:none"><label>k <input id="k" type="range" min="2" max="12" value="5" /></label><span id="kval" class="muted">5</span></span>
+          <span id="denswrap" class="kwrap" style="display:none">
+            <label>σ <input id="denssigma" type="range" min="1" max="20" value="6" title="Density bandwidth" /></label>
+            <label>glow <input id="densint" type="range" min="0" max="1" step="0.02" value="0.22" title="3D density glow intensity" /></label>
+          </span>
+          <button id="lassoBtn" class="btn" title="Lasso-select points (drag a loop)">▱ Lasso</button>
+          <button id="layersBtn" class="btn" title="Show / hide the layers panel">Layers</button>
+          <button id="saveLand" class="btn" title="Save landscape as PNG">Save PNG</button>
+        </div>
+      </div>
+      <div class="pane-body">
+        <aside class="layers" id="layersRail">
+          <div class="layers-head">
+            <span>Layers</span>
+            <button id="addLayer" class="btn small" disabled title="Make a layer from the current lasso selection">+ selection</button>
+          </div>
+          <div class="cluster-row">
+            <label>KMeans k <input id="clusterK" type="number" min="2" max="20" value="5" /></label>
+            <button id="clusterBtn" class="btn small" title="Cluster the latent space into k layers + a centroid layer">Cluster</button>
+          </div>
+          <div class="cluster-row" id="saveRow" style="display:none">
+            <label>save as <select id="saveFmt"><option value="xmd">.xmd</option><option value="star">.star</option><option value="cs">.cs</option></select></label>
+            <button id="saveAll" class="btn small" title="Save every layer to the project">Save all</button>
+          </div>
+          <ul id="layerList" class="layer-list"></ul>
+          <div id="noLayers" class="muted small layers-hint">Use <b>▱ Lasso</b> to select points, then <b>+ selection</b> to make a layer. A layer can be morphed as a volume series.</div>
+        </aside>
+        <div class="rail-resize" id="railResize" title="Drag to resize the layers panel"></div>
+        <div class="canvas-wrap">
+          <canvas id="scatter"></canvas>
+          <canvas id="scatter3d" style="display:none"></canvas>
+          <canvas id="lassoCanvas" class="overlay"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <div class="divider" id="paneDivider" title="Drag to resize the panes"></div>
+
+    <!-- ───────────────── Volume ───────────────── -->
+    <section class="pane" id="volPane">
+      <div class="pane-head">
+        <div class="pane-title">Decoded map <span id="sel" class="muted"></span></div>
+        <div class="toolbar">
+          <label>render
+            <select id="rendermode">
+              <option value="surface" selected>Surface</option>
+              <option value="mip">Volume · MIP</option>
+              <option value="emission">Volume · glow</option>
+            </select>
+          </label>
+          <label id="lightlbl">light <select id="light"><option value="standard" selected>standard</option><option value="smooth">smooth</option><option value="raytraced">ray traced</option></select></label>
+          <label id="smoothlbl">smooth <input id="smooth" type="range" min="0" max="20" value="6" title="Surface mesh smoothing (Taubin iterations)" /></label>
+          <span id="volctrls" style="display:none">
+            <label>γ <input id="vgamma" type="range" min="0.3" max="3" step="0.1" value="1.4" title="Transfer-function gamma" /></label>
+            <label>bright <input id="vbright" type="range" min="0.2" max="3" step="0.1" value="1.2" title="Brightness / opacity" /></label>
+          </span>
+          <label>surface <input id="color" type="color" value="#dcdcdc" title="Surface / volume color" /></label>
+          <label>bg <input id="bg" type="color" value="#040610" title="Background color" /></label>
+          <button id="reset" class="btn">Reset view</button>
+          <button id="saveMap" class="btn" title="Save map as PNG">Save PNG</button>
+          <button id="mrc" class="btn" title="Download decoded map as .mrc">.mrc</button>
+        </div>
+      </div>
+      <div class="hist-strip">
+        <span class="hist-label muted">contour</span>
+        <canvas id="hist"></canvas>
+      </div>
+      <div class="canvas-wrap"><canvas id="gl"></canvas><canvas id="glvol" style="display:none"></canvas></div>
+      <div class="morph-bar">
+        <span class="muted">Path <button id="pathToggle" class="iconbtn" title="Show / hide the full path" style="display:none">▸</button> <span id="morphto" class="mono">—</span></span>
+        <button id="clearpath" class="btn" title="Clear the morph path">Clear</button>
+        <label class="muted">frames/seg <input id="frames" type="number" min="4" max="120" value="36" /></label>
+        <label class="muted">speed <input id="speed" type="range" min="2" max="30" value="25" title="Playback speed (frames/sec)" /></label>
+        <button id="play" class="btn" disabled>▶ Play</button>
+        <button id="record" class="btn" disabled title="Record the morph as a .webm video">● Record</button>
+        <button id="stop" class="btn" disabled title="Stop and rewind to the start">■ Stop</button>
+        <input id="scrub" class="scrub" type="range" min="0" max="0" value="0" step="1" disabled title="Scrub through the morph / series" />
+        <span id="framelbl" class="muted small mono">—</span>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

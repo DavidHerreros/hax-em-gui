@@ -1,0 +1,255 @@
+// Minimal WebGL2 3D point-cloud renderer for the latent landscape (3 PCs).
+// Orbit camera (shared style with gl.js), per-point color, selection/target
+// rings, CPU-side picking, and high-DPI / transparent snapshots. No deps.
+import { perspective, lookAt, multiply, mulVec4 } from "./mat4.js";
+import { createOrbit } from "./orbit.js";
+
+const VERT = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aColor;
+layout(location=2) in float aFlag;   // 0 normal, 1 current, 2 path, 3 selection
+uniform mat4 uProj;
+uniform mat4 uView;
+uniform float uSize;
+out vec3 vColor;
+out float vFlag;
+void main() {
+  vColor = aColor; vFlag = aFlag;
+  gl_Position = uProj * uView * vec4(aPos, 1.0);
+  gl_PointSize = uSize * (aFlag > 0.5 ? 2.1 : 1.0);
+}`;
+
+const FRAG = `#version 300 es
+precision highp float;
+in vec3 vColor;
+in float vFlag;
+uniform float uAlpha;                          // base point opacity (rings stay opaque)
+out vec4 outColor;
+void main() {
+  vec2 d = gl_PointCoord - vec2(0.5);
+  float r = length(d);
+  if (r > 0.5) discard;                       // round dots
+  if (vFlag > 0.5 && r > 0.34 && r < 0.5) {   // highlight ring (always visible)
+    vec3 ring = vFlag > 2.5 ? vec3(0.95,0.96,0.98)      // selection (white)
+              : vFlag > 1.5 ? vec3(0.957,0.447,0.714)   // path (pink)
+                            : vec3(0.176,0.831,0.749);  // current (teal)
+    outColor = vec4(ring, 1.0); return;
+  }
+  if (uAlpha < 0.01) discard;                  // points hidden
+  float shade = 1.0 - r * 0.5;                 // subtle sphere shading
+  outColor = vec4(vColor * shade, uAlpha);
+}`;
+
+// Additive "density glow" splats — large soft sprites on a heat ramp, summed with
+// additive blending so dense regions brighten (the 3D analogue of the 2D heatmap).
+const VERT_SPLAT = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in float aDens;   // local density 0..1
+uniform mat4 uProj;
+uniform mat4 uView;
+uniform float uSize;
+out float vDens;
+void main() { vDens = aDens; gl_Position = uProj * uView * vec4(aPos, 1.0); gl_PointSize = uSize * (0.45 + aDens); }`;
+
+const FRAG_SPLAT = `#version 300 es
+precision highp float;
+in float vDens;
+uniform float uIntensity;
+out vec4 outColor;
+vec3 ramp(float t) {
+  t = clamp(t, 0.0, 1.0);
+  vec3 c0 = vec3(0.059,0.090,0.165), c1 = vec3(0.118,0.251,0.471), c2 = vec3(0.051,0.580,0.533), c3 = vec3(0.980,0.800,0.082);
+  if (t < 0.333) return mix(c0, c1, t / 0.333);
+  if (t < 0.666) return mix(c1, c2, (t - 0.333) / 0.333);
+  return mix(c2, c3, (t - 0.666) / 0.334);
+}
+void main() {
+  vec2 d = gl_PointCoord - vec2(0.5);
+  float a = exp(-dot(d, d) * 9.0);          // gaussian falloff (tighter)
+  if (a < 0.01) discard;
+  outColor = vec4(ramp(vDens), a * (0.03 + 0.32 * vDens) * uIntensity);
+}`;
+
+export function createCloud(canvas, onSelect) {
+  const gl = canvas.getContext("webgl2", { antialias: true, depth: true, preserveDrawingBuffer: true, premultipliedAlpha: false });
+  if (!gl) throw new Error("WebGL2 is not available in this browser.");
+
+  const prog = link(gl, VERT, FRAG);
+  const u = (n) => gl.getUniformLocation(prog, n);
+  const uProj = u("uProj"), uView = u("uView"), uSize = u("uSize"), uAlpha = u("uAlpha");
+
+  const splatProg = link(gl, VERT_SPLAT, FRAG_SPLAT);
+  const su = (n) => gl.getUniformLocation(splatProg, n);
+  const sProj = su("uProj"), sView = su("uView"), sSize = su("uSize"), sIntensity = su("uIntensity");
+
+  const vao = gl.createVertexArray();
+  const posBuf = gl.createBuffer(), colBuf = gl.createBuffer(), flagBuf = gl.createBuffer(), densBuf = gl.createBuffer();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, flagBuf); gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+
+  const splatVao = gl.createVertexArray();   // aPos (shared) + aDens
+  gl.bindVertexArray(splatVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, densBuf); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  gl.enable(gl.DEPTH_TEST);
+
+  let bg = [0.016, 0.024, 0.06];
+  let norm = null;        // Float32Array(N*3) normalized to [-1,1] cube
+  let count = 0;
+  let colorData = null;   // persisted per-point RGB so points are never left black
+  let showDens = false, hasDens = false, densIntensity = 0.22, pointAlpha = 1.0;
+  let selected = -1, pathArr = [], selArr = [];
+
+  const orbit = createOrbit(canvas, () => render(), (e) => { const i = pick(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); });
+  function matrices() {
+    const aspect = canvas.width / Math.max(1, canvas.height);
+    const proj = perspective((45 * Math.PI) / 180, aspect, 0.01, 100);
+    // camera fixed on +Z; the model is rotated by the trackball matrix (baked into view).
+    const view = multiply(lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]), orbit.rotation);
+    return { proj, view };
+  }
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.floor(canvas.clientWidth * dpr)), h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  }
+  function drawScene(alpha = 1) {
+    const { proj, view } = matrices();
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(bg[0], bg[1], bg[2], alpha);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (!count) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // density glow overlay (additive, behind the points, no depth writes)
+    if (showDens && hasDens) {
+      gl.useProgram(splatProg);
+      gl.uniformMatrix4fv(sProj, false, proj);
+      gl.uniformMatrix4fv(sView, false, view);
+      gl.uniform1f(sSize, 34.0 * dpr);
+      gl.uniform1f(sIntensity, densIntensity);
+      gl.depthMask(false); gl.disable(gl.DEPTH_TEST);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+      gl.bindVertexArray(splatVao); gl.drawArrays(gl.POINTS, 0, count); gl.bindVertexArray(null);
+      gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+    }
+    gl.useProgram(prog);
+    gl.uniformMatrix4fv(uProj, false, proj);
+    gl.uniformMatrix4fv(uView, false, view);
+    gl.uniform1f(uSize, 6.0 * dpr);
+    gl.uniform1f(uAlpha, pointAlpha);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.bindVertexArray(vao);
+    gl.drawArrays(gl.POINTS, 0, count);
+    gl.bindVertexArray(null);
+    gl.disable(gl.BLEND);
+  }
+  function render() { resize(); drawScene(1); }
+
+  function normalizePoints(pts) {
+    const n = pts.length;
+    const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    for (const p of pts) for (let d = 0; d < 3; d++) { const v = p[d] || 0; if (v < mn[d]) mn[d] = v; if (v > mx[d]) mx[d] = v; }
+    let ext = 0; for (let d = 0; d < 3; d++) ext = Math.max(ext, mx[d] - mn[d]);
+    if (!(ext > 0)) ext = 1;
+    const s = 1.8 / ext;
+    const out = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) for (let d = 0; d < 3; d++) out[i * 3 + d] = (((pts[i][d] || 0) - (mn[d] + mx[d]) / 2) * s);
+    return out;
+  }
+
+  function uploadFlags() {
+    const f = new Float32Array(count);
+    for (const si of selArr) if (si >= 0 && si < count) f[si] = 3;    // selection = white
+    for (const pi of pathArr) if (pi >= 0 && pi < count) f[pi] = 2;   // path = pink
+    if (selected >= 0 && selected < count) f[selected] = 1;           // current = teal (wins)
+    gl.bindBuffer(gl.ARRAY_BUFFER, flagBuf); gl.bufferData(gl.ARRAY_BUFFER, f, gl.DYNAMIC_DRAW);
+  }
+
+  function pick(cx, cy) {
+    if (!norm) return -1;
+    const rect = canvas.getBoundingClientRect();
+    const r = Math.min(window.devicePixelRatio || 1, 2);
+    const px = (cx - rect.left) * r, py = (cy - rect.top) * r;
+    const { proj, view } = matrices();
+    const mvp = multiply(proj, view);
+    let best = -1, bestD = Infinity;
+    for (let i = 0; i < count; i++) {
+      const c = mulVec4(mvp, [norm[i * 3], norm[i * 3 + 1], norm[i * 3 + 2], 1]);
+      if (c[3] <= 0) continue;
+      const sx = (c[0] / c[3] * 0.5 + 0.5) * canvas.width;
+      const sy = (1 - (c[1] / c[3] * 0.5 + 0.5)) * canvas.height;
+      const dd = (sx - px) ** 2 + (sy - py) ** 2;
+      if (dd < bestD) { bestD = dd; best = i; }
+    }
+    const tol = (16 * r) ** 2;   // ignore clicks far from any point
+    return bestD <= tol ? best : -1;
+  }
+
+  window.addEventListener("resize", render);
+
+  return {
+    setPoints(pts) {
+      norm = normalizePoints(pts); count = pts.length;
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, norm, gl.STATIC_DRAW);
+      // (re)seed colors so a fresh point set is never drawn black before applyColor()
+      if (!colorData || colorData.length !== count * 3) { colorData = new Float32Array(count * 3); for (let i = 0; i < count * 3; i++) colorData[i] = [0.58, 0.64, 0.74][i % 3]; }
+      gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferData(gl.ARRAY_BUFFER, colorData, gl.STATIC_DRAW);
+      uploadFlags(); render();
+    },
+    setColors(colors) { colorData = colors; gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW); render(); },
+    setDensityField(values) { hasDens = !!(values && values.length === count); gl.bindBuffer(gl.ARRAY_BUFFER, densBuf); gl.bufferData(gl.ARRAY_BUFFER, values || new Float32Array(count), gl.STATIC_DRAW); render(); },
+    showDensity(on) { showDens = on; render(); },
+    setDensityIntensity(v) { densIntensity = Math.max(0, v); render(); },
+    setPointAlpha(a) { pointAlpha = Math.max(0, Math.min(1, a)); render(); },
+    select(i) { selected = i; uploadFlags(); render(); },
+    setPath(arr) { pathArr = arr || []; uploadFlags(); render(); },
+    setSelection(arr) { selArr = arr || []; uploadFlags(); render(); },
+    // CSS-space screen coords of every point (null where behind the camera)
+    projectedPoints() {
+      const out = new Array(count).fill(null);
+      if (!norm) return out;
+      const { proj, view } = matrices();
+      const mvp = multiply(proj, view);
+      const W = canvas.clientWidth, H = canvas.clientHeight;
+      for (let i = 0; i < count; i++) {
+        const c = mulVec4(mvp, [norm[i * 3], norm[i * 3 + 1], norm[i * 3 + 2], 1]);
+        if (c[3] <= 0) continue;
+        out[i] = [(c[0] / c[3] * 0.5 + 0.5) * W, (1 - (c[1] / c[3] * 0.5 + 0.5)) * H];
+      }
+      return out;
+    },
+    setBackground(rgb) { bg = rgb; render(); },
+    resetView() { orbit.reset(); },
+    render,
+    get selected() { return selected; },
+    async snapshot({ scale = 2, transparent = false } = {}) {
+      const ow = canvas.width, oh = canvas.height;
+      canvas.width = Math.floor(canvas.clientWidth * scale); canvas.height = Math.floor(canvas.clientHeight * scale);
+      drawScene(transparent ? 0 : 1);
+      const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
+      canvas.width = ow; canvas.height = oh; render();
+      return blob;
+    },
+  };
+}
+
+function link(gl, vsrc, fsrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vsrc));
+  gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fsrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("shader link failed: " + gl.getProgramInfoLog(p));
+  return p;
+}
+function compile(gl, type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error("shader compile: " + gl.getShaderInfoLog(s));
+  return s;
+}
