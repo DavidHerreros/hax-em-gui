@@ -23,6 +23,7 @@ from . import gpus, projects, registry, settings_store
 from .command import ValidationError
 from .config import settings
 from .jobs import JobActive, JobNotFound, JobNotSaved, ProjectNotFound, manager
+from .labels import manager as label_manager
 from .workflows import WorkflowError, manager as wf_manager
 from .projects import ProjectsRootUnset
 from .tensorboard import tb_manager
@@ -57,6 +58,7 @@ async def revalidate_static(request: Request, call_next):
 @app.on_event("startup")
 def _startup() -> None:
     manager.init()
+    label_manager.init()
     wf_manager.init()
     app.state.http = httpx.AsyncClient(timeout=None)
     app.state.shutdown = asyncio.Event()
@@ -115,6 +117,7 @@ def program(name: str) -> dict[str, Any]:
         "output_arg": registry.output_arg(name),
         "ssd_arg": registry.ssd_arg(name),
         "bindable": adapters.bindable_fields(name),
+        "bindable_multi": adapters.multi_bindable_fields(name),
         "producers": adapters.producers_for(name),
         "produces": adapters.produces(name),
     }
@@ -216,7 +219,7 @@ def delete_project(project_id: str) -> dict[str, bool]:
 @app.get("/api/projects/{project_id}/jobs", dependencies=[Depends(auth)])
 def project_jobs(project_id: str) -> list[dict[str, Any]]:
     _project_or_404(project_id)
-    return manager.list_for_project(project_id)
+    return _attach_labels(manager.list_for_project(project_id))
 
 
 @app.get("/api/projects/{project_id}/sources", dependencies=[Depends(auth)])
@@ -253,7 +256,7 @@ def list_jobs(limit: int = 100, status: str | None = None) -> list[dict[str, Any
 
 
 def _with_project_names(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Attach the project display name to each job (best-effort)."""
+    """Attach the project display name + labels to each job (best-effort)."""
     names: dict[str, str | None] = {}
     for job in jobs:
         pid = job.get("project_id")
@@ -264,6 +267,14 @@ def _with_project_names(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 proj = None
             names[pid] = proj["name"] if proj else None
         job["project_name"] = names.get(pid) if pid else None
+    return _attach_labels(jobs)
+
+
+def _attach_labels(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach each job's labels (one batched query)."""
+    by_job = label_manager.labels_for_many([j["id"] for j in jobs])
+    for job in jobs:
+        job["labels"] = by_job.get(job["id"], [])
     return jobs
 
 
@@ -379,6 +390,54 @@ async def job_log_ws(websocket: WebSocket, job_id: str) -> None:
         pass
     finally:
         manager.unsubscribe(job_id, queue)
+
+
+# -- labels ----------------------------------------------------------------
+class LabelBody(BaseModel):
+    name: str
+    color: str | None = None
+
+
+class LabelUpdate(BaseModel):
+    name: str | None = None
+    color: str | None = None
+
+
+class JobLabels(BaseModel):
+    labels: list[str] = []
+
+
+@app.get("/api/labels", dependencies=[Depends(auth)])
+def list_labels() -> list[dict[str, Any]]:
+    return label_manager.list()
+
+
+@app.post("/api/labels", dependencies=[Depends(auth)])
+def create_label(body: LabelBody) -> dict[str, Any]:
+    if not body.name.strip():
+        raise HTTPException(status_code=422, detail="label name required")
+    return label_manager.create(body.name, body.color)
+
+
+@app.put("/api/labels/{lid}", dependencies=[Depends(auth)])
+def update_label(lid: str, body: LabelUpdate) -> dict[str, Any]:
+    try:
+        return label_manager.update(lid, name=body.name, color=body.color)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="label not found")
+
+
+@app.delete("/api/labels/{lid}", dependencies=[Depends(auth)])
+def delete_label(lid: str) -> dict[str, bool]:
+    label_manager.delete(lid)
+    return {"deleted": True}
+
+
+@app.put("/api/jobs/{job_id}/labels", dependencies=[Depends(auth)])
+def set_job_labels(job_id: str, body: JobLabels) -> dict[str, Any]:
+    if manager.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"labels": label_manager.set_job_labels(job_id, body.labels)}
 
 
 # -- metrics (TensorBoard) -------------------------------------------------
@@ -718,6 +777,7 @@ def workflow_catalog() -> list[dict[str, Any]]:
         out.append({
             **p,
             "bindable": adapters.bindable_fields(p["name"]),
+            "bindable_multi": adapters.multi_bindable_fields(p["name"]),
             "produces": adapters.produces(p["name"]),
         })
     return out

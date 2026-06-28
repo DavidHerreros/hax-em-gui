@@ -5,6 +5,7 @@ import { api } from "../api.js";
 import { errorBox, skeleton } from "./ui.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
+import { jobLabelChips, loadLabels } from "./labels.js";
 
 export function badge(status) {
   const animated = status === "running" || status === "pending";
@@ -19,19 +20,21 @@ export function JobsView() {
   root.appendChild(body);
   mount(body, skeleton("260px"));
 
-  const filters = { project: "", program: "", status: "" };
+  const filters = { project: "", program: "", status: "", label: "" };
   const projectSel = filterSelect("All projects", (v) => { filters.project = v; renderBody(); });
   const programSel = filterSelect("All programs", (v) => { filters.program = v; renderBody(); });
   const statusSel = filterSelect("All statuses", (v) => { filters.status = v; renderBody(); });
+  const labelSel = filterSelect("All labels", (v) => { filters.label = v; renderBody(); });
   const clearBtn = h("button", { class: "btn ghost filter-clear", title: "Clear filters", onclick: () => {
-    filters.project = filters.program = filters.status = "";
-    projectSel.value = programSel.value = statusSel.value = "";
+    filters.project = filters.program = filters.status = filters.label = "";
+    projectSel.value = programSel.value = statusSel.value = labelSel.value = "";
     renderBody();
   } }, icon("x", 14), "Clear");
   filterBar.append(
     h("div", { class: "filter-group" }, icon("box", 14), projectSel),
     h("div", { class: "filter-group" }, icon("sliders", 14), programSel),
     h("div", { class: "filter-group" }, icon("list", 14), statusSel),
+    h("div", { class: "filter-group" }, icon("more", 14), labelSel),
     clearBtn);
 
   let allJobs = [];
@@ -43,7 +46,8 @@ export function JobsView() {
     const jobs = allJobs.filter((j) =>
       (!filters.project || projectKey(j) === filters.project) &&
       (!filters.program || j.program === filters.program) &&
-      (!filters.status || j.status === filters.status));
+      (!filters.status || j.status === filters.status) &&
+      (!filters.label || (j.labels || []).some((l) => l.id === filters.label)));
     mount(body, jobs.length ? groupedList(jobs) : h("p", { class: "muted" }, "No jobs match the current filters."));
   }
 
@@ -51,6 +55,22 @@ export function JobsView() {
     syncOptions(projectSel, distinct(allJobs.map(projectKey)), filters, "project");
     syncOptions(programSel, distinct(allJobs.map((j) => j.program)), filters, "program");
     syncOptions(statusSel, distinct(allJobs.map((j) => j.status)), filters, "status");
+    syncLabelOptions();
+  }
+
+  // The label filter maps id -> name (a job carries label objects, not strings).
+  function syncLabelOptions() {
+    const seen = new Map();
+    for (const j of allJobs) for (const l of j.labels || []) seen.set(l.id, l.name);
+    const sig = JSON.stringify([...seen]);
+    if (labelSel._sig === sig) return;
+    labelSel._sig = sig;
+    if (filters.label && !seen.has(filters.label)) filters.label = "";
+    clear(labelSel);
+    labelSel.appendChild(h("option", { value: "" }, "All labels"));
+    for (const [id, name] of [...seen].sort((a, b) => a[1].localeCompare(b[1])))
+      labelSel.appendChild(h("option", { value: id, selected: id === filters.label }, name));
+    labelSel.value = filters.label;
   }
 
   async function refresh() {
@@ -67,6 +87,7 @@ export function JobsView() {
       if (!stop) mount(body, errorBox(err));
     }
   }
+  loadLabels().catch(() => {});
   refresh();
   const timer = setInterval(refresh, 3000);
 
@@ -119,7 +140,7 @@ function groupedList(jobs) {
 
 // A change signature for a job list: re-render only when ids/statuses/names change.
 export function jobsSignature(jobs) {
-  return jobs.map((j) => `${j.id}:${j.status}:${j.name || ""}`).join("|");
+  return jobs.map((j) => `${j.id}:${j.status}:${j.name || ""}:${(j.labels || []).map((l) => l.id).join(",")}`).join("|");
 }
 
 // What to show as a run's title: its custom name, falling back to the program.
@@ -174,6 +195,7 @@ function row(job, i) {
     badge(job.status),
     title,
     job.name ? h("span", { class: "prog-sub mono" }, job.program) : null,
+    jobLabelChips(job, { editable: true }),
     gpuLabel(job.gpu) ? h("span", { class: "muted", style: { fontSize: "12px" } }, gpuLabel(job.gpu)) : null,
     h("span", { class: "time" }, new Date(job.created_at).toLocaleString()),
     jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); }, onDeleted: () => a.remove() })

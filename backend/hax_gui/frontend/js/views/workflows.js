@@ -13,15 +13,24 @@ import { store, getState } from "../store.js";
 import { errorBox } from "./ui.js";
 import { visibleFields } from "./formFields.js";
 import { openFilePicker } from "./filePicker.js";
+import { nodeLabelChips, loadLabels, labelsByIds } from "./labels.js";
 
 const NODE_W = 196;     // node width (px)
 const HEADER_H = 34;    // node header height
 const ROW_H = 26;       // per-input-port row height
+const CONTENT_W = 4000; // scrollable canvas content size (matches the wires SVG)
+const CONTENT_H = 3000;
 const SVG_NS = "http://www.w3.org/2000/svg";
+
+// Concrete colors for the minimap (canvas 2D can't read CSS custom properties).
+const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", running: "#38bdf8", succeeded: "#22c55e", failed: "#ef4444", blocked: "#f59e0b", cancelled: "#94a3b8", idle: "#94a3b8" };
 
 // Programs that expose a train/predict mode — wiring their model output into
 // another node of the same program inherits the form parameters (mode aside).
 const MODED_PROGRAMS = new Set(["hetsiren", "zernike3deep", "reconsiren"]);
+
+// Same grouping/order as the right-menu program launcher.
+const CATEGORY_ORDER = ["Networks", "Post-processing", "Metrics", "Viewers", "Other"];
 
 const STATUS_COLOR = {
   saved: "#a78bfa", pending: "var(--muted)", running: "var(--accent)",
@@ -46,8 +55,10 @@ export function WorkflowsView() {
   let dirty = false;
   let poll = null;
   const schemaCache = {};
-  let drag = null;          // active node drag / wiring gesture
+  let drag = null;          // active node drag / wiring / pan gesture
   let nodeSeq = 1, edgeSeq = 1;
+  let minimapOn = true;     // overview window visible?
+  let mmXform = null;       // last minimap transform (for click-to-navigate)
 
   const horiz = () => graph.orientation !== "vertical";
 
@@ -61,6 +72,8 @@ export function WorkflowsView() {
   const statusEl = h("span", { class: "wf-status muted" }, "");
   const orientBtn = h("button", { class: "btn small", title: "Toggle horizontal / vertical layout", onclick: toggleOrientation });
   const layoutBtn = h("button", { class: "btn small", title: "Auto-arrange into dependency levels", onclick: () => { autoLayout(); dirty = true; } }, icon("sliders", 14), "Tidy");
+  const centerBtn = h("button", { class: "btn small", title: "Center the workflow in view", onclick: centerView }, icon("orbit", 14), "Center");
+  const mmBtn = h("button", { class: "btn small", title: "Toggle the overview minimap", onclick: toggleMinimap }, icon("grid", 14), "Map");
   const importBtn = h("button", { class: "btn small", title: "Import the open project's jobs as a workflow", onclick: importProject }, icon("box", 14), "From project");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
   const runSelBtn = h("button", { class: "btn secondary", title: "Run the selected step(s) only", onclick: () => runNodes([...selectedSet]) }, icon("play", 15), "Run selected");
@@ -69,23 +82,40 @@ export function WorkflowsView() {
   const topbar = h("div", { class: "wf-topbar" },
     h("strong", null, "Workflow"), wfSelect,
     h("button", { class: "btn small", onclick: () => openWorkflow(null) }, "+ New"),
-    importBtn, nameInput, orientBtn, layoutBtn,
+    importBtn, nameInput, orientBtn, layoutBtn, centerBtn, mmBtn,
     h("span", { style: { flex: "1" } }), statusEl, saveBtn, runSelBtn, runBtn, delBtn);
 
-  // ── body: palette | canvas | inspector ──
+  // ── body: palette | canvas (+minimap) | inspector ──
   const palette = h("div", { class: "wf-palette" });
-  const svg = svgEl("svg", { class: "wf-wires", width: "4000", height: "3000" });
+  const svg = svgEl("svg", { class: "wf-wires", width: String(CONTENT_W), height: String(CONTENT_H) });
   const nodesLayer = h("div", { class: "wf-nodes" });
   const canvas = h("div", { class: "wf-canvas" }, svg, nodesLayer);
+  const minimap = h("canvas", { class: "wf-minimap", title: "Overview — click to jump" });
+  const canvasWrap = h("div", { class: "wf-canvas-wrap" }, canvas, minimap);
   const inspector = h("div", { class: "wf-inspector" });
-  const body = h("div", { class: "wf-body" }, palette, canvas, inspector);
+  const body = h("div", { class: "wf-body" }, palette, canvasWrap, inspector);
   root.append(topbar, body);
 
-  // clicking empty canvas clears the selection
+  // empty-canvas drag pans the view (and a click without movement clears selection)
   canvas.addEventListener("pointerdown", (e) => {
     if (e.target === canvas || e.target === nodesLayer || e.target === svg) {
-      selected = null; selectedSet.clear(); renderNodes(); renderInspector();
+      e.preventDefault();
+      drag = { kind: "pan", sx: e.clientX, sy: e.clientY, sl: canvas.scrollLeft, st: canvas.scrollTop, moved: false };
+      canvas.classList.add("panning");
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
     }
+  });
+  canvas.addEventListener("scroll", drawMinimap);
+  minimap.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    if (!mmXform) return;
+    const r = minimap.getBoundingClientRect();
+    const cx = mmXform.gx0 + (e.clientX - r.left - mmXform.ox) / mmXform.s;
+    const cy = mmXform.gy0 + (e.clientY - r.top - mmXform.oy) / mmXform.s;
+    canvas.scrollLeft = Math.max(0, cx - canvas.clientWidth / 2);
+    canvas.scrollTop = Math.max(0, cy - canvas.clientHeight / 2);
+    drawMinimap();
   });
 
   // drag-and-drop a palette program onto the canvas (drop on a node => auto-wire)
@@ -108,6 +138,8 @@ export function WorkflowsView() {
       byName = Object.fromEntries(catalog.map((p) => [p.name, p]));
     } catch (err) { mount(palette, errorBox(err)); return; }
     renderPalette(); syncOrientBtn();
+    mmBtn.classList.toggle("on", minimapOn);
+    loadLabels().catch(() => {});
     await refreshList();
     openWorkflow(null);
   }
@@ -126,13 +158,20 @@ export function WorkflowsView() {
     clear(palette);
     palette.appendChild(h("div", { class: "wf-palette-head" }, "Programs"));
     palette.appendChild(h("div", { class: "muted small", style: { padding: "0 10px 6px" } }, "Click or drag onto the canvas."));
-    for (const p of catalog) {
-      const producesTag = p.produces && p.produces.length ? "out: " + (p.produces.includes("latents") ? "latents" : p.produces[0]) : "";
-      const item = h("button", { class: "wf-pal-item", title: p.description || p.name, draggable: "true", onclick: () => addNode(p.name) },
-        h("span", { class: "mono" }, p.name),
-        producesTag ? h("span", { class: "wf-pal-out muted small" }, producesTag) : null);
-      item.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", p.name); e.dataTransfer.effectAllowed = "copy"; });
-      palette.appendChild(item);
+    // Group by program category, same order as the right-menu launcher.
+    const byCat = {};
+    for (const p of catalog) (byCat[p.category || "Other"] ??= []).push(p);
+    const cats = Object.keys(byCat).sort((a, b) => ((CATEGORY_ORDER.indexOf(a) + 1) || 99) - ((CATEGORY_ORDER.indexOf(b) + 1) || 99));
+    for (const cat of cats) {
+      palette.appendChild(h("div", { class: "wf-pal-cat" }, cat));
+      for (const p of byCat[cat]) {
+        const producesTag = p.produces && p.produces.length ? "out: " + (p.produces.includes("latents") ? "latents" : p.produces[0]) : "";
+        const item = h("button", { class: "wf-pal-item", title: p.description || p.name, draggable: "true", onclick: () => addNode(p.name) },
+          h("span", { class: "mono" }, p.name),
+          producesTag ? h("span", { class: "wf-pal-out muted small" }, producesTag) : null);
+        item.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", p.name); e.dataTransfer.effectAllowed = "copy"; });
+        palette.appendChild(item);
+      }
     }
     palette.appendChild(h("div", { class: "wf-legend" },
       ...["saved", "succeeded", "running", "failed", "blocked"].map((s) =>
@@ -144,7 +183,7 @@ export function WorkflowsView() {
     const x = pos ? pos.x : 60 + (graph.nodes.length % 4) * 60 + canvas.scrollLeft;
     const y = pos ? pos.y : 60 + (graph.nodes.length % 6) * 40 + canvas.scrollTop;
     const id = "n" + (nodeSeq++);
-    const node = { id, program, args: {}, gpu: "0", name: "", x, y };
+    const node = { id, program, args: {}, gpu: "0", name: "", labels: [], x, y };
     graph.nodes.push(node);
     selectOnly(id); dirty = true;
     renderNodes(); renderInspector();
@@ -157,9 +196,18 @@ export function WorkflowsView() {
     if (selected === id) selected = selectedSet.size ? [...selectedSet][0] : null;
     dirty = true; renderNodes(); renderInspector();
   }
+  const isMultiField = (program, field) => (byName[program]?.bindable_multi || []).includes(field);
+
   function addEdge(fromId, toId, field, kind) {
     if (fromId === toId) return;
-    graph.edges = graph.edges.filter((e) => !(e.to === toId && e.field === field));   // one source per field
+    const dstProg = nodeById(toId)?.program;
+    if (isMultiField(dstProg, field)) {
+      // multi-valued input (e.g. FlexConsensus --input_space): keep all sources,
+      // just avoid wiring the exact same source twice.
+      if (graph.edges.some((e) => e.to === toId && e.field === field && e.from === fromId)) return;
+    } else {
+      graph.edges = graph.edges.filter((e) => !(e.to === toId && e.field === field));  // one source per field
+    }
     graph.edges.push({ id: "e" + (edgeSeq++), from: fromId, to: toId, field, kind });
     inheritParams(fromId, toId, kind);
     dirty = true; renderNodes(); renderInspector();
@@ -220,6 +268,7 @@ export function WorkflowsView() {
     clear(nodesLayer);
     for (const n of graph.nodes) nodesLayer.appendChild(nodeEl(n));
     redrawWires();
+    drawMinimap();
   }
 
   function portEl(cls, originX, originY, pos, data) {
@@ -238,8 +287,10 @@ export function WorkflowsView() {
     el.dataset.node = n.id;
     if (st) el.style.borderColor = STATUS_COLOR[st] || "var(--border)";
     // header (drag handle + select + run + remove)
+    const labelDots = labelsByIds(n.labels);
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
+      labelDots.length ? h("span", { class: "wf-node-labels" }, ...labelDots.map((l) => h("span", { class: "wf-node-ldot", style: { background: l.color }, title: l.name }))) : null,
       st ? h("span", { class: "wf-node-st", style: { color: STATUS_COLOR[st] } }, st) : null,
       h("button", { class: "wf-node-run", title: "Run this step", disabled: running, onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon("play", 12)),
       h("button", { class: "wf-node-x", title: "Remove step", onclick: (e) => { e.stopPropagation(); removeNode(n.id); } }, "×"));
@@ -248,11 +299,13 @@ export function WorkflowsView() {
     // input ports (label rows in the body + an absolutely-placed dot per port)
     const ins = inputsOf(n.program);
     ins.forEach(([field, kind], i) => {
-      const wired = graph.edges.find((e) => e.to === n.id && e.field === field);
+      const wiredAll = graph.edges.filter((e) => e.to === n.id && e.field === field);
+      const multi = isMultiField(n.program, field);
+      const label = field + (multi && wiredAll.length ? ` ×${wiredAll.length}` : "");
       const row = h("div", { class: "wf-port-row" + (horiz() ? " in" : " v") },
-        h("span", { class: "wf-port-label", title: `${field} (${kind})` }, field));
+        h("span", { class: "wf-port-label", title: `${field} (${kind})${multi ? " — accepts multiple" : ""}` }, label));
       el.appendChild(row);
-      el.appendChild(portEl("in" + (wired ? " wired" : ""), n.x, n.y, inPort(n, i, ins.length),
+      el.appendChild(portEl("in" + (wiredAll.length ? " wired" : "") + (multi ? " multi" : ""), n.x, n.y, inPort(n, i, ins.length),
         { node: n.id, field, kind }));
     });
     // single output port
@@ -330,6 +383,13 @@ export function WorkflowsView() {
   }
   function onMove(e) {
     if (!drag) return;
+    if (drag.kind === "pan") {
+      canvas.scrollLeft = drag.sl - (e.clientX - drag.sx);
+      canvas.scrollTop = drag.st - (e.clientY - drag.sy);
+      if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 3) drag.moved = true;
+      drawMinimap();
+      return;
+    }
     const p = canvasPoint(e);
     if (drag.kind === "node") {
       const ddx = p.x - drag.ox, ddy = p.y - drag.oy;
@@ -348,6 +408,11 @@ export function WorkflowsView() {
   function onUp(e) {
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onUp);
+    if (drag && drag.kind === "pan") {
+      canvas.classList.remove("panning");
+      if (!drag.moved) { selected = null; selectedSet.clear(); renderNodes(); renderInspector(); }  // a plain click clears the selection
+      drag = null; return;
+    }
     if (drag && drag.kind === "wire") {
       const tgt = document.elementFromPoint(e.clientX, e.clientY);
       const port = tgt && tgt.closest && tgt.closest(".wf-port.in");
@@ -379,21 +444,29 @@ export function WorkflowsView() {
     gpuI.addEventListener("input", () => { n.gpu = gpuI.value; dirty = true; });
     inspector.appendChild(h("label", { class: "wf-lbl" }, "Name", nameI));
     inspector.appendChild(h("label", { class: "wf-lbl" }, "GPU", gpuI));
+    inspector.appendChild(h("label", { class: "wf-lbl" }, "Labels",
+      nodeLabelChips(n, { onChange: () => { dirty = true; const el = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"]`); if (el) renderNodes(); } })));
 
     const schema = schemaCache[n.program];
     if (!schema) { loadSchema(n.program).then(() => { if (selected === n.id) renderInspector(); }); inspector.appendChild(h("div", { class: "muted small" }, "Loading parameters…")); return; }
     const bindable = byName[n.program]?.bindable || {};
     inspector.appendChild(h("div", { class: "wf-insp-sub muted small" }, "Parameters"));
     for (const f of visibleFields(schema)) {
-      const wired = graph.edges.find((e) => e.to === n.id && e.field === f.name);
-      if (wired) {
-        const src = nodeById(wired.from);
-        inspector.appendChild(h("label", { class: "wf-lbl" }, f.name,
-          h("div", { class: "wf-wired-chip" }, icon("link", 12), `from ${src ? (src.name || src.program) : "?"} · ${wired.kind}`)));
+      const wiredAll = graph.edges.filter((e) => e.to === n.id && e.field === f.name);
+      const multi = isMultiField(n.program, f.name);
+      if (wiredAll.length) {
+        const chips = wiredAll.map((w) => {
+          const src = nodeById(w.from);
+          return h("div", { class: "wf-wired-chip" }, icon("link", 12),
+            h("span", { style: { flex: "1" } }, `from ${src ? (src.name || src.program) : "?"} · ${w.kind}`),
+            h("button", { class: "wf-chip-x", title: "Remove connection", onclick: () => removeEdge(w.id) }, "×"));
+        });
+        inspector.appendChild(h("label", { class: "wf-lbl" },
+          f.name + (multi ? ` (${wiredAll.length})` : "") + (multi ? "  — wire more sources to add" : ""), ...chips));
         continue;
       }
       inspector.appendChild(h("label", { class: "wf-lbl", title: f.help || "" },
-        f.name + (f.required ? " *" : "") + (f.name in bindable ? "  (wirable)" : ""), argInput(n, f)));
+        f.name + (f.required ? " *" : "") + (f.name in bindable ? (multi ? "  (wirable, multi)" : "  (wirable)") : ""), argInput(n, f)));
     }
   }
 
@@ -459,7 +532,15 @@ export function WorkflowsView() {
         else { n.y = PAD + d * (HEADER_H + 3 * ROW_H + 70); n.x = cross; cross += NODE_W + GAP_CROSS; }
       }
     });
+    // shift the laid-out graph to the middle of the scrollable content so there's
+    // room to pan on every side, then center the viewport on it
+    const b = graphBBox();
+    if (b) {
+      const offx = Math.round(CONTENT_W / 2 - b.cx), offy = Math.round(CONTENT_H / 2 - b.cy);
+      for (const n of graph.nodes) { n.x = Math.max(0, n.x + offx); n.y = Math.max(0, n.y + offy); }
+    }
     renderNodes();
+    centerView();
   }
   function topoLocal() {
     const ids = graph.nodes.map((n) => n.id);
@@ -469,6 +550,62 @@ export function WorkflowsView() {
     const q = ids.filter((i) => indeg[i] === 0), order = [];
     while (q.length) { const i = q.shift(); order.push(i); for (const j of adj[i]) if (--indeg[j] === 0) q.push(j); }
     return order.length === ids.length ? order : null;
+  }
+
+  // ── view: center, pan, minimap ──
+  function graphBBox() {
+    if (!graph.nodes.length) return null;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const n of graph.nodes) {
+      x0 = Math.min(x0, n.x); y0 = Math.min(y0, n.y);
+      x1 = Math.max(x1, n.x + NODE_W); y1 = Math.max(y1, n.y + nodeHeight(n));
+    }
+    return { x0, y0, x1, y1, cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0 };
+  }
+  // Scroll so the graph's bounding box sits in the middle of the viewport.
+  function centerView() {
+    const b = graphBBox(); if (!b) return;
+    canvas.scrollLeft = Math.max(0, Math.min(CONTENT_W - canvas.clientWidth, b.cx - canvas.clientWidth / 2));
+    canvas.scrollTop = Math.max(0, Math.min(CONTENT_H - canvas.clientHeight, b.cy - canvas.clientHeight / 2));
+    drawMinimap();
+  }
+  function toggleMinimap() { minimapOn = !minimapOn; minimap.classList.toggle("hidden", !minimapOn); mmBtn.classList.toggle("on", minimapOn); drawMinimap(); }
+
+  function drawMinimap() {
+    if (!minimapOn) return;
+    const W = minimap.clientWidth, H = minimap.clientHeight;
+    if (!W || !H) return;
+    const dpr = window.devicePixelRatio || 1;
+    minimap.width = Math.round(W * dpr); minimap.height = Math.round(H * dpr);
+    const ctx = minimap.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const b = graphBBox();
+    if (!b) { mmXform = null; return; }
+    const pad = 60;
+    const gx0 = b.x0 - pad, gy0 = b.y0 - pad, gw = b.w + 2 * pad, gh = b.h + 2 * pad;
+    const s = Math.min(W / gw, H / gh);
+    const ox = (W - gw * s) / 2, oy = (H - gh * s) / 2;
+    mmXform = { gx0, gy0, ox, oy, s };
+    const tx = (x) => ox + (x - gx0) * s, ty = (y) => oy + (y - gy0) * s;
+    // edges
+    ctx.strokeStyle = "#64748b"; ctx.lineWidth = 1;
+    for (const e of graph.edges) {
+      const sN = nodeById(e.from), dN = nodeById(e.to); if (!sN || !dN) continue;
+      const ins = inputsOf(dN.program);
+      const idx = Math.max(0, ins.findIndex(([f]) => f === e.field));
+      const p1 = outPort(sN), p2 = inPort(dN, idx, ins.length);
+      ctx.beginPath(); ctx.moveTo(tx(p1.x), ty(p1.y)); ctx.lineTo(tx(p2.x), ty(p2.y)); ctx.stroke();
+    }
+    // nodes (colored by run status)
+    for (const n of graph.nodes) {
+      const st = runState && runState[n.id] ? runState[n.id].status : null;
+      ctx.fillStyle = (st && MINI_STATUS[st]) || "#94a3b8";
+      ctx.fillRect(tx(n.x), ty(n.y), Math.max(2, NODE_W * s), Math.max(2, nodeHeight(n) * s));
+    }
+    // current viewport rectangle
+    ctx.strokeStyle = "#2dd4bf"; ctx.lineWidth = 1.5;
+    ctx.strokeRect(tx(canvas.scrollLeft), ty(canvas.scrollTop), canvas.clientWidth * s, canvas.clientHeight * s);
   }
 
   // ── import a project ──
@@ -556,7 +693,7 @@ export function WorkflowsView() {
       syncOrientBtn();
       // freshly imported / never-laid-out graphs have all-zero coords — tidy once
       if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
-      else renderNodes();
+      else { renderNodes(); centerView(); }
       renderInspector();
       flash(wf.status && wf.status !== "idle" ? `${wf.status} — ${countStatuses()}` : "Loaded.", "muted");
       if (wf.status === "running") startPolling();

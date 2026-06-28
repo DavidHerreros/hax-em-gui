@@ -228,6 +228,20 @@ class JobManager:
         if not bindings:
             return values
         for field, binding in bindings.items():
+            # A list binding feeds a multi-valued input (e.g. FlexConsensus
+            # --input_space): materialise every source into its own file.
+            if isinstance(binding, list):
+                paths = []
+                for i, one in enumerate(binding):
+                    source = self.get(one.get("job_id", ""))
+                    if source is None:
+                        raise ValidationError({field: "a source job no longer exists"})
+                    try:
+                        paths.append(adapters.produce(one.get("kind", ""), source, workdir, f"{field}_{i}"))
+                    except adapters.AdapterError as exc:
+                        raise ValidationError({field: str(exc)})
+                values[field] = paths
+                continue
             source = self.get(binding.get("job_id", ""))
             if source is None:
                 raise ValidationError({field: "source job no longer exists"})

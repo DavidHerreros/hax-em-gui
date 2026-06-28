@@ -45,6 +45,13 @@ export const api = {
   cancelJob: (id) => req(`/api/jobs/${id}/cancel`, { method: "POST" }),
   rerunJob: (id) => req(`/api/jobs/${id}/rerun`, { method: "POST" }),
   deleteJob: (id) => req(`/api/jobs/${id}`, { method: "DELETE" }),
+  // labels (colored tags on jobs)
+  labels: () => req("/api/labels"),
+  createLabel: (name, color) => req("/api/labels", { method: "POST", body: JSON.stringify({ name, color: color || null }) }),
+  updateLabel: (id, body) => req(`/api/labels/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteLabel: (id) => req(`/api/labels/${id}`, { method: "DELETE" }),
+  setJobLabels: (jobId, labels) => req(`/api/jobs/${jobId}/labels`, { method: "PUT", body: JSON.stringify({ labels }) }),
+
   startTensorBoard: (logdir) =>
     req("/api/tensorboard", { method: "POST", body: JSON.stringify({ logdir }) }),
   tensorboards: () => req("/api/tensorboard"),

@@ -34,11 +34,28 @@ BINDABLE_FIELDS: dict[str, dict[str, str]] = {
     "hetsiren": {"reload": "hetsiren_model"},
     "zernike3deep": {"reload": "zernike3deep_model"},
     "reconsiren": {"reload": "reconsiren_model"},
-    "flexconsensus": {"reload": "flexconsensus_model"},
+    # FlexConsensus consensuates many input latent spaces, so `--input_space` is a
+    # *multi-valued* input: wire one latents source per program you want included.
+    "flexconsensus": {"reload": "flexconsensus_model", "input_space": "latents"},
     "latent_space_deconvolution": {"reload": "deconvolver_model"},
     "image_gray_scale_adjustment": {"reload": "image_adjust_model"},
     "volume_gray_scale_adjustment": {"reload": "volume_adjust_model"},
 }
+
+# Bindable fields that accept *several* sources (the program's flag is nargs="+").
+# Each wired source is materialised into its own file and passed as a list.
+MULTI_BINDABLE: dict[str, set[str]] = {
+    "flexconsensus": {"input_space"},
+}
+
+
+def multi_bindable_fields(program: str) -> list[str]:
+    """Bindable fields of `program` that accept multiple wired sources."""
+    return sorted(MULTI_BINDABLE.get(program, set()))
+
+
+def is_multi_bindable(program: str, field: str) -> bool:
+    return field in MULTI_BINDABLE.get(program, set())
 
 # The checkpoint subfolder each network program writes inside its run folder.
 # A run only contains this when it actually trained/saved a model (e.g. a

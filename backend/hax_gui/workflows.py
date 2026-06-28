@@ -21,6 +21,7 @@ from typing import Any
 from . import adapters, registry
 from .config import settings
 from .jobs import ACTIVE, manager as jobs
+from .labels import manager as labels
 
 
 def _now() -> str:
@@ -145,15 +146,20 @@ class WorkflowManager:
             bindings = j.get("bindings") or {}
             for field in bindings:           # bound fields live on the edge, not as literals
                 args.pop(field, None)
+            try:
+                node_labels = [lab["id"] for lab in labels.labels_for(j["id"])]
+            except Exception:  # noqa: BLE001
+                node_labels = []
             nodes.append({"id": nid, "program": j["program"], "args": args,
                           "gpu": j.get("gpu") or "0", "name": j.get("name") or "",
-                          "x": 0, "y": 0, "job_id": j["id"]})
+                          "labels": node_labels, "x": 0, "y": 0, "job_id": j["id"]})
             state[nid] = {"job_id": j["id"], "status": j["status"], "error": None}
             for field, b in bindings.items():
-                if b.get("job_id") in id_map:
-                    edges.append({"id": f"e{eseq}", "from": id_map[b["job_id"]], "to": nid,
-                                  "field": field, "kind": b.get("kind")})
-                    eseq += 1
+                for one in (b if isinstance(b, list) else [b]):   # multi-valued inputs -> many edges
+                    if one.get("job_id") in id_map:
+                        edges.append({"id": f"e{eseq}", "from": id_map[one["job_id"]], "to": nid,
+                                      "field": field, "kind": one.get("kind")})
+                        eseq += 1
         graph = {"nodes": nodes, "edges": edges, "orientation": "horizontal"}
         return graph, state
 
@@ -203,9 +209,13 @@ class WorkflowManager:
                 errors.append(f"input '{dst['program']}.{field}' expects '{field_kind}', not '{kind}'")
             elif kind not in adapters.produces(src["program"]):
                 errors.append(f"'{src['program']}' cannot provide '{kind}' for '{dst['program']}.{field}'")
-        # one source per input field (a field can't be wired twice)
+        # one source per input field (a field can't be wired twice) — except
+        # multi-valued inputs (e.g. FlexConsensus --input_space), which take many.
         seen: set[tuple] = set()
         for e in edges:
+            dst = by_id.get(e.get("to"))
+            if dst and adapters.is_multi_bindable(dst["program"], e.get("field")):
+                continue
             key = (e.get("to"), e.get("field"))
             if key in seen:
                 errors.append(f"input '{e.get('field')}' on a node is wired more than once")
@@ -272,7 +282,13 @@ class WorkflowManager:
                 for auto in (registry.output_arg(node["program"]), registry.ssd_arg(node["program"])):
                     if auto:
                         args.pop(auto, None)
-                bindings = {e["field"]: {"job_id": state[e["from"]]["job_id"], "kind": e["kind"]} for e in deps}
+                bindings: dict[str, Any] = {}
+                for e in deps:
+                    one = {"job_id": state[e["from"]]["job_id"], "kind": e["kind"]}
+                    if adapters.is_multi_bindable(node["program"], e["field"]):
+                        bindings.setdefault(e["field"], []).append(one)   # multi-valued input
+                    else:
+                        bindings[e["field"]] = one
                 for field in bindings:           # drop any stale literal so the binding wins
                     args.pop(field, None)
                 try:
@@ -284,6 +300,11 @@ class WorkflowManager:
                     continue
 
                 jid = job["id"]
+                if node.get("labels"):           # carry the node's labels onto the job
+                    try:
+                        labels.set_job_labels(jid, node["labels"])
+                    except Exception:  # noqa: BLE001 - labels are non-critical
+                        pass
                 state[nid] = {"job_id": jid, "status": "running", "error": None}
                 self._set_run(wid, "running", state)
                 final = await self._wait_job(jid)

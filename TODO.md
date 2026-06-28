@@ -62,6 +62,37 @@ browser in the dev environment).
   dependency tiers along the active axis (`autoLayout`); also runs automatically
   on orientation change and on project import.
 
+#### Workflow builder — follow-ups
+
+- [x] **FlexConsensus multi-input** — `--input_space` is now a *multi-valued*
+  bindable input: wire one latents source per program you want consensuated.
+  Backend `adapters.MULTI_BINDABLE` + a list-valued binding resolved into one
+  file per source (`jobs._resolve_bindings`), grouped by the workflow executor and
+  validated to allow many edges into the field; the input port shows `×N` and the
+  inspector lists every wired source. Verified end-to-end (two predict latents →
+  one FlexConsensus node → `--input_space a b`).
+- [x] **Palette grouped like the right menu** — programs in the canvas palette are
+  grouped by category (Networks / Post-processing / Metrics / Viewers) in the same
+  order as the launcher.
+- [x] **Center + pan + minimap** — "Center" scrolls the graph to the middle of the
+  view; dragging an empty canvas area pans (grab cursor); auto-layout recenters
+  the graph in the scrollable content. A toggleable overview **minimap** (bottom-
+  right) draws all nodes/edges (status-colored) with the current viewport rectangle
+  and click-to-jump.
+
+#### Job labels (colored tags)
+
+- [x] **Labels across the app** — colored, named tags attached to jobs to identify,
+  group and filter runs. Backend `labels.py` (global `labels` + `job_labels`
+  tables), CRUD at `/api/labels`, `PUT /api/jobs/{id}/labels`, and labels attached
+  to every job response. Frontend shared component (`labels.js`): chips + an
+  anchored picker with inline create / recolor / rename / delete. Integrated into
+  the **Jobs view** (chips per row + a Label filter), **Project executions**, the
+  **Job detail** header, and the **Workflow builder** (per-node labels in the
+  inspector + colored dots on the node; importing a project carries each job's
+  labels, and a node's labels are applied to its job when it runs). Verified
+  end-to-end (CRUD, attach, filter data, project import).
+
 - [x] **1** — Left menu collapses to icons-only via a header toggle.
 - [x] **2** — Project manager: Settings page sets a common projects root (gear icon
   at the bottom of the left menu); projects are folders under it; each run gets a

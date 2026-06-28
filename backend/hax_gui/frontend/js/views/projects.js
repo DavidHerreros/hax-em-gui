@@ -8,6 +8,7 @@ import { badge, jobsSignature, gpuLabel, jobDisplayName, jobMenuButton } from ".
 import { errorBox } from "./ui.js";
 import { ProjectManager } from "./projectManager.js";
 import { makeJobDraggable } from "./inputBinding.js";
+import { jobLabelChips, loadLabels } from "./labels.js";
 
 export function ProjectsView() {
   const root = h("div", { class: "view projects-view" });
@@ -84,6 +85,7 @@ function projectPanel(project) {
 
   let stop = false;
   let lastSig = null;
+  loadLabels().catch(() => {});
   async function refresh() {
     try {
       const jobs = await api.projectJobs(project.id);
@@ -112,6 +114,7 @@ function execList(jobs) {
       title,
       h("span", { class: "exec-prog mono" }, j.program),
       h("span", { class: "exec-folder mono" }, folderName(j.workdir)),
+      jobLabelChips(j, { editable: true }),
       gpuLabel(j.gpu) ? h("span", { class: "muted small" }, gpuLabel(j.gpu)) : null,
       h("span", { class: "exec-time" }, new Date(j.created_at).toLocaleString()),
       jobMenuButton(j, { onRenamed: (u) => { title.textContent = jobDisplayName(u); }, onDeleted: () => a.remove() }));

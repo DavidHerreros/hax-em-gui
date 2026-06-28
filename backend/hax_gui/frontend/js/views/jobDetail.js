@@ -7,6 +7,7 @@ import { navigate, reload } from "../router.js";
 import { store } from "../store.js";
 import { errorBox } from "./ui.js";
 import { badge, jobDisplayName } from "./jobs.js";
+import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
 import { promptModal } from "./promptModal.js";
 import { createTerminal } from "./terminal.js";
@@ -42,6 +43,7 @@ export function JobDetailView(params) {
     if (isNamed) head.appendChild(h("span", { class: "muted mono", style: { fontSize: "12px" } }, job.program));
     head.appendChild(badge(status));
     if (job && job.project_name) head.appendChild(h("span", { class: "proj-chip" }, icon("box", 12), job.project_name));
+    if (job) head.appendChild(jobLabelChips(job, { editable: true }));
     const running = status === "running" || status === "pending";
     if (job && job.return_code != null && !running) {
       head.appendChild(h("span", { class: "muted", style: { fontSize: "12px" } }, "exit " + job.return_code));
