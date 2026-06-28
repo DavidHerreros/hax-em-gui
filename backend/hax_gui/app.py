@@ -477,21 +477,44 @@ async def start_viewer(body: ViewerStart) -> dict[str, Any]:
                                 reduced=body.reduced)
 
 
+@app.get("/api/viewer/flexconsensus/{job_id}", dependencies=[Depends(auth)])
+def flexconsensus_spaces(job_id: str) -> dict[str, Any]:
+    """The consensus output spaces of a FlexConsensus run, each with the decoder
+    network auto-detected from the predict run that produced its input space."""
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.get("program") != "flexconsensus":
+        raise HTTPException(status_code=422, detail="not a FlexConsensus run")
+    spaces = _flexconsensus_spaces(job)
+    return {"spaces": [{k: v for k, v in s.items() if k != "reload"} for s in spaces]}
+
+
 @app.post("/api/viewer/from-job/{job_id}", dependencies=[Depends(auth)])
-async def start_viewer_from_job(job_id: str) -> dict[str, Any]:
+async def start_viewer_from_job(job_id: str, space: int | None = None) -> dict[str, Any]:
     job = manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     program = job.get("program", "")
     args = job.get("args", {})
-    # FlexConsensus produces a consensus space but no volume decoder; it can only
-    # be viewed as a reduced display space bound into an annotate_space job.
+    # FlexConsensus: pick one consensus output space; its input space supplies the
+    # full latents to decode, and the decoder network is auto-detected.
     if program == "flexconsensus":
-        raise HTTPException(
-            status_code=422,
-            detail="FlexConsensus has no volume decoder; bind its consensus to an annotate_space "
-                   "job's z_space_reduced and open the viewer from that job instead.",
-        )
+        spaces = _flexconsensus_spaces(job)
+        if space is None:
+            raise HTTPException(status_code=422,
+                                detail={"choose_flexconsensus_space": True,
+                                        "spaces": [{k: v for k, v in s.items() if k != "reload"} for s in spaces]})
+        sp = next((s for s in spaces if s["index"] == space), None)
+        if sp is None:
+            raise HTTPException(status_code=422, detail="unknown consensus space")
+        if not sp["viewable"]:
+            raise HTTPException(status_code=422, detail=sp["reason"] or "this consensus space is not viewable")
+        title = f"{job.get('name') or 'FlexConsensus'} · {sp['name']}"
+        project_dir = projects.dir_for(job.get("project_id"))
+        metadata = _find_latent_metadata(project_dir, sp["input_space"])
+        return await _ensure_viewer(sp["input_space"], sp["reload"], title, metadata,
+                                    str(project_dir) if project_dir else None, sp["consensus"])
     reload_raw = args.get("pickled_nn") or args.get("reload")
     # Full latents: a direct input (annotate_space), or derived from this run's
     # own output (a predict run's predicted latents).
@@ -548,6 +571,92 @@ def _find_latent_metadata(project_dir: "Path | None", latents: str) -> str | Non
     except Exception:  # noqa: BLE001
         return None
     return None
+
+
+_PREDICT_PROGRAMS = {"hetsiren", "zernike3deep", "reconsiren"}
+
+
+def _load_latents_array(path: str):
+    import numpy as np
+    p = Path(path)
+    arr = np.loadtxt(p) if p.suffix == ".txt" else np.load(p)
+    return np.atleast_2d(np.asarray(arr, dtype=np.float32))
+
+
+def _predict_latents_array(job: dict[str, Any]):
+    """Load a predict run's latents (extracting the metadata column if needed)."""
+    src = adapters.source_file_for("latents", job)
+    if src is None:
+        return None
+    try:
+        if src.suffix == ".npy":
+            return _load_latents_array(str(src))
+        out_dir = settings.data_dir / "viewer_cache" / "_cmp"
+        produced = adapters.produce("latents", job, out_dir, job["id"])
+        return _load_latents_array(produced)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _find_decoder(input_path: str, predict_jobs: list[dict[str, Any]]):
+    """Find the predict job (and its decoder checkpoint) that produced `input_path`,
+    by path containment first, then by matching latents (shape + first row)."""
+    try:
+        ip = Path(input_path).expanduser().resolve()
+    except Exception:  # noqa: BLE001
+        ip = None
+    for j in predict_jobs:
+        wd = j.get("workdir")
+        net = j["args"].get("reload") or j["args"].get("pickled_nn")
+        if wd and net and ip and str(ip).startswith(str(Path(wd).expanduser().resolve())):
+            return j, str(adapters.checkpoint_dir(j["program"], net))
+    import numpy as np
+    try:
+        lat = _load_latents_array(input_path)
+    except Exception:  # noqa: BLE001
+        return None, None
+    for j in predict_jobs:
+        net = j["args"].get("reload") or j["args"].get("pickled_nn")
+        if not net:
+            continue
+        cand = _predict_latents_array(j)
+        if cand is not None and cand.shape == lat.shape and np.allclose(cand[0], lat[0], atol=1e-3):
+            return j, str(adapters.checkpoint_dir(j["program"], net))
+    return None, None
+
+
+def _flexconsensus_spaces(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve a FlexConsensus run's consensus output spaces. Each space pairs a
+    consensus file (display) with its input latent space (decoded) and the
+    auto-detected decoder network from the predict run that produced that input."""
+    args = job.get("args", {})
+    raw = args.get("input_space")
+    entries = raw if isinstance(raw, list) else (str(raw).split() if raw else [])
+    workdir = Path(job.get("workdir") or ".")
+    pid = job.get("project_id")
+    predict = [j for j in (manager.list_for_project(pid) if pid else []) if j["program"] in _PREDICT_PROGRAMS]
+    spaces = []
+    for i, entry in enumerate(entries):
+        entry = str(entry)
+        # FlexConsensus accepts "NAME:path"; plain paths are auto-named "Input_i".
+        # (Linux paths have no ':' so a ':' marks an explicit name.)
+        if ":" in entry:
+            name, ipath = entry.split(":", 1)
+        else:
+            name, ipath = f"Input_{i}", entry
+        cons = workdir / f"{name}_consensus.npy"
+        djob, reload = _find_decoder(ipath, predict)
+        ok = bool(djob and reload and cons.exists())
+        spaces.append({
+            "index": i, "name": name, "input_space": ipath, "consensus": str(cons),
+            "consensus_exists": cons.exists(),
+            "decoder_job": djob["id"] if djob else None,
+            "decoder_program": djob["program"] if djob else None,
+            "reload": reload, "viewable": ok,
+            "reason": None if ok else ("no consensus output found for this space" if not cons.exists()
+                                       else "couldn't auto-detect the decoder network for this space"),
+        })
+    return spaces
 
 
 async def _ensure_viewer(latents: str, reload: str, title: str,

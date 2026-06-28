@@ -6,17 +6,19 @@ import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
+import { launchViewerForJob } from "./viewerLaunch.js";
 
 // Predict runs of these programs expose latents as output (predicted_latents),
 // so they become viewable once finished even without a latents input field.
 const PREDICT_LATENT_PROGS = new Set(["hetsiren", "zernike3deep", "reconsiren"]);
 
 // A job is viewable if it has a network checkpoint plus latents — either a
-// latents input, or a finished predict run whose output provides them.
-// FlexConsensus has no volume decoder, so it is not directly viewable.
+// latents input, or a finished predict run whose output provides them. A finished
+// FlexConsensus run is viewable too: the user picks a consensus space and its
+// decoder is auto-detected.
 function viewable(job) {
   const a = job.args || {};
-  if (job.program === "flexconsensus") return null;
+  if (job.program === "flexconsensus") return job.status === "succeeded" ? true : null;
   const reload = a.pickled_nn || a.reload;
   if (!reload) return null;
   if (a.z_space || a.latents || a.latents_file) return true;
@@ -75,7 +77,7 @@ export function ViewerView() {
   async function launch(job, btn) {
     if (btn) { btn.disabled = true; btn.lastChild.textContent = "Starting…"; }
     try {
-      store.openViewer(await api.viewerFromJob(job.id));
+      await launchViewerForJob(job);   // handles the FlexConsensus space chooser
     } catch (err) {
       mount(runsBox, errorBox(err));
     } finally {

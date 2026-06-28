@@ -61,7 +61,8 @@ export const api = {
 
   // WebGL viewer sessions
   viewers: () => req("/api/viewer"),
-  viewerFromJob: (jobId) => req(`/api/viewer/from-job/${jobId}`, { method: "POST" }),
+  viewerFromJob: (jobId, space) => req(`/api/viewer/from-job/${jobId}${space != null ? `?space=${space}` : ""}`, { method: "POST" }),
+  flexconsensusSpaces: (jobId) => req(`/api/viewer/flexconsensus/${jobId}`),
   stopViewer: (id) => req(`/api/viewer/${id}`, { method: "DELETE" }),
 
   // settings + projects

@@ -7,6 +7,7 @@ import { navigate, reload } from "../router.js";
 import { store } from "../store.js";
 import { errorBox } from "./ui.js";
 import { badge, jobDisplayName } from "./jobs.js";
+import { launchViewerForJob } from "./viewerLaunch.js";
 import { promptModal } from "./promptModal.js";
 import { createTerminal } from "./terminal.js";
 
@@ -71,8 +72,10 @@ export function JobDetailView(params) {
   }
 
   function viewable(j) {
-    const a = (j && j.args) || {};
-    if (!j || j.program === "flexconsensus") return false;
+    if (!j) return false;
+    const a = j.args || {};
+    // a finished FlexConsensus run is viewable: pick a consensus space (auto-decoder)
+    if (j.program === "flexconsensus") return j.status === "succeeded";
     const reload = a.pickled_nn || a.reload;
     if (!reload) return false;
     if (a.z_space || a.latents || a.latents_file) return true;
@@ -82,7 +85,7 @@ export function JobDetailView(params) {
   }
   async function openViewer() {
     clear(actionErr);
-    try { store.openViewer(await api.viewerFromJob(id)); navigate("/viewer"); }
+    try { if (await launchViewerForJob(job)) navigate("/viewer"); }
     catch (err) { mount(actionErr, errorBox(err)); }
   }
   const viewerBtn = () => h("button", { class: "btn secondary", onclick: openViewer, title: "Explore this run's conformational landscape in the embedded WebGL viewer" }, icon("box", 15), "3D viewer");
