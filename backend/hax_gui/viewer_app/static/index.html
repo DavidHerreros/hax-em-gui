@@ -50,6 +50,18 @@
           <span id="kwrap" class="kwrap" style="display:none"><label>k <input id="k" type="range" min="2" max="12" value="5" /></label><span id="kval" class="muted">5</span></span>
           <span id="denswrap" class="kwrap" style="display:none">
             <label>σ <input id="denssigma" type="range" min="1" max="20" value="6" title="Density bandwidth" /></label>
+            <label>map
+              <select id="densmap" title="Density colormap">
+                <option value="viridis" selected>viridis</option>
+                <option value="magma">magma</option>
+                <option value="plasma">plasma</option>
+                <option value="inferno">inferno</option>
+                <option value="turbo">turbo</option>
+                <option value="cividis">cividis</option>
+                <option value="gray">gray</option>
+                <option value="teal">teal</option>
+              </select>
+            </label>
             <label>glow <input id="densint" type="range" min="0" max="1" step="0.02" value="0.22" title="3D density glow intensity" /></label>
           </span>
           <button id="lassoBtn" class="btn" title="Lasso-select points (drag a loop)">▱ Lasso</button>
@@ -61,6 +73,7 @@
         <aside class="layers" id="layersRail">
           <div class="layers-head">
             <span>Layers</span>
+            <button id="addPath" class="btn small" title="Save the current morph path as an editable path layer">+ path</button>
             <button id="addLayer" class="btn small" disabled title="Make a layer from the current lasso selection">+ selection</button>
           </div>
           <div class="cluster-row">

@@ -57,13 +57,15 @@ const FRAG_SPLAT = `#version 300 es
 precision highp float;
 in float vDens;
 uniform float uIntensity;
+uniform vec3 uRamp[6];     // density colormap stops (low->high)
+uniform int uRampN;        // number of active stops
 out vec4 outColor;
 vec3 ramp(float t) {
   t = clamp(t, 0.0, 1.0);
-  vec3 c0 = vec3(0.059,0.090,0.165), c1 = vec3(0.118,0.251,0.471), c2 = vec3(0.051,0.580,0.533), c3 = vec3(0.980,0.800,0.082);
-  if (t < 0.333) return mix(c0, c1, t / 0.333);
-  if (t < 0.666) return mix(c1, c2, (t - 0.333) / 0.333);
-  return mix(c2, c3, (t - 0.666) / 0.334);
+  float f = t * float(uRampN - 1);
+  int i = int(floor(f));
+  i = min(i, uRampN - 2);
+  return mix(uRamp[i], uRamp[i + 1], f - float(i));
 }
 void main() {
   vec2 d = gl_PointCoord - vec2(0.5);
@@ -71,6 +73,18 @@ void main() {
   if (a < 0.01) discard;
   outColor = vec4(ramp(vDens), a * (0.03 + 0.32 * vDens) * uIntensity);
 }`;
+
+// Morph-path polyline (a line strip through the path waypoints, drawn on top).
+const VERT_LINE = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uProj; uniform mat4 uView;
+void main() { gl_Position = uProj * uView * vec4(aPos, 1.0); }`;
+const FRAG_LINE = `#version 300 es
+precision highp float;
+uniform vec3 uColor;
+out vec4 outColor;
+void main() { outColor = vec4(uColor, 1.0); }`;
 
 export function createCloud(canvas, onSelect) {
   const gl = canvas.getContext("webgl2", { antialias: true, depth: true, preserveDrawingBuffer: true, premultipliedAlpha: false });
@@ -83,6 +97,9 @@ export function createCloud(canvas, onSelect) {
   const splatProg = link(gl, VERT_SPLAT, FRAG_SPLAT);
   const su = (n) => gl.getUniformLocation(splatProg, n);
   const sProj = su("uProj"), sView = su("uView"), sSize = su("uSize"), sIntensity = su("uIntensity");
+  const sRamp = su("uRamp"), sRampN = su("uRampN");
+  let rampFlat = new Float32Array([0.27, 0.0, 0.33, 0.23, 0.32, 0.55, 0.13, 0.57, 0.55, 0.37, 0.79, 0.38, 0.99, 0.91, 0.15, 0, 0, 0]);   // viridis (normalized)
+  let rampN = 5;
 
   const vao = gl.createVertexArray();
   const posBuf = gl.createBuffer(), colBuf = gl.createBuffer(), flagBuf = gl.createBuffer(), densBuf = gl.createBuffer();
@@ -97,6 +114,14 @@ export function createCloud(canvas, onSelect) {
   gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
   gl.bindBuffer(gl.ARRAY_BUFFER, densBuf); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 0, 0);
   gl.bindVertexArray(null);
+
+  const lineProg = link(gl, VERT_LINE, FRAG_LINE);
+  const lProj = gl.getUniformLocation(lineProg, "uProj"), lView = gl.getUniformLocation(lineProg, "uView"), lColor = gl.getUniformLocation(lineProg, "uColor");
+  const lineBuf = gl.createBuffer(), lineVao = gl.createVertexArray();
+  gl.bindVertexArray(lineVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  let lineCount = 0, lineColor = [0.957, 0.447, 0.714];
   gl.enable(gl.DEPTH_TEST);
 
   let bg = [0.016, 0.024, 0.06];
@@ -133,6 +158,8 @@ export function createCloud(canvas, onSelect) {
       gl.uniformMatrix4fv(sView, false, view);
       gl.uniform1f(sSize, 34.0 * dpr);
       gl.uniform1f(sIntensity, densIntensity);
+      gl.uniform3fv(sRamp, rampFlat);
+      gl.uniform1i(sRampN, rampN);
       gl.depthMask(false); gl.disable(gl.DEPTH_TEST);
       gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
       gl.bindVertexArray(splatVao); gl.drawArrays(gl.POINTS, 0, count); gl.bindVertexArray(null);
@@ -148,6 +175,16 @@ export function createCloud(canvas, onSelect) {
     gl.drawArrays(gl.POINTS, 0, count);
     gl.bindVertexArray(null);
     gl.disable(gl.BLEND);
+    // morph-path polyline, drawn on top (depth test off) so it reads over points
+    if (lineCount >= 2) {
+      gl.useProgram(lineProg);
+      gl.uniformMatrix4fv(lProj, false, proj);
+      gl.uniformMatrix4fv(lView, false, view);
+      gl.uniform3fv(lColor, lineColor);
+      gl.disable(gl.DEPTH_TEST);
+      gl.bindVertexArray(lineVao); gl.drawArrays(gl.LINE_STRIP, 0, lineCount); gl.bindVertexArray(null);
+      gl.enable(gl.DEPTH_TEST);
+    }
   }
   function render() { resize(); drawScene(1); }
 
@@ -206,9 +243,24 @@ export function createCloud(canvas, onSelect) {
     setDensityField(values) { hasDens = !!(values && values.length === count); gl.bindBuffer(gl.ARRAY_BUFFER, densBuf); gl.bufferData(gl.ARRAY_BUFFER, values || new Float32Array(count), gl.STATIC_DRAW); render(); },
     showDensity(on) { showDens = on; render(); },
     setDensityIntensity(v) { densIntensity = Math.max(0, v); render(); },
+    setColormap(stops) {
+      if (!stops || stops.length < 2) return;
+      const n = Math.min(6, stops.length);
+      const flat = new Float32Array(18);
+      for (let i = 0; i < n; i++) { flat[i * 3] = stops[i][0] / 255; flat[i * 3 + 1] = stops[i][1] / 255; flat[i * 3 + 2] = stops[i][2] / 255; }
+      rampFlat = flat; rampN = n; if (showDens) render();
+    },
     setPointAlpha(a) { pointAlpha = Math.max(0, Math.min(1, a)); render(); },
     select(i) { selected = i; uploadFlags(); render(); },
     setPath(arr) { pathArr = arr || []; uploadFlags(); render(); },
+    setPathOrder(arr, colorRgb) {
+      const ids = (arr || []).filter((i) => i >= 0 && i < count);
+      const buf = new Float32Array(ids.length * 3);
+      for (let k = 0; k < ids.length; k++) { buf[k * 3] = norm[ids[k] * 3]; buf[k * 3 + 1] = norm[ids[k] * 3 + 1]; buf[k * 3 + 2] = norm[ids[k] * 3 + 2]; }
+      gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf); gl.bufferData(gl.ARRAY_BUFFER, buf, gl.DYNAMIC_DRAW);
+      lineCount = ids.length; if (colorRgb) lineColor = colorRgb;
+      render();
+    },
     setSelection(arr) { selArr = arr || []; uploadFlags(); render(); },
     // CSS-space screen coords of every point (null where behind the camera)
     projectedPoints() {

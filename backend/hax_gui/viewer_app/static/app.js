@@ -6,6 +6,18 @@ import { createScatter, clusterColor } from "./scatter.js";
 import { createCloud } from "./cloud.js";
 import { createHistogram } from "./histogram.js";
 
+// Density colormaps (RGB 0–255 control stops, low→high). Default viridis.
+const COLORMAPS = {
+  viridis: [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]],
+  magma: [[0, 0, 4], [81, 18, 124], [183, 55, 121], [252, 137, 97], [252, 253, 191]],
+  plasma: [[13, 8, 135], [126, 3, 168], [204, 71, 120], [248, 149, 64], [240, 249, 33]],
+  inferno: [[0, 0, 4], [87, 16, 110], [188, 55, 84], [249, 142, 9], [252, 255, 164]],
+  turbo: [[48, 18, 59], [33, 144, 141], [124, 211, 67], [253, 190, 61], [165, 14, 1]],
+  cividis: [[0, 32, 76], [44, 70, 107], [124, 123, 120], [187, 175, 113], [255, 234, 70]],
+  gray: [[20, 22, 30], [110, 114, 124], [180, 184, 192], [235, 237, 242]],
+  teal: [[15, 23, 42], [30, 64, 120], [13, 148, 136], [250, 204, 21]],
+};
+
 const $ = (id) => document.getElementById(id);
 const status = (m, k = "") => { const e = $("status"); e.textContent = m; e.className = "status " + k; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -13,7 +25,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let renderer, scatter, cloud = null, hist;
 let L = null, umapData = null, points3 = [];
 const clusterCache = {};
-const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.22, current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 25, pointAlpha: 1, pathExpanded: false, smooth: 6 };
+const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.22, densMap: "viridis", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 25, pointAlpha: 1, pathExpanded: false, smooth: 6 };
 const frameDelay = () => 1000 / Math.max(2, Math.min(30, state.fps));
 let decodeToken = 0;
 
@@ -25,8 +37,9 @@ let volRenderer = null, curVolMeta = null;
 
 // lasso + layers
 let lassoArmed = false, lassoing = false, lassoPts = [], lctx = null, lassoMode = "replace";
-const layers = [];   // { name, color(hex), indices[], visible, kind? }
+const layers = [];   // { name, color(hex), indices[], visible, kind? }  (kind 'path' = ordered morph path)
 let layerSeq = 0;
+let editingPathLayer = null;   // the path layer currently being edited (shift-click add/remove)
 // KMeans centroids: virtual indices >= L.n, with PCA coords + a per-centroid color
 let indexColor = {};     // index -> hex (decoded maps of these indices are auto-colored)
 let centroidPCA = {};    // index -> PCA vector (so centroids order along an axis for series)
@@ -48,6 +61,10 @@ function applyTheme(theme) {
   renderer.setBackground(c);
   if (volRenderer) volRenderer.setBackground(c);
   if (cloud) cloud.setBackground(c);
+  // Selection rings / path use a theme-aware contrast color computed at draw time,
+  // so the landscape must repaint when the theme toggles.
+  if (scatter) scatter.draw();
+  if (cloud) cloud.render();
 }
 
 async function boot() {
@@ -55,6 +72,7 @@ async function boot() {
   catch (err) { status("WebGL2 unavailable: " + err.message, "err"); return; }
   scatter = createScatter($("scatter"), onSelect);
   hist = createHistogram($("hist"), onLevel);
+  applyColormap();
   applyTheme(new URLSearchParams(location.search).get("theme"));
   window.addEventListener("message", (e) => { if (e.data && e.data.type === "hax-theme") applyTheme(e.data.theme); });
 
@@ -93,7 +111,7 @@ function wireControls() {
     state.dims = +e.target.value; const is3 = is3d();
     $("scatter").style.display = is3 ? "none" : ""; $("scatter3d").style.display = is3 ? "" : "none";
     $("zwrap").style.display = is3 ? "" : "none";
-    if (is3 && !cloud) { try { cloud = createCloud($("scatter3d"), onSelect); cloud.setBackground(hexToRgb($("bg").value)); } catch (err) { status("WebGL2 unavailable for 3D: " + err.message, "err"); state.dims = 2; $("dims").value = "2"; $("scatter").style.display = ""; $("scatter3d").style.display = "none"; return; } }
+    if (is3 && !cloud) { try { cloud = createCloud($("scatter3d"), onSelect); cloud.setBackground(hexToRgb($("bg").value)); cloud.setColormap(COLORMAPS[state.densMap] || COLORMAPS.viridis); } catch (err) { status("WebGL2 unavailable for 3D: " + err.message, "err"); state.dims = 2; $("dims").value = "2"; $("scatter").style.display = ""; $("scatter3d").style.display = "none"; return; } }
     refreshAxisEnabled();
     updatePoints(); applyColor(); syncSelection();   // re-apply color so 2D↔3D keeps density/cluster/layers
   });
@@ -114,6 +132,7 @@ function wireControls() {
     $("layersBtn").classList.toggle("active", !collapsed);
   });
   $("addLayer").addEventListener("click", addLayerFromSelection);
+  $("addPath").addEventListener("click", makePathLayer);
   $("clusterBtn").addEventListener("click", computeClusters);
   $("saveAll").addEventListener("click", saveAllLayers);
   $("layersBtn").classList.add("active");   // rail visible by default
@@ -126,6 +145,7 @@ function wireControls() {
     if (is3d() && cloud) applyColor(); else scatter.setDensityBandwidth(state.densBandwidth);
   });
   $("densint").addEventListener("input", (e) => { state.densIntensity = +e.target.value; if (cloud) cloud.setDensityIntensity(state.densIntensity); });
+  $("densmap").addEventListener("change", (e) => { state.densMap = e.target.value; applyColormap(); if (state.colorBy === "density") applyColor(); });
   $("light").addEventListener("change", (e) => renderer.setLighting(e.target.value));
   $("smooth").addEventListener("input", (e) => { state.smooth = +e.target.value; if (state.timeline.length && state.frame > 0) liveFrame(state.frame); else liveDecode(); });
   $("color").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setColor(c); if (volRenderer) volRenderer.setColor(c); });
@@ -146,7 +166,29 @@ function wireControls() {
   $("vbright").addEventListener("input", (e) => { state.vBright = +e.target.value; if (volRenderer) volRenderer.setBrightness(state.vBright); });
 }
 
+// Save the current morph path ([current, ...path]) as an editable path layer.
+function makePathLayer() {
+  const traj = [state.current, ...state.path].filter((v) => v >= 0);
+  if (traj.length < 2) { status("Build a morph path first (shift-click states), then “+ path”.", "warn"); return; }
+  layerSeq += 1;
+  const ly = { name: `Path ${layers.length + 1}`, color: clusterColor(layerSeq - 1), indices: [...traj], visible: true, kind: "path" };
+  layers.push(ly);
+  renderLayers();
+  status(`Saved “${ly.name}” (${traj.length} waypoints). Press ✎ on it to edit, ▶ to morph along it.`);
+}
+// Load a path layer into the live morph path for editing (toggle off to finish).
+function editPathLayer(ly) {
+  if (editingPathLayer === ly) { editingPathLayer = null; renderLayers(); syncSelection(); status(`Finished editing “${ly.name}”.`); return; }
+  editingPathLayer = ly;
+  const idx = ly.indices.filter((v) => v >= 0);
+  state.path = idx.slice(1);
+  renderLayers();
+  status(`Editing “${ly.name}”: shift-click empty states to add waypoints, shift-click a waypoint to remove it.`, "busy");
+  onSelect(idx[0]);   // make the first waypoint current + decode it
+}
+
 function clearPath() {
+  editingPathLayer = null;
   if (playing) setPlaying(false);
   state.path = []; state.frame = 0; syncSelection(); updatePathLabel();
 }
@@ -282,21 +324,41 @@ function density3(pts, frac = 0.12) {
 
 
 // Keep both landscape views highlighting the same current state + path + selection.
+// Push the selected density colormap to the 2D heatmap and the 3D glow shader.
+function applyColormap() {
+  const stops = COLORMAPS[state.densMap] || COLORMAPS.viridis;
+  scatter.setColormap(stops);
+  if (cloud) cloud.setColormap(stops);
+}
+
 function syncSelection() {
   scatter.select(state.current); scatter.setPath(state.path); scatter.setSelection(state.selection);
-  if (cloud) { cloud.select(state.current); cloud.setPath(state.path); cloud.setSelection(state.selection); }
+  const traj = [state.current, ...state.path].filter((v) => v >= 0);
+  const col = editingPathLayer ? editingPathLayer.color : "#f472b6";
+  scatter.setPathOrder(traj, col);
+  if (cloud) { cloud.select(state.current); cloud.setPath(state.path); cloud.setSelection(state.selection); cloud.setPathOrder(traj, hexToRgb(col)); }
 }
 
 async function onSelect(i, opts) {
   if (playing) setPlaying(false);              // editing the path stops playback
   if (opts && opts.shift) {
-    // append a waypoint to the morph path (skip if it repeats the last one)
-    const last = state.path.length ? state.path[state.path.length - 1] : state.current;
-    if (i !== last) state.path.push(i);
+    // shift-click toggles a waypoint: remove it if already on the path, else append
+    const at = state.path.indexOf(i);
+    if (at >= 0) state.path.splice(at, 1);
+    else if (i !== state.current) {
+      const last = state.path.length ? state.path[state.path.length - 1] : state.current;
+      if (i !== last) state.path.push(i);
+    }
+    if (editingPathLayer) {                        // keep the edited path layer in sync
+      editingPathLayer.indices = [state.current, ...state.path].filter((v) => v >= 0);
+      renderLayers(); if (state.colorBy === "layers") applyColor();
+    }
     syncSelection(); updatePathLabel();
     return;
   }
-  state.current = i; syncSelection(); updatePathLabel(); $("sel").textContent = `state #${i}`;
+  state.current = i;
+  if (editingPathLayer) { editingPathLayer.indices = [state.current, ...state.path].filter((v) => v >= 0); renderLayers(); if (state.colorBy === "layers") applyColor(); }
+  syncSelection(); updatePathLabel(); $("sel").textContent = `state #${i}`;
   try {
     const h = await (await fetch(`./api/histogram?index=${i}`)).json();
     hist.setData(h, h.mean + state.sigma * h.std);
@@ -586,18 +648,20 @@ function renderLayers() {
   const ul = $("layerList"); ul.innerHTML = "";
   $("noLayers").style.display = layers.length ? "none" : "";
   layers.forEach((ly) => {
-    const li = document.createElement("li"); li.className = "layer-item" + (ly.visible ? "" : " hidden");
+    const editing = editingPathLayer === ly;
+    const li = document.createElement("li"); li.className = "layer-item" + (ly.visible ? "" : " hidden") + (editing ? " editing" : "") + (ly.kind === "path" ? " path" : "");
     const eye = iconBtn(ly.visible ? "◉" : "○", "Show / hide", () => { ly.visible = !ly.visible; renderLayers(); if (state.colorBy === "layers") applyColor(); });
     const sw = document.createElement("input"); sw.type = "color"; sw.className = "swatch"; sw.value = ly.color; sw.title = "Layer color";
-    sw.addEventListener("input", (e) => { ly.color = e.target.value; if (state.colorBy === "layers") applyColor(); });
-    const name = document.createElement("span"); name.className = "lname"; name.textContent = ly.name; name.title = "Click to rename";
+    sw.addEventListener("input", (e) => { ly.color = e.target.value; if (state.colorBy === "layers") applyColor(); if (editingPathLayer === ly) syncSelection(); });
+    const name = document.createElement("span"); name.className = "lname"; name.textContent = (ly.kind === "path" ? "↳ " : "") + ly.name; name.title = "Click to rename";
     name.addEventListener("click", () => { const v = prompt("Layer name", ly.name); if (v) { ly.name = v.trim() || ly.name; renderLayers(); } });
     const cnt = document.createElement("span"); cnt.className = "lcount"; cnt.textContent = `${ly.indices.length}`;
-    const series = iconBtn("▶", "Morph through this layer as a volume series", () => playLayerSeries(ly));
-    const del = iconBtn("✕", "Delete layer", () => { layers.splice(layers.indexOf(ly), 1); renderLayers(); if (state.colorBy === "layers") applyColor(); });
-    li.append(eye, sw, name, cnt, series);
+    li.append(eye, sw, name, cnt);
+    if (ly.kind === "path") li.append(iconBtn(editing ? "✓" : "✎", editing ? "Finish editing this path" : "Edit waypoints (shift-click to add/remove)", () => editPathLayer(ly)));
+    li.append(iconBtn("▶", ly.kind === "path" ? "Morph along this path" : "Morph through this layer as a volume series", () => playLayerSeries(ly)));
     if (exportAvailable) li.append(iconBtn("⤓", "Save layer (metadata + average volume) to the project", () => saveLayer(ly)));
-    li.append(del); ul.appendChild(li);
+    li.append(iconBtn("✕", "Delete layer", () => { if (editingPathLayer === ly) editingPathLayer = null; layers.splice(layers.indexOf(ly), 1); renderLayers(); if (state.colorBy === "layers") applyColor(); }));
+    ul.appendChild(li);
   });
 }
 const coordOf = (i) => (i >= L.n ? (centroidPCA[i] ? centroidPCA[i][state.x] : 0) : (activeCoords() || L.pca)[i][state.x]);
@@ -652,7 +716,8 @@ async function saveAllLayers() {
 }
 
 async function playLayerSeries(ly) {
-  const ordered = orderAlongAxis(ly.indices);
+  // path layers morph in their stored waypoint order; others order along the axis
+  const ordered = ly.kind === "path" ? ly.indices.filter((v) => v >= 0) : orderAlongAxis(ly.indices);
   if (ordered.length < 2) { status("A series needs ≥2 states.", "warn"); return; }
   if (playing) setPlaying(false);
   state.current = ordered[0]; state.path = ordered.slice(1); state.frame = 0;

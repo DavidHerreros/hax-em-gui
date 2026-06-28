@@ -13,7 +13,9 @@ export function createScatter(canvas, onSelect) {
   const ctx = canvas.getContext("2d");
   let points = [], labels = null, showDensity = false, pointColors = null;
   let selected = -1, hover = -1, pathSet = new Set(), selSet = new Set();
+  let pathOrder = [], pathColor = "#f472b6";   // ordered morph path drawn as a polyline
   let densBandwidth = 6, pointAlpha = 1.0;
+  let cmap = [[15, 23, 42], [30, 64, 120], [13, 148, 136], [250, 204, 21]];   // density colormap stops
   let bounds = { minX: -1, minY: -1, maxX: 1, maxY: 1 };
   const PAD = 26;
 
@@ -35,6 +37,14 @@ export function createScatter(canvas, onSelect) {
     const w = canvas.width, h = canvas.height;
     return [PAD + (x - bounds.minX) / (bounds.maxX - bounds.minX) * (w - 2 * PAD),
       h - PAD - (y - bounds.minY) / (bounds.maxY - bounds.minY) * (h - 2 * PAD)];
+  }
+
+  // Density color from the active colormap (alpha rises with t so faint→opaque).
+  function ramp(t) {
+    t = Math.max(0, Math.min(1, t));
+    const f = t * (cmap.length - 1), i = Math.min(cmap.length - 2, Math.floor(f)), u = f - i;
+    const c = (a, b) => Math.round(a + (b - a) * u);
+    return `rgba(${c(cmap[i][0], cmap[i + 1][0])},${c(cmap[i][1], cmap[i + 1][1])},${c(cmap[i][2], cmap[i + 1][2])},${0.25 + 0.6 * t})`;
   }
 
   function drawDensity() {
@@ -71,6 +81,7 @@ export function createScatter(canvas, onSelect) {
       ctx.fill();
     }
     ctx.globalAlpha = 1;
+    drawPath();
     // selection ring must contrast with the background -> dark on the light theme
     const selCol = document.documentElement.dataset.theme === "light" ? "rgba(15,23,42,0.9)" : "rgba(241,245,249,0.9)";
     for (const si of selSet) ring(si, selCol, 1.7, true);
@@ -85,6 +96,17 @@ export function createScatter(canvas, onSelect) {
       }
       ctx.beginPath(); ctx.arc(sx, sy, r * scale, 0, Math.PI * 2); ctx.strokeStyle = col; ctx.lineWidth = 1.6 * dpr(); ctx.stroke();
     }
+  }
+  // Connect the ordered morph waypoints with a polyline (dark halo + colored line
+  // + small numbered ticks) so a path is visible on the landscape.
+  function drawPath() {
+    const pts = pathOrder.filter((i) => i >= 0 && points[i]).map((i) => toScreen(points[i][0], points[i][1]));
+    if (pts.length < 2) return;
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.strokeStyle = "rgba(15,23,42,0.55)"; ctx.lineWidth = 4.5 * dpr(); ctx.stroke();
+    ctx.strokeStyle = pathColor; ctx.lineWidth = 2 * dpr(); ctx.stroke();
   }
   function draw() { resize(); paint(null); }
 
@@ -108,9 +130,11 @@ export function createScatter(canvas, onSelect) {
     setPointColors(arr) { pointColors = arr; draw(); },   // per-point CSS color (layers mode); null clears
     setDensity(on) { showDensity = on; draw(); },
     setDensityBandwidth(b) { densBandwidth = Math.max(1, b | 0); if (showDensity) draw(); },
+    setColormap(stops) { if (stops && stops.length >= 2) cmap = stops; if (showDensity) draw(); },
     setPointAlpha(a) { pointAlpha = Math.max(0, Math.min(1, a)); draw(); },
     select(i) { selected = i; draw(); },
     setPath(arr) { pathSet = new Set(arr || []); draw(); },
+    setPathOrder(arr, color) { pathOrder = arr || []; if (color) pathColor = color; draw(); },
     setSelection(arr) { selSet = new Set(arr || []); draw(); },
     // CSS-space screen coords of every point (for app-driven lasso enclosure)
     projectedPoints() { const r = dpr(); return points.map(([x, y]) => { const [sx, sy] = toScreen(x, y); return [sx / r, sy / r]; }); },

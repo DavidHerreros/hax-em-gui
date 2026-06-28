@@ -97,6 +97,8 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .layer-item .iconbtn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 13px; padding: 1px 3px; line-height: 1; border-radius: 4px; }
 .layer-item .iconbtn:hover { color: var(--accent); }
 .layer-item.hidden .lname { opacity: 0.45; text-decoration: line-through; }
+.layer-item.path { border-style: dashed; }
+.layer-item.editing { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .layers-hint { padding: 10px; line-height: 1.5; }
 .cluster-row { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); }
 .cluster-row label { display: inline-flex; align-items: center; gap: 5px; }
