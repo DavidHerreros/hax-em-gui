@@ -24,8 +24,29 @@ browser in the dev environment).
   binding system; blocks downstream steps on failure. Backend + engine verified
   (validation, topo/cycle detection, binding wiring, failure propagation). *Keep
   in mind / next:* curated templates, parallel branch execution, canvas pan/zoom,
-  richer per-field editors (file pickers), live per-node log peek. The canvas UI
-  itself needs an in-browser pass (no browser in the dev env).
+  live per-node log peek. The canvas UI itself needs an in-browser pass (no
+  browser in the dev env).
+
+#### Workflow builder — backlog (requested)
+
+- [ ] **Layout modes** — horizontal and vertical arrangement of the graph.
+- [ ] **File-field picker** — for parameters that take a file, allow choosing via
+  the existing file browser (instead of a plain text input in the node inspector).
+- [ ] **Inherit params on predict↔train wiring** — when connecting a predict node
+  to a train node, pre-fill the predict node with the train node's form
+  parameters by default (they're usually identical apart from `--mode`).
+- [x] **Custom box names → job names** — already implemented: a node's "name"
+  field becomes the launched job's name.
+- [ ] **Open a project as a workflow** — load an existing project's jobs into the
+  builder as a graph (inferred from input bindings) and edit it from there.
+- [ ] **Run single nodes / a selection** — run one node or a selected subset from
+  the builder, and surface each node's state (saved / executed / succeeded /
+  failed) on the canvas.
+- [ ] **Drag-and-drop add + drop-to-connect** — drag a program from the palette
+  onto the canvas (not only click-to-add); dropping a node on top of another
+  auto-connects compatible output→input ports.
+- [ ] **Auto-layout button** — re-arrange the graph into dependency levels
+  (topological tiers / sub-workflows) so it is easier to follow.
 
 - [x] **1** — Left menu collapses to icons-only via a header toggle.
 - [x] **2** — Project manager: Settings page sets a common projects root (gear icon
