@@ -650,13 +650,13 @@ export function WorkflowsView() {
     const ox = (W - gw * s) / 2, oy = (H - gh * s) / 2;
     mmXform = { gx0, gy0, ox, oy, s };
     const tx = (x) => ox + (x - gx0) * s, ty = (y) => oy + (y - gy0) * s;
-    // edges
-    ctx.strokeStyle = "#64748b"; ctx.lineWidth = 1;
+    // edges — connect tile centers (the tiles are small squares centered on each
+    // node), so wires visibly join the boxes; tiles are drawn after, on top.
+    const center = (n) => ({ x: n.x + NODE_W / 2, y: n.y + nodeHeight(n) / 2 });
+    ctx.strokeStyle = "#64748b"; ctx.lineWidth = 1.25;
     for (const e of graph.edges) {
       const sN = nodeById(e.from), dN = nodeById(e.to); if (!sN || !dN) continue;
-      const ins = inputsOf(dN.program);
-      const idx = Math.max(0, ins.findIndex(([f]) => f === e.field));
-      const p1 = outPort(sN), p2 = inPort(dN, idx, ins.length);
+      const p1 = center(sN), p2 = center(dN);
       ctx.beginPath(); ctx.moveTo(tx(p1.x), ty(p1.y)); ctx.lineTo(tx(p2.x), ty(p2.y)); ctx.stroke();
     }
     // nodes — small rounded squares colored by run status. Size from the node's
