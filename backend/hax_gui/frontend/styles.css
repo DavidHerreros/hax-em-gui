@@ -612,8 +612,8 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .lbl-add:hover { border-color: var(--brand, #2dd4bf); color: var(--brand, #2dd4bf); }
 
 /* label picker popover */
-.lblpick { position: fixed; z-index: 1000; min-width: 232px; max-width: 280px; background: var(--surface);
-  border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 32px rgba(0,0,0,.35); padding: 8px; }
+.lblpick { position: fixed; z-index: 1000; min-width: 232px; max-width: 280px; background: var(--modal-bg);
+  border: 1px solid var(--border-2); border-radius: 10px; box-shadow: 0 10px 32px var(--shadow); padding: 8px; }
 .lblpick-head { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 2px 4px 6px; }
 .lblpick-list { max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
 .lblpick-row { display: flex; align-items: center; gap: 4px; border-radius: 6px; }

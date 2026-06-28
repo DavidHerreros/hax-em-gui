@@ -659,11 +659,13 @@ export function WorkflowsView() {
       const p1 = outPort(sN), p2 = inPort(dN, idx, ins.length);
       ctx.beginPath(); ctx.moveTo(tx(p1.x), ty(p1.y)); ctx.lineTo(tx(p2.x), ty(p2.y)); ctx.stroke();
     }
-    // nodes — small rounded squares colored by run status
-    const side = Math.max(9, NODE_W * s * 0.7);
+    // nodes — small rounded squares colored by run status. Size from the node's
+    // *smaller* dimension (its height) so stacked tier neighbours never overlap
+    // (nodes are much wider than tall, and stack closer vertically than NODE_W).
     for (const n of graph.nodes) {
       const st = runState && runState[n.id] ? runState[n.id].status : null;
       const col = (st && MINI_STATUS[st]) || "#94a3b8";
+      const side = Math.max(7, Math.min(NODE_W, nodeHeight(n)) * s * 0.82);
       const cx = tx(n.x + NODE_W / 2) - side / 2, cy = ty(n.y + nodeHeight(n) / 2) - side / 2;
       roundRectPath(ctx, cx, cy, side, side, Math.max(2, side * 0.28));
       ctx.fillStyle = col; ctx.fill();
