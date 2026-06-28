@@ -44,6 +44,18 @@ function svgEl(tag, attrs = {}) {
   return el;
 }
 
+// Trace a rounded-rectangle path on a 2D context (for the minimap node tiles).
+function roundRectPath(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
 export function WorkflowsView() {
   let catalog = [];
   let byName = {};
@@ -86,15 +98,66 @@ export function WorkflowsView() {
     h("span", { style: { flex: "1" } }), statusEl, saveBtn, runSelBtn, runBtn, delBtn);
 
   // ── body: palette | canvas (+minimap) | inspector ──
-  const palette = h("div", { class: "wf-palette" });
+  // Both side panels are resizable (drag the divider) and collapsible (chevron in
+  // the panel bar; a thin reopen tab brings it back), like the main-window menus.
+  let paletteW = 200, inspectorW = 264;
+  const paletteInner = h("div", { class: "wf-pane-inner" });
+  const palette = h("div", { class: "wf-palette", style: { width: paletteW + "px" } },
+    h("div", { class: "wf-pane-bar" },
+      h("span", { class: "wf-pane-title" }, "Programs"),
+      h("button", { class: "wf-pane-collapse", title: "Hide programs", onclick: () => setPalette(false) }, icon("chevronLeft", 16))),
+    paletteInner);
+
   const svg = svgEl("svg", { class: "wf-wires", width: String(CONTENT_W), height: String(CONTENT_H) });
   const nodesLayer = h("div", { class: "wf-nodes" });
   const canvas = h("div", { class: "wf-canvas" }, svg, nodesLayer);
   const minimap = h("canvas", { class: "wf-minimap", title: "Overview — click to jump" });
   const canvasWrap = h("div", { class: "wf-canvas-wrap" }, canvas, minimap);
-  const inspector = h("div", { class: "wf-inspector" });
-  const body = h("div", { class: "wf-body" }, palette, canvasWrap, inspector);
+
+  const inspBody = h("div", { class: "wf-pane-inner wf-inspector-body" });
+  const inspector = h("div", { class: "wf-inspector", style: { width: inspectorW + "px" } },
+    h("div", { class: "wf-pane-bar" },
+      h("button", { class: "wf-pane-collapse", title: "Hide inspector", onclick: () => setInspector(false) }, icon("chevronRight", 16)),
+      h("span", { class: "wf-pane-title" }, "Inspector")),
+    inspBody);
+
+  const paletteRz = h("div", { class: "wf-rz", title: "Drag to resize" });
+  const inspectorRz = h("div", { class: "wf-rz", title: "Drag to resize" });
+  paletteRz.addEventListener("pointerdown", (e) => startResize(e, "palette"));
+  inspectorRz.addEventListener("pointerdown", (e) => startResize(e, "inspector"));
+  const reopenLeft = h("button", { class: "wf-reopen left hidden", title: "Show programs", onclick: () => setPalette(true) }, icon("chevronRight", 16));
+  const reopenRight = h("button", { class: "wf-reopen right hidden", title: "Show inspector", onclick: () => setInspector(true) }, icon("chevronLeft", 16));
+
+  const body = h("div", { class: "wf-body" }, palette, paletteRz, canvasWrap, inspectorRz, inspector, reopenLeft, reopenRight);
   root.append(topbar, body);
+
+  function setPalette(open) {
+    palette.classList.toggle("collapsed", !open);
+    paletteRz.classList.toggle("hidden", !open);
+    reopenLeft.classList.toggle("hidden", open);
+    if (open) palette.style.width = paletteW + "px";
+    drawMinimap();
+  }
+  function setInspector(open) {
+    inspector.classList.toggle("collapsed", !open);
+    inspectorRz.classList.toggle("hidden", !open);
+    reopenRight.classList.toggle("hidden", open);
+    if (open) inspector.style.width = inspectorW + "px";
+    drawMinimap();
+  }
+  function startResize(e, which) {
+    e.preventDefault();
+    const startX = e.clientX, pw = paletteW, iw = inspectorW;
+    document.body.style.cursor = "col-resize";
+    function mv(ev) {
+      if (which === "palette") { paletteW = Math.max(150, Math.min(400, pw + (ev.clientX - startX))); palette.style.width = paletteW + "px"; }
+      else { inspectorW = Math.max(200, Math.min(520, iw - (ev.clientX - startX))); inspector.style.width = inspectorW + "px"; }
+      drawMinimap();
+    }
+    function up() { window.removeEventListener("pointermove", mv); window.removeEventListener("pointerup", up); document.body.style.cursor = ""; }
+    window.addEventListener("pointermove", mv);
+    window.addEventListener("pointerup", up);
+  }
 
   // empty-canvas drag pans the view (and a click without movement clears selection)
   canvas.addEventListener("pointerdown", (e) => {
@@ -155,25 +218,24 @@ export function WorkflowsView() {
   }
 
   function renderPalette() {
-    clear(palette);
-    palette.appendChild(h("div", { class: "wf-palette-head" }, "Programs"));
-    palette.appendChild(h("div", { class: "muted small", style: { padding: "0 10px 6px" } }, "Click or drag onto the canvas."));
+    clear(paletteInner);
+    paletteInner.appendChild(h("div", { class: "muted small", style: { padding: "8px 10px 6px" } }, "Click or drag onto the canvas."));
     // Group by program category, same order as the right-menu launcher.
     const byCat = {};
     for (const p of catalog) (byCat[p.category || "Other"] ??= []).push(p);
     const cats = Object.keys(byCat).sort((a, b) => ((CATEGORY_ORDER.indexOf(a) + 1) || 99) - ((CATEGORY_ORDER.indexOf(b) + 1) || 99));
     for (const cat of cats) {
-      palette.appendChild(h("div", { class: "wf-pal-cat" }, cat));
+      paletteInner.appendChild(h("div", { class: "wf-pal-cat" }, cat));
       for (const p of byCat[cat]) {
         const producesTag = p.produces && p.produces.length ? "out: " + (p.produces.includes("latents") ? "latents" : p.produces[0]) : "";
         const item = h("button", { class: "wf-pal-item", title: p.description || p.name, draggable: "true", onclick: () => addNode(p.name) },
           h("span", { class: "mono" }, p.name),
           producesTag ? h("span", { class: "wf-pal-out muted small" }, producesTag) : null);
         item.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", p.name); e.dataTransfer.effectAllowed = "copy"; });
-        palette.appendChild(item);
+        paletteInner.appendChild(item);
       }
     }
-    palette.appendChild(h("div", { class: "wf-legend" },
+    paletteInner.appendChild(h("div", { class: "wf-legend" },
       ...["saved", "succeeded", "running", "failed", "blocked"].map((s) =>
         h("span", { class: "wf-leg" }, h("span", { class: "wf-leg-dot", style: { background: STATUS_COLOR[s] } }), s))));
   }
@@ -430,27 +492,27 @@ export function WorkflowsView() {
 
   // ── inspector (per-node args) ──
   function renderInspector() {
-    clear(inspector);
+    clear(inspBody);
     const n = selected && nodeById(selected);
     if (!n) {
-      inspector.appendChild(h("div", { class: "wf-insp-empty muted" },
+      inspBody.appendChild(h("div", { class: "wf-insp-empty muted" },
         "Select a step to edit its parameters. Wire a step's output port into another step's input port to pass data. Shift-click to multi-select."));
       return;
     }
-    inspector.appendChild(h("div", { class: "wf-insp-head" }, h("strong", null, n.program)));
+    inspBody.appendChild(h("div", { class: "wf-insp-head" }, h("strong", null, n.program)));
     const nameI = h("input", { class: "wf-field", placeholder: "step name (optional)", value: n.name || "" });
     nameI.addEventListener("input", () => { n.name = nameI.value; dirty = true; const t = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"] .wf-node-title`); if (t) t.textContent = n.name || n.program; });
     const gpuI = h("input", { class: "wf-field", placeholder: "GPU (e.g. 0, empty = CPU)", value: n.gpu ?? "0" });
     gpuI.addEventListener("input", () => { n.gpu = gpuI.value; dirty = true; });
-    inspector.appendChild(h("label", { class: "wf-lbl" }, "Name", nameI));
-    inspector.appendChild(h("label", { class: "wf-lbl" }, "GPU", gpuI));
-    inspector.appendChild(h("label", { class: "wf-lbl" }, "Labels",
+    inspBody.appendChild(h("label", { class: "wf-lbl" }, "Name", nameI));
+    inspBody.appendChild(h("label", { class: "wf-lbl" }, "GPU", gpuI));
+    inspBody.appendChild(h("label", { class: "wf-lbl" }, "Labels",
       nodeLabelChips(n, { onChange: () => { dirty = true; const el = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"]`); if (el) renderNodes(); } })));
 
     const schema = schemaCache[n.program];
-    if (!schema) { loadSchema(n.program).then(() => { if (selected === n.id) renderInspector(); }); inspector.appendChild(h("div", { class: "muted small" }, "Loading parameters…")); return; }
+    if (!schema) { loadSchema(n.program).then(() => { if (selected === n.id) renderInspector(); }); inspBody.appendChild(h("div", { class: "muted small" }, "Loading parameters…")); return; }
     const bindable = byName[n.program]?.bindable || {};
-    inspector.appendChild(h("div", { class: "wf-insp-sub muted small" }, "Parameters"));
+    inspBody.appendChild(h("div", { class: "wf-insp-sub muted small" }, "Parameters"));
     for (const f of visibleFields(schema)) {
       const wiredAll = graph.edges.filter((e) => e.to === n.id && e.field === f.name);
       const multi = isMultiField(n.program, f.name);
@@ -461,11 +523,11 @@ export function WorkflowsView() {
             h("span", { style: { flex: "1" } }, `from ${src ? (src.name || src.program) : "?"} · ${w.kind}`),
             h("button", { class: "wf-chip-x", title: "Remove connection", onclick: () => removeEdge(w.id) }, "×"));
         });
-        inspector.appendChild(h("label", { class: "wf-lbl" },
+        inspBody.appendChild(h("label", { class: "wf-lbl" },
           f.name + (multi ? ` (${wiredAll.length})` : "") + (multi ? "  — wire more sources to add" : ""), ...chips));
         continue;
       }
-      inspector.appendChild(h("label", { class: "wf-lbl", title: f.help || "" },
+      inspBody.appendChild(h("label", { class: "wf-lbl", title: f.help || "" },
         f.name + (f.required ? " *" : "") + (f.name in bindable ? (multi ? "  (wirable, multi)" : "  (wirable)") : ""), argInput(n, f)));
     }
   }
@@ -597,11 +659,15 @@ export function WorkflowsView() {
       const p1 = outPort(sN), p2 = inPort(dN, idx, ins.length);
       ctx.beginPath(); ctx.moveTo(tx(p1.x), ty(p1.y)); ctx.lineTo(tx(p2.x), ty(p2.y)); ctx.stroke();
     }
-    // nodes (colored by run status)
+    // nodes — small rounded squares colored by run status
+    const side = Math.max(9, NODE_W * s * 0.7);
     for (const n of graph.nodes) {
       const st = runState && runState[n.id] ? runState[n.id].status : null;
-      ctx.fillStyle = (st && MINI_STATUS[st]) || "#94a3b8";
-      ctx.fillRect(tx(n.x), ty(n.y), Math.max(2, NODE_W * s), Math.max(2, nodeHeight(n) * s));
+      const col = (st && MINI_STATUS[st]) || "#94a3b8";
+      const cx = tx(n.x + NODE_W / 2) - side / 2, cy = ty(n.y + nodeHeight(n) / 2) - side / 2;
+      roundRectPath(ctx, cx, cy, side, side, Math.max(2, side * 0.28));
+      ctx.fillStyle = col; ctx.fill();
+      ctx.lineWidth = 1; ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.stroke();
     }
     // current viewport rectangle
     ctx.strokeStyle = "#2dd4bf"; ctx.lineWidth = 1.5;

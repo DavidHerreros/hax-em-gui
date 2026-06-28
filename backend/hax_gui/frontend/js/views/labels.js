@@ -25,6 +25,19 @@ async function _refresh() { _cache = await api.labels(); _notify(); return _cach
 const labelById = (id) => getLabelsCache().find((l) => l.id === id);
 export function labelsByIds(ids) { return (ids || []).map(labelById).filter(Boolean); }
 
+// Place a fixed popover near its anchor, right-aligned and clamped inside the
+// viewport (so it never spills off the right/bottom — the inspector sits at the
+// far right of the window). Measures the real size, so call after content renders.
+function placePopover(menu, anchorEl) {
+  const r = anchorEl.getBoundingClientRect();
+  const mw = menu.offsetWidth || 240, mh = menu.offsetHeight || 0;
+  let left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
+  let top = r.bottom + 4;
+  if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 4);
+  menu.style.left = left + "px";
+  menu.style.top = top + "px";
+}
+
 // One read-only chip. `onRemove` (optional) renders a × to detach it.
 export function labelChip(label, onRemove) {
   if (!label) return null;
@@ -92,7 +105,7 @@ function openPicker(anchorEl, adapter, onChange) {
   const overlay = h("div", { class: "ctx-overlay", onclick: close }, menu);
   document.body.appendChild(overlay);
   document.addEventListener("keydown", onKey, true);
-  position();
+  placePopover(menu, anchorEl);
   renderList();
 
   function selectedSet() { return new Set(adapter.selected()); }
@@ -112,6 +125,7 @@ function openPicker(anchorEl, adapter, onChange) {
           on ? icon("check", 14) : null),
         h("button", { class: "lblpick-edit", title: "Edit label", onclick: (e) => { e.stopPropagation(); openLabelEditor(e.currentTarget, l, async () => { await _refresh(); renderList(); onChange && onChange(); }); } }, icon("pencil", 13))));
     }
+    placePopover(menu, anchorEl);   // content height is now known — reposition/clamp
   }
   async function toggle(l) {
     const sel = selectedSet();
@@ -129,14 +143,6 @@ function openPicker(anchorEl, adapter, onChange) {
       onChange && onChange();
       renderList();
     } catch { /* ignore */ }
-  }
-  function position() {
-    const r = anchorEl.getBoundingClientRect();
-    const mw = menu.offsetWidth || 240, mh = menu.offsetHeight || 0;
-    const left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8));
-    let top = r.bottom + 4;
-    if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 4);
-    menu.style.left = left + "px"; menu.style.top = top + "px";
   }
   function close() { overlay.remove(); document.removeEventListener("keydown", onKey, true); }
   function onKey(e) { if (e.key === "Escape") { e.stopPropagation(); close(); } }
@@ -172,10 +178,7 @@ function openLabelEditor(anchorEl, label, onDone) {
   const overlay = h("div", { class: "ctx-overlay", onclick: close }, menu);
   document.body.appendChild(overlay);
   document.addEventListener("keydown", onKey, true);
-  const r = anchorEl.getBoundingClientRect();
-  const mw = menu.offsetWidth || 240;
-  menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8)) + "px";
-  menu.style.top = (r.bottom + 4) + "px";
+  placePopover(menu, anchorEl);
   function close() { overlay.remove(); document.removeEventListener("keydown", onKey, true); }
   function onKey(e) { if (e.key === "Escape") { e.stopPropagation(); close(); } }
 }
@@ -187,7 +190,6 @@ function openColorMenu(anchorEl, current, onPick) {
         onclick: (e) => { e.preventDefault(); onPick(c); close(); } }))));
   const overlay = h("div", { class: "ctx-overlay", onclick: close }, menu);
   document.body.appendChild(overlay);
-  const r = anchorEl.getBoundingClientRect();
-  menu.style.left = r.left + "px"; menu.style.top = (r.bottom + 4) + "px";
+  placePopover(menu, anchorEl);
   function close() { overlay.remove(); }
 }
