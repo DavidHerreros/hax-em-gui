@@ -45,6 +45,8 @@ const DRAG_R = 12;   // px: grab radius for a waypoint / control handle
 // A free-spline path layer keeps editable control points in data coords (not snapped
 // to states); it is only snapped to the nearest states silently at morph time.
 let editCurve = null;   // the curve layer currently being edited (control-point handles shown)
+// orbit-while-editing (3D): an empty-space drag rotates the camera instead of editing
+let orbiting = false, orbMoved = false, orbX = 0, orbY = 0, orbDownX = 0, orbDownY = 0;
 const layers = [];   // { name, color(hex), indices[], visible, kind? }  (kind 'path' = ordered morph path)
 let layerSeq = 0;
 let editingPathLayer = null;   // the path layer currently being edited (shift-click add/remove)
@@ -298,6 +300,10 @@ function curveToIndices(ly) {
   }
   return seq;
 }
+// Editing-hint text — in 3D an empty-space drag orbits, so retrace moves to Shift-drag.
+const curveEditHint = () => is3d()
+  ? "drag a handle to move · alt-click to delete · drag empty space to rotate · tap to insert · Shift-drag to retrace"
+  : "drag a handle to move · alt-click to delete · tap the line to insert · draw to retrace";
 function startCurveFromStroke(strokePts) {
   const ctrl = strokeToCtrl(strokePts);
   if (ctrl.length < 2) { status("Draw a longer line across the landscape.", "warn"); return; }
@@ -314,7 +320,7 @@ function editCurveLayer(ly) {
   setViewTo(ly.embed, ly.axes, ly.dims);
   if (!pathDrawArmed) setPathDrawArmed(true);
   renderLayers(); refreshFreeCurves();
-  status(`Editing “${ly.name}”: drag a handle to move it · alt-click a handle to delete · tap the line to insert · draw to retrace.`, "busy");
+  status(`Editing “${ly.name}”: ${curveEditHint()}.`, "busy");
 }
 // Switch the landscape view (embedding / axes / dims) by driving the existing controls.
 function setViewTo(embed, axes, dims) {
@@ -727,6 +733,14 @@ function sizeLasso() {
 function setupLasso() {
   const lc = $("lassoCanvas"); lctx = lc.getContext("2d"); sizeLasso();
   window.addEventListener("resize", sizeLasso);
+  // The overlay only receives wheel events while armed (else pointer-events:none lets
+  // them fall through to the landscape canvas, which zooms itself). Forward to the
+  // active landscape so the wheel zooms even mid-lasso / mid-edit.
+  lc.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (is3d() && cloud) cloud.orbitZoom(e.deltaY);
+    else scatter.zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * 0.0015));
+  }, { passive: false });
   lc.addEventListener("pointerdown", (e) => {
     if (!lassoArmed) return;
     lassoing = true;
@@ -750,7 +764,10 @@ function setupLasso() {
         }
         draggingCtrl = h; return;   // renderer already shows the handles
       }
-      drawing = true; drawPts = [[e.offsetX, e.offsetY]]; return;   // tap = insert · drag = retrace
+      if (is3d() && cloud && !e.shiftKey) {              // 3D empty space: drag = orbit, tap = insert
+        orbiting = true; orbMoved = false; orbX = orbDownX = e.clientX; orbY = orbDownY = e.clientY; return;
+      }
+      drawing = true; drawPts = [[e.offsetX, e.offsetY]]; return;   // 2D/shift: tap = insert · drag = retrace
     }
     if (editingPathLayer) {                                // index-path waypoint editing
       const proj = activeLand().projectedPoints();
@@ -760,13 +777,23 @@ function setupLasso() {
     drawing = true; drawPts = [[e.offsetX, e.offsetY]];     // stroke or tap (resolved on pointerup)
   });
   lc.addEventListener("pointermove", (e) => {
+    if (orbiting) {                                       // rotate the 3D camera; curve + handles follow live
+      if (Math.abs(e.clientX - orbDownX) + Math.abs(e.clientY - orbDownY) > 4) orbMoved = true;
+      if (orbMoved && cloud) cloud.orbitRotate(e.clientX - orbX, e.clientY - orbY);
+      orbX = e.clientX; orbY = e.clientY; return;
+    }
     if (draggingCtrl >= 0) { const v = screenToVec(e.offsetX, e.offsetY); if (v) { editCurve.ctrl[draggingCtrl] = v; refreshFreeCurves(); } return; }
     if (draggingWp >= 0) { drawDragPreview(currentTrajectory(), draggingWp, [e.offsetX, e.offsetY], activeLand().projectedPoints()); return; }
     if (drawing) { drawPts.push([e.offsetX, e.offsetY]); drawStroke(); }
   });
   lc.addEventListener("pointerup", (e) => {
-    if (draggingCtrl < 0 && draggingWp < 0 && !drawing) return;
+    if (draggingCtrl < 0 && draggingWp < 0 && !drawing && !orbiting) return;
     try { lc.releasePointerCapture(e.pointerId); } catch {}
+    if (orbiting) {                                        // a drag rotated; a tap inserts a control point
+      orbiting = false;
+      if (!orbMoved) { const v = screenToVec(e.offsetX, e.offsetY); if (v) { insertCtrlPointVec(v); commitCurve(); status(`Added a control point (${editCurve.ctrl.length}).`); } }
+      return;
+    }
     if (draggingCtrl >= 0) {                                // finish moving a control point
       const v = screenToVec(e.offsetX, e.offsetY), pos = draggingCtrl; draggingCtrl = -1;
       if (v) editCurve.ctrl[pos] = v;
@@ -876,7 +903,7 @@ function setPathDrawArmed(on) {
   pathDrawArmed = on;
   if (on && lassoArmed) setLassoArmed(false);
   if (!on) {
-    drawing = false; draggingWp = -1; draggingCtrl = -1; drawPts = [];
+    drawing = false; draggingWp = -1; draggingCtrl = -1; drawPts = []; orbiting = false;
     const finished = editCurve || editingPathLayer;
     editCurve = null;                                  // curve layers stay visible via refreshFreeCurves
     if (lctx) lctx.clearRect(0, 0, $("lassoCanvas").clientWidth, $("lassoCanvas").clientHeight);
@@ -884,7 +911,7 @@ function setPathDrawArmed(on) {
   }
   syncOverlayArmed();
   $("drawBtn").classList.toggle("active", on);
-  if (on) { sizeLasso(); status(editCurve ? "Editing a curve: drag handles · alt-click to delete · tap the line to insert · draw to retrace." : editingPathLayer ? "Editing path: draw to retrace · drag a waypoint · shift-tap a state to add/remove." : "Draw a smooth curve across the landscape · it morphs by snapping to states only at play time."); }
+  if (on) { sizeLasso(); status(editCurve ? `Editing a curve: ${curveEditHint()}.` : editingPathLayer ? "Editing path: draw to retrace · drag a waypoint · shift-tap a state to add/remove." : "Draw a smooth curve across the landscape · it morphs by snapping to states only at play time."); }
 }
 function drawLasso() {
   const lc = $("lassoCanvas"); lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);

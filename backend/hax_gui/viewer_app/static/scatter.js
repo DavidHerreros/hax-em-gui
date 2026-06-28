@@ -17,7 +17,8 @@ export function createScatter(canvas, onSelect) {
   let freeCurves = [];   // [{ pts:[[x,y]...] data coords, color }] free-spline overlays
   let densBandwidth = 6, pointAlpha = 1.0;
   let cmap = [[15, 23, 42], [30, 64, 120], [13, 148, 136], [250, 204, 21]];   // density colormap stops
-  let bounds = { minX: -1, minY: -1, maxX: 1, maxY: 1 };
+  let bounds = { minX: -1, minY: -1, maxX: 1, maxY: 1 };   // data extent (fit)
+  let view = { minX: -1, minY: -1, maxX: 1, maxY: 1 };     // visible window (zoom/pan); == bounds when fit
   const PAD = 26;
 
   function setBounds() {
@@ -28,6 +29,31 @@ export function createScatter(canvas, onSelect) {
     if (d - b < 1e-6) { b -= 1; d += 1; }
     const mx = (c - a) * 0.05, my = (d - b) * 0.05;
     bounds = { minX: a - mx, minY: b - my, maxX: c + mx, maxY: d + my };
+    view = { ...bounds };   // new data refits the view
+  }
+  // ── zoom / pan (wheel zooms toward the cursor; drag pans; dbl-click resets) ──
+  function clampView() {
+    const bw = bounds.maxX - bounds.minX, bh = bounds.maxY - bounds.minY;
+    const vw = Math.min(bw, Math.max(bw / 40, view.maxX - view.minX));
+    const vh = Math.min(bh, Math.max(bh / 40, view.maxY - view.minY));
+    let cx = (view.minX + view.maxX) / 2, cy = (view.minY + view.maxY) / 2;
+    cx = Math.min(bounds.maxX - vw / 2, Math.max(bounds.minX + vw / 2, cx));
+    cy = Math.min(bounds.maxY - vh / 2, Math.max(bounds.minY + vh / 2, cy));
+    view = { minX: cx - vw / 2, maxX: cx + vw / 2, minY: cy - vh / 2, maxY: cy + vh / 2 };
+  }
+  function zoomAt(cssX, cssY, factor) {
+    const [bx, by] = unproject(cssX, cssY);
+    const fx = (bx - view.minX) / (view.maxX - view.minX), fy = (by - view.minY) / (view.maxY - view.minY);
+    const vw = (view.maxX - view.minX) / factor, vh = (view.maxY - view.minY) / factor;
+    view = { minX: bx - fx * vw, maxX: bx + (1 - fx) * vw, minY: by - fy * vh, maxY: by + (1 - fy) * vh };
+    clampView(); draw();
+  }
+  function panBy(dxCss, dyCss) {
+    const r = dpr();
+    const ddx = dxCss * r * (view.maxX - view.minX) / Math.max(1, canvas.width - 2 * PAD);
+    const ddy = dyCss * r * (view.maxY - view.minY) / Math.max(1, canvas.height - 2 * PAD);
+    view = { minX: view.minX - ddx, maxX: view.maxX - ddx, minY: view.minY + ddy, maxY: view.maxY + ddy };
+    clampView(); draw();
   }
   const dpr = () => Math.min(window.devicePixelRatio || 1, 2);
   function resize() {
@@ -36,16 +62,26 @@ export function createScatter(canvas, onSelect) {
   }
   function toScreen(x, y) {
     const w = canvas.width, h = canvas.height;
-    return [PAD + (x - bounds.minX) / (bounds.maxX - bounds.minX) * (w - 2 * PAD),
-      h - PAD - (y - bounds.minY) / (bounds.maxY - bounds.minY) * (h - 2 * PAD)];
+    return [PAD + (x - view.minX) / (view.maxX - view.minX) * (w - 2 * PAD),
+      h - PAD - (y - view.minY) / (view.maxY - view.minY) * (h - 2 * PAD)];
+  }
+  // CSS-space screen px -> data coords (inverse of toScreen, in the current view)
+  function unproject(sx, sy) {
+    const r = dpr(), w = canvas.width, h = canvas.height, dx = sx * r, dy = sy * r;
+    return [view.minX + (dx - PAD) / Math.max(1, w - 2 * PAD) * (view.maxX - view.minX),
+      view.minY + (h - PAD - dy) / Math.max(1, h - 2 * PAD) * (view.maxY - view.minY)];
   }
 
-  // Density color from the active colormap (alpha rises with t so faint→opaque).
+  // Density color from the active colormap (alpha rises with t so faint→opaque). The
+  // light theme needs a higher, more opaque range or the colormap washes out on the
+  // pale background.
   function ramp(t) {
     t = Math.max(0, Math.min(1, t));
     const f = t * (cmap.length - 1), i = Math.min(cmap.length - 2, Math.floor(f)), u = f - i;
     const c = (a, b) => Math.round(a + (b - a) * u);
-    return `rgba(${c(cmap[i][0], cmap[i + 1][0])},${c(cmap[i][1], cmap[i + 1][1])},${c(cmap[i][2], cmap[i + 1][2])},${0.25 + 0.6 * t})`;
+    const light = document.documentElement.dataset.theme === "light";
+    const alpha = light ? 0.5 + 0.48 * t : 0.25 + 0.6 * t;
+    return `rgba(${c(cmap[i][0], cmap[i + 1][0])},${c(cmap[i][1], cmap[i + 1][1])},${c(cmap[i][2], cmap[i + 1][2])},${alpha})`;
   }
 
   function drawDensity() {
@@ -58,11 +94,14 @@ export function createScatter(canvas, onSelect) {
     for (let p = 0; p < densBandwidth; p++) blur(grid, G);   // wider sigma = more passes
     let max = 0; for (let i = 0; i < grid.length; i++) max = Math.max(max, grid[i]);
     if (max <= 0) return;
-    const w = canvas.width, h = canvas.height, cw = (w - 2 * PAD) / G, ch = (h - 2 * PAD) / G;
+    const bw = bounds.maxX - bounds.minX, bh = bounds.maxY - bounds.minY;
     for (let gy = 0; gy < G; gy++) for (let gx = 0; gx < G; gx++) {
       const v = grid[gy * G + gx] / max; if (v < 0.02) continue;
+      // map the cell's data rectangle through toScreen so it tracks zoom / pan
+      const [sx0, syTop] = toScreen(bounds.minX + gx / G * bw, bounds.minY + (gy + 1) / G * bh);
+      const [sx1, syBot] = toScreen(bounds.minX + (gx + 1) / G * bw, bounds.minY + gy / G * bh);
       ctx.fillStyle = ramp(v);
-      ctx.fillRect(PAD + gx * cw, h - PAD - (gy + 1) * ch, cw + 1, ch + 1);
+      ctx.fillRect(sx0, syTop, sx1 - sx0 + 1, syBot - syTop + 1);
     }
   }
 
@@ -144,9 +183,24 @@ export function createScatter(canvas, onSelect) {
     }
     return best;
   }
-  canvas.addEventListener("click", (e) => { const i = nearest(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); });
+  // click selects (suppressed if the pointer was a pan-drag); drag pans; wheel zooms
+  // toward the cursor; double-click refits. (When the lasso/draw overlay is armed it
+  // sits on top and intercepts these — the app forwards the wheel there instead.)
+  let panning = false, panned = false, plx = 0, ply = 0;
+  canvas.addEventListener("pointerdown", (e) => { panning = true; panned = false; plx = e.clientX; ply = e.clientY; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!panning) return;
+    const dx = e.clientX - plx, dy = e.clientY - ply;
+    if (Math.abs(dx) + Math.abs(dy) > 3) panned = true;
+    if (panned) panBy(dx, dy);
+    plx = e.clientX; ply = e.clientY;
+  });
+  canvas.addEventListener("pointerup", (e) => { panning = false; try { canvas.releasePointerCapture(e.pointerId); } catch {} });
+  canvas.addEventListener("click", (e) => { if (panned) return; const i = nearest(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); });
   canvas.addEventListener("mousemove", (e) => { const i = nearest(e.clientX, e.clientY); if (i !== hover) { hover = i; draw(); } });
   canvas.addEventListener("mouseleave", () => { hover = -1; draw(); });
+  canvas.addEventListener("wheel", (e) => { e.preventDefault(); zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * 0.0015)); }, { passive: false });
+  canvas.addEventListener("dblclick", () => { view = { ...bounds }; draw(); });
   window.addEventListener("resize", draw);
 
   return {
@@ -164,11 +218,9 @@ export function createScatter(canvas, onSelect) {
     onRender(cb) { onRenderCb = cb; },   // called after every draw (overlay can re-sync to the new projection)
     // Project / unproject between data coords and CSS-space screen px (2D is invertible).
     projectData(pts) { const r = dpr(); return pts.map(([x, y]) => { const [sx, sy] = toScreen(x, y); return [sx / r, sy / r]; }); },
-    unproject(sx, sy) {
-      const r = dpr(), w = canvas.width, h = canvas.height, dx = sx * r, dy = sy * r;
-      return [bounds.minX + (dx - PAD) / Math.max(1, w - 2 * PAD) * (bounds.maxX - bounds.minX),
-        bounds.minY + (h - PAD - dy) / Math.max(1, h - 2 * PAD) * (bounds.maxY - bounds.minY)];
-    },
+    unproject,
+    zoomAt,   // app forwards the wheel here when the overlay is armed
+    resetView() { view = { ...bounds }; draw(); },
     setSelection(arr) { selSet = new Set(arr || []); draw(); },
     // CSS-space screen coords of every point (for app-driven lasso enclosure)
     projectedPoints() { const r = dpr(); return points.map(([x, y]) => { const [sx, sy] = toScreen(x, y); return [sx / r, sy / r]; }); },

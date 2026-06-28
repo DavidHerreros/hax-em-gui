@@ -43,6 +43,8 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
     get rotation() { return R; },
     get dist() { return dist; },
     get eye() { return [0, 0, dist]; },
+    drag(dx, dy) { rotateBy(dx, dy); onChange(); },   // externally driven rotation (e.g. an overlay)
+    zoom(deltaY) { dist = Math.max(1.2, Math.min(16, dist * Math.exp(deltaY * 0.001))); onChange(); },
     reset() { R = identity(); dist = dist0; onChange(); },
   };
 }
