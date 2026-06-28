@@ -156,11 +156,13 @@ export function openLabelPicker(anchorEl, job, onChange) {
   }, () => onChange && onChange(job));
 }
 
-// Anchored popover for a workflow node (labels stored locally as ids on the node).
+// Anchored popover for a workflow node. Labels live on the node (applied to its
+// job when it runs); if the node is already linked to a job (a live project
+// workflow), the change is also pushed to that job immediately.
 export function openNodeLabelPicker(anchorEl, node, onChange) {
   openPicker(anchorEl, {
     selected: () => node.labels || [],
-    setSelected: (ids) => { node.labels = ids; },
+    setSelected: (ids) => { node.labels = ids; if (node.job_id) api.setJobLabels(node.job_id, ids).catch(() => {}); },
   }, onChange);
 }
 

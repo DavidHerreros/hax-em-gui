@@ -14,6 +14,7 @@ import { errorBox } from "./ui.js";
 import { visibleFields } from "./formFields.js";
 import { openFilePicker } from "./filePicker.js";
 import { nodeLabelChips, loadLabels, labelsByIds } from "./labels.js";
+import { promptModal } from "./promptModal.js";
 
 const NODE_W = 196;     // node width (px)
 const HEADER_H = 34;    // node header height
@@ -86,7 +87,8 @@ export function WorkflowsView() {
   const layoutBtn = h("button", { class: "btn small", title: "Auto-arrange into dependency levels", onclick: () => { autoLayout(); dirty = true; } }, icon("sliders", 14), "Tidy");
   const centerBtn = h("button", { class: "btn small", title: "Center the workflow in view", onclick: centerView }, icon("orbit", 14), "Center");
   const mmBtn = h("button", { class: "btn small", title: "Toggle the overview minimap", onclick: toggleMinimap }, icon("grid", 14), "Map");
-  const importBtn = h("button", { class: "btn small", title: "Import the open project's jobs as a workflow", onclick: importProject }, icon("box", 14), "From project");
+  const importBtn = h("button", { class: "btn small", title: "Open the active project as a live workflow (edits & runs change the project)", onclick: openProject }, icon("box", 14), "Open project");
+  const asProjBtn = h("button", { class: "btn small", title: "Create a new project backed by this workflow", onclick: saveAsProject }, icon("plus", 14), "Save as project");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
   const runSelBtn = h("button", { class: "btn secondary", title: "Run the selected step(s) only", onclick: () => runNodes([...selectedSet]) }, icon("play", 15), "Run selected");
   const runBtn = h("button", { class: "btn", title: "Run the whole workflow", onclick: () => runNodes(null) }, icon("play", 15), "Run all");
@@ -94,7 +96,7 @@ export function WorkflowsView() {
   const topbar = h("div", { class: "wf-topbar" },
     h("strong", null, "Workflow"), wfSelect,
     h("button", { class: "btn small", onclick: () => openWorkflow(null) }, "+ New"),
-    importBtn, nameInput, orientBtn, layoutBtn, centerBtn, mmBtn,
+    importBtn, asProjBtn, nameInput, orientBtn, layoutBtn, centerBtn, mmBtn,
     h("span", { style: { flex: "1" } }), statusEl, saveBtn, runSelBtn, runBtn, delBtn);
 
   // ── body: palette | canvas (+minimap) | inspector ──
@@ -676,19 +678,36 @@ export function WorkflowsView() {
     ctx.strokeRect(tx(canvas.scrollLeft), ty(canvas.scrollTop), canvas.clientWidth * s, canvas.clientHeight * s);
   }
 
-  // ── import a project ──
-  async function importProject() {
+  // ── open a project as a live workflow ──
+  async function openProject() {
     const pid = getState().activeProjectId;
-    if (!pid) { flash("Open a project first (Projects) to import it.", "err"); return; }
-    flash("Importing project…", "busy");
+    if (!pid) { flash("Open a project first (Projects) to open it as a workflow.", "err"); return; }
+    flash("Opening project…", "busy");
     try {
-      const imported = await api.workflowFromProject(pid);
+      const opened = await api.workflowFromProject(pid);
       await refreshList();
-      await openWorkflow(imported.id);
-      autoLayout();
-      flash(`Imported ${graph.nodes.length} step(s). Edit & re-run as a workflow.`, "muted");
-    } catch (err) { flash("Import failed: " + (err.detail || err.message), "err"); }
+      await openWorkflow(opened.id);
+      flash(`Opened "${wf ? wf.name : "project"}" as a live workflow — edits & runs change the project.`, "muted");
+    } catch (err) { flash("Open failed: " + (err.detail || err.message), "err"); }
   }
+
+  // Create a new project backed by this workflow (so edits/runs populate it).
+  async function saveAsProject() {
+    const name = await promptModal({ title: "Save as new project", label: "Project name", value: nameInput.value.trim(), placeholder: "my-project", okText: "Create project" });
+    if (!name) return;
+    await save();             // ensure the workflow record exists first
+    if (!wf) return;
+    try {
+      wf = await api.workflowSaveAsProject(wf.id, name);
+      nameInput.value = wf.name || name;
+      await refreshList();
+      syncProjectBtn();
+      flash(`Saved as project "${name}" — this workflow now drives it.`, "muted");
+    } catch (err) { flash("Couldn't create project: " + (err.detail || err.message), "err"); }
+  }
+
+  // "Save as project" is only offered for a draft workflow not yet bound to one.
+  function syncProjectBtn() { asProjBtn.style.display = wf && wf.project_id ? "none" : ""; }
 
   // ── persistence + run ──
   function graphSnapshot() { return { nodes: graph.nodes, edges: graph.edges, orientation: graph.orientation }; }
@@ -700,14 +719,14 @@ export function WorkflowsView() {
     try {
       if (wf) wf = await api.updateWorkflow(wf.id, { name, graph: graphSnapshot() });
       else wf = await api.createWorkflow({ project_id: pid, name, graph: graphSnapshot() });
-      dirty = false; flash("Saved.", "muted"); await refreshList(); wfSelect.value = wf.id;
+      dirty = false; flash("Saved.", "muted"); await refreshList(); wfSelect.value = wf.id; syncProjectBtn();
     } catch (err) { flash("Save failed: " + (err.detail || err.message), "err"); }
     return wf;
   }
 
   // ids === null -> run the whole workflow; an array -> run that subset only.
   async function runNodes(ids) {
-    if (!getState().activeProjectId) { flash("Open a project first (Projects) — workflow steps run into it.", "err"); return; }
+    if (!(wf && wf.project_id) && !getState().activeProjectId) { flash("Open a project first (Projects), or use “Save as project” — steps run into a project.", "err"); return; }
     if (!graph.nodes.length) { flash("Add at least one step.", "warn"); return; }
     if (ids && !ids.length) { flash("Select one or more steps first.", "warn"); return; }
     await save();
@@ -722,13 +741,24 @@ export function WorkflowsView() {
     }
   }
 
+  // Adopt a server graph into local state (keeping the id counters ahead).
+  function adoptGraph(g) {
+    graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || graph.orientation || "horizontal" };
+    nodeSeq = Math.max(1, ...graph.nodes.map((n) => +(n.id.replace(/\D/g, "")) || 0)) + 1;
+    edgeSeq = Math.max(1, ...graph.edges.map((e) => +((e.id || "").replace(/\D/g, "")) || 0)) + 1;
+  }
+
   function startPolling() {
     stopPolling();
     poll = setInterval(async () => {
       if (!wf) return stopPolling();
       try {
         const w = await api.workflow(wf.id);
-        wf = w; runState = w.run_state || null; renderNodes();
+        wf = w; runState = w.run_state || null;
+        // when a run settles, adopt the server graph so live node<->job links and
+        // statuses (project workflows write job ids back) are reflected
+        if (w.status !== "running" && w.graph) { adoptGraph(w.graph); if (!dirty) renderInspector(); }
+        renderNodes();
         const counts = countStatuses();
         flash(`${w.status} — ${counts}`, w.status === "running" ? "busy" : (w.status === "succeeded" ? "muted" : "err"));
         if (w.status !== "running") stopPolling();
@@ -748,17 +778,13 @@ export function WorkflowsView() {
     selectedSet.clear();
     if (!id) {
       wf = null; graph = { nodes: [], edges: [], orientation: "horizontal" }; runState = null; selected = null; nameInput.value = "";
-      wfSelect.value = ""; syncOrientBtn(); renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
+      wfSelect.value = ""; syncOrientBtn(); syncProjectBtn(); renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
     }
     try {
       wf = await api.workflow(id);
-      const g = wf.graph || {};
-      graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || "horizontal" };
-      // keep id counters ahead of loaded ids
-      nodeSeq = Math.max(1, ...graph.nodes.map((n) => +(n.id.replace(/\D/g, "")) || 0)) + 1;
-      edgeSeq = Math.max(1, ...graph.edges.map((e) => +((e.id || "").replace(/\D/g, "")) || 0)) + 1;
+      adoptGraph(wf.graph || {});
       runState = wf.run_state || null; selected = null; nameInput.value = wf.name || ""; wfSelect.value = wf.id;
-      syncOrientBtn();
+      syncOrientBtn(); syncProjectBtn();
       // freshly imported / never-laid-out graphs have all-zero coords — tidy once
       if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
       else { renderNodes(); centerView(); }

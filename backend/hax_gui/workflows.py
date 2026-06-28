@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import adapters, registry
+from . import adapters, projects, registry
 from .config import settings
 from .jobs import ACTIVE, manager as jobs
 from .labels import manager as labels
@@ -59,18 +60,25 @@ class WorkflowManager:
             )
             """
         )
+        # `kind`: 'standalone' (a saved graph whose runs create new jobs) or
+        # 'project' (a live, editable view of a project — runs rerun the project's
+        # own jobs in place). Added idempotently for older databases.
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(workflows)").fetchall()}
+        if "kind" not in cols:
+            self._db.execute("ALTER TABLE workflows ADD COLUMN kind TEXT NOT NULL DEFAULT 'standalone'")
         # A workflow left 'running' from a previous server process is stale.
         self._db.execute("UPDATE workflows SET status='interrupted' WHERE status='running'")
         self._db.commit()
 
     # -- CRUD --------------------------------------------------------------
-    def save(self, project_id: str | None, name: str | None, graph: dict[str, Any]) -> dict[str, Any]:
+    def save(self, project_id: str | None, name: str | None, graph: dict[str, Any],
+             kind: str = "standalone") -> dict[str, Any]:
         wid = uuid.uuid4().hex[:12]
         now = _now()
         self._db.execute(
-            "INSERT INTO workflows (id, project_id, name, graph, run_state, status, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (wid, project_id, (name or "").strip() or "Untitled workflow", json.dumps(graph), None, "idle", now, now),
+            "INSERT INTO workflows (id, project_id, name, graph, run_state, status, created_at, updated_at, kind) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (wid, project_id, (name or "").strip() or "Untitled workflow", json.dumps(graph), None, "idle", now, now, kind),
         )
         self._db.commit()
         return self.get(wid)
@@ -125,12 +133,28 @@ class WorkflowManager:
         self._db.commit()
         return self.get(wid)
 
-    # -- import an existing project as a workflow ---------------------------
+    # -- a project as a live workflow --------------------------------------
+    @staticmethod
+    def _clean_args(job: dict[str, Any]) -> dict[str, Any]:
+        """A job's args minus auto-managed dirs and bound (edge-fed) fields."""
+        args = dict(job.get("args") or {})
+        for auto in (registry.output_arg(job["program"]), registry.ssd_arg(job["program"])):
+            if auto:
+                args.pop(auto, None)
+        for field in (job.get("bindings") or {}):
+            args.pop(field, None)
+        return args
+
+    @staticmethod
+    def _labels_of(job_id: str) -> list[str]:
+        try:
+            return [lab["id"] for lab in labels.labels_for(job_id)]
+        except Exception:  # noqa: BLE001
+            return []
+
     def build_from_project(self, project_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Infer a workflow graph from a project's jobs. Each job becomes a node;
-        each job's stored input bindings become edges. Returns (graph, run_state)
-        where run_state carries every node's real job id + status so the canvas
-        shows what's already executed/succeeded/failed/saved."""
+        """Infer a fresh workflow graph from a project's jobs. Each job becomes a
+        node (carrying its `job_id`); each job's input bindings become edges."""
         job_list = list(reversed(jobs.list_for_project(project_id)))  # oldest first
         id_map = {j["id"]: f"n{i + 1}" for i, j in enumerate(job_list)}
         nodes: list[dict[str, Any]] = []
@@ -139,29 +163,107 @@ class WorkflowManager:
         eseq = 1
         for j in job_list:
             nid = id_map[j["id"]]
-            args = dict(j.get("args") or {})
-            for auto in (registry.output_arg(j["program"]), registry.ssd_arg(j["program"])):
-                if auto:
-                    args.pop(auto, None)
-            bindings = j.get("bindings") or {}
-            for field in bindings:           # bound fields live on the edge, not as literals
-                args.pop(field, None)
-            try:
-                node_labels = [lab["id"] for lab in labels.labels_for(j["id"])]
-            except Exception:  # noqa: BLE001
-                node_labels = []
-            nodes.append({"id": nid, "program": j["program"], "args": args,
+            nodes.append({"id": nid, "program": j["program"], "args": self._clean_args(j),
                           "gpu": j.get("gpu") or "0", "name": j.get("name") or "",
-                          "labels": node_labels, "x": 0, "y": 0, "job_id": j["id"]})
+                          "labels": self._labels_of(j["id"]), "x": 0, "y": 0, "job_id": j["id"]})
             state[nid] = {"job_id": j["id"], "status": j["status"], "error": None}
-            for field, b in bindings.items():
+            for field, b in (j.get("bindings") or {}).items():
                 for one in (b if isinstance(b, list) else [b]):   # multi-valued inputs -> many edges
                     if one.get("job_id") in id_map:
                         edges.append({"id": f"e{eseq}", "from": id_map[one["job_id"]], "to": nid,
                                       "field": field, "kind": one.get("kind")})
                         eseq += 1
-        graph = {"nodes": nodes, "edges": edges, "orientation": "horizontal"}
+        return {"nodes": nodes, "edges": edges, "orientation": "horizontal"}, state
+
+    def open_project(self, project_id: str, name: str | None = None) -> dict[str, Any]:
+        """Get-or-create the project's *live* workflow. Re-opening returns the same
+        workflow, reconciled with the project's current jobs (added/removed jobs,
+        statuses, labels), so the canvas stays a true view of the project."""
+        row = self._db.execute(
+            "SELECT * FROM workflows WHERE project_id=? AND kind='project' ORDER BY created_at LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        if row is not None:
+            wid = self._row(row)["id"]
+            graph, state = self._synced_graph(self._row(row)["graph"], project_id)
+            self._db.execute(
+                "UPDATE workflows SET graph=?, run_state=?, updated_at=? WHERE id=?",
+                (json.dumps(graph), json.dumps(state), _now(), wid),
+            )
+            self._db.commit()
+            return self.get(wid)
+        graph, state = self.build_from_project(project_id)
+        wf = self.save(project_id, name or "Project workflow", graph, kind="project")
+        return self.seed_state(wf["id"], state)
+
+    def _synced_graph(self, stored: dict[str, Any], project_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Reconcile a stored project-workflow graph with the project's jobs:
+        keep node positions / user-added (not-yet-run) nodes, drop nodes whose job
+        was deleted, refresh linked nodes from their job, add nodes for new jobs,
+        and rebuild edges from job bindings (plus user edges among un-run nodes)."""
+        job_list = list(reversed(jobs.list_for_project(project_id)))
+        by_job = {j["id"]: j for j in job_list}
+        nodes = [dict(n) for n in stored.get("nodes", [])]
+        # 1. drop nodes whose linked job vanished
+        nodes = [n for n in nodes if not n.get("job_id") or n["job_id"] in by_job]
+        node_for_job = {n["job_id"]: n for n in nodes if n.get("job_id")}
+        next_n = max([int(re.sub(r"\D", "", n["id"]) or 0) for n in nodes], default=0)
+        # 2. refresh linked nodes; add a node for each job not yet represented
+        for j in job_list:
+            n = node_for_job.get(j["id"])
+            if n is None:
+                next_n += 1
+                n = {"id": f"n{next_n}", "program": j["program"], "x": 0, "y": 0, "job_id": j["id"]}
+                nodes.append(n); node_for_job[j["id"]] = n
+            n["program"] = j["program"]
+            n["args"] = self._clean_args(j)
+            n["gpu"] = j.get("gpu") or n.get("gpu") or "0"
+            n["name"] = j.get("name") or ""
+            n["labels"] = self._labels_of(j["id"])
+        present = {n["id"] for n in nodes}
+        # 3. edges: from job bindings (linked) + stored edges touching an un-run node
+        binding_edges = []
+        for j in job_list:
+            nid = node_for_job[j["id"]]["id"]
+            for field, b in (j.get("bindings") or {}).items():
+                for one in (b if isinstance(b, list) else [b]):
+                    src = node_for_job.get(one.get("job_id"))
+                    if src:
+                        binding_edges.append({"from": src["id"], "to": nid, "field": field, "kind": one.get("kind")})
+        linked_ids = {n["id"] for n in nodes if n.get("job_id")}
+        user_edges = [e for e in stored.get("edges", [])
+                      if e.get("from") in present and e.get("to") in present
+                      and (e["from"] not in linked_ids or e["to"] not in linked_ids)]
+        seen, edges, eseq = set(), [], 0
+        for e in binding_edges + user_edges:
+            key = (e["from"], e["to"], e.get("field"))
+            if key in seen:
+                continue
+            seen.add(key); eseq += 1
+            edges.append({"id": f"e{eseq}", "from": e["from"], "to": e["to"], "field": e.get("field"), "kind": e.get("kind")})
+        graph = {"nodes": nodes, "edges": edges, "orientation": stored.get("orientation", "horizontal")}
+        state = {}
+        for n in nodes:
+            jid = n.get("job_id")
+            if jid and jid in by_job:
+                state[n["id"]] = {"job_id": jid, "status": by_job[jid]["status"], "error": None}
+            else:
+                state[n["id"]] = {"job_id": None, "status": "idle", "error": None}
         return graph, state
+
+    def save_as_project(self, wid: str, name: str) -> dict[str, Any]:
+        """Create a new project and bind this workflow to it as the project's live
+        view, so running/editing the workflow populates the new project."""
+        wf = self.get(wid)
+        if wf is None:
+            raise KeyError(wid)
+        proj = projects.create(name)
+        self._db.execute(
+            "UPDATE workflows SET project_id=?, kind='project', name=?, updated_at=? WHERE id=?",
+            (proj["id"], (name or "").strip() or "Project workflow", _now(), wid),
+        )
+        self._db.commit()
+        return self.get(wid)
 
     # -- validation --------------------------------------------------------
     @staticmethod
@@ -263,6 +365,8 @@ class WorkflowManager:
             nodes = {n["id"]: n for n in graph["nodes"]}
             edges = graph["edges"]
             project_id = wf["project_id"]
+            is_project = wf.get("kind") == "project"   # live view: rerun jobs in place
+            graph_dirty = False
             order = self.topo_order(graph["nodes"], edges)
             state = wf["run_state"] or {i: {"job_id": None, "status": "pending", "error": None} for i in nodes}
 
@@ -291,15 +395,21 @@ class WorkflowManager:
                         bindings[e["field"]] = one
                 for field in bindings:           # drop any stale literal so the binding wins
                     args.pop(field, None)
+                # In a live project workflow, a node linked to an existing job
+                # reruns *that* job in place (modifying the project), instead of
+                # creating a duplicate. New nodes create a job and get linked.
+                replace = node.get("job_id") if (is_project and node.get("job_id") and jobs.get(node["job_id"])) else None
                 try:
                     job = await jobs.create(node["program"], args, node.get("gpu"), project_id,
-                                            name=node.get("name"), bindings=bindings)
+                                            name=node.get("name"), bindings=bindings, replace_job_id=replace)
                 except Exception as exc:  # noqa: BLE001 - surface build/validation failures per node
                     state[nid] = {"job_id": None, "status": "failed", "error": str(exc)}
                     self._set_run(wid, "running", state)
                     continue
 
                 jid = job["id"]
+                if is_project and node.get("job_id") != jid:
+                    node["job_id"] = jid; graph_dirty = True   # link the new job to its node
                 if node.get("labels"):           # carry the node's labels onto the job
                     try:
                         labels.set_job_labels(jid, node["labels"])
@@ -312,6 +422,9 @@ class WorkflowManager:
                               "error": None if final == "succeeded" else "step failed (see the job log)"}
                 self._set_run(wid, "running", state)
 
+            if graph_dirty:           # persist new node<->job links for the live view
+                self._db.execute("UPDATE workflows SET graph=? WHERE id=?", (json.dumps(graph), wid))
+                self._db.commit()
             # judge overall status by the nodes actually run this pass
             judged = [s for nid, s in state.items() if only is None or nid in only]
             done = "succeeded" if all(s["status"] == "succeeded" for s in judged) else "failed"

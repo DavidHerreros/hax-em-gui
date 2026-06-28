@@ -43,11 +43,17 @@ browser in the dev environment).
   source→`mode=train`, target→`mode=predict`.
 - [x] **Custom box names → job names** — a node's "name" field becomes the
   launched job's name.
-- [x] **Open a project as a workflow** — "From project" imports the open project's
-  jobs as an editable graph: nodes = jobs, edges inferred from each job's stored
-  input bindings, seeded with every job's real status. Backend
-  `WorkflowManager.build_from_project` + `POST /api/workflows/from-project/{pid}`;
-  the canvas auto-tidies the imported graph.
+- [x] **Open a project as a *live* workflow** — "Open project" opens the project's
+  single, persistent workflow (`kind='project'`), reconciled with the project's
+  current jobs on every open (`open_project` + `_synced_graph`): nodes = jobs (each
+  carrying its `job_id`), edges from bindings, node positions preserved, externally-
+  added jobs appear, deleted jobs drop. Editing it **modifies the actual project**:
+  running a linked node *reruns its job in place* (new nodes create a job and get
+  linked back into the graph); labeling a linked node pushes labels to its job
+  immediately. Also **"Save as project"** creates a new project and binds the draft
+  workflow to it (`save_as_project`), so the workflow then drives that project.
+  Backend verified end-to-end (idempotent open, sync of external adds, rerun-in-
+  place vs create, label round-trip, save-as-project).
 - [x] **Run single nodes / a selection** — a ▶ button on each node runs just that
   step; shift/ctrl-click multi-selects and "Run selected" runs the subset; the
   backend `run(wid, only=…)` keeps untouched nodes' state so an already-succeeded

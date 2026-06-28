@@ -856,15 +856,27 @@ async def run_workflow(wid: str, body: WorkflowRun = WorkflowRun()) -> dict[str,
 
 @app.post("/api/workflows/from-project/{project_id}", dependencies=[Depends(auth)])
 def workflow_from_project(project_id: str, body: WorkflowFromProject = WorkflowFromProject()) -> dict[str, Any]:
-    """Import a project's jobs as an editable workflow graph (nodes = jobs, edges
-    inferred from each job's stored input bindings), seeded with each job's status."""
+    """Open a project as a *live* workflow (get-or-create): nodes = the project's
+    jobs, edges inferred from input bindings, kept in sync with the project. Editing
+    / running / labeling this workflow modifies the actual project."""
     proj = _project_or_404(project_id)
-    graph, state = wf_manager.build_from_project(project_id)
-    if not graph["nodes"]:
-        raise HTTPException(status_code=422, detail="this project has no jobs to import")
-    name = (body.name or f"{proj['name']} (imported)").strip()
-    wf = wf_manager.save(project_id, name, graph)
-    return wf_manager.seed_state(wf["id"], state)
+    return wf_manager.open_project(project_id, body.name or proj["name"])
+
+
+@app.post("/api/workflows/{wid}/save-as-project", dependencies=[Depends(auth)])
+def workflow_save_as_project(wid: str, body: WorkflowFromProject = WorkflowFromProject()) -> dict[str, Any]:
+    """Create a new project and bind this workflow to it as the project's live
+    view, so further edits/runs of the workflow populate the new project."""
+    wf = wf_manager.get(wid)
+    if wf is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    name = (body.name or wf.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="project name required")
+    try:
+        return wf_manager.save_as_project(wid, name)
+    except ProjectsRootUnset as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 # -- static SPA (mounted last so /api and /ws take precedence) -------------

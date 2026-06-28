@@ -68,6 +68,7 @@ export const api = {
   // to run just that subset (a single node or a selection).
   runWorkflow: (id, nodes) => req(`/api/workflows/${id}/run`, { method: "POST", body: JSON.stringify(nodes ? { nodes } : {}) }),
   workflowFromProject: (projectId, name) => req(`/api/workflows/from-project/${projectId}`, { method: "POST", body: JSON.stringify({ name: name || null }) }),
+  workflowSaveAsProject: (id, name) => req(`/api/workflows/${id}/save-as-project`, { method: "POST", body: JSON.stringify({ name }) }),
 
   // WebGL viewer sessions
   viewers: () => req("/api/viewer"),
