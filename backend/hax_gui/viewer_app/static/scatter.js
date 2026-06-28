@@ -14,6 +14,7 @@ export function createScatter(canvas, onSelect) {
   let points = [], labels = null, showDensity = false, pointColors = null;
   let selected = -1, hover = -1, pathSet = new Set(), selSet = new Set();
   let pathOrder = [], pathColor = "#f472b6";   // ordered morph path drawn as a polyline
+  let freeCurves = [];   // [{ pts:[[x,y]...] data coords, color }] free-spline overlays
   let densBandwidth = 6, pointAlpha = 1.0;
   let cmap = [[15, 23, 42], [30, 64, 120], [13, 148, 136], [250, 204, 21]];   // density colormap stops
   let bounds = { minX: -1, minY: -1, maxX: 1, maxY: 1 };
@@ -81,6 +82,7 @@ export function createScatter(canvas, onSelect) {
       ctx.fill();
     }
     ctx.globalAlpha = 1;
+    drawFreeCurves();
     drawPath();
     // selection ring must contrast with the background -> dark on the light theme
     const selCol = document.documentElement.dataset.theme === "light" ? "rgba(15,23,42,0.9)" : "rgba(241,245,249,0.9)";
@@ -108,7 +110,30 @@ export function createScatter(canvas, onSelect) {
     ctx.strokeStyle = "rgba(15,23,42,0.55)"; ctx.lineWidth = 4.5 * dpr(); ctx.stroke();
     ctx.strokeStyle = pathColor; ctx.lineWidth = 2 * dpr(); ctx.stroke();
   }
-  function draw() { resize(); paint(null); }
+  // Free-spline overlays: app passes an already-sampled dense polyline in data coords.
+  function drawFreeCurves() {
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    for (const fc of freeCurves) {
+      const pts = (fc.pts || []).map(([x, y]) => toScreen(x, y));
+      if (pts.length >= 2) {
+        ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+        ctx.strokeStyle = "rgba(15,23,42,0.55)"; ctx.lineWidth = 4.5 * dpr(); ctx.stroke();
+        ctx.strokeStyle = fc.color || "#f472b6"; ctx.lineWidth = 2 * dpr(); ctx.stroke();
+      }
+      if (fc.handles) {                                  // editable control-point handles
+        const rr = 5 * dpr();
+        for (const [hx, hy] of fc.handles) {
+          const [sx, sy] = toScreen(hx, hy);
+          ctx.beginPath(); ctx.arc(sx, sy, rr, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(255,255,255,0.92)"; ctx.fill();
+          ctx.strokeStyle = "rgba(15,23,42,0.65)"; ctx.lineWidth = 1.5 * dpr(); ctx.stroke();
+        }
+      }
+    }
+  }
+  function draw() { resize(); paint(null); if (onRenderCb) onRenderCb(); }
+  let onRenderCb = null;
 
   function nearest(cx, cy) {
     const rect = canvas.getBoundingClientRect(), r = dpr(), px = (cx - rect.left) * r, py = (cy - rect.top) * r;
@@ -135,6 +160,15 @@ export function createScatter(canvas, onSelect) {
     select(i) { selected = i; draw(); },
     setPath(arr) { pathSet = new Set(arr || []); draw(); },
     setPathOrder(arr, color) { pathOrder = arr || []; if (color) pathColor = color; draw(); },
+    setFreeCurves(list) { freeCurves = list || []; draw(); },
+    onRender(cb) { onRenderCb = cb; },   // called after every draw (overlay can re-sync to the new projection)
+    // Project / unproject between data coords and CSS-space screen px (2D is invertible).
+    projectData(pts) { const r = dpr(); return pts.map(([x, y]) => { const [sx, sy] = toScreen(x, y); return [sx / r, sy / r]; }); },
+    unproject(sx, sy) {
+      const r = dpr(), w = canvas.width, h = canvas.height, dx = sx * r, dy = sy * r;
+      return [bounds.minX + (dx - PAD) / Math.max(1, w - 2 * PAD) * (bounds.maxX - bounds.minX),
+        bounds.minY + (h - PAD - dy) / Math.max(1, h - 2 * PAD) * (bounds.maxY - bounds.minY)];
+    },
     setSelection(arr) { selSet = new Set(arr || []); draw(); },
     // CSS-space screen coords of every point (for app-driven lasso enclosure)
     projectedPoints() { const r = dpr(); return points.map(([x, y]) => { const [sx, sy] = toScreen(x, y); return [sx / r, sy / r]; }); },

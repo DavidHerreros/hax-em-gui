@@ -40,8 +40,11 @@ let lassoArmed = false, lassoing = false, lassoPts = [], lctx = null, lassoMode 
 // freehand path tool (shares the lasso overlay): drag to trace a path across the
 // points, or grab an existing waypoint to drag it onto another state. Works on the
 // active 2D or 3D landscape via projectedPoints().
-let pathDrawArmed = false, drawing = false, drawPts = [], draggingWp = -1;
-const DRAG_R = 12;   // px: grab radius for an existing waypoint
+let pathDrawArmed = false, drawing = false, drawPts = [], draggingWp = -1, draggingCtrl = -1;
+const DRAG_R = 12;   // px: grab radius for a waypoint / control handle
+// A free-spline path layer keeps editable control points in data coords (not snapped
+// to states); it is only snapped to the nearest states silently at morph time.
+let editCurve = null;   // the curve layer currently being edited (control-point handles shown)
 const layers = [];   // { name, color(hex), indices[], visible, kind? }  (kind 'path' = ordered morph path)
 let layerSeq = 0;
 let editingPathLayer = null;   // the path layer currently being edited (shift-click add/remove)
@@ -139,7 +142,8 @@ function wireControls() {
   });
   $("addLayer").addEventListener("click", addLayerFromSelection);
   $("addPath").addEventListener("click", makePathLayer);
-  $("clusterBtn").addEventListener("click", computeClusters);
+  $("clusterBtn").addEventListener("click", () => computeClusters());
+  $("clusterSeedBtn").addEventListener("click", clusterFromPicks);
   $("saveAll").addEventListener("click", saveAllLayers);
   $("layersBtn").classList.add("active");   // rail visible by default
   $("k").addEventListener("input", (e) => { state.k = +e.target.value; $("kval").textContent = state.k; if (state.colorBy === "cluster") applyColor(); });
@@ -186,7 +190,7 @@ function makePathLayer() {
 // Arms the freehand draw tool so the path can be retraced / its waypoints dragged.
 function editPathLayer(ly) {
   if (editingPathLayer === ly) { editingPathLayer = null; setPathDrawArmed(false); renderLayers(); syncSelection(); status(`Finished editing “${ly.name}”.`); return; }
-  editingPathLayer = ly;
+  editCurve = null; editingPathLayer = ly;
   const idx = ly.indices.filter((v) => v >= 0);
   state.path = idx.slice(1);
   renderLayers();
@@ -218,6 +222,129 @@ function applyTrajectory(traj, decodeCurrent) {
   if (editingPathLayer) { editingPathLayer.indices = [...traj]; renderLayers(); if (state.colorBy === "layers") applyColor(); }
   syncSelection(); updatePathLabel();
   if (state.current >= 0) $("sel").textContent = `state #${state.current}`;
+}
+
+// ───────── free-spline paths (drawn curves, snapped to states only at morph time) ─────────
+// A curve layer: { kind:"curve", ctrl:[[x,y(,z)]...] data coords, embed, axes, dims, color, name, visible }
+const embedCoords = (embed) => (embed === "umap" ? umapData : embed === "latent" ? L.latents : L.pca);
+const curveDims = () => (is3d() ? 3 : 2);
+const viewAxes = () => (is3d() ? [state.x, state.y, state.z] : [state.x, state.y]);
+const axesOf = (vec) => viewAxes().map((a) => vec[a]);   // full embedding vector -> current display axes
+// A curve lives in its embedding; control points carry full embedding vectors, so it
+// renders in any axis/2D/3D view of that embedding (we just read the displayed axes).
+function curveMatchesView(ly) { return ly.embed === state.embedding; }
+// Map a screen point to a full embedding vector: the displayed axes are free (where
+// you drew), the remaining axes are borrowed from the nearest state (depth/structure).
+function screenToVec(sx, sy) {
+  const disp = activeLand().unproject(sx, sy);
+  const coords = embedCoords(state.embedding);
+  if (!disp || !coords) return null;
+  const ax = viewAxes();
+  let best = -1, bestD = Infinity;
+  for (let i = 0; i < coords.length; i++) { let dd = 0; for (let d = 0; d < ax.length; d++) { const e = coords[i][ax[d]] - disp[d]; dd += e * e; } if (dd < bestD) { bestD = dd; best = i; } }
+  const vec = best >= 0 ? coords[best].slice() : new Array((coords[0] || disp).length).fill(0);
+  ax.forEach((a, d) => { vec[a] = disp[d]; });
+  return vec;
+}
+// Catmull-Rom spline sampled into a dense polyline (data coords); linear for 2 points.
+function splineSamples(ctrl, perSeg = 16) {
+  const n = ctrl.length, dim = (ctrl[0] || []).length || 2;
+  if (n < 2) return ctrl.map((p) => p.slice());
+  if (n === 2) { const out = []; for (let t = 0; t <= perSeg; t++) out.push(lerpVec(ctrl[0], ctrl[1], t / perSeg, dim)); return out; }
+  const out = [], at = (i) => ctrl[Math.max(0, Math.min(n - 1, i))];
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
+    for (let s = 0; s < perSeg; s++) {
+      const t = s / perSeg, t2 = t * t, t3 = t2 * t, v = new Array(dim);
+      for (let d = 0; d < dim; d++)
+        v[d] = 0.5 * ((2 * p1[d]) + (-p0[d] + p2[d]) * t + (2 * p0[d] - 5 * p1[d] + 4 * p2[d] - p3[d]) * t2 + (-p0[d] + 3 * p1[d] - 3 * p2[d] + p3[d]) * t3);
+      out.push(v);
+    }
+  }
+  out.push(at(n - 1).slice());
+  return out;
+}
+const lerpVec = (a, b, t, dim) => { const v = new Array(dim); for (let d = 0; d < dim; d++) v[d] = a[d] + (b[d] - a[d]) * t; return v; };
+
+// Show every visible curve layer that matches the current view on the active landscape.
+function refreshFreeCurves() {
+  if (!scatter) return;
+  const land = activeLand();
+  if (!land.setFreeCurves) return;
+  const list = layers.filter((ly) => ly.kind === "curve" && ly.visible && curveMatchesView(ly))
+    // sample full vectors, show displayed axes; the edited curve also carries its
+    // control-point handles so the renderer draws them in the same pass (never drift).
+    .map((ly) => ({ pts: splineSamples(ly.ctrl, 16).map(axesOf), color: ly.color, handles: ly === editCurve ? ly.ctrl.map(axesOf) : null }));
+  land.setFreeCurves(list);
+}
+// Resample a freehand stroke into a handful of free control points (full embedding vectors).
+function strokeToCtrl(strokePts) {
+  const pts = resampleStroke(strokePts, 55);          // ~one handle every 55 px
+  const ctrl = pts.map(([sx, sy]) => screenToVec(sx, sy)).filter(Boolean);
+  return ctrl.length > 24 ? ctrl.filter((_, i) => i % Math.ceil(ctrl.length / 24) === 0) : ctrl;
+}
+// Snap a curve to an ordered, deduped state-index sequence (silent, at morph time).
+function curveToIndices(ly) {
+  const coords = embedCoords(ly.embed);
+  if (!coords || !coords.length) return [];
+  const dim = coords[0].length, dense = splineSamples(ly.ctrl, 24), seq = [];
+  for (const p of dense) {
+    let best = -1, bestD = Infinity;
+    for (let i = 0; i < coords.length; i++) {
+      let dd = 0; for (let d = 0; d < dim; d++) { const e = coords[i][d] - (p[d] || 0); dd += e * e; }
+      if (dd < bestD) { bestD = dd; best = i; }
+    }
+    if (best >= 0 && (!seq.length || seq[seq.length - 1] !== best)) seq.push(best);
+  }
+  return seq;
+}
+function startCurveFromStroke(strokePts) {
+  const ctrl = strokeToCtrl(strokePts);
+  if (ctrl.length < 2) { status("Draw a longer line across the landscape.", "warn"); return; }
+  layerSeq += 1;
+  const ly = { name: `Curve ${layers.length + 1}`, color: clusterColor(layerSeq - 1), visible: true, kind: "curve", ctrl, embed: state.embedding, axes: viewAxes(), dims: curveDims() };
+  layers.push(ly); editCurve = ly;
+  renderLayers(); refreshFreeCurves();
+  status(`Drew “${ly.name}” (${ctrl.length} points). Drag handles to edit · tap the line to add a point · ▶ to morph.`);
+}
+// Load a curve layer for editing (switches the view to the one it was drawn in).
+function editCurveLayer(ly) {
+  if (editCurve === ly) { editCurve = null; setPathDrawArmed(false); renderLayers(); status(`Finished editing “${ly.name}”.`); return; }
+  editingPathLayer = null; editCurve = ly;
+  setViewTo(ly.embed, ly.axes, ly.dims);
+  if (!pathDrawArmed) setPathDrawArmed(true);
+  renderLayers(); refreshFreeCurves();
+  status(`Editing “${ly.name}”: drag a handle to move it · alt-click a handle to delete · tap the line to insert · draw to retrace.`, "busy");
+}
+// Switch the landscape view (embedding / axes / dims) by driving the existing controls.
+function setViewTo(embed, axes, dims) {
+  if (state.embedding !== embed) { $("embed").value = embed; $("embed").dispatchEvent(new Event("change")); }
+  if (state.dims !== dims) { $("dims").value = String(dims); $("dims").dispatchEvent(new Event("change")); }
+  if (state.x !== axes[0]) { $("xaxis").value = String(axes[0]); $("xaxis").dispatchEvent(new Event("change")); }
+  if (state.y !== axes[1]) { $("yaxis").value = String(axes[1]); $("yaxis").dispatchEvent(new Event("change")); }
+  if (dims === 3 && axes[2] != null && state.z !== axes[2]) { $("zaxis").value = String(axes[2]); $("zaxis").dispatchEvent(new Event("change")); }
+}
+// Insert a control point (full embedding vector) into the curve's nearest segment.
+function insertCtrlPointVec(vec) {
+  const ctrl = editCurve.ctrl;
+  if (ctrl.length < 2) { ctrl.push(vec); return; }
+  const disp = ctrl.map(axesOf), p = axesOf(vec);
+  let bestSeg = 0, bestD = Infinity;
+  for (let i = 0; i < ctrl.length - 1; i++) { const d = segDist(p, disp[i], disp[i + 1]); if (d < bestD) { bestD = d; bestSeg = i; } }
+  ctrl.splice(bestSeg + 1, 0, vec);
+}
+function segDist(p, a, b) {
+  const dim = a.length; let len2 = 0, t = 0;
+  for (let d = 0; d < dim; d++) len2 += (b[d] - a[d]) ** 2;
+  if (len2 > 0) { for (let d = 0; d < dim; d++) t += (p[d] - a[d]) * (b[d] - a[d]); t = Math.max(0, Math.min(1, t / len2)); }
+  let dd = 0; for (let d = 0; d < dim; d++) dd += (a[d] + (b[d] - a[d]) * t - p[d]) ** 2;
+  return dd;
+}
+const curveHandleAt = (sx, sy) => editCurve ? hitWaypointPts(sx, sy, activeLand().projectData(editCurve.ctrl.map(axesOf))) : -1;
+function hitWaypointPts(sx, sy, proj) {
+  let best = -1, bestD = DRAG_R * DRAG_R;
+  for (let k = 0; k < proj.length; k++) { const p = proj[k]; if (!p) continue; const dd = (p[0] - sx) ** 2 + (p[1] - sy) ** 2; if (dd < bestD) { bestD = dd; best = k; } }
+  return best;
 }
 function trajectory() {
   // [current, ...waypoints] with consecutive duplicates collapsed
@@ -274,11 +401,13 @@ function updatePoints() {
     $("axisinfo").textContent = `${axisLabel(state.x)} · ${axisLabel(state.y)} · ${axisLabel(state.z)}`;
     cloud.setPoints(points3);
     applyColor();
+    refreshFreeCurves();   // curve + its handles are drawn by the renderer (always aligned)
     return;
   }
   const pts = c.map((r) => [r[state.x], r[state.y]]);
   $("axisinfo").textContent = `${axisLabel(state.x)} · ${axisLabel(state.y)}`;
   scatter.setPoints(pts);
+  refreshFreeCurves();
 }
 
 async function clusterLabels() {
@@ -318,7 +447,7 @@ function computeColors(labels) {
     for (let i = 0; i < n; i++) { out[i * 3] = 0.5; out[i * 3 + 1] = 0.55; out[i * 3 + 2] = 0.62; }
   } else if (state.colorBy === "layers") {
     for (let i = 0; i < n; i++) { out[i * 3] = 0.39; out[i * 3 + 1] = 0.45; out[i * 3 + 2] = 0.55; }
-    for (const ly of layers) { if (!ly.visible) continue; const c = hexToRgb(ly.color); for (const i of ly.indices) { out[i * 3] = c[0]; out[i * 3 + 1] = c[1]; out[i * 3 + 2] = c[2]; } }
+    for (const ly of layers) { if (!ly.visible || !ly.indices) continue; const c = hexToRgb(ly.color); for (const i of ly.indices) { out[i * 3] = c[0]; out[i * 3 + 1] = c[1]; out[i * 3 + 2] = c[2]; } }
   } else {
     for (let i = 0; i < n; i++) { out[i * 3] = 0.58; out[i * 3 + 1] = 0.64; out[i * 3 + 2] = 0.74; }
   }
@@ -328,7 +457,7 @@ function computeColors(labels) {
 // CSS colors for the 2D scatter in "layers" mode (dim gray + visible layer colors).
 function layerColorsCSS() {
   const out = new Array(L.n).fill("rgba(100,116,139,0.4)");
-  for (const ly of layers) { if (!ly.visible) continue; for (const i of ly.indices) out[i] = ly.color; }
+  for (const ly of layers) { if (!ly.visible || !ly.indices) continue; for (const i of ly.indices) out[i] = ly.color; }
   return out;
 }
 
@@ -607,43 +736,70 @@ function setupLasso() {
   lc.addEventListener("pointermove", (e) => { if (!lassoing) return; lassoPts.push([e.offsetX, e.offsetY]); drawLasso(); });
   lc.addEventListener("pointerup", (e) => { if (!lassoing) return; lassoing = false; try { lc.releasePointerCapture(e.pointerId); } catch {} finishLasso(); });
 
-  // freehand path tool (same overlay): drag a waypoint to move it, else trace a path
+  // Draw tool (same overlay). Dispatches on mode: editing a free curve, editing an
+  // index path's waypoints, or a fresh draw (stroke -> new free curve, tap -> select).
   lc.addEventListener("pointerdown", (e) => {
     if (!pathDrawArmed) return;
-    const proj = activeLand().projectedPoints();
-    const wp = hitWaypoint(e.offsetX, e.offsetY, currentTrajectory(), proj);
     lc.setPointerCapture(e.pointerId);
-    if (wp >= 0) { draggingWp = wp; drawDragPreview(currentTrajectory(), wp, [e.offsetX, e.offsetY], proj); }
-    else { drawing = true; drawPts = [[e.offsetX, e.offsetY]]; }
+    if (editCurve) {
+      const h = curveHandleAt(e.offsetX, e.offsetY);
+      if (h >= 0) {
+        if (e.altKey || e.ctrlKey || e.metaKey) {        // alt-click a handle = delete it (keep >= 2)
+          if (editCurve.ctrl.length > 2) { editCurve.ctrl.splice(h, 1); commitCurve(); status(`Removed a control point (${editCurve.ctrl.length} left).`); }
+          return;
+        }
+        draggingCtrl = h; return;   // renderer already shows the handles
+      }
+      drawing = true; drawPts = [[e.offsetX, e.offsetY]]; return;   // tap = insert · drag = retrace
+    }
+    if (editingPathLayer) {                                // index-path waypoint editing
+      const proj = activeLand().projectedPoints();
+      const wp = hitWaypoint(e.offsetX, e.offsetY, currentTrajectory(), proj);
+      if (wp >= 0) { draggingWp = wp; drawDragPreview(currentTrajectory(), wp, [e.offsetX, e.offsetY], proj); return; }
+    }
+    drawing = true; drawPts = [[e.offsetX, e.offsetY]];     // stroke or tap (resolved on pointerup)
   });
   lc.addEventListener("pointermove", (e) => {
+    if (draggingCtrl >= 0) { const v = screenToVec(e.offsetX, e.offsetY); if (v) { editCurve.ctrl[draggingCtrl] = v; refreshFreeCurves(); } return; }
     if (draggingWp >= 0) { drawDragPreview(currentTrajectory(), draggingWp, [e.offsetX, e.offsetY], activeLand().projectedPoints()); return; }
     if (drawing) { drawPts.push([e.offsetX, e.offsetY]); drawStroke(); }
   });
   lc.addEventListener("pointerup", (e) => {
-    if (draggingWp < 0 && !drawing) return;
+    if (draggingCtrl < 0 && draggingWp < 0 && !drawing) return;
     try { lc.releasePointerCapture(e.pointerId); } catch {}
+    if (draggingCtrl >= 0) {                                // finish moving a control point
+      const v = screenToVec(e.offsetX, e.offsetY), pos = draggingCtrl; draggingCtrl = -1;
+      if (v) editCurve.ctrl[pos] = v;
+      commitCurve(); status(`Moved control point ${pos + 1}.`); return;
+    }
     lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
-    const proj = activeLand().projectedPoints();
-    if (draggingWp >= 0) {                         // drop the dragged waypoint on the nearest state
+    if (draggingWp >= 0) {                                  // drop the dragged waypoint on the nearest state
+      const proj = activeLand().projectedPoints();
       const i = nearestPointTo(e.offsetX, e.offsetY, proj), pos = draggingWp; draggingWp = -1;
       if (i >= 0) { const traj = currentTrajectory(); traj[pos] = i; applyTrajectory(traj, pos === 0); status(`Moved waypoint ${pos + 1} → state #${i}.`); }
       return;
     }
     drawing = false;
-    const pts = drawPts; drawPts = [];
-    if (strokeSpan(pts) <= 8) {                     // a tap, not a stroke -> behave like a click
-      const i = nearestPointTo(pts[0][0], pts[0][1], proj);
-      if (i >= 0) onSelect(i, { shift: e.shiftKey });
+    const pts = drawPts; drawPts = []; const tap = strokeSpan(pts) <= 8;
+    if (editCurve) {                                        // tap = insert a point · stroke = retrace
+      if (tap) { const v = screenToVec(pts[0][0], pts[0][1]); if (v) { insertCtrlPointVec(v); commitCurve(); status(`Added a control point (${editCurve.ctrl.length}).`); } }
+      else { const ctrl = strokeToCtrl(pts); if (ctrl.length >= 2) { editCurve.ctrl = ctrl; commitCurve(); status(`Retraced “${editCurve.name}” (${ctrl.length} points).`); } }
       return;
     }
-    const traj = strokeToPath(pts, proj);
-    if (traj.length < 1) { status("Draw across the points to trace a path.", "warn"); return; }
-    applyTrajectory(traj, true);
-    status(`Traced a ${traj.length}-state path${editingPathLayer ? ` into “${editingPathLayer.name}”` : ""}. “+ path” to save · ▶ to morph.`);
+    if (editingPathLayer) {                                 // index-path: tap = add/remove, stroke = retrace
+      const proj = activeLand().projectedPoints();
+      if (tap) { const i = nearestPointTo(pts[0][0], pts[0][1], proj); if (i >= 0) onSelect(i, { shift: e.shiftKey }); return; }
+      const traj = strokeToPath(pts, proj);
+      if (traj.length >= 1) { applyTrajectory(traj, true); status(`Retraced into “${editingPathLayer.name}” (${traj.length} states).`); }
+      return;
+    }
+    // fresh: a tap selects a state, a real stroke draws a new free curve
+    if (tap) { const proj = activeLand().projectedPoints(); const i = nearestPointTo(pts[0][0], pts[0][1], proj); if (i >= 0) onSelect(i, { shift: e.shiftKey }); return; }
+    startCurveFromStroke(pts);
   });
 }
-const pathHexColor = () => (editingPathLayer ? editingPathLayer.color : "#f472b6");
+function commitCurve() { renderLayers(); refreshFreeCurves(); }
+const pathHexColor = () => (editCurve ? editCurve.color : editingPathLayer ? editingPathLayer.color : "#f472b6");
 function nearestPointTo(sx, sy, proj) {
   let best = -1, bestD = Infinity;
   for (let i = 0; i < proj.length; i++) { const p = proj[i]; if (!p) continue; const dd = (p[0] - sx) ** 2 + (p[1] - sy) ** 2; if (dd < bestD) { bestD = dd; best = i; } }
@@ -719,10 +875,16 @@ function setLassoArmed(on) {
 function setPathDrawArmed(on) {
   pathDrawArmed = on;
   if (on && lassoArmed) setLassoArmed(false);
-  if (!on) { drawing = false; draggingWp = -1; drawPts = []; if (lctx) lctx.clearRect(0, 0, $("lassoCanvas").clientWidth, $("lassoCanvas").clientHeight); }
+  if (!on) {
+    drawing = false; draggingWp = -1; draggingCtrl = -1; drawPts = [];
+    const finished = editCurve || editingPathLayer;
+    editCurve = null;                                  // curve layers stay visible via refreshFreeCurves
+    if (lctx) lctx.clearRect(0, 0, $("lassoCanvas").clientWidth, $("lassoCanvas").clientHeight);
+    if (finished) renderLayers();
+  }
   syncOverlayArmed();
   $("drawBtn").classList.toggle("active", on);
-  if (on) { sizeLasso(); status(editingPathLayer ? "Draw to retrace the path · drag a waypoint to move it · shift-tap a state to add/remove." : "Draw a freehand path across the points · drag to trace, then “+ path” to save."); }
+  if (on) { sizeLasso(); status(editCurve ? "Editing a curve: drag handles · alt-click to delete · tap the line to insert · draw to retrace." : editingPathLayer ? "Editing path: draw to retrace · drag a waypoint · shift-tap a state to add/remove." : "Draw a smooth curve across the landscape · it morphs by snapping to states only at play time."); }
 }
 function drawLasso() {
   const lc = $("lassoCanvas"); lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
@@ -785,34 +947,47 @@ function renderLayers() {
   const ul = $("layerList"); ul.innerHTML = "";
   $("noLayers").style.display = layers.length ? "none" : "";
   layers.forEach((ly) => {
-    const editing = editingPathLayer === ly;
-    const li = document.createElement("li"); li.className = "layer-item" + (ly.visible ? "" : " hidden") + (editing ? " editing" : "") + (ly.kind === "path" ? " path" : "");
+    const isCurve = ly.kind === "curve";
+    const editing = editingPathLayer === ly || editCurve === ly;
+    const li = document.createElement("li"); li.className = "layer-item" + (ly.visible ? "" : " hidden") + (editing ? " editing" : "") + (ly.kind === "path" || isCurve ? " path" : "");
     const eye = iconBtn(ly.visible ? "◉" : "○", "Show / hide", () => { ly.visible = !ly.visible; renderLayers(); if (state.colorBy === "layers") applyColor(); });
     const sw = document.createElement("input"); sw.type = "color"; sw.className = "swatch"; sw.value = ly.color; sw.title = "Layer color";
-    sw.addEventListener("input", (e) => { ly.color = e.target.value; if (state.colorBy === "layers") applyColor(); if (editingPathLayer === ly) syncSelection(); });
-    const name = document.createElement("span"); name.className = "lname"; name.textContent = (ly.kind === "path" ? "↳ " : "") + ly.name; name.title = "Click to rename";
+    sw.addEventListener("input", (e) => { ly.color = e.target.value; if (state.colorBy === "layers") applyColor(); if (isCurve) refreshFreeCurves(); if (editingPathLayer === ly) syncSelection(); });
+    const name = document.createElement("span"); name.className = "lname"; name.textContent = (ly.kind === "path" ? "↳ " : isCurve ? "∿ " : "") + ly.name; name.title = "Click to rename";
     name.addEventListener("click", () => { const v = prompt("Layer name", ly.name); if (v) { ly.name = v.trim() || ly.name; renderLayers(); } });
-    const cnt = document.createElement("span"); cnt.className = "lcount"; cnt.textContent = `${ly.indices.length}`;
+    const cnt = document.createElement("span"); cnt.className = "lcount"; cnt.textContent = `${isCurve ? ly.ctrl.length : ly.indices.length}`;
     li.append(eye, sw, name, cnt);
     if (ly.kind === "path") li.append(iconBtn(editing ? "✓" : "✎", editing ? "Finish editing this path" : "Edit waypoints (shift-click to add/remove)", () => editPathLayer(ly)));
-    li.append(iconBtn("▶", ly.kind === "path" ? "Morph along this path" : "Morph through this layer as a volume series", () => playLayerSeries(ly)));
-    if (exportAvailable) li.append(iconBtn("⤓", "Save layer (metadata + average volume) to the project", () => saveLayer(ly)));
-    li.append(iconBtn("✕", "Delete layer", () => { if (editingPathLayer === ly) { editingPathLayer = null; setPathDrawArmed(false); } layers.splice(layers.indexOf(ly), 1); renderLayers(); if (state.colorBy === "layers") applyColor(); }));
+    if (isCurve) li.append(iconBtn(editing ? "✓" : "✎", editing ? "Finish editing this curve" : "Edit the curve (drag handles · alt-click delete · tap to insert)", () => editCurveLayer(ly)));
+    li.append(iconBtn("▶", isCurve ? "Morph along this curve (snaps to nearest states)" : ly.kind === "path" ? "Morph along this path" : "Morph through this layer as a volume series", () => playLayerSeries(ly)));
+    if (exportAvailable && !isCurve) li.append(iconBtn("⤓", "Save layer (metadata + average volume) to the project", () => saveLayer(ly)));
+    li.append(iconBtn("✕", "Delete layer", () => { if (editingPathLayer === ly) { editingPathLayer = null; setPathDrawArmed(false); } if (editCurve === ly) { editCurve = null; setPathDrawArmed(false); } layers.splice(layers.indexOf(ly), 1); renderLayers(); refreshFreeCurves(); if (state.colorBy === "layers") applyColor(); }));
     ul.appendChild(li);
   });
+  refreshFreeCurves();
 }
 const coordOf = (i) => (i >= L.n ? (centroidPCA[i] ? centroidPCA[i][state.x] : 0) : (activeCoords() || L.pca)[i][state.x]);
 const orderAlongAxis = (idx) => [...idx].sort((a, b) => coordOf(a) - coordOf(b));
 
 // ---- KMeans clustering -> one layer per cluster + a decodable centroid layer ----
-async function computeClusters() {
+// Use your shift-clicked states (the morph picks) as the initial cluster centers.
+function clusterFromPicks() {
+  const seeds = [...new Set([state.current, ...state.path].filter((v) => v >= 0 && v < L.n))];
+  if (seeds.length < 2) { status("Shift-click at least two states first, then “Seed from picks”.", "warn"); return; }
+  computeClusters(seeds);
+}
+async function computeClusters(seeds) {
+  const seeded = Array.isArray(seeds) && seeds.length >= 2;
   const k = Math.max(2, Math.min(20, +$("clusterK").value || 5));
-  status(`Computing KMeans (k=${k})…`, "busy");
+  const url = seeded ? `./api/kmeans?seeds=${seeds.join(",")}` : `./api/kmeans?k=${k}`;
+  const label = seeded ? `seeded KMeans (${seeds.length} picks)` : `KMeans (k=${k})`;
+  status(`Computing ${label}…`, "busy");
   let d;
-  try { d = await (await fetch(`./api/kmeans?k=${k}`)).json(); }
+  try { d = await (await fetch(url)).json(); }
   catch (err) { status("Clustering failed: " + err, "err"); return; }
+  if (seeded) $("clusterK").value = d.k;   // reflect the seed-derived cluster count
   // drop previous auto-generated cluster/centroid layers (keep manual ones)
-  for (let i = layers.length - 1; i >= 0; i--) if (layers[i].kind) layers.splice(i, 1);
+  for (let i = layers.length - 1; i >= 0; i--) if (layers[i].kind === "cluster" || layers[i].kind === "centroid") layers.splice(i, 1);
   indexColor = {}; centroidPCA = {};
   const groups = Array.from({ length: d.k }, () => []);
   d.labels.forEach((lab, i) => groups[lab] && groups[lab].push(i));
@@ -822,7 +997,7 @@ async function computeClusters() {
   layers.push({ name: "Centroids", color: "#ffffff", indices: cents, visible: true, kind: "centroid" });
   $("colorby").value = "layers"; state.colorBy = "layers"; toggleColorWraps();
   renderLayers(); applyColor();
-  status(`KMeans k=${d.k}: ${d.k} cluster layers + a centroid layer (▶ to morph between clusters).`);
+  status(`${seeded ? "Seeded KMeans" : "KMeans"} k=${d.k}: ${d.k} cluster layers + a centroid layer (▶ to morph between clusters).`);
 }
 
 // Surface/volume color for a decoded state: cluster color for centroids, else the picker.
@@ -847,15 +1022,18 @@ async function saveLayer(ly) {
   } catch (err) { status("Save failed: " + err.message, "err"); }
 }
 async function saveAllLayers() {
-  if (!layers.length) { status("No layers to save.", "warn"); return; }
-  for (const ly of layers) await saveLayer(ly);
-  status(`Saved ${layers.length} layer(s) to the project.`);
+  const saveable = layers.filter((ly) => ly.kind !== "curve");
+  if (!saveable.length) { status("No layers to save.", "warn"); return; }
+  for (const ly of saveable) await saveLayer(ly);
+  status(`Saved ${saveable.length} layer(s) to the project.`);
 }
 
 async function playLayerSeries(ly) {
-  // path layers morph in their stored waypoint order; others order along the axis
-  const ordered = ly.kind === "path" ? ly.indices.filter((v) => v >= 0) : orderAlongAxis(ly.indices);
-  if (ordered.length < 2) { status("A series needs ≥2 states.", "warn"); return; }
+  // curve = snap the spline to states (silently); path = stored waypoint order; else order along the axis
+  const ordered = ly.kind === "curve" ? curveToIndices(ly)
+    : ly.kind === "path" ? ly.indices.filter((v) => v >= 0)
+      : orderAlongAxis(ly.indices);
+  if (ordered.length < 2) { status(ly.kind === "curve" ? "Draw the curve across at least two states." : "A series needs ≥2 states.", "warn"); return; }
   if (playing) setPlaying(false);
   state.current = ordered[0]; state.path = ordered.slice(1); state.frame = 0;
   syncSelection(); updatePathLabel(); $("sel").textContent = `state #${ordered[0]}`;

@@ -100,10 +100,11 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .layer-item.path { border-style: dashed; }
 .layer-item.editing { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .layers-hint { padding: 10px; line-height: 1.5; }
-.cluster-row { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+.cluster-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); }
 .cluster-row label { display: inline-flex; align-items: center; gap: 5px; }
 .cluster-row input[type="number"] { width: 48px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 2px 5px; }
-.cluster-row .btn { margin-left: auto; }
+.cluster-row .btn { white-space: nowrap; }
+.cluster-row .btn:first-of-type { margin-left: auto; }
 
 /* ── canvas area ── */
 .canvas-wrap { flex: 1; position: relative; min-width: 0; min-height: 0; }

@@ -76,15 +76,24 @@ class Landscape:
                 self._pca_var = (ev / ev.sum()).astype(float).tolist()
         return self._pca
 
-    def kmeans_full(self, k: int):
+    def kmeans_full(self, k: int, seeds: list[int] | None = None):
         """KMeans on the display latents -> (labels, decodable centroid latents,
         centroid PCA coords). Centroids are the per-cluster mean of the *decode*
-        latents, so they remain decodable even when the display is a reduced space."""
-        k = int(max(2, min(20, k)))
+        latents, so they remain decodable even when the display is a reduced space.
+
+        When ``seeds`` (state indices) are given, they are used as the initial
+        cluster centers and fix the cluster count (k = number of unique seeds)."""
         _ = self.pca  # ensure the PCA basis exists
+        seeds = [int(s) for s in (seeds or []) if 0 <= int(s) < self.n]
+        seeds = list(dict.fromkeys(seeds))  # de-dup, keep order
         try:
             from sklearn.cluster import KMeans
-            labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(self.latents).astype(int)
+            if len(seeds) >= 2:
+                labels = KMeans(n_clusters=len(seeds), init=self.latents[seeds],
+                                n_init=1, random_state=0).fit_predict(self.latents).astype(int)
+            else:
+                k = int(max(2, min(20, k)))
+                labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(self.latents).astype(int)
         except Exception:  # noqa: BLE001 - degenerate fallback: one cluster
             labels = np.zeros(self.n, dtype=int)
         uniq = np.unique(labels)
@@ -401,6 +410,14 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
     ls = decoder.landscape
     exporter = Exporter(decoder, metadata, project_dir)
 
+    # The frontend is plain ES modules served statically; tell the browser never to
+    # cache them so code changes always take effect on a reload (no stale app.js).
+    @app.middleware("http")
+    async def _no_cache(request, call_next):
+        resp = await call_next(request)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
     @app.get("/api/health")
     def health() -> dict:
         return {"ok": True, "n": int(ls.n), "dims": int(ls.dim)}
@@ -429,9 +446,17 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         return {"k": int(k), "labels": ls.clusters(k)}
 
     @app.get("/api/kmeans")
-    def kmeans(k: int = Query(5)) -> dict:
-        """KMeans -> per-state labels + decodable centroids (virtual indices base..base+k-1)."""
-        labels, centroids, cpca = ls.kmeans_full(k)
+    def kmeans(k: int = Query(5), seeds: str = Query("")) -> dict:
+        """KMeans -> per-state labels + decodable centroids (virtual indices base..base+k-1).
+        ``seeds`` is an optional comma-separated list of state indices used as the
+        initial cluster centers (then k = number of unique seeds)."""
+        seed_list = None
+        if seeds.strip():
+            try:
+                seed_list = [int(x) for x in seeds.split(",") if x.strip() != ""]
+            except ValueError:
+                seed_list = None
+        labels, centroids, cpca = ls.kmeans_full(k, seed_list)
         base = decoder.set_centroids(centroids)
         return {
             "k": int(centroids.shape[0]),

@@ -1,7 +1,7 @@
 // Minimal WebGL2 3D point-cloud renderer for the latent landscape (3 PCs).
 // Orbit camera (shared style with gl.js), per-point color, selection/target
 // rings, CPU-side picking, and high-DPI / transparent snapshots. No deps.
-import { perspective, lookAt, multiply, mulVec4 } from "./mat4.js";
+import { perspective, lookAt, multiply, mulVec4, invert } from "./mat4.js";
 import { createOrbit } from "./orbit.js";
 
 const VERT = `#version 300 es
@@ -86,6 +86,21 @@ uniform vec3 uColor;
 out vec4 outColor;
 void main() { outColor = vec4(uColor, 1.0); }`;
 
+// Editable control-point handles: white discs with a dark rim, drawn as point sprites.
+const VERT_HANDLE = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uProj; uniform mat4 uView; uniform float uSize;
+void main() { gl_Position = uProj * uView * vec4(aPos, 1.0); gl_PointSize = uSize; }`;
+const FRAG_HANDLE = `#version 300 es
+precision highp float;
+out vec4 outColor;
+void main() {
+  float r = length(gl_PointCoord - vec2(0.5));
+  if (r > 0.5) discard;
+  outColor = r > 0.36 ? vec4(0.06, 0.09, 0.16, 1.0) : vec4(1.0, 1.0, 1.0, 0.95);
+}`;
+
 export function createCloud(canvas, onSelect) {
   const gl = canvas.getContext("webgl2", { antialias: true, depth: true, preserveDrawingBuffer: true, premultipliedAlpha: false });
   if (!gl) throw new Error("WebGL2 is not available in this browser.");
@@ -121,11 +136,21 @@ export function createCloud(canvas, onSelect) {
   gl.bindVertexArray(lineVao);
   gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
   gl.bindVertexArray(null);
-  let lineCount = 0, lineColor = [0.957, 0.447, 0.714];
+  let lineCount = 0, lineColor = [0.957, 0.447, 0.714], lineData = new Float32Array(0);
+
+  const handleProg = link(gl, VERT_HANDLE, FRAG_HANDLE);
+  const hProj = gl.getUniformLocation(handleProg, "uProj"), hView = gl.getUniformLocation(handleProg, "uView"), hSize = gl.getUniformLocation(handleProg, "uSize");
+  const handleBuf = gl.createBuffer(), handleVao = gl.createVertexArray();
+  gl.bindVertexArray(handleVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, handleBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  let handleData = new Float32Array(0), handleCount = 0;
   gl.enable(gl.DEPTH_TEST);
 
   let bg = [0.016, 0.024, 0.06];
   let norm = null;        // Float32Array(N*3) normalized to [-1,1] cube
+  let nCenter = [0, 0, 0], nScale = 1;   // data->norm: (p - nCenter) * nScale
+  let freeCurves = [];    // [{ flat:Float32Array(norm), n, color:[r,g,b] }] free-spline overlays
   let count = 0;
   let colorData = null;   // persisted per-point RGB so points are never left black
   let showDens = false, hasDens = false, densIntensity = 0.22, pointAlpha = 1.0;
@@ -175,18 +200,40 @@ export function createCloud(canvas, onSelect) {
     gl.drawArrays(gl.POINTS, 0, count);
     gl.bindVertexArray(null);
     gl.disable(gl.BLEND);
-    // morph-path polyline, drawn on top (depth test off) so it reads over points
-    if (lineCount >= 2) {
+    // morph-path polyline + free-spline overlays, drawn on top (depth test off)
+    if (lineCount >= 2 || freeCurves.length) {
       gl.useProgram(lineProg);
       gl.uniformMatrix4fv(lProj, false, proj);
       gl.uniformMatrix4fv(lView, false, view);
-      gl.uniform3fv(lColor, lineColor);
       gl.disable(gl.DEPTH_TEST);
-      gl.bindVertexArray(lineVao); gl.drawArrays(gl.LINE_STRIP, 0, lineCount); gl.bindVertexArray(null);
+      gl.bindVertexArray(lineVao);
+      if (lineCount >= 2) {
+        gl.uniform3fv(lColor, lineColor);
+        gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf); gl.bufferData(gl.ARRAY_BUFFER, lineData, gl.DYNAMIC_DRAW);
+        gl.drawArrays(gl.LINE_STRIP, 0, lineCount);
+      }
+      for (const fc of freeCurves) {
+        if (fc.n < 2) continue;
+        gl.uniform3fv(lColor, fc.color);
+        gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf); gl.bufferData(gl.ARRAY_BUFFER, fc.flat, gl.DYNAMIC_DRAW);
+        gl.drawArrays(gl.LINE_STRIP, 0, fc.n);
+      }
+      gl.bindVertexArray(null);
+      gl.enable(gl.DEPTH_TEST);
+    }
+    // editable control-point handles (point sprites), drawn on top of everything
+    if (handleCount) {
+      gl.useProgram(handleProg);
+      gl.uniformMatrix4fv(hProj, false, proj);
+      gl.uniformMatrix4fv(hView, false, view);
+      gl.uniform1f(hSize, 11.0 * dpr);
+      gl.disable(gl.DEPTH_TEST);
+      gl.bindVertexArray(handleVao); gl.drawArrays(gl.POINTS, 0, handleCount); gl.bindVertexArray(null);
       gl.enable(gl.DEPTH_TEST);
     }
   }
-  function render() { resize(); drawScene(1); }
+  function render() { resize(); drawScene(1); if (onRenderCb) onRenderCb(); }
+  let onRenderCb = null;
 
   function normalizePoints(pts) {
     const n = pts.length;
@@ -194,11 +241,14 @@ export function createCloud(canvas, onSelect) {
     for (const p of pts) for (let d = 0; d < 3; d++) { const v = p[d] || 0; if (v < mn[d]) mn[d] = v; if (v > mx[d]) mx[d] = v; }
     let ext = 0; for (let d = 0; d < 3; d++) ext = Math.max(ext, mx[d] - mn[d]);
     if (!(ext > 0)) ext = 1;
-    const s = 1.8 / ext;
+    nScale = 1.8 / ext;
+    for (let d = 0; d < 3; d++) nCenter[d] = (mn[d] + mx[d]) / 2;
     const out = new Float32Array(n * 3);
-    for (let i = 0; i < n; i++) for (let d = 0; d < 3; d++) out[i * 3 + d] = (((pts[i][d] || 0) - (mn[d] + mx[d]) / 2) * s);
+    for (let i = 0; i < n; i++) for (let d = 0; d < 3; d++) out[i * 3 + d] = ((pts[i][d] || 0) - nCenter[d]) * nScale;
     return out;
   }
+  const dataToNorm = (p) => [((p[0] || 0) - nCenter[0]) * nScale, ((p[1] || 0) - nCenter[1]) * nScale, ((p[2] || 0) - nCenter[2]) * nScale];
+  const normToData = (q) => [q[0] / nScale + nCenter[0], q[1] / nScale + nCenter[1], q[2] / nScale + nCenter[2]];
 
   function uploadFlags() {
     const f = new Float32Array(count);
@@ -257,9 +307,51 @@ export function createCloud(canvas, onSelect) {
       const ids = (arr || []).filter((i) => i >= 0 && i < count);
       const buf = new Float32Array(ids.length * 3);
       for (let k = 0; k < ids.length; k++) { buf[k * 3] = norm[ids[k] * 3]; buf[k * 3 + 1] = norm[ids[k] * 3 + 1]; buf[k * 3 + 2] = norm[ids[k] * 3 + 2]; }
-      gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf); gl.bufferData(gl.ARRAY_BUFFER, buf, gl.DYNAMIC_DRAW);
-      lineCount = ids.length; if (colorRgb) lineColor = colorRgb;
+      lineData = buf; lineCount = ids.length; if (colorRgb) lineColor = colorRgb;
       render();
+    },
+    // Free-spline overlays: list of { pts:[[x,y,z]...] data coords, color, handles? }.
+    setFreeCurves(list) {
+      const norms = (arr) => { const f = new Float32Array(arr.length * 3); for (let k = 0; k < arr.length; k++) { const q = dataToNorm(arr[k]); f[k * 3] = q[0]; f[k * 3 + 1] = q[1]; f[k * 3 + 2] = q[2]; } return f; };
+      freeCurves = (list || []).map((c) => {
+        const pts = c.pts || [];
+        return { flat: norms(pts), n: pts.length, color: typeof c.color === "string" ? hexToRgb01(c.color) : (c.color || [0.957, 0.447, 0.714]) };
+      });
+      const handlePts = (list || []).flatMap((c) => c.handles || []);
+      handleData = norms(handlePts); handleCount = handlePts.length;
+      gl.bindBuffer(gl.ARRAY_BUFFER, handleBuf); gl.bufferData(gl.ARRAY_BUFFER, handleData, gl.DYNAMIC_DRAW);
+      render();
+    },
+    // Project data-coord points to CSS screen px (null where behind the camera).
+    projectData(pts) {
+      const out = new Array(pts.length).fill(null);
+      if (!norm) return out;
+      const { proj, view } = matrices(), mvp = multiply(proj, view);
+      const W = canvas.clientWidth, H = canvas.clientHeight;
+      for (let i = 0; i < pts.length; i++) {
+        const np = dataToNorm(pts[i]); const c = mulVec4(mvp, [np[0], np[1], np[2], 1]);
+        if (c[3] <= 0) continue;
+        out[i] = [(c[0] / c[3] * 0.5 + 0.5) * W, (1 - (c[1] / c[3] * 0.5 + 0.5)) * H];
+      }
+      return out;
+    },
+    // Unproject a CSS screen px to data coords, taking depth from the nearest state.
+    unproject(sx, sy) {
+      if (!norm || !count) return null;
+      const { proj, view } = matrices(), mvp = multiply(proj, view);
+      const W = canvas.clientWidth, H = canvas.clientHeight;
+      let best = -1, bestD = Infinity, ndcZ = 0;
+      for (let i = 0; i < count; i++) {
+        const c = mulVec4(mvp, [norm[i * 3], norm[i * 3 + 1], norm[i * 3 + 2], 1]);
+        if (c[3] <= 0) continue;
+        const px = (c[0] / c[3] * 0.5 + 0.5) * W, py = (1 - (c[1] / c[3] * 0.5 + 0.5)) * H;
+        const dd = (px - sx) ** 2 + (py - sy) ** 2;
+        if (dd < bestD) { bestD = dd; best = i; ndcZ = c[2] / c[3]; }
+      }
+      if (best < 0) return null;
+      const im = invert(mvp); if (!im) return null;
+      const w = mulVec4(im, [sx / W * 2 - 1, (1 - sy / H) * 2 - 1, ndcZ, 1]);
+      return normToData([w[0] / w[3], w[1] / w[3], w[2] / w[3]]);
     },
     setSelection(arr) { selArr = arr || []; uploadFlags(); render(); },
     // CSS-space screen coords of every point (null where behind the camera)
@@ -277,6 +369,7 @@ export function createCloud(canvas, onSelect) {
       return out;
     },
     setBackground(rgb) { bg = rgb; render(); },
+    onRender(cb) { onRenderCb = cb; },   // called after every render (overlay re-syncs to the camera)
     resetView() { orbit.reset(); },
     render,
     get selected() { return selected; },
@@ -291,6 +384,12 @@ export function createCloud(canvas, onSelect) {
   };
 }
 
+function hexToRgb01(h) {
+  h = String(h).replace("#", "");
+  if (h.length === 3) h = h.split("").map((x) => x + x).join("");
+  const n = parseInt(h, 16) || 0;
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
 function link(gl, vsrc, fsrc) {
   const p = gl.createProgram();
   gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vsrc));
