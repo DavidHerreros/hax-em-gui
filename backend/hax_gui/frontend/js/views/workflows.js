@@ -110,11 +110,38 @@ export function WorkflowsView() {
       h("button", { class: "wf-pane-collapse", title: "Hide programs", onclick: () => setPalette(false) }, icon("chevronLeft", 16))),
     paletteInner);
 
+  // The content (wires + nodes) lives in a fixed CONTENT_W×CONTENT_H layer that is
+  // CSS-scaled by `zoom`; a sizer of the scaled size gives the scroll container its
+  // extent. Node coords stay in content units — only the view scales.
+  let zoom = 1;
+  const ZOOM_MIN = 0.2, ZOOM_MAX = 2.5;
   const svg = svgEl("svg", { class: "wf-wires", width: String(CONTENT_W), height: String(CONTENT_H) });
   const nodesLayer = h("div", { class: "wf-nodes" });
-  const canvas = h("div", { class: "wf-canvas" }, svg, nodesLayer);
+  const contentLayer = h("div", { class: "wf-content", style: { width: CONTENT_W + "px", height: CONTENT_H + "px" } }, svg, nodesLayer);
+  const sizer = h("div", { class: "wf-sizer" }, contentLayer);
+  const canvas = h("div", { class: "wf-canvas" }, sizer);
   const minimap = h("canvas", { class: "wf-minimap", title: "Overview — click to jump" });
   const canvasWrap = h("div", { class: "wf-canvas-wrap" }, canvas, minimap);
+
+  function applyZoom() {
+    sizer.style.width = CONTENT_W * zoom + "px";
+    sizer.style.height = CONTENT_H * zoom + "px";
+    contentLayer.style.transform = `scale(${zoom})`;
+  }
+  applyZoom();
+  // Mouse wheel zooms (toward the cursor) instead of scrolling.
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const cx = (canvas.scrollLeft + mx) / zoom, cy = (canvas.scrollTop + my) / zoom;   // content point under cursor
+    const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * Math.exp(-e.deltaY * 0.0015)));
+    if (next === zoom) return;
+    zoom = next; applyZoom();
+    canvas.scrollLeft = cx * zoom - mx;   // keep that content point under the cursor
+    canvas.scrollTop = cy * zoom - my;
+    drawMinimap();
+  }, { passive: false });
 
   const inspBody = h("div", { class: "wf-pane-inner wf-inspector-body" });
   const inspector = h("div", { class: "wf-inspector", style: { width: inspectorW + "px" } },
@@ -163,7 +190,7 @@ export function WorkflowsView() {
 
   // empty-canvas drag pans the view (and a click without movement clears selection)
   canvas.addEventListener("pointerdown", (e) => {
-    if (e.target === canvas || e.target === nodesLayer || e.target === svg) {
+    if (e.target === canvas || e.target === nodesLayer || e.target === svg || e.target === sizer || e.target === contentLayer) {
       e.preventDefault();
       drag = { kind: "pan", sx: e.clientX, sy: e.clientY, sl: canvas.scrollLeft, st: canvas.scrollTop, moved: false };
       canvas.classList.add("panning");
@@ -178,8 +205,8 @@ export function WorkflowsView() {
     const r = minimap.getBoundingClientRect();
     const cx = mmXform.gx0 + (e.clientX - r.left - mmXform.ox) / mmXform.s;
     const cy = mmXform.gy0 + (e.clientY - r.top - mmXform.oy) / mmXform.s;
-    canvas.scrollLeft = Math.max(0, cx - canvas.clientWidth / 2);
-    canvas.scrollTop = Math.max(0, cy - canvas.clientHeight / 2);
+    canvas.scrollLeft = Math.max(0, cx * zoom - canvas.clientWidth / 2);
+    canvas.scrollTop = Math.max(0, cy * zoom - canvas.clientHeight / 2);
     drawMinimap();
   });
 
@@ -418,7 +445,7 @@ export function WorkflowsView() {
   // ── gestures (node drag + wiring) ──
   function canvasPoint(e) {
     const r = canvas.getBoundingClientRect();
-    return { x: e.clientX - r.left + canvas.scrollLeft, y: e.clientY - r.top + canvas.scrollTop };
+    return { x: (e.clientX - r.left + canvas.scrollLeft) / zoom, y: (e.clientY - r.top + canvas.scrollTop) / zoom };
   }
   function elementNodeAt(clientX, clientY) {
     const tgt = document.elementFromPoint(clientX, clientY);
@@ -626,11 +653,12 @@ export function WorkflowsView() {
     }
     return { x0, y0, x1, y1, cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0 };
   }
-  // Scroll so the graph's bounding box sits in the middle of the viewport.
+  // Scroll so the graph's bounding box sits in the middle of the viewport (the
+  // content is scaled by `zoom`, so content coords map to scroll via *zoom).
   function centerView() {
     const b = graphBBox(); if (!b) return;
-    canvas.scrollLeft = Math.max(0, Math.min(CONTENT_W - canvas.clientWidth, b.cx - canvas.clientWidth / 2));
-    canvas.scrollTop = Math.max(0, Math.min(CONTENT_H - canvas.clientHeight, b.cy - canvas.clientHeight / 2));
+    canvas.scrollLeft = Math.max(0, Math.min(CONTENT_W * zoom - canvas.clientWidth, b.cx * zoom - canvas.clientWidth / 2));
+    canvas.scrollTop = Math.max(0, Math.min(CONTENT_H * zoom - canvas.clientHeight, b.cy * zoom - canvas.clientHeight / 2));
     drawMinimap();
   }
   function toggleMinimap() { minimapOn = !minimapOn; minimap.classList.toggle("hidden", !minimapOn); mmBtn.classList.toggle("on", minimapOn); drawMinimap(); }
@@ -673,9 +701,9 @@ export function WorkflowsView() {
       ctx.fillStyle = col; ctx.fill();
       ctx.lineWidth = 1; ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.stroke();
     }
-    // current viewport rectangle
+    // current viewport rectangle (scroll is in scaled px → /zoom for content coords)
     ctx.strokeStyle = "#2dd4bf"; ctx.lineWidth = 1.5;
-    ctx.strokeRect(tx(canvas.scrollLeft), ty(canvas.scrollTop), canvas.clientWidth * s, canvas.clientHeight * s);
+    ctx.strokeRect(tx(canvas.scrollLeft / zoom), ty(canvas.scrollTop / zoom), (canvas.clientWidth / zoom) * s, (canvas.clientHeight / zoom) * s);
   }
 
   // ── open a project as a live workflow ──
