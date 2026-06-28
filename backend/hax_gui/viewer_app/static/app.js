@@ -37,6 +37,11 @@ let volRenderer = null, curVolMeta = null;
 
 // lasso + layers
 let lassoArmed = false, lassoing = false, lassoPts = [], lctx = null, lassoMode = "replace";
+// freehand path tool (shares the lasso overlay): drag to trace a path across the
+// points, or grab an existing waypoint to drag it onto another state. Works on the
+// active 2D or 3D landscape via projectedPoints().
+let pathDrawArmed = false, drawing = false, drawPts = [], draggingWp = -1;
+const DRAG_R = 12;   // px: grab radius for an existing waypoint
 const layers = [];   // { name, color(hex), indices[], visible, kind? }  (kind 'path' = ordered morph path)
 let layerSeq = 0;
 let editingPathLayer = null;   // the path layer currently being edited (shift-click add/remove)
@@ -127,6 +132,7 @@ function wireControls() {
   $("yaxis").addEventListener("change", (e) => { state.y = +e.target.value; updatePoints(); });
   $("colorby").addEventListener("change", (e) => { state.colorBy = e.target.value; toggleColorWraps(); applyColor(); });
   $("lassoBtn").addEventListener("click", () => setLassoArmed(!lassoArmed));
+  $("drawBtn").addEventListener("click", () => setPathDrawArmed(!pathDrawArmed));
   $("layersBtn").addEventListener("click", () => {
     const collapsed = $("layersRail").classList.toggle("collapsed");
     $("layersBtn").classList.toggle("active", !collapsed);
@@ -177,20 +183,41 @@ function makePathLayer() {
   status(`Saved “${ly.name}” (${traj.length} waypoints). Press ✎ on it to edit, ▶ to morph along it.`);
 }
 // Load a path layer into the live morph path for editing (toggle off to finish).
+// Arms the freehand draw tool so the path can be retraced / its waypoints dragged.
 function editPathLayer(ly) {
-  if (editingPathLayer === ly) { editingPathLayer = null; renderLayers(); syncSelection(); status(`Finished editing “${ly.name}”.`); return; }
+  if (editingPathLayer === ly) { editingPathLayer = null; setPathDrawArmed(false); renderLayers(); syncSelection(); status(`Finished editing “${ly.name}”.`); return; }
   editingPathLayer = ly;
   const idx = ly.indices.filter((v) => v >= 0);
   state.path = idx.slice(1);
   renderLayers();
-  status(`Editing “${ly.name}”: shift-click empty states to add waypoints, shift-click a waypoint to remove it.`, "busy");
+  setPathDrawArmed(true);
+  status(`Editing “${ly.name}”: draw to retrace · drag a waypoint to move it · shift-click a state to add/remove.`, "busy");
   onSelect(idx[0]);   // make the first waypoint current + decode it
 }
 
 function clearPath() {
-  editingPathLayer = null;
+  if (editingPathLayer) { editingPathLayer = null; setPathDrawArmed(false); }
   if (playing) setPlaying(false);
   state.path = []; state.frame = 0; syncSelection(); updatePathLabel();
+}
+
+// The live morph trajectory as an ordered index list ([current, ...waypoints]).
+const currentTrajectory = () => [state.current, ...state.path].filter((v) => v >= 0);
+
+// Commit a new ordered trajectory to the live path (and the edited layer, if any).
+// decodeCurrent re-decodes the head state when it changed (e.g. moving waypoint 0).
+function applyTrajectory(traj, decodeCurrent) {
+  traj = traj.filter((v) => v >= 0).filter((v, i, a) => i === 0 || v !== a[i - 1]);
+  const prevCur = state.current;
+  state.path = traj.slice(1);
+  if (decodeCurrent && traj.length && traj[0] !== prevCur) {
+    onSelect(traj[0], {});   // sets current, syncs the edited layer + decodes
+    return;
+  }
+  state.current = traj.length ? traj[0] : -1;
+  if (editingPathLayer) { editingPathLayer.indices = [...traj]; renderLayers(); if (state.colorBy === "layers") applyColor(); }
+  syncSelection(); updatePathLabel();
+  if (state.current >= 0) $("sel").textContent = `state #${state.current}`;
 }
 function trajectory() {
   // [current, ...waypoints] with consecutive duplicates collapsed
@@ -579,13 +606,123 @@ function setupLasso() {
   });
   lc.addEventListener("pointermove", (e) => { if (!lassoing) return; lassoPts.push([e.offsetX, e.offsetY]); drawLasso(); });
   lc.addEventListener("pointerup", (e) => { if (!lassoing) return; lassoing = false; try { lc.releasePointerCapture(e.pointerId); } catch {} finishLasso(); });
+
+  // freehand path tool (same overlay): drag a waypoint to move it, else trace a path
+  lc.addEventListener("pointerdown", (e) => {
+    if (!pathDrawArmed) return;
+    const proj = activeLand().projectedPoints();
+    const wp = hitWaypoint(e.offsetX, e.offsetY, currentTrajectory(), proj);
+    lc.setPointerCapture(e.pointerId);
+    if (wp >= 0) { draggingWp = wp; drawDragPreview(currentTrajectory(), wp, [e.offsetX, e.offsetY], proj); }
+    else { drawing = true; drawPts = [[e.offsetX, e.offsetY]]; }
+  });
+  lc.addEventListener("pointermove", (e) => {
+    if (draggingWp >= 0) { drawDragPreview(currentTrajectory(), draggingWp, [e.offsetX, e.offsetY], activeLand().projectedPoints()); return; }
+    if (drawing) { drawPts.push([e.offsetX, e.offsetY]); drawStroke(); }
+  });
+  lc.addEventListener("pointerup", (e) => {
+    if (draggingWp < 0 && !drawing) return;
+    try { lc.releasePointerCapture(e.pointerId); } catch {}
+    lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
+    const proj = activeLand().projectedPoints();
+    if (draggingWp >= 0) {                         // drop the dragged waypoint on the nearest state
+      const i = nearestPointTo(e.offsetX, e.offsetY, proj), pos = draggingWp; draggingWp = -1;
+      if (i >= 0) { const traj = currentTrajectory(); traj[pos] = i; applyTrajectory(traj, pos === 0); status(`Moved waypoint ${pos + 1} → state #${i}.`); }
+      return;
+    }
+    drawing = false;
+    const pts = drawPts; drawPts = [];
+    if (strokeSpan(pts) <= 8) {                     // a tap, not a stroke -> behave like a click
+      const i = nearestPointTo(pts[0][0], pts[0][1], proj);
+      if (i >= 0) onSelect(i, { shift: e.shiftKey });
+      return;
+    }
+    const traj = strokeToPath(pts, proj);
+    if (traj.length < 1) { status("Draw across the points to trace a path.", "warn"); return; }
+    applyTrajectory(traj, true);
+    status(`Traced a ${traj.length}-state path${editingPathLayer ? ` into “${editingPathLayer.name}”` : ""}. “+ path” to save · ▶ to morph.`);
+  });
+}
+const pathHexColor = () => (editingPathLayer ? editingPathLayer.color : "#f472b6");
+function nearestPointTo(sx, sy, proj) {
+  let best = -1, bestD = Infinity;
+  for (let i = 0; i < proj.length; i++) { const p = proj[i]; if (!p) continue; const dd = (p[0] - sx) ** 2 + (p[1] - sy) ** 2; if (dd < bestD) { bestD = dd; best = i; } }
+  return best;
+}
+function hitWaypoint(sx, sy, traj, proj) {
+  let best = -1, bestD = DRAG_R * DRAG_R;
+  for (let k = 0; k < traj.length; k++) { const p = proj[traj[k]]; if (!p) continue; const dd = (p[0] - sx) ** 2 + (p[1] - sy) ** 2; if (dd < bestD) { bestD = dd; best = k; } }
+  return best;
+}
+function strokeSpan(pts) {
+  if (!pts || !pts.length) return 0;
+  let a = Infinity, b = Infinity, c = -Infinity, d = -Infinity;
+  for (const [x, y] of pts) { a = Math.min(a, x); b = Math.min(b, y); c = Math.max(c, x); d = Math.max(d, y); }
+  return Math.hypot(c - a, d - b);
+}
+// Resample a freehand stroke at a fixed arc-length step so dense/jittery sampling
+// doesn't bias the snap, then map each sample to its nearest state (deduped).
+function resampleStroke(pts, step) {
+  if (pts.length < 2) return pts.slice();
+  const out = [pts[0]]; let [px, py] = pts[0];
+  for (let i = 1; i < pts.length; i++) {
+    let [x1, y1] = pts[i], dx = x1 - px, dy = y1 - py, d = Math.hypot(dx, dy);
+    while (d >= step) { const t = step / d; px += dx * t; py += dy * t; out.push([px, py]); dx = x1 - px; dy = y1 - py; d = Math.hypot(dx, dy); }
+  }
+  out.push(pts[pts.length - 1]);
+  return out;
+}
+function strokeToPath(pts, proj) {
+  proj = proj || activeLand().projectedPoints();
+  const seq = [];
+  for (const [sx, sy] of resampleStroke(pts, 10)) {
+    const i = nearestPointTo(sx, sy, proj);
+    if (i >= 0 && (!seq.length || seq[seq.length - 1] !== i)) seq.push(i);
+  }
+  return seq;
+}
+function drawStroke() {
+  const lc = $("lassoCanvas"); lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
+  if (drawPts.length < 2) return;
+  lctx.lineJoin = "round"; lctx.lineCap = "round";
+  lctx.beginPath(); lctx.moveTo(drawPts[0][0], drawPts[0][1]);
+  for (let i = 1; i < drawPts.length; i++) lctx.lineTo(drawPts[i][0], drawPts[i][1]);
+  lctx.strokeStyle = "rgba(15,23,42,0.5)"; lctx.lineWidth = 5; lctx.setLineDash([]); lctx.stroke();
+  lctx.strokeStyle = pathHexColor(); lctx.lineWidth = 2.5; lctx.stroke();
+}
+// Preview the path while a waypoint is being dragged (that node follows the cursor).
+function drawDragPreview(traj, pos, cursor, proj) {
+  const lc = $("lassoCanvas"); lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
+  const pts = traj.map((idx, k) => (k === pos ? cursor : proj[idx] || null));
+  const col = pathHexColor();
+  lctx.lineJoin = "round"; lctx.lineCap = "round";
+  lctx.beginPath(); let started = false;
+  for (const p of pts) { if (!p) { started = false; continue; } if (!started) { lctx.moveTo(p[0], p[1]); started = true; } else lctx.lineTo(p[0], p[1]); }
+  lctx.strokeStyle = "rgba(15,23,42,0.5)"; lctx.lineWidth = 5; lctx.setLineDash([]); lctx.stroke();
+  lctx.strokeStyle = col; lctx.lineWidth = 2.5; lctx.stroke();
+  for (let k = 0; k < pts.length; k++) {
+    const p = pts[k]; if (!p) continue;
+    lctx.beginPath(); lctx.arc(p[0], p[1], k === pos ? 7 : 4, 0, Math.PI * 2);
+    lctx.fillStyle = k === pos ? col : "rgba(255,255,255,0.92)";
+    lctx.strokeStyle = "rgba(15,23,42,0.65)"; lctx.lineWidth = 1.5; lctx.fill(); lctx.stroke();
+  }
 }
 const LASSO_RGB = { replace: "45,212,191", add: "74,222,128", remove: "248,113,113" };
+const syncOverlayArmed = () => $("lassoCanvas").classList.toggle("armed", lassoArmed || pathDrawArmed);
 function setLassoArmed(on) {
   lassoArmed = on;
-  $("lassoCanvas").classList.toggle("armed", on);
+  if (on && pathDrawArmed) setPathDrawArmed(false);   // tools are mutually exclusive
+  syncOverlayArmed();
   $("lassoBtn").classList.toggle("active", on);
   if (on) { sizeLasso(); status("Lasso: drag = replace · Shift = add · Alt/Ctrl = remove."); }
+}
+function setPathDrawArmed(on) {
+  pathDrawArmed = on;
+  if (on && lassoArmed) setLassoArmed(false);
+  if (!on) { drawing = false; draggingWp = -1; drawPts = []; if (lctx) lctx.clearRect(0, 0, $("lassoCanvas").clientWidth, $("lassoCanvas").clientHeight); }
+  syncOverlayArmed();
+  $("drawBtn").classList.toggle("active", on);
+  if (on) { sizeLasso(); status(editingPathLayer ? "Draw to retrace the path · drag a waypoint to move it · shift-tap a state to add/remove." : "Draw a freehand path across the points · drag to trace, then “+ path” to save."); }
 }
 function drawLasso() {
   const lc = $("lassoCanvas"); lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
@@ -660,7 +797,7 @@ function renderLayers() {
     if (ly.kind === "path") li.append(iconBtn(editing ? "✓" : "✎", editing ? "Finish editing this path" : "Edit waypoints (shift-click to add/remove)", () => editPathLayer(ly)));
     li.append(iconBtn("▶", ly.kind === "path" ? "Morph along this path" : "Morph through this layer as a volume series", () => playLayerSeries(ly)));
     if (exportAvailable) li.append(iconBtn("⤓", "Save layer (metadata + average volume) to the project", () => saveLayer(ly)));
-    li.append(iconBtn("✕", "Delete layer", () => { if (editingPathLayer === ly) editingPathLayer = null; layers.splice(layers.indexOf(ly), 1); renderLayers(); if (state.colorBy === "layers") applyColor(); }));
+    li.append(iconBtn("✕", "Delete layer", () => { if (editingPathLayer === ly) { editingPathLayer = null; setPathDrawArmed(false); } layers.splice(layers.indexOf(ly), 1); renderLayers(); if (state.colorBy === "layers") applyColor(); }));
     ul.appendChild(li);
   });
 }
