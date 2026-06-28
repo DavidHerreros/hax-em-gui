@@ -39,8 +39,13 @@ class SaveLayer(BaseModel):
 # Landscape: embeddings (PCA/UMAP) + clustering of the latent space.
 # --------------------------------------------------------------------------
 class Landscape:
-    def __init__(self, latents: np.ndarray) -> None:
+    def __init__(self, latents: np.ndarray, decode: np.ndarray | None = None) -> None:
+        # `latents` drives the display (embedding/clustering); `decode` is the
+        # full latent space whose rows decode to volumes. They differ only when a
+        # reduced display space (z_space_reduced) is supplied — then centroids are
+        # returned in the decodable full space so generated states still work.
         self.latents = latents
+        self.decode = decode if decode is not None else latents
         self.n, self.dim = latents.shape
         self._pca = None
         self._pca_var = None
@@ -72,18 +77,22 @@ class Landscape:
         return self._pca
 
     def kmeans_full(self, k: int):
-        """KMeans on the latents -> (labels, centroid latents, centroid PCA coords)."""
+        """KMeans on the display latents -> (labels, decodable centroid latents,
+        centroid PCA coords). Centroids are the per-cluster mean of the *decode*
+        latents, so they remain decodable even when the display is a reduced space."""
         k = int(max(2, min(20, k)))
         _ = self.pca  # ensure the PCA basis exists
         try:
             from sklearn.cluster import KMeans
-            km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(self.latents)
-            labels = km.labels_.astype(int)
-            centroids = km.cluster_centers_.astype(np.float32)
+            labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(self.latents).astype(int)
         except Exception:  # noqa: BLE001 - degenerate fallback: one cluster
             labels = np.zeros(self.n, dtype=int)
-            centroids = self.latents.mean(0, keepdims=True).astype(np.float32)
-        cpca = ((centroids - self._pca_mean) @ self._pca_comp.T).astype(np.float32)
+        uniq = np.unique(labels)
+        # decodable centroids: mean of the full (decode) latents per cluster
+        centroids = np.stack([self.decode[labels == c].mean(0) for c in uniq]).astype(np.float32)
+        # display positions: mean of the display latents per cluster, projected to PCA
+        disp_centers = np.stack([self.latents[labels == c].mean(0) for c in uniq]).astype(np.float32)
+        cpca = ((disp_centers - self._pca_mean) @ self._pca_comp.T).astype(np.float32)
         return labels, centroids, cpca
 
     @property
@@ -121,9 +130,17 @@ class Landscape:
 # Decoder: load network + latents, decode a latent -> density grid (lazy JAX).
 # --------------------------------------------------------------------------
 class Decoder:
-    def __init__(self, latents_path: str, reload_path: str) -> None:
-        self.latents = _load_latents(latents_path)
-        self.landscape = Landscape(self.latents)
+    def __init__(self, latents_path: str, reload_path: str, reduced_path: str | None = None) -> None:
+        self.latents = _load_latents(latents_path)   # full latents, used for decoding
+        display = self.latents
+        if reduced_path:
+            reduced = _load_latents(reduced_path)
+            if reduced.shape[0] == self.latents.shape[0]:
+                display = reduced   # show the reduced space; still decode the full latents
+            else:
+                print(f"[viewer] z_space_reduced has {reduced.shape[0]} rows but z_space has "
+                      f"{self.latents.shape[0]}; ignoring the reduced space.", flush=True)
+        self.landscape = Landscape(display, decode=self.latents)
         self._reload = reload_path
         self._decode = None  # built lazily on first decode (defers the JAX import)
         self._cache: dict[int, np.ndarray] = {}
@@ -541,6 +558,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="WebGL conformational-landscape viewer backend")
     parser.add_argument("--latents", required=True, help="latents .npy/.txt of shape (N, latent_dim)")
     parser.add_argument("--reload", required=True, help="trained network checkpoint dir (e.g. <run>/HetSIREN)")
+    parser.add_argument("--z_space_reduced", dest="reduced", default=None,
+                        help="optional reduced-dimensionality latents (row-aligned) used only to display the "
+                             "landscape; volumes are still decoded from --latents (e.g. a FlexConsensus consensus)")
     parser.add_argument("--title", default="Conformational landscape")
     parser.add_argument("--metadata", default=None, help="row-aligned particle metadata (.xmd/.star) for layer export")
     parser.add_argument("--project-dir", dest="project_dir", default=None, help="project folder where exported layers are written")
@@ -548,7 +568,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8051)
     args = parser.parse_args()
 
-    decoder = Decoder(args.latents, args.reload)
+    decoder = Decoder(args.latents, args.reload, reduced_path=args.reduced)
     app = build_app(decoder, title=args.title, metadata=args.metadata, project_dir=args.project_dir)
 
     import uvicorn

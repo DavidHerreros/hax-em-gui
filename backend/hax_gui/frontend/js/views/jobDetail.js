@@ -72,7 +72,13 @@ export function JobDetailView(params) {
 
   function viewable(j) {
     const a = (j && j.args) || {};
-    return (a.z_space || a.latents || a.latents_file) && (a.pickled_nn || a.reload);
+    if (!j || j.program === "flexconsensus") return false;
+    const reload = a.pickled_nn || a.reload;
+    if (!reload) return false;
+    if (a.z_space || a.latents || a.latents_file) return true;
+    // predict runs expose latents as output once finished
+    const PREDICT_LATENT_PROGS = ["hetsiren", "zernike3deep", "reconsiren"];
+    return PREDICT_LATENT_PROGS.includes(j.program) && j.status === "succeeded";
   }
   async function openViewer() {
     clear(actionErr);

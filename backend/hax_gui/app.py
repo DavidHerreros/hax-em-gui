@@ -465,11 +465,13 @@ class ViewerStart(BaseModel):
     latents: str
     reload: str
     title: str | None = None
+    reduced: str | None = None
 
 
 @app.post("/api/viewer", dependencies=[Depends(auth)])
 async def start_viewer(body: ViewerStart) -> dict[str, Any]:
-    return await _ensure_viewer(body.latents, body.reload, body.title or "Conformational landscape")
+    return await _ensure_viewer(body.latents, body.reload, body.title or "Conformational landscape",
+                                reduced=body.reduced)
 
 
 @app.post("/api/viewer/from-job/{job_id}", dependencies=[Depends(auth)])
@@ -477,18 +479,39 @@ async def start_viewer_from_job(job_id: str) -> dict[str, Any]:
     job = manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    program = job.get("program", "")
     args = job.get("args", {})
-    latents = args.get("z_space") or args.get("latents") or args.get("latents_file")
-    reload = args.get("pickled_nn") or args.get("reload")
-    if not latents or not reload:
+    # FlexConsensus produces a consensus space but no volume decoder; it can only
+    # be viewed as a reduced display space bound into an annotate_space job.
+    if program == "flexconsensus":
         raise HTTPException(
             status_code=422,
-            detail="this run has no latents + network to view (need z_space/latents and pickled_nn/reload)",
+            detail="FlexConsensus has no volume decoder; bind its consensus to an annotate_space "
+                   "job's z_space_reduced and open the viewer from that job instead.",
         )
+    reload_raw = args.get("pickled_nn") or args.get("reload")
+    # Full latents: a direct input (annotate_space), or derived from this run's
+    # own output (a predict run's predicted latents).
+    latents = args.get("z_space") or args.get("latents") or args.get("latents_file")
+    if not latents:
+        try:
+            latents = adapters.produce("latents", job, settings.data_dir / "viewer_cache" / job_id, "z_space")
+        except adapters.AdapterError:
+            latents = None
+    if not latents or not reload_raw:
+        raise HTTPException(
+            status_code=422,
+            detail="this run has no latents + network to view (need latents/z_space — or a predict "
+                   "run's output — plus pickled_nn/reload)",
+        )
+    reload = str(adapters.checkpoint_dir(program, reload_raw))
+    # Optional reduced display space (e.g. a FlexConsensus consensus bound here).
+    reduced = args.get("z_space_reduced")
     title = job.get("name") or job.get("program") or "Conformational landscape"
     project_dir = projects.dir_for(job.get("project_id"))
     metadata = _find_latent_metadata(project_dir, latents)
-    return await _ensure_viewer(latents, reload, title, metadata, str(project_dir) if project_dir else None)
+    return await _ensure_viewer(latents, reload, title, metadata,
+                                str(project_dir) if project_dir else None, reduced)
 
 
 def _find_latent_metadata(project_dir: "Path | None", latents: str) -> str | None:
@@ -525,9 +548,10 @@ def _find_latent_metadata(project_dir: "Path | None", latents: str) -> str | Non
 
 
 async def _ensure_viewer(latents: str, reload: str, title: str,
-                         metadata: str | None = None, project_dir: str | None = None) -> dict[str, Any]:
+                         metadata: str | None = None, project_dir: str | None = None,
+                         reduced: str | None = None) -> dict[str, Any]:
     try:
-        return await viewer_manager.ensure(latents, reload, title, metadata, project_dir)
+        return await viewer_manager.ensure(latents, reload, title, metadata, project_dir, reduced)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except (RuntimeError, TimeoutError) as exc:

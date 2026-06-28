@@ -42,7 +42,8 @@ class ViewerManager:
         return [self._public(i) for i in self._by_id.values()]
 
     async def ensure(self, latents: str, reload: str, title: str = "Conformational landscape",
-                     metadata: str | None = None, project_dir: str | None = None) -> dict[str, Any]:
+                     metadata: str | None = None, project_dir: str | None = None,
+                     reduced: str | None = None) -> dict[str, Any]:
         """Start (or reuse) a viewer for (latents, reload) and wait until it's up."""
         if not _SERVER.exists():
             raise RuntimeError(f"viewer backend not found at {_SERVER}")
@@ -52,8 +53,11 @@ class ViewerManager:
             raise FileNotFoundError(f"latents file not found: {lat}")
         if not (ckpt / "checkpoints").is_dir():
             raise FileNotFoundError(f"network checkpoint not found at: {ckpt}")
+        red = Path(reduced).expanduser() if reduced else None
+        if red is not None and not red.exists():
+            red = None   # ignore a missing reduced-space file rather than failing the launch
 
-        key = (str(lat), str(ckpt))
+        key = (str(lat), str(ckpt), str(red) if red else "")
         existing = self._by_key.get(key)
         if existing and existing["proc"].poll() is None:
             existing["title"] = title
@@ -69,6 +73,8 @@ class ViewerManager:
             "--host", "127.0.0.1",
             "--port", str(port),
         ]
+        if red is not None:
+            cmd += ["--z_space_reduced", str(red)]
         if project_dir:
             cmd += ["--project-dir", str(project_dir)]
         if metadata:

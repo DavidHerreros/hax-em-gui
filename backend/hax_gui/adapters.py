@@ -86,6 +86,13 @@ _LATENT_PRODUCERS: list[dict[str, Any]] = [
         "programs": {"filter_latents"},
         "globs": ["filtered_latents.npy"],
     },
+    {
+        # FlexConsensus consensus space — a reduced latent space; bind it to a
+        # viewer/annotate_space `z_space_reduced` (display), not to `z_space`.
+        "style": "file",
+        "programs": {"flexconsensus"},
+        "globs": ["*_consensus.npy"],
+    },
 ]
 
 
@@ -169,6 +176,26 @@ def source_file_for(kind: str, job: dict[str, Any]) -> Path | None:
     if spec is None:
         return None
     return _find_artifact(Path(workdir), spec, program)
+
+
+def checkpoint_dir(program: str, reload_path: str) -> Path:
+    """Resolve a directly-loadable checkpoint dir from a job's reload/pickled_nn
+    value, which may already be the checkpoint or the run folder that holds it.
+
+    annotate_space's ``pickled_nn`` is the checkpoint dir itself; a predict run's
+    ``reload`` is the training run folder, so the checkpoint is ``<reload>/<Name>``.
+    """
+    p = Path(reload_path).expanduser()
+    if _is_loadable_checkpoint(p):
+        return p
+    name = _CHECKPOINT_DIR.get(program)
+    if name and _is_loadable_checkpoint(p / name):
+        return p / name
+    if p.is_dir():
+        for child in sorted(p.iterdir()):
+            if child.is_dir() and _is_loadable_checkpoint(child):
+                return child
+    return p
 
 
 def compatible_sources(kind: str, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:

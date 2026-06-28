@@ -90,12 +90,13 @@ class JobManager:
                 finished_at TEXT,
                 project_id TEXT,
                 workdir TEXT,
-                cwd TEXT
+                cwd TEXT,
+                bindings TEXT
             )
             """
         )
         # Add columns to pre-existing databases (idempotent).
-        for col in ("project_id TEXT", "workdir TEXT", "cwd TEXT", "name TEXT"):
+        for col in ("project_id TEXT", "workdir TEXT", "cwd TEXT", "name TEXT", "bindings TEXT"):
             try:
                 self._db.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -171,15 +172,18 @@ class JobManager:
         log_path = workdir / "run.log"
         status = "pending" if launch else "saved"
         name_val = (name or "").strip() or None
+        # Persist the input bindings so a later rerun can re-materialise them into
+        # a fresh run folder (the produced files live in this job's workdir).
+        bindings_val = json.dumps(bindings) if bindings else None
         if replace_job_id:
             # Replace in place: keep the same id (and created_at, so the row stays
             # put in lists) and discard the previous run folder.
             old = self.get(replace_job_id)
             self._exec(
                 "UPDATE jobs SET program=?, name=?, args=?, gpu=?, command=?, status=?, log_path=?, "
-                "workdir=?, cwd=?, return_code=NULL, finished_at=NULL WHERE id=?",
+                "workdir=?, cwd=?, bindings=?, return_code=NULL, finished_at=NULL WHERE id=?",
                 (program, name_val, json.dumps(values), gpu or None, json.dumps(command),
-                 status, str(log_path), str(workdir), cwd, replace_job_id),
+                 status, str(log_path), str(workdir), cwd, bindings_val, replace_job_id),
             )
             if old and old.get("workdir"):
                 old_wd = Path(old["workdir"])
@@ -187,10 +191,10 @@ class JobManager:
                     shutil.rmtree(old_wd, ignore_errors=True)
         else:
             self._exec(
-                "INSERT INTO jobs (id, program, name, args, gpu, command, status, log_path, created_at, project_id, workdir, cwd) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO jobs (id, program, name, args, gpu, command, status, log_path, created_at, project_id, workdir, cwd, bindings) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, program, name_val, json.dumps(values), gpu or None,
-                 json.dumps(command), status, str(log_path), _now(), project_id, str(workdir), cwd),
+                 json.dumps(command), status, str(log_path), _now(), project_id, str(workdir), cwd, bindings_val),
             )
         self._buffers[job_id] = deque()
         self._buflens[job_id] = 0
@@ -249,8 +253,15 @@ class JobManager:
         for arg in (registry.output_arg(program), registry.ssd_arg(program)):
             if arg:
                 args.pop(arg, None)
+        # Re-pass the original bindings so create() re-materialises job-derived
+        # inputs into the fresh run folder (the previous folder is removed). Drop
+        # the stale produced paths first so a missing binding can't slip through.
+        bindings = job.get("bindings")
+        if bindings:
+            for field in bindings:
+                args.pop(field, None)
         return await self.create(program, args, job["gpu"], job["project_id"],
-                                 name=job.get("name"), replace_job_id=job_id)
+                                 name=job.get("name"), bindings=bindings, replace_job_id=job_id)
 
     def rename(self, job_id: str, name: str) -> dict[str, Any]:
         """Set (or clear) a job's custom display name."""
@@ -451,6 +462,7 @@ class JobManager:
         data = dict(row)
         data["args"] = json.loads(data["args"])
         data["command"] = json.loads(data["command"])
+        data["bindings"] = json.loads(data["bindings"]) if data.get("bindings") else None
         data["active"] = data["status"] in ACTIVE
         return data
 

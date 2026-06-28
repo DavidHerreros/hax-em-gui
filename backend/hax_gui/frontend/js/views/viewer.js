@@ -7,12 +7,20 @@ import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
 
-// A job is viewable if it carries both a latents file and a network checkpoint.
+// Predict runs of these programs expose latents as output (predicted_latents),
+// so they become viewable once finished even without a latents input field.
+const PREDICT_LATENT_PROGS = new Set(["hetsiren", "zernike3deep", "reconsiren"]);
+
+// A job is viewable if it has a network checkpoint plus latents — either a
+// latents input, or a finished predict run whose output provides them.
+// FlexConsensus has no volume decoder, so it is not directly viewable.
 function viewable(job) {
   const a = job.args || {};
-  const latents = a.z_space || a.latents || a.latents_file;
+  if (job.program === "flexconsensus") return null;
   const reload = a.pickled_nn || a.reload;
-  return latents && reload ? { latents, reload } : null;
+  if (!reload) return null;
+  if (a.z_space || a.latents || a.latents_file) return true;
+  return PREDICT_LATENT_PROGS.has(job.program) && job.status === "succeeded" ? true : null;
 }
 
 export function ViewerView() {
@@ -51,7 +59,7 @@ export function ViewerView() {
       h("button", { class: "btn-icon", title: "Refresh", style: { marginLeft: "auto" }, onclick: loadRuns }, icon("refresh", 15)));
     if (!jobs.length) {
       return h("div", null, header,
-        h("p", { class: "muted small" }, "None yet. Launch annotate_space (or any run) with both a latents file and a ", h("span", { class: "mono" }, "--pickled_nn"), " network, then refresh."));
+        h("p", { class: "muted small" }, "None yet. Open the viewer from an ", h("span", { class: "mono" }, "annotate_space"), " run, or from a finished ", h("span", { class: "mono" }, "hetsiren/zernike3deep/reconsiren"), " predict run (its latents + network), then refresh."));
     }
     return h("div", null, header, ...jobs.map((j) => {
       const btn = h("button", { class: "run-row", onclick: () => launch(j, btn) },
