@@ -18,3 +18,7 @@ backend/.hax_gui/
 .DS_Store
 .vscode/
 .idea/
+
+# MD files
+VIEWER_PLAN.md
+TODO.md
