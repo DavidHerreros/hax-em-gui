@@ -85,8 +85,11 @@ export function WorkflowsView() {
   const statusEl = h("span", { class: "wf-status muted" }, "");
   const orientBtn = h("button", { class: "btn small", title: "Toggle horizontal / vertical layout", onclick: toggleOrientation });
   const layoutBtn = h("button", { class: "btn small", title: "Auto-arrange into dependency levels", onclick: () => { autoLayout(); dirty = true; } }, icon("sliders", 14), "Tidy");
+  const pinBtn = h("button", { class: "btn small", title: "Pin the current node layout so you can return to it", onclick: saveLayout }, icon("bookmark", 14), "Pin layout");
+  const restoreBtn = h("button", { class: "btn small", title: "Restore the pinned layout", onclick: restoreLayout }, icon("restore", 14), "Restore");
   const centerBtn = h("button", { class: "btn small", title: "Center the workflow in view", onclick: centerView }, icon("orbit", 14), "Center");
   const mmBtn = h("button", { class: "btn small", title: "Toggle the overview minimap", onclick: toggleMinimap }, icon("grid", 14), "Map");
+  const zoomLabel = h("button", { class: "btn small wf-zoom", title: "Reset zoom to 100%", onclick: resetZoom }, "100%");
   const importBtn = h("button", { class: "btn small", title: "Open the active project as a live workflow (edits & runs change the project)", onclick: openProject }, icon("box", 14), "Open project");
   const asProjBtn = h("button", { class: "btn small", title: "Create a new project backed by this workflow", onclick: saveAsProject }, icon("plus", 14), "Save as project");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
@@ -96,7 +99,7 @@ export function WorkflowsView() {
   const topbar = h("div", { class: "wf-topbar" },
     h("strong", null, "Workflow"), wfSelect,
     h("button", { class: "btn small", onclick: () => openWorkflow(null) }, "+ New"),
-    importBtn, asProjBtn, nameInput, orientBtn, layoutBtn, centerBtn, mmBtn,
+    importBtn, asProjBtn, nameInput, orientBtn, layoutBtn, pinBtn, restoreBtn, centerBtn, mmBtn, zoomLabel,
     h("span", { style: { flex: "1" } }), statusEl, saveBtn, runSelBtn, runBtn, delBtn);
 
   // ── body: palette | canvas (+minimap) | inspector ──
@@ -127,20 +130,26 @@ export function WorkflowsView() {
     sizer.style.width = CONTENT_W * zoom + "px";
     sizer.style.height = CONTENT_H * zoom + "px";
     contentLayer.style.transform = `scale(${zoom})`;
+    updateZoomLabel();
   }
+  function updateZoomLabel() { zoomLabel.textContent = Math.round(zoom * 100) + "%"; }
+  // Zoom to `next`, keeping the content point under (mx,my) (canvas-local px) fixed.
+  function zoomTo(next, mx, my) {
+    next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, next));
+    if (next === zoom) return;
+    const cx = (canvas.scrollLeft + mx) / zoom, cy = (canvas.scrollTop + my) / zoom;
+    zoom = next; applyZoom();
+    canvas.scrollLeft = cx * zoom - mx;
+    canvas.scrollTop = cy * zoom - my;
+    drawMinimap();
+  }
+  function resetZoom() { zoomTo(1, canvas.clientWidth / 2, canvas.clientHeight / 2); }
   applyZoom();
   // Mouse wheel zooms (toward the cursor) instead of scrolling.
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
     const rect = canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    const cx = (canvas.scrollLeft + mx) / zoom, cy = (canvas.scrollTop + my) / zoom;   // content point under cursor
-    const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * Math.exp(-e.deltaY * 0.0015)));
-    if (next === zoom) return;
-    zoom = next; applyZoom();
-    canvas.scrollLeft = cx * zoom - mx;   // keep that content point under the cursor
-    canvas.scrollTop = cy * zoom - my;
-    drawMinimap();
+    zoomTo(zoom * Math.exp(-e.deltaY * 0.0015), e.clientX - rect.left, e.clientY - rect.top);
   }, { passive: false });
 
   const inspBody = h("div", { class: "wf-pane-inner wf-inspector-body" });
@@ -737,8 +746,47 @@ export function WorkflowsView() {
   // "Save as project" is only offered for a draft workflow not yet bound to one.
   function syncProjectBtn() { asProjBtn.style.display = wf && wf.project_id ? "none" : ""; }
 
+  // ── pinned layout (save / restore node positions) ──
+  // Independent of "Tidy": pins the user's own arrangement so they can return to it.
+  async function saveLayout() {
+    if (!graph.nodes.length) { flash("Add some steps first.", "warn"); return; }
+    graph.savedLayout = {
+      orientation: graph.orientation,
+      pos: Object.fromEntries(graph.nodes.map((n) => [n.id, { x: n.x, y: n.y, job: n.job_id || null }])),
+    };
+    syncLayoutBtns();
+    if (wf) await save();      // persist the pin
+    flash(`Pinned the current layout (${graph.nodes.length} positions).`, "muted");
+  }
+  function restoreLayout() {
+    const sl = graph.savedLayout;
+    if (!sl || !sl.pos) { flash("No pinned layout yet — pin one first.", "warn"); return; }
+    if (sl.orientation && sl.orientation !== graph.orientation) { graph.orientation = sl.orientation; syncOrientBtn(); }
+    const known = [], unknown = [];
+    for (const n of graph.nodes) {
+      // match by node id, falling back to job id (project re-syncs can renumber)
+      const p = sl.pos[n.id] || (n.job_id ? Object.values(sl.pos).find((q) => q.job && q.job === n.job_id) : null);
+      if (p) { n.x = p.x; n.y = p.y; known.push(n); } else unknown.push(n);
+    }
+    // Nodes added since the pin aren't in it — stack them just to the right of the
+    // restored arrangement so they're visible and don't overlap it.
+    if (unknown.length) {
+      const refs = known.length ? known : graph.nodes.filter((n) => !unknown.includes(n));
+      const x1 = Math.max(0, ...(refs.length ? refs : graph.nodes).map((n) => n.x + NODE_W));
+      let y = refs.length ? Math.min(...refs.map((n) => n.y)) : 40;
+      for (const n of unknown) { n.x = x1 + 80; n.y = y; y += nodeHeight(n) + 26; }
+    }
+    dirty = true; renderNodes(); centerView();
+    flash(unknown.length ? `Restored the pinned layout; placed ${unknown.length} new node(s) alongside it.` : "Restored the pinned layout.", "muted");
+  }
+  function syncLayoutBtns() {
+    const has = !!(graph.savedLayout && graph.savedLayout.pos);
+    restoreBtn.disabled = !has;
+    restoreBtn.classList.toggle("disabled", !has);
+  }
+
   // ── persistence + run ──
-  function graphSnapshot() { return { nodes: graph.nodes, edges: graph.edges, orientation: graph.orientation }; }
+  function graphSnapshot() { return { nodes: graph.nodes, edges: graph.edges, orientation: graph.orientation, savedLayout: graph.savedLayout || null }; }
   function flash(msg, kind = "warn") { statusEl.className = "wf-status " + kind; statusEl.textContent = msg; }
 
   async function save() {
@@ -771,9 +819,10 @@ export function WorkflowsView() {
 
   // Adopt a server graph into local state (keeping the id counters ahead).
   function adoptGraph(g) {
-    graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || graph.orientation || "horizontal" };
+    graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || graph.orientation || "horizontal", savedLayout: g.savedLayout || null };
     nodeSeq = Math.max(1, ...graph.nodes.map((n) => +(n.id.replace(/\D/g, "")) || 0)) + 1;
     edgeSeq = Math.max(1, ...graph.edges.map((e) => +((e.id || "").replace(/\D/g, "")) || 0)) + 1;
+    syncLayoutBtns();
   }
 
   function startPolling() {
@@ -806,7 +855,7 @@ export function WorkflowsView() {
     selectedSet.clear();
     if (!id) {
       wf = null; graph = { nodes: [], edges: [], orientation: "horizontal" }; runState = null; selected = null; nameInput.value = "";
-      wfSelect.value = ""; syncOrientBtn(); syncProjectBtn(); renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
+      wfSelect.value = ""; syncOrientBtn(); syncProjectBtn(); syncLayoutBtns(); renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
     }
     try {
       wf = await api.workflow(id);

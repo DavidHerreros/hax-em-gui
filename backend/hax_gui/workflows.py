@@ -241,7 +241,8 @@ class WorkflowManager:
                 continue
             seen.add(key); eseq += 1
             edges.append({"id": f"e{eseq}", "from": e["from"], "to": e["to"], "field": e.get("field"), "kind": e.get("kind")})
-        graph = {"nodes": nodes, "edges": edges, "orientation": stored.get("orientation", "horizontal")}
+        graph = {"nodes": nodes, "edges": edges, "orientation": stored.get("orientation", "horizontal"),
+                 "savedLayout": stored.get("savedLayout")}
         state = {}
         for n in nodes:
             jid = n.get("job_id")

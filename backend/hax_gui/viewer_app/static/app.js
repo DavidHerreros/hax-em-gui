@@ -532,8 +532,12 @@ function drawLasso() {
   lctx.beginPath(); lctx.moveTo(lassoPts[0][0], lassoPts[0][1]);
   for (let i = 1; i < lassoPts.length; i++) lctx.lineTo(lassoPts[i][0], lassoPts[i][1]);
   lctx.closePath();
-  lctx.fillStyle = `rgba(${rgb},0.10)`; lctx.fill();
-  lctx.strokeStyle = `rgba(${rgb},0.9)`; lctx.lineWidth = 1.5; lctx.setLineDash([5, 4]); lctx.stroke(); lctx.setLineDash([]);
+  lctx.fillStyle = `rgba(${rgb},0.16)`; lctx.fill();
+  // dark contrast halo first, so the loop reads on light backgrounds too...
+  lctx.lineJoin = "round";
+  lctx.strokeStyle = "rgba(15,23,42,0.55)"; lctx.lineWidth = 4; lctx.setLineDash([]); lctx.stroke();
+  // ...then the bright dashed colored line on top
+  lctx.strokeStyle = `rgba(${rgb},1)`; lctx.lineWidth = 2; lctx.setLineDash([6, 4]); lctx.stroke(); lctx.setLineDash([]);
 }
 function finishLasso() {
   const poly = lassoPts; lassoPts = [];

@@ -543,6 +543,8 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .wf-minimap { position: absolute; right: 12px; bottom: 12px; width: 210px; height: 150px; background: color-mix(in srgb, var(--surface) 88%, transparent); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.25); z-index: 6; cursor: pointer; }
 .wf-minimap.hidden { display: none; }
 .wf-topbar .btn.small.on { border-color: var(--brand, #2dd4bf); color: var(--brand, #2dd4bf); }
+.wf-topbar .btn.small.wf-zoom { min-width: 52px; justify-content: center; font-variant-numeric: tabular-nums; }
+.wf-topbar .btn.small.disabled, .wf-topbar .btn.small:disabled { opacity: .45; cursor: default; pointer-events: none; }
 .wf-canvas { flex: 1; position: relative; overflow: auto; background: var(--bg); cursor: grab; }
 .wf-canvas.panning { cursor: grabbing; }
 .wf-sizer { position: relative; }

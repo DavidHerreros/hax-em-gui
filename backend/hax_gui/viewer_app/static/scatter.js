@@ -71,12 +71,18 @@ export function createScatter(canvas, onSelect) {
       ctx.fill();
     }
     ctx.globalAlpha = 1;
-    for (const si of selSet) ring(si, "rgba(241,245,249,0.85)", 1.7);
+    // selection ring must contrast with the background -> dark on the light theme
+    const selCol = document.documentElement.dataset.theme === "light" ? "rgba(15,23,42,0.9)" : "rgba(241,245,249,0.9)";
+    for (const si of selSet) ring(si, selCol, 1.7, true);
     for (const pi of pathSet) ring(pi, "#f472b6");
     ring(selected, "#2dd4bf");
-    function ring(i, col, scale = 2.4) {
+    function ring(i, col, scale = 2.4, halo = false) {
       if (i < 0 || !points[i]) return;
       const [sx, sy] = toScreen(points[i][0], points[i][1]);
+      if (halo) {  // faint opposite-tone halo so the ring reads on any background
+        ctx.beginPath(); ctx.arc(sx, sy, r * scale, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 3.2 * dpr(); ctx.stroke();
+      }
       ctx.beginPath(); ctx.arc(sx, sy, r * scale, 0, Math.PI * 2); ctx.strokeStyle = col; ctx.lineWidth = 1.6 * dpr(); ctx.stroke();
     }
   }
