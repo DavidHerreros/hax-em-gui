@@ -57,7 +57,10 @@ export const api = {
   createWorkflow: (body) => req("/api/workflows", { method: "POST", body: JSON.stringify(body) }),
   updateWorkflow: (id, body) => req(`/api/workflows/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteWorkflow: (id) => req(`/api/workflows/${id}`, { method: "DELETE" }),
-  runWorkflow: (id) => req(`/api/workflows/${id}/run`, { method: "POST" }),
+  // runWorkflow with no `nodes` runs the whole graph; pass an array of node ids
+  // to run just that subset (a single node or a selection).
+  runWorkflow: (id, nodes) => req(`/api/workflows/${id}/run`, { method: "POST", body: JSON.stringify(nodes ? { nodes } : {}) }),
+  workflowFromProject: (projectId, name) => req(`/api/workflows/from-project/${projectId}`, { method: "POST", body: JSON.stringify({ name: name || null }) }),
 
   // WebGL viewer sessions
   viewers: () => req("/api/viewer"),

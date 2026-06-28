@@ -111,6 +111,52 @@ class WorkflowManager:
         self._db.execute("DELETE FROM workflows WHERE id=?", (wid,))
         self._db.commit()
 
+    def seed_state(self, wid: str, state: dict) -> dict[str, Any]:
+        """Attach a run_state to a workflow without marking it running. Used when
+        importing a project so each node shows its existing job's status."""
+        wf = self.get(wid)
+        if wf is None:
+            raise KeyError(wid)
+        self._db.execute(
+            "UPDATE workflows SET run_state=?, updated_at=? WHERE id=?",
+            (json.dumps(state), _now(), wid),
+        )
+        self._db.commit()
+        return self.get(wid)
+
+    # -- import an existing project as a workflow ---------------------------
+    def build_from_project(self, project_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Infer a workflow graph from a project's jobs. Each job becomes a node;
+        each job's stored input bindings become edges. Returns (graph, run_state)
+        where run_state carries every node's real job id + status so the canvas
+        shows what's already executed/succeeded/failed/saved."""
+        job_list = list(reversed(jobs.list_for_project(project_id)))  # oldest first
+        id_map = {j["id"]: f"n{i + 1}" for i, j in enumerate(job_list)}
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        state: dict[str, Any] = {}
+        eseq = 1
+        for j in job_list:
+            nid = id_map[j["id"]]
+            args = dict(j.get("args") or {})
+            for auto in (registry.output_arg(j["program"]), registry.ssd_arg(j["program"])):
+                if auto:
+                    args.pop(auto, None)
+            bindings = j.get("bindings") or {}
+            for field in bindings:           # bound fields live on the edge, not as literals
+                args.pop(field, None)
+            nodes.append({"id": nid, "program": j["program"], "args": args,
+                          "gpu": j.get("gpu") or "0", "name": j.get("name") or "",
+                          "x": 0, "y": 0, "job_id": j["id"]})
+            state[nid] = {"job_id": j["id"], "status": j["status"], "error": None}
+            for field, b in bindings.items():
+                if b.get("job_id") in id_map:
+                    edges.append({"id": f"e{eseq}", "from": id_map[b["job_id"]], "to": nid,
+                                  "field": field, "kind": b.get("kind")})
+                    eseq += 1
+        graph = {"nodes": nodes, "edges": edges, "orientation": "horizontal"}
+        return graph, state
+
     # -- validation --------------------------------------------------------
     @staticmethod
     def topo_order(nodes: list[dict], edges: list[dict]) -> list[str]:
@@ -171,7 +217,10 @@ class WorkflowManager:
         return errors
 
     # -- execution ---------------------------------------------------------
-    async def run(self, wid: str) -> dict[str, Any]:
+    async def run(self, wid: str, only: list[str] | None = None) -> dict[str, Any]:
+        """Run the whole workflow, or just the nodes in `only` (a subset run). For
+        a subset run, nodes outside the set keep their existing run_state, so an
+        already-succeeded upstream node supplies its job to the nodes being run."""
         wf = self.get(wid)
         if wf is None:
             raise KeyError(wid)
@@ -180,14 +229,24 @@ class WorkflowManager:
         errors = self.validate(wf["graph"])
         if errors:
             raise WorkflowError(errors)
-        # seed run state (all pending) and kick off the background executor
         nodes = wf["graph"]["nodes"]
-        state = {n["id"]: {"job_id": None, "status": "pending", "error": None} for n in nodes}
+        ids = {n["id"] for n in nodes}
+        only_set = set(only) & ids if only is not None else None
+        if only is not None and not only_set:
+            raise WorkflowError(["none of the selected steps exist in this workflow"])
+        prev = wf["run_state"] or {}
+        # nodes being run reset to pending; others keep their prior state (job + status)
+        state = {}
+        for n in nodes:
+            if only_set is None or n["id"] in only_set:
+                state[n["id"]] = {"job_id": None, "status": "pending", "error": None}
+            else:
+                state[n["id"]] = prev.get(n["id"], {"job_id": None, "status": "idle", "error": None})
         self._set_run(wid, "running", state)
-        self._running[wid] = asyncio.create_task(self._execute(wid))
+        self._running[wid] = asyncio.create_task(self._execute(wid, only_set))
         return self.get(wid)
 
-    async def _execute(self, wid: str) -> None:
+    async def _execute(self, wid: str, only: set[str] | None = None) -> None:
         try:
             wf = self.get(wid)
             graph = wf["graph"]
@@ -198,6 +257,8 @@ class WorkflowManager:
             state = wf["run_state"] or {i: {"job_id": None, "status": "pending", "error": None} for i in nodes}
 
             for nid in order:
+                if only is not None and nid not in only:
+                    continue  # subset run: leave untouched (its job feeds downstream deps)
                 deps = [e for e in edges if e["to"] == nid]
                 # block if any upstream did not succeed
                 if any(state.get(e["from"], {}).get("status") != "succeeded" for e in deps):
@@ -230,7 +291,9 @@ class WorkflowManager:
                               "error": None if final == "succeeded" else "step failed (see the job log)"}
                 self._set_run(wid, "running", state)
 
-            done = "succeeded" if all(s["status"] == "succeeded" for s in state.values()) else "failed"
+            # judge overall status by the nodes actually run this pass
+            judged = [s for nid, s in state.items() if only is None or nid in only]
+            done = "succeeded" if all(s["status"] == "succeeded" for s in judged) else "failed"
             self._set_run(wid, done, state)
         except asyncio.CancelledError:
             self._set_run(wid, "cancelled", self.get(wid)["run_state"])

@@ -734,6 +734,16 @@ class WorkflowUpdate(BaseModel):
     graph: dict[str, Any] | None = None
 
 
+class WorkflowRun(BaseModel):
+    # Optional subset of node ids to run (a single node or a selection); when
+    # omitted the whole workflow runs.
+    nodes: list[str] | None = None
+
+
+class WorkflowFromProject(BaseModel):
+    name: str | None = None
+
+
 @app.get("/api/workflows", dependencies=[Depends(auth)])
 def list_workflows(project_id: str | None = None) -> list[dict[str, Any]]:
     return wf_manager.list(project_id)
@@ -775,13 +785,26 @@ def validate_workflow(wid: str) -> dict[str, Any]:
 
 
 @app.post("/api/workflows/{wid}/run", dependencies=[Depends(auth)])
-async def run_workflow(wid: str) -> dict[str, Any]:
+async def run_workflow(wid: str, body: WorkflowRun = WorkflowRun()) -> dict[str, Any]:
     try:
-        return await wf_manager.run(wid)
+        return await wf_manager.run(wid, body.nodes)
     except KeyError:
         raise HTTPException(status_code=404, detail="workflow not found")
     except WorkflowError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
+
+
+@app.post("/api/workflows/from-project/{project_id}", dependencies=[Depends(auth)])
+def workflow_from_project(project_id: str, body: WorkflowFromProject = WorkflowFromProject()) -> dict[str, Any]:
+    """Import a project's jobs as an editable workflow graph (nodes = jobs, edges
+    inferred from each job's stored input bindings), seeded with each job's status."""
+    proj = _project_or_404(project_id)
+    graph, state = wf_manager.build_from_project(project_id)
+    if not graph["nodes"]:
+        raise HTTPException(status_code=422, detail="this project has no jobs to import")
+    name = (body.name or f"{proj['name']} (imported)").strip()
+    wf = wf_manager.save(project_id, name, graph)
+    return wf_manager.seed_state(wf["id"], state)
 
 
 # -- static SPA (mounted last so /api and /ws take precedence) -------------

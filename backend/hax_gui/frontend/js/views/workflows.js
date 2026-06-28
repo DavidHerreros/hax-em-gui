@@ -1,21 +1,32 @@
 // Visual workflow builder: a node-graph canvas where program nodes are wired
 // output->input (mapping to the job input-binding system) and run as a DAG.
 // Hand-written vanilla JS; SVG for the wires, absolutely-positioned divs for nodes.
+//
+// Features: horizontal/vertical layout, auto-layout into dependency tiers,
+// drag-and-drop add + drop-to-connect, per-node + selection runs with live
+// per-node status, predict<->train parameter inheritance on wiring, file-browser
+// pickers for path args, and "import a project as a workflow".
 import { h, clear, mount } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState } from "../store.js";
 import { errorBox } from "./ui.js";
 import { visibleFields } from "./formFields.js";
+import { openFilePicker } from "./filePicker.js";
 
 const NODE_W = 196;     // node width (px)
 const HEADER_H = 34;    // node header height
 const ROW_H = 26;       // per-input-port row height
 const SVG_NS = "http://www.w3.org/2000/svg";
 
+// Programs that expose a train/predict mode — wiring their model output into
+// another node of the same program inherits the form parameters (mode aside).
+const MODED_PROGRAMS = new Set(["hetsiren", "zernike3deep", "reconsiren"]);
+
 const STATUS_COLOR = {
-  pending: "var(--muted)", running: "var(--accent)", succeeded: "#22c55e",
-  failed: "var(--err)", blocked: "var(--warn)", skipped: "var(--muted)",
+  saved: "#a78bfa", pending: "var(--muted)", running: "var(--accent)",
+  succeeded: "#22c55e", failed: "var(--err)", blocked: "var(--warn)",
+  cancelled: "var(--muted)", interrupted: "var(--warn)", idle: "var(--muted)", skipped: "var(--muted)",
 };
 
 function svgEl(tag, attrs = {}) {
@@ -27,15 +38,18 @@ function svgEl(tag, attrs = {}) {
 export function WorkflowsView() {
   let catalog = [];
   let byName = {};
-  let graph = { nodes: [], edges: [] };
+  let graph = { nodes: [], edges: [], orientation: "horizontal" };
   let wf = null;            // saved workflow record
-  let selected = null;      // selected node id
+  let selected = null;      // primary selected node id (drives the inspector)
+  const selectedSet = new Set();   // multi-selection (run / move together)
   let runState = null;      // {nodeId: {job_id, status, error}}
   let dirty = false;
   let poll = null;
   const schemaCache = {};
   let drag = null;          // active node drag / wiring gesture
   let nodeSeq = 1, edgeSeq = 1;
+
+  const horiz = () => graph.orientation !== "vertical";
 
   const root = h("div", { class: "view workflows-view" });
 
@@ -45,13 +59,18 @@ export function WorkflowsView() {
   const wfSelect = h("select", { class: "wf-select", title: "Open a saved workflow" });
   wfSelect.addEventListener("change", () => openWorkflow(wfSelect.value || null));
   const statusEl = h("span", { class: "wf-status muted" }, "");
+  const orientBtn = h("button", { class: "btn small", title: "Toggle horizontal / vertical layout", onclick: toggleOrientation });
+  const layoutBtn = h("button", { class: "btn small", title: "Auto-arrange into dependency levels", onclick: () => { autoLayout(); dirty = true; } }, icon("sliders", 14), "Tidy");
+  const importBtn = h("button", { class: "btn small", title: "Import the open project's jobs as a workflow", onclick: importProject }, icon("box", 14), "From project");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
-  const runBtn = h("button", { class: "btn", onclick: run }, icon("play", 15), "Run");
+  const runSelBtn = h("button", { class: "btn secondary", title: "Run the selected step(s) only", onclick: () => runNodes([...selectedSet]) }, icon("play", 15), "Run selected");
+  const runBtn = h("button", { class: "btn", title: "Run the whole workflow", onclick: () => runNodes(null) }, icon("play", 15), "Run all");
   const delBtn = h("button", { class: "btn", title: "Delete this workflow", onclick: removeWorkflow }, icon("trash", 15));
   const topbar = h("div", { class: "wf-topbar" },
     h("strong", null, "Workflow"), wfSelect,
     h("button", { class: "btn small", onclick: () => openWorkflow(null) }, "+ New"),
-    nameInput, h("span", { style: { flex: "1" } }), statusEl, saveBtn, runBtn, delBtn);
+    importBtn, nameInput, orientBtn, layoutBtn,
+    h("span", { style: { flex: "1" } }), statusEl, saveBtn, runSelBtn, runBtn, delBtn);
 
   // ── body: palette | canvas | inspector ──
   const palette = h("div", { class: "wf-palette" });
@@ -64,7 +83,22 @@ export function WorkflowsView() {
 
   // clicking empty canvas clears the selection
   canvas.addEventListener("pointerdown", (e) => {
-    if (e.target === canvas || e.target === nodesLayer || e.target === svg) { selected = null; renderNodes(); renderInspector(); }
+    if (e.target === canvas || e.target === nodesLayer || e.target === svg) {
+      selected = null; selectedSet.clear(); renderNodes(); renderInspector();
+    }
+  });
+
+  // drag-and-drop a palette program onto the canvas (drop on a node => auto-wire)
+  canvas.addEventListener("dragover", (e) => { if (drag?.kind !== "node") { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; canvas.classList.add("wf-drop"); } });
+  canvas.addEventListener("dragleave", (e) => { if (e.target === canvas) canvas.classList.remove("wf-drop"); });
+  canvas.addEventListener("drop", (e) => {
+    e.preventDefault(); canvas.classList.remove("wf-drop");
+    const program = e.dataTransfer.getData("text/plain");
+    if (!program || !byName[program]) return;
+    const overNode = elementNodeAt(e.clientX, e.clientY);   // existing node under the drop, if any
+    const p = canvasPoint(e);
+    const n = addNode(program, { x: Math.max(0, p.x - NODE_W / 2), y: Math.max(0, p.y - HEADER_H / 2) });
+    if (overNode && overNode !== n.id) autoConnect(overNode, n.id);
   });
 
   // ── data load ──
@@ -73,7 +107,7 @@ export function WorkflowsView() {
       catalog = await api.workflowCatalog();
       byName = Object.fromEntries(catalog.map((p) => [p.name, p]));
     } catch (err) { mount(palette, errorBox(err)); return; }
-    renderPalette();
+    renderPalette(); syncOrientBtn();
     await refreshList();
     openWorkflow(null);
   }
@@ -91,43 +125,95 @@ export function WorkflowsView() {
   function renderPalette() {
     clear(palette);
     palette.appendChild(h("div", { class: "wf-palette-head" }, "Programs"));
-    palette.appendChild(h("div", { class: "muted small", style: { padding: "0 10px 6px" } }, "Click to add a step."));
+    palette.appendChild(h("div", { class: "muted small", style: { padding: "0 10px 6px" } }, "Click or drag onto the canvas."));
     for (const p of catalog) {
       const producesTag = p.produces && p.produces.length ? "out: " + (p.produces.includes("latents") ? "latents" : p.produces[0]) : "";
-      palette.appendChild(h("button", { class: "wf-pal-item", title: p.description || p.name, onclick: () => addNode(p.name) },
+      const item = h("button", { class: "wf-pal-item", title: p.description || p.name, draggable: "true", onclick: () => addNode(p.name) },
         h("span", { class: "mono" }, p.name),
-        producesTag ? h("span", { class: "wf-pal-out muted small" }, producesTag) : null));
+        producesTag ? h("span", { class: "wf-pal-out muted small" }, producesTag) : null);
+      item.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", p.name); e.dataTransfer.effectAllowed = "copy"; });
+      palette.appendChild(item);
     }
+    palette.appendChild(h("div", { class: "wf-legend" },
+      ...["saved", "succeeded", "running", "failed", "blocked"].map((s) =>
+        h("span", { class: "wf-leg" }, h("span", { class: "wf-leg-dot", style: { background: STATUS_COLOR[s] } }), s))));
   }
 
   // ── graph mutation ──
-  function addNode(program) {
-    const x = 60 + (graph.nodes.length % 4) * 60 + canvas.scrollLeft;
-    const y = 60 + (graph.nodes.length % 6) * 40 + canvas.scrollTop;
+  function addNode(program, pos) {
+    const x = pos ? pos.x : 60 + (graph.nodes.length % 4) * 60 + canvas.scrollLeft;
+    const y = pos ? pos.y : 60 + (graph.nodes.length % 6) * 40 + canvas.scrollTop;
     const id = "n" + (nodeSeq++);
-    graph.nodes.push({ id, program, args: {}, gpu: "0", name: "", x, y });
-    selected = id; dirty = true;
+    const node = { id, program, args: {}, gpu: "0", name: "", x, y };
+    graph.nodes.push(node);
+    selectOnly(id); dirty = true;
     renderNodes(); renderInspector();
+    return node;
   }
   function removeNode(id) {
     graph.nodes = graph.nodes.filter((n) => n.id !== id);
     graph.edges = graph.edges.filter((e) => e.from !== id && e.to !== id);
-    if (selected === id) selected = null;
+    selectedSet.delete(id);
+    if (selected === id) selected = selectedSet.size ? [...selectedSet][0] : null;
     dirty = true; renderNodes(); renderInspector();
   }
   function addEdge(fromId, toId, field, kind) {
     if (fromId === toId) return;
     graph.edges = graph.edges.filter((e) => !(e.to === toId && e.field === field));   // one source per field
     graph.edges.push({ id: "e" + (edgeSeq++), from: fromId, to: toId, field, kind });
+    inheritParams(fromId, toId, kind);
     dirty = true; renderNodes(); renderInspector();
   }
   function removeEdge(id) { graph.edges = graph.edges.filter((e) => e.id !== id); dirty = true; renderNodes(); renderInspector(); }
 
+  // When a node's model output feeds another node of the same moded program
+  // (train -> predict), copy the source's parameters into the target (mode aside),
+  // since a predict run usually matches its training run apart from --mode.
+  function inheritParams(fromId, toId, kind) {
+    const src = nodeById(fromId), dst = nodeById(toId);
+    if (!src || !dst || src.program !== dst.program) return;
+    if (!MODED_PROGRAMS.has(dst.program) || !String(kind || "").endsWith("_model")) return;
+    const wiredFields = new Set(graph.edges.filter((e) => e.to === toId).map((e) => e.field));
+    for (const [k, v] of Object.entries(src.args || {})) {
+      if (k === "mode" || wiredFields.has(k)) continue;
+      if (!(k in dst.args)) dst.args[k] = v;
+    }
+    if (!("mode" in dst.args)) dst.args.mode = "predict";
+    if (!("mode" in src.args)) src.args.mode = "train";
+  }
+
+  // Auto-wire a freshly dropped node `b` to the node `a` it landed on: prefer
+  // a -> b (a's output into b's input), else b -> a, on the first matching kind.
+  function autoConnect(aId, bId) {
+    const a = nodeById(aId), b = nodeById(bId);
+    if (!a || !b) return;
+    const aOut = byName[a.program]?.produces || [], bOut = byName[b.program]?.produces || [];
+    const aIn = inputsOf(a.program), bIn = inputsOf(b.program);
+    let hit = bIn.find(([, kind]) => aOut.includes(kind));
+    if (hit) return addEdge(aId, bId, hit[0], hit[1]);
+    hit = aIn.find(([, kind]) => bOut.includes(kind));
+    if (hit) { addEdge(bId, aId, hit[0], hit[1]); return; }
+    flash(`No compatible ports between ${a.program} and ${b.program}.`);
+  }
+
   const nodeById = (id) => graph.nodes.find((n) => n.id === id);
   const inputsOf = (program) => Object.entries((byName[program] || {}).bindable || {});
   const nodeHeight = (n) => HEADER_H + Math.max(1, inputsOf(n.program).length) * ROW_H + 8;
-  const outPort = (n) => ({ x: n.x + NODE_W, y: n.y + HEADER_H / 2 });
-  const inPort = (n, idx) => ({ x: n.x, y: n.y + HEADER_H + idx * ROW_H + ROW_H / 2 });
+
+  // Port positions (canvas coords) — orientation-aware.
+  function outPort(n) {
+    return horiz() ? { x: n.x + NODE_W, y: n.y + HEADER_H / 2 }
+                   : { x: n.x + NODE_W / 2, y: n.y + nodeHeight(n) };
+  }
+  function inPort(n, idx, count) {
+    if (horiz()) return { x: n.x, y: n.y + HEADER_H + idx * ROW_H + ROW_H / 2 };
+    const c = Math.max(1, count);
+    return { x: n.x + (NODE_W * (idx + 1)) / (c + 1), y: n.y };
+  }
+
+  // ── selection ──
+  function selectOnly(id) { selectedSet.clear(); if (id) selectedSet.add(id); selected = id; }
+  function toggleSel(id) { if (selectedSet.has(id)) selectedSet.delete(id); else selectedSet.add(id); selected = selectedSet.has(id) ? id : ([...selectedSet][0] || null); }
 
   // ── rendering ──
   function renderNodes() {
@@ -136,34 +222,42 @@ export function WorkflowsView() {
     redrawWires();
   }
 
+  function portEl(cls, originX, originY, pos, data) {
+    const el = h("span", { class: "wf-port abs " + cls, style: { left: pos.x - originX - 6 + "px", top: pos.y - originY - 6 + "px" } });
+    Object.assign(el.dataset, data);
+    return el;
+  }
+
   function nodeEl(n) {
     const st = runState && runState[n.id] ? runState[n.id].status : null;
+    const running = wf && wf.status === "running";
     const el = h("div", {
-      class: "wf-node" + (selected === n.id ? " sel" : ""),
+      class: "wf-node" + (selectedSet.has(n.id) ? " sel" : "") + (selected === n.id ? " primary" : ""),
       style: { left: n.x + "px", top: n.y + "px", width: NODE_W + "px", height: nodeHeight(n) + "px" },
     });
     el.dataset.node = n.id;
     if (st) el.style.borderColor = STATUS_COLOR[st] || "var(--border)";
-    // header (drag handle + select)
+    // header (drag handle + select + run + remove)
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
       st ? h("span", { class: "wf-node-st", style: { color: STATUS_COLOR[st] } }, st) : null,
+      h("button", { class: "wf-node-run", title: "Run this step", disabled: running, onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon("play", 12)),
       h("button", { class: "wf-node-x", title: "Remove step", onclick: (e) => { e.stopPropagation(); removeNode(n.id); } }, "×"));
     head.addEventListener("pointerdown", (e) => startNodeDrag(e, n));
     el.appendChild(head);
-    // input ports
-    inputsOf(n.program).forEach(([field, kind], i) => {
+    // input ports (label rows in the body + an absolutely-placed dot per port)
+    const ins = inputsOf(n.program);
+    ins.forEach(([field, kind], i) => {
       const wired = graph.edges.find((e) => e.to === n.id && e.field === field);
-      const port = h("span", { class: "wf-port in" + (wired ? " wired" : "") });
-      port.dataset.node = n.id; port.dataset.field = field; port.dataset.kind = kind;
-      const row = h("div", { class: "wf-port-row in" }, port,
+      const row = h("div", { class: "wf-port-row" + (horiz() ? " in" : " v") },
         h("span", { class: "wf-port-label", title: `${field} (${kind})` }, field));
       el.appendChild(row);
+      el.appendChild(portEl("in" + (wired ? " wired" : ""), n.x, n.y, inPort(n, i, ins.length),
+        { node: n.id, field, kind }));
     });
     // single output port
     if ((byName[n.program]?.produces || []).length) {
-      const op = h("span", { class: "wf-port out" });
-      op.dataset.node = n.id; op.dataset.out = "1";
+      const op = portEl("out", n.x, n.y, outPort(n), { node: n.id, out: "1" });
       op.addEventListener("pointerdown", (e) => startWire(e, n));
       el.appendChild(op);
     }
@@ -171,8 +265,14 @@ export function WorkflowsView() {
   }
 
   function wirePath(p1, p2, edge, temp = false) {
-    const dx = Math.max(40, Math.abs(p2.x - p1.x) * 0.5);
-    const d = `M ${p1.x} ${p1.y} C ${p1.x + dx} ${p1.y}, ${p2.x - dx} ${p2.y}, ${p2.x} ${p2.y}`;
+    let d;
+    if (horiz()) {
+      const dx = Math.max(40, Math.abs(p2.x - p1.x) * 0.5);
+      d = `M ${p1.x} ${p1.y} C ${p1.x + dx} ${p1.y}, ${p2.x - dx} ${p2.y}, ${p2.x} ${p2.y}`;
+    } else {
+      const dy = Math.max(40, Math.abs(p2.y - p1.y) * 0.5);
+      d = `M ${p1.x} ${p1.y} C ${p1.x} ${p1.y + dy}, ${p2.x} ${p2.y - dy}, ${p2.x} ${p2.y}`;
+    }
     const st = edge && runState && runState[edge.from] ? runState[edge.from].status : null;
     const path = svgEl("path", {
       d, fill: "none", "stroke-width": temp ? 2 : 2.5,
@@ -191,8 +291,9 @@ export function WorkflowsView() {
     for (const e of graph.edges) {
       const s = nodeById(e.from), d = nodeById(e.to);
       if (!s || !d) continue;
-      const idx = Math.max(0, inputsOf(d.program).findIndex(([f]) => f === e.field));
-      svg.appendChild(wirePath(outPort(s), inPort(d, idx), e));
+      const ins = inputsOf(d.program);
+      const idx = Math.max(0, ins.findIndex(([f]) => f === e.field));
+      svg.appendChild(wirePath(outPort(s), inPort(d, idx, ins.length), e));
     }
     if (drag && drag.kind === "wire" && tempTo) svg.appendChild(wirePath(outPort(nodeById(drag.from)), tempTo, null, true));
   }
@@ -202,13 +303,22 @@ export function WorkflowsView() {
     const r = canvas.getBoundingClientRect();
     return { x: e.clientX - r.left + canvas.scrollLeft, y: e.clientY - r.top + canvas.scrollTop };
   }
+  function elementNodeAt(clientX, clientY) {
+    const tgt = document.elementFromPoint(clientX, clientY);
+    const el = tgt && tgt.closest && tgt.closest(".wf-node");
+    return el ? el.dataset.node : null;
+  }
   function startNodeDrag(e, n) {
-    if (e.target.closest(".wf-node-x")) return;
+    if (e.target.closest(".wf-node-x") || e.target.closest(".wf-node-run")) return;
     e.preventDefault();
-    selected = n.id; renderInspector();
+    if (e.shiftKey || e.ctrlKey || e.metaKey) toggleSel(n.id);
+    else if (!selectedSet.has(n.id)) selectOnly(n.id);
+    else selected = n.id;
+    renderNodes(); renderInspector();
     const p = canvasPoint(e);
-    drag = { kind: "node", id: n.id, dx: p.x - n.x, dy: p.y - n.y };
-    nodesLayer.querySelectorAll(".wf-node").forEach((el) => el.classList.toggle("sel", el.dataset.node === n.id));
+    // move every selected node together
+    const group = (selectedSet.has(n.id) ? [...selectedSet] : [n.id]).map((id) => nodeById(id)).filter(Boolean);
+    drag = { kind: "node", id: n.id, ox: p.x, oy: p.y, start: group.map((g) => ({ id: g.id, x: g.x, y: g.y })) };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -222,11 +332,15 @@ export function WorkflowsView() {
     if (!drag) return;
     const p = canvasPoint(e);
     if (drag.kind === "node") {
-      const n = nodeById(drag.id); if (!n) return;
-      n.x = Math.max(0, p.x - drag.dx); n.y = Math.max(0, p.y - drag.dy);
-      const el = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"]`);
-      if (el) { el.style.left = n.x + "px"; el.style.top = n.y + "px"; }
-      redrawWires();
+      const ddx = p.x - drag.ox, ddy = p.y - drag.oy;
+      for (const s of drag.start) {
+        const node = nodeById(s.id); if (!node) continue;
+        node.x = Math.max(0, s.x + ddx); node.y = Math.max(0, s.y + ddy);
+        const el = nodesLayer.querySelector(`.wf-node[data-node="${node.id}"]`);
+        if (el) { el.style.left = node.x + "px"; el.style.top = node.y + "px"; }
+      }
+      // ports move with the node; cheapest correct redraw is a full re-render
+      renderNodes();
     } else {
       redrawWires(p);
     }
@@ -255,7 +369,7 @@ export function WorkflowsView() {
     const n = selected && nodeById(selected);
     if (!n) {
       inspector.appendChild(h("div", { class: "wf-insp-empty muted" },
-        "Select a step to edit its parameters. Wire a step's output port (right) into another step's input port (left) to pass data."));
+        "Select a step to edit its parameters. Wire a step's output port into another step's input port to pass data. Shift-click to multi-select."));
       return;
     }
     inspector.appendChild(h("div", { class: "wf-insp-head" }, h("strong", null, n.program)));
@@ -267,7 +381,7 @@ export function WorkflowsView() {
     inspector.appendChild(h("label", { class: "wf-lbl" }, "GPU", gpuI));
 
     const schema = schemaCache[n.program];
-    if (!schema) { api.program(n.program).then((s) => { schemaCache[n.program] = s; if (selected === n.id) renderInspector(); }).catch(() => {}); inspector.appendChild(h("div", { class: "muted small" }, "Loading parameters…")); return; }
+    if (!schema) { loadSchema(n.program).then(() => { if (selected === n.id) renderInspector(); }); inspector.appendChild(h("div", { class: "muted small" }, "Loading parameters…")); return; }
     const bindable = byName[n.program]?.bindable || {};
     inspector.appendChild(h("div", { class: "wf-insp-sub muted small" }, "Parameters"));
     for (const f of visibleFields(schema)) {
@@ -304,11 +418,75 @@ export function WorkflowsView() {
     const inp = h("input", { class: "wf-field", type: numeric ? "number" : "text",
       placeholder: f.default != null ? String(f.default) : "", value: cur != null ? String(cur) : "" });
     inp.addEventListener("input", () => set(numeric && inp.value !== "" ? Number(inp.value) : inp.value));
+    // file/dir parameters get a "browse the server" button (same picker as the form)
+    if (f.widget === "path") {
+      const browse = h("button", { class: "wf-browse btn-icon", type: "button", title: "Browse server",
+        onclick: () => openFilePicker(f.path_kind || "file", (p) => { inp.value = p; set(p); }) }, icon("folderOpen", 15));
+      return h("div", { class: "wf-path-row" }, inp, browse);
+    }
     return inp;
   }
 
+  function loadSchema(program) {
+    if (schemaCache[program]) return Promise.resolve(schemaCache[program]);
+    return api.program(program).then((s) => (schemaCache[program] = s)).catch(() => null);
+  }
+
+  // ── layout ──
+  function toggleOrientation() {
+    graph.orientation = horiz() ? "vertical" : "horizontal";
+    syncOrientBtn(); autoLayout(); dirty = true;
+  }
+  function syncOrientBtn() {
+    clear(orientBtn);
+    orientBtn.append(icon(horiz() ? "arrowRight" : "chevronRight", 14), horiz() ? "Horizontal" : "Vertical");
+  }
+
+  // Arrange nodes into longest-path dependency tiers along the layout axis.
+  function autoLayout() {
+    const order = topoLocal();
+    if (!order) { flash("Can't auto-layout: the graph has a cycle.", "err"); return; }
+    const depth = {};
+    for (const n of graph.nodes) depth[n.id] = 0;
+    for (const id of order) for (const e of graph.edges) if (e.from === id) depth[e.to] = Math.max(depth[e.to] || 0, (depth[id] || 0) + 1);
+    const tiers = {};
+    for (const n of graph.nodes) (tiers[depth[n.id] || 0] ||= []).push(n);
+    const PAD = 40, GAP_MAIN = 100, GAP_CROSS = 26;
+    Object.keys(tiers).map(Number).sort((a, b) => a - b).forEach((d) => {
+      let cross = PAD;
+      for (const n of tiers[d]) {
+        if (horiz()) { n.x = PAD + d * (NODE_W + GAP_MAIN); n.y = cross; cross += nodeHeight(n) + GAP_CROSS; }
+        else { n.y = PAD + d * (HEADER_H + 3 * ROW_H + 70); n.x = cross; cross += NODE_W + GAP_CROSS; }
+      }
+    });
+    renderNodes();
+  }
+  function topoLocal() {
+    const ids = graph.nodes.map((n) => n.id);
+    const indeg = Object.fromEntries(ids.map((i) => [i, 0]));
+    const adj = Object.fromEntries(ids.map((i) => [i, []]));
+    for (const e of graph.edges) if (adj[e.from] && e.to in indeg) { adj[e.from].push(e.to); indeg[e.to]++; }
+    const q = ids.filter((i) => indeg[i] === 0), order = [];
+    while (q.length) { const i = q.shift(); order.push(i); for (const j of adj[i]) if (--indeg[j] === 0) q.push(j); }
+    return order.length === ids.length ? order : null;
+  }
+
+  // ── import a project ──
+  async function importProject() {
+    const pid = getState().activeProjectId;
+    if (!pid) { flash("Open a project first (Projects) to import it.", "err"); return; }
+    flash("Importing project…", "busy");
+    try {
+      const imported = await api.workflowFromProject(pid);
+      await refreshList();
+      await openWorkflow(imported.id);
+      autoLayout();
+      flash(`Imported ${graph.nodes.length} step(s). Edit & re-run as a workflow.`, "muted");
+    } catch (err) { flash("Import failed: " + (err.detail || err.message), "err"); }
+  }
+
   // ── persistence + run ──
-  function graphSnapshot() { return { nodes: graph.nodes, edges: graph.edges }; }
+  function graphSnapshot() { return { nodes: graph.nodes, edges: graph.edges, orientation: graph.orientation }; }
   function flash(msg, kind = "warn") { statusEl.className = "wf-status " + kind; statusEl.textContent = msg; }
 
   async function save() {
@@ -322,13 +500,18 @@ export function WorkflowsView() {
     return wf;
   }
 
-  async function run() {
+  // ids === null -> run the whole workflow; an array -> run that subset only.
+  async function runNodes(ids) {
     if (!getState().activeProjectId) { flash("Open a project first (Projects) — workflow steps run into it.", "err"); return; }
     if (!graph.nodes.length) { flash("Add at least one step.", "warn"); return; }
+    if (ids && !ids.length) { flash("Select one or more steps first.", "warn"); return; }
     await save();
     if (!wf) return;
-    try { wf = await api.runWorkflow(wf.id); flash("Running…", "busy"); startPolling(); }
-    catch (err) {
+    try {
+      wf = await api.runWorkflow(wf.id, ids || undefined);
+      flash(ids ? `Running ${ids.length} step(s)…` : "Running…", "busy");
+      startPolling();
+    } catch (err) {
       const errs = err.detail && err.detail.errors ? err.detail.errors : [err.detail || err.message];
       flash("Cannot run: " + errs.join("; "), "err");
     }
@@ -340,7 +523,7 @@ export function WorkflowsView() {
       if (!wf) return stopPolling();
       try {
         const w = await api.workflow(wf.id);
-        runState = w.run_state || null; renderNodes();
+        wf = w; runState = w.run_state || null; renderNodes();
         const counts = countStatuses();
         flash(`${w.status} — ${counts}`, w.status === "running" ? "busy" : (w.status === "succeeded" ? "muted" : "err"));
         if (w.status !== "running") stopPolling();
@@ -357,18 +540,24 @@ export function WorkflowsView() {
 
   async function openWorkflow(id) {
     stopPolling();
+    selectedSet.clear();
     if (!id) {
-      wf = null; graph = { nodes: [], edges: [] }; runState = null; selected = null; nameInput.value = "";
-      wfSelect.value = ""; renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
+      wf = null; graph = { nodes: [], edges: [], orientation: "horizontal" }; runState = null; selected = null; nameInput.value = "";
+      wfSelect.value = ""; syncOrientBtn(); renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
     }
     try {
       wf = await api.workflow(id);
-      graph = wf.graph && wf.graph.nodes ? { nodes: wf.graph.nodes, edges: wf.graph.edges || [] } : { nodes: [], edges: [] };
+      const g = wf.graph || {};
+      graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || "horizontal" };
       // keep id counters ahead of loaded ids
       nodeSeq = Math.max(1, ...graph.nodes.map((n) => +(n.id.replace(/\D/g, "")) || 0)) + 1;
       edgeSeq = Math.max(1, ...graph.edges.map((e) => +((e.id || "").replace(/\D/g, "")) || 0)) + 1;
       runState = wf.run_state || null; selected = null; nameInput.value = wf.name || ""; wfSelect.value = wf.id;
-      renderNodes(); renderInspector();
+      syncOrientBtn();
+      // freshly imported / never-laid-out graphs have all-zero coords — tidy once
+      if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
+      else renderNodes();
+      renderInspector();
       flash(wf.status && wf.status !== "idle" ? `${wf.status} — ${countStatuses()}` : "Loaded.", "muted");
       if (wf.status === "running") startPolling();
     } catch (err) { flash("Load failed: " + (err.detail || err.message), "err"); }

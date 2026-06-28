@@ -27,26 +27,40 @@ browser in the dev environment).
   live per-node log peek. The canvas UI itself needs an in-browser pass (no
   browser in the dev env).
 
-#### Workflow builder — backlog (requested)
+#### Workflow builder — backlog (requested) — ✅ all implemented
 
-- [ ] **Layout modes** — horizontal and vertical arrangement of the graph.
-- [ ] **File-field picker** — for parameters that take a file, allow choosing via
-  the existing file browser (instead of a plain text input in the node inspector).
-- [ ] **Inherit params on predict↔train wiring** — when connecting a predict node
-  to a train node, pre-fill the predict node with the train node's form
-  parameters by default (they're usually identical apart from `--mode`).
-- [x] **Custom box names → job names** — already implemented: a node's "name"
-  field becomes the launched job's name.
-- [ ] **Open a project as a workflow** — load an existing project's jobs into the
-  builder as a graph (inferred from input bindings) and edit it from there.
-- [ ] **Run single nodes / a selection** — run one node or a selected subset from
-  the builder, and surface each node's state (saved / executed / succeeded /
-  failed) on the canvas.
-- [ ] **Drag-and-drop add + drop-to-connect** — drag a program from the palette
-  onto the canvas (not only click-to-add); dropping a node on top of another
-  auto-connects compatible output→input ports.
-- [ ] **Auto-layout button** — re-arrange the graph into dependency levels
-  (topological tiers / sub-workflows) so it is easier to follow.
+- [x] **Layout modes** — a Horizontal/Vertical toggle in the topbar
+  (`graph.orientation`, persisted). Port geometry is orientation-aware (inputs on
+  the left edge + output on the right for horizontal; inputs along the top edge +
+  output on the bottom for vertical) and wires bend along the active axis.
+- [x] **File-field picker** — node-inspector parameters whose schema `widget` is
+  `path` now render a 📂 browse button (`openFilePicker`) beside the text input,
+  same server file browser as the launcher form.
+- [x] **Inherit params on predict↔train wiring** — wiring a moded program's model
+  output into another node of the *same* program (`*_model` kind, e.g. a HetSIREN
+  train → HetSIREN predict) copies the source's parameters into the target
+  (`inheritParams`), filling only unset/unwired fields, and defaults
+  source→`mode=train`, target→`mode=predict`.
+- [x] **Custom box names → job names** — a node's "name" field becomes the
+  launched job's name.
+- [x] **Open a project as a workflow** — "From project" imports the open project's
+  jobs as an editable graph: nodes = jobs, edges inferred from each job's stored
+  input bindings, seeded with every job's real status. Backend
+  `WorkflowManager.build_from_project` + `POST /api/workflows/from-project/{pid}`;
+  the canvas auto-tidies the imported graph.
+- [x] **Run single nodes / a selection** — a ▶ button on each node runs just that
+  step; shift/ctrl-click multi-selects and "Run selected" runs the subset; the
+  backend `run(wid, only=…)` keeps untouched nodes' state so an already-succeeded
+  upstream feeds the steps being run. Per-node status (saved / running /
+  succeeded / failed / blocked) colors each node + its outgoing wires, with a
+  legend under the palette.
+- [x] **Drag-and-drop add + drop-to-connect** — palette programs are draggable
+  onto the canvas (in addition to click-to-add); dropping a program on top of an
+  existing node auto-connects the first compatible output→input port pair
+  (`autoConnect`).
+- [x] **Auto-layout button** — "Tidy" arranges the graph into longest-path
+  dependency tiers along the active axis (`autoLayout`); also runs automatically
+  on orientation change and on project import.
 
 - [x] **1** — Left menu collapses to icons-only via a header toggle.
 - [x] **2** — Project manager: Settings page sets a common projects root (gear icon

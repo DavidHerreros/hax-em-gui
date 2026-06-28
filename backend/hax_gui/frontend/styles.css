@@ -537,10 +537,27 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .wf-port-row { display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px; position: relative; }
 .wf-port-label { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wf-port { width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--brand, #2dd4bf); background: var(--surface); flex-shrink: 0; }
-.wf-port.in { position: absolute; left: -6px; }
 .wf-port.in.wired { background: var(--brand, #2dd4bf); }
 .wf-port-row.in { padding-left: 14px; }
-.wf-port.out { position: absolute; right: -6px; top: 12px; cursor: crosshair; background: var(--brand, #2dd4bf); }
+.wf-port-row.v { padding: 0 8px; }
+/* dots are absolutely placed on the node from JS geometry (orientation-aware) */
+.wf-port.abs { position: absolute; z-index: 3; }
+.wf-port.out { cursor: crosshair; background: var(--brand, #2dd4bf); }
+
+/* per-node header buttons (run this step / remove) */
+.wf-node-run { background: none; border: none; color: var(--muted); cursor: pointer; padding: 0 2px; display: inline-flex; align-items: center; }
+.wf-node-run:hover { color: var(--brand, #2dd4bf); }
+.wf-node-run:disabled { opacity: .35; cursor: default; }
+.wf-node.primary { box-shadow: 0 0 0 2px var(--brand, #2dd4bf), 0 2px 12px rgba(0,0,0,.3); }
+.wf-node.sel:not(.primary) { box-shadow: 0 0 0 1.5px var(--brand, #2dd4bf); }
+
+/* drag-and-drop a program onto the canvas */
+.wf-canvas.wf-drop { outline: 2px dashed var(--brand, #2dd4bf); outline-offset: -6px; }
+
+/* status legend under the palette */
+.wf-legend { display: flex; flex-direction: column; gap: 4px; padding: 10px; border-top: 1px solid var(--border); margin-top: 6px; }
+.wf-leg { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.wf-leg-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
 
 .wf-inspector { width: 260px; flex-shrink: 0; border-left: 1px solid var(--border); overflow-y: auto; background: var(--surface); padding: 10px 12px; }
 .wf-insp-empty { font-size: 12.5px; line-height: 1.5; }
@@ -550,3 +567,6 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .wf-field { padding: 5px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 12.5px; }
 .wf-bool { display: inline-flex; align-items: center; }
 .wf-wired-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border: 1px dashed var(--brand, #2dd4bf); border-radius: 6px; color: var(--text); font-size: 11.5px; }
+.wf-path-row { display: flex; gap: 5px; align-items: stretch; }
+.wf-path-row .wf-field { flex: 1; min-width: 0; }
+.wf-browse { flex-shrink: 0; }
