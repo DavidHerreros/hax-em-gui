@@ -6,6 +6,27 @@
 Backend verified end-to-end; frontend built but pending an in-browser check (no
 browser in the dev environment).
 
+### Big-ticket roadmap status
+
+- **annotate_space + interactive 3D** — ✅ DONE via the browser-native WebGL
+  viewer (`viewer_app/`): isosurface + SSAO, point cloud, volume ray-marching,
+  morph/export, launchable from annotate_space and predict runs. *Keep in mind:*
+  the native PyQt5/napari path still exists for users who want it.
+- **Remote ChimeraX (WebRTC)** — ✅ Effectively superseded: the WebGL viewer
+  renders the conformational landscape and decoded maps client-side (ChimeraX-
+  like shading), so the planned headless-ChimeraX + NVENC→WebRTC pixel stream is
+  no longer needed for the common path. *Keep in mind:* revisit only if true
+  ChimeraX-renderer fidelity (its exact volume/render features) is ever required.
+- **Workflow builder** — ✅ MVP done (PLAN §7): a **node-graph canvas** (`views/
+  workflows.js`) where program nodes are wired output→input, backed by a DAG
+  engine (`workflows.py`) that topologically schedules each node as a real job,
+  passing an upstream node's output into the downstream input via the existing
+  binding system; blocks downstream steps on failure. Backend + engine verified
+  (validation, topo/cycle detection, binding wiring, failure propagation). *Keep
+  in mind / next:* curated templates, parallel branch execution, canvas pan/zoom,
+  richer per-field editors (file pickers), live per-node log peek. The canvas UI
+  itself needs an in-browser pass (no browser in the dev env).
+
 - [x] **1** — Left menu collapses to icons-only via a header toggle.
 - [x] **2** — Project manager: Settings page sets a common projects root (gear icon
   at the bottom of the left menu); projects are folders under it; each run gets a

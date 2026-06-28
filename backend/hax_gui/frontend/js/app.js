@@ -13,6 +13,7 @@ import { MetricsView } from "./views/metrics.js";
 import { ViewerView } from "./views/viewer.js";
 import { JobsView } from "./views/jobs.js";
 import { JobDetailView } from "./views/jobDetail.js";
+import { WorkflowsView } from "./views/workflows.js";
 
 const DOCS_URL = "https://davidherreros.github.io/hax-em-docs/";
 const THEME_KEY = "hax_gui_theme";
@@ -90,13 +91,6 @@ function buildRightMenu() {
   subscribe(syncRail);
   syncRail();
   return menu;
-}
-
-function WorkflowsView() {
-  return h("div", { class: "view empty-state" },
-    icon("workflow", 40),
-    h("p", { style: { fontSize: "18px", marginTop: "16px" } }, "Visual workflow builder — coming in Phase 3."),
-    h("p", { class: "muted", style: { marginTop: "4px" } }, "Chain programs into pipelines, wiring outputs to inputs."));
 }
 
 initTheme();

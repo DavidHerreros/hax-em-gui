@@ -50,6 +50,15 @@ export const api = {
   tensorboards: () => req("/api/tensorboard"),
   metricsJobs: () => req("/api/metrics/jobs"),
 
+  // workflows (visual pipeline builder)
+  workflowCatalog: () => req("/api/workflows/catalog"),
+  workflows: (projectId) => req(`/api/workflows${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
+  workflow: (id) => req(`/api/workflows/${id}`),
+  createWorkflow: (body) => req("/api/workflows", { method: "POST", body: JSON.stringify(body) }),
+  updateWorkflow: (id, body) => req(`/api/workflows/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteWorkflow: (id) => req(`/api/workflows/${id}`, { method: "DELETE" }),
+  runWorkflow: (id) => req(`/api/workflows/${id}/run`, { method: "POST" }),
+
   // WebGL viewer sessions
   viewers: () => req("/api/viewer"),
   viewerFromJob: (jobId) => req(`/api/viewer/from-job/${jobId}`, { method: "POST" }),

@@ -23,6 +23,7 @@ from . import gpus, projects, registry, settings_store
 from .command import ValidationError
 from .config import settings
 from .jobs import JobActive, JobNotFound, JobNotSaved, ProjectNotFound, manager
+from .workflows import WorkflowError, manager as wf_manager
 from .projects import ProjectsRootUnset
 from .tensorboard import tb_manager
 from .viewer import viewer_manager
@@ -56,6 +57,7 @@ async def revalidate_static(request: Request, call_next):
 @app.on_event("startup")
 def _startup() -> None:
     manager.init()
+    wf_manager.init()
     app.state.http = httpx.AsyncClient(timeout=None)
     app.state.shutdown = asyncio.Event()
 
@@ -114,6 +116,7 @@ def program(name: str) -> dict[str, Any]:
         "ssd_arg": registry.ssd_arg(name),
         "bindable": adapters.bindable_fields(name),
         "producers": adapters.producers_for(name),
+        "produces": adapters.produces(name),
     }
 
 
@@ -594,6 +597,82 @@ async def viewer_proxy(vid: str, path: str, request: Request) -> Response:
         headers=out_headers,
         media_type=upstream.headers.get("content-type"),
     )
+
+
+# -- workflows (visual pipeline builder + DAG engine) ----------------------
+@app.get("/api/workflows/catalog", dependencies=[Depends(auth)])
+def workflow_catalog() -> list[dict[str, Any]]:
+    """Program palette for the canvas: each entry's bindable input fields (input
+    ports) and the artifact kinds it produces (output ports)."""
+    out = []
+    for p in registry.list_programs():
+        out.append({
+            **p,
+            "bindable": adapters.bindable_fields(p["name"]),
+            "produces": adapters.produces(p["name"]),
+        })
+    return out
+
+
+class WorkflowBody(BaseModel):
+    project_id: str | None = None
+    name: str | None = None
+    graph: dict[str, Any] = {"nodes": [], "edges": []}
+
+
+class WorkflowUpdate(BaseModel):
+    name: str | None = None
+    graph: dict[str, Any] | None = None
+
+
+@app.get("/api/workflows", dependencies=[Depends(auth)])
+def list_workflows(project_id: str | None = None) -> list[dict[str, Any]]:
+    return wf_manager.list(project_id)
+
+
+@app.post("/api/workflows", dependencies=[Depends(auth)])
+def create_workflow(body: WorkflowBody) -> dict[str, Any]:
+    return wf_manager.save(body.project_id, body.name, body.graph)
+
+
+@app.get("/api/workflows/{wid}", dependencies=[Depends(auth)])
+def get_workflow(wid: str) -> dict[str, Any]:
+    wf = wf_manager.get(wid)
+    if wf is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return wf
+
+
+@app.put("/api/workflows/{wid}", dependencies=[Depends(auth)])
+def update_workflow(wid: str, body: WorkflowUpdate) -> dict[str, Any]:
+    try:
+        return wf_manager.update(wid, name=body.name, graph=body.graph)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="workflow not found")
+
+
+@app.delete("/api/workflows/{wid}", dependencies=[Depends(auth)])
+def delete_workflow(wid: str) -> dict[str, str]:
+    wf_manager.delete(wid)
+    return {"status": "deleted"}
+
+
+@app.post("/api/workflows/{wid}/validate", dependencies=[Depends(auth)])
+def validate_workflow(wid: str) -> dict[str, Any]:
+    wf = wf_manager.get(wid)
+    if wf is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return {"errors": wf_manager.validate(wf["graph"])}
+
+
+@app.post("/api/workflows/{wid}/run", dependencies=[Depends(auth)])
+async def run_workflow(wid: str) -> dict[str, Any]:
+    try:
+        return await wf_manager.run(wid)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    except WorkflowError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
 
 
 # -- static SPA (mounted last so /api and /ws take precedence) -------------

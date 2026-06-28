@@ -502,3 +502,51 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 /* ===== 3D viewer tab ===== */
 .viewer-view .tb-frame { height: calc(100vh - 240px); min-height: 520px; }
 .viewer-view .section-head { margin-bottom: 10px; }
+
+/* ── Workflow builder (node-graph canvas) ───────────────────────────── */
+.container:has(.workflows-view) { max-width: none; padding: 0; height: 100%; }
+.workflows-view { display: flex; flex-direction: column; height: 100%; min-height: 480px; }
+
+.wf-topbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; flex-wrap: wrap; }
+.wf-name { flex: 0 1 220px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); }
+.wf-select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); max-width: 200px; }
+.wf-status { font-size: 12px; }
+.wf-status.busy { color: var(--brand, #2dd4bf); } .wf-status.err { color: #ef4444; } .wf-status.warn { color: #f59e0b; }
+
+.wf-body { flex: 1; display: flex; min-height: 0; }
+.wf-palette { width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); overflow-y: auto; background: var(--surface); }
+.wf-palette-head { padding: 10px 10px 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.wf-pal-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; text-align: left; padding: 7px 10px; background: none; border: none; border-top: 1px solid var(--border); color: var(--text); cursor: pointer; font-size: 13px; }
+.wf-pal-item:hover { background: var(--bg); }
+.wf-pal-out { font-size: 10px; }
+
+.wf-canvas { flex: 1; position: relative; overflow: auto; background: var(--bg);
+  background-image: radial-gradient(var(--border) 1px, transparent 1px); background-size: 22px 22px; }
+.wf-wires { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 1; }
+.wf-nodes { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; }
+
+.wf-node { position: absolute; border: 1.5px solid var(--border); border-radius: 10px; background: var(--surface); box-shadow: 0 2px 8px rgba(0,0,0,.18); user-select: none; }
+.wf-node.sel { box-shadow: 0 0 0 2px var(--brand, #2dd4bf), 0 2px 10px rgba(0,0,0,.25); }
+.wf-node-head { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 8px; cursor: grab; border-bottom: 1px solid var(--border); }
+.wf-node-head:active { cursor: grabbing; }
+.wf-node-title { flex: 1; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-node-st { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.wf-node-x { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px; }
+.wf-node-x:hover { color: #ef4444; }
+
+.wf-port-row { display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px; position: relative; }
+.wf-port-label { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-port { width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--brand, #2dd4bf); background: var(--surface); flex-shrink: 0; }
+.wf-port.in { position: absolute; left: -6px; }
+.wf-port.in.wired { background: var(--brand, #2dd4bf); }
+.wf-port-row.in { padding-left: 14px; }
+.wf-port.out { position: absolute; right: -6px; top: 12px; cursor: crosshair; background: var(--brand, #2dd4bf); }
+
+.wf-inspector { width: 260px; flex-shrink: 0; border-left: 1px solid var(--border); overflow-y: auto; background: var(--surface); padding: 10px 12px; }
+.wf-insp-empty { font-size: 12.5px; line-height: 1.5; }
+.wf-insp-head { font-size: 14px; margin-bottom: 8px; }
+.wf-insp-sub { margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .05em; }
+.wf-lbl { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; color: var(--muted); margin-bottom: 8px; }
+.wf-field { padding: 5px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 12.5px; }
+.wf-bool { display: inline-flex; align-items: center; }
+.wf-wired-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border: 1px dashed var(--brand, #2dd4bf); border-radius: 6px; color: var(--text); font-size: 11.5px; }

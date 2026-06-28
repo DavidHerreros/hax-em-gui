@@ -126,6 +126,20 @@ def producer_programs(kind: str) -> list[str]:
     return sorted(progs)
 
 
+def produces(program: str) -> list[str]:
+    """The artifact kinds a program's output can feed into another program's input
+    (its workflow output ports): e.g. a predict run -> ``latents``; a trained
+    network -> its ``*_model`` kinds."""
+    kinds: set[str] = set()
+    for spec in _LATENT_PRODUCERS:
+        if program in spec["programs"]:
+            kinds.add("latents")
+    for kind, info in _MODEL_KINDS.items():
+        if program in info["programs"]:
+            kinds.add(kind)
+    return sorted(kinds)
+
+
 def producers_for(program: str) -> dict[str, list[str]]:
     """{kind: [producer programs]} for every bindable field-kind of `program`."""
     kinds = set(bindable_fields(program).values())
