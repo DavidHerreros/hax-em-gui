@@ -453,6 +453,14 @@ class JobManager:
             rows = self._exec("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,), fetch="all")
         return [self._row(r) for r in rows]
 
+    def count_active(self) -> int:
+        """Number of jobs currently pending or running (used to gate updates)."""
+        row = self._exec(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status IN ('pending','running')",
+            fetch="one",
+        )
+        return int(row["n"]) if row else 0
+
     def list_for_project(self, project_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self._exec(
             "SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT ?",

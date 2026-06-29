@@ -6,6 +6,7 @@ import { defineRoutes, setOutlet, onRoute, startRouter } from "./router.js";
 import { getToken, setToken } from "./api.js";
 import { store, getState, subscribe } from "./store.js";
 import { buildLauncher } from "./views/launcher.js";
+import { startUpdates, updateBadge } from "./updates.js";
 import { HomeView } from "./views/home.js";
 import { ProjectsView } from "./views/projects.js";
 import { SettingsView } from "./views/settings.js";
@@ -65,6 +66,7 @@ function buildSidebar() {
     h("div", { class: "brand" },
       h("img", { src: "/assets/logo_small.png", alt: "Hax" }),
       h("span", { class: "side-label brand-name" }, "Hax"),
+      updateBadge(),
       collapseBtn),
     h("nav", { class: "nav" }, ...navLinks),
     h("div", { class: "spacer" }),
@@ -122,3 +124,4 @@ defineRoutes([
 ]);
 
 startRouter();
+startUpdates();

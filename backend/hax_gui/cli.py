@@ -90,6 +90,46 @@ def _running() -> dict | None:
     return state
 
 
+# ── self-restart (used by the in-GUI updater after updating hax-em-gui) ──────
+def self_restart_possible() -> bool:
+    """True when this very process is the server tracked in the state file, so a
+    detached ``restart`` would relaunch *us* on the same host/port. False for a
+    raw ``uvicorn …`` launch (no state file) — the caller then asks the user to
+    restart by hand."""
+    state = _running()
+    return bool(state and state.get("pid") == os.getpid())
+
+
+def _spawn_detached(action: str, delay: float) -> bool:
+    """Detach a helper that waits ``delay`` seconds (so the caller can flush its
+    final messages to clients) and then runs ``hax-gui <action>``. Returns whether
+    it was scheduled (False when this isn't the tracked server)."""
+    if not self_restart_possible():
+        return False
+    settings.ensure_dirs()
+    import subprocess
+
+    log = open(settings.data_dir / "server.log", "ab")
+    subprocess.Popen(
+        [sys.executable, "-c",
+         f"import time; time.sleep({delay}); from hax_gui.cli import main; main(['{action}'])"],
+        stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+        start_new_session=True,  # survive this server being SIGTERM'd
+    )
+    return True
+
+
+def spawn_restart(delay: float = 2.0) -> bool:
+    """Restart the server in place (used after a self-contained GUI update)."""
+    return _spawn_detached("restart", delay)
+
+
+def spawn_stop(delay: float = 2.0) -> bool:
+    """Close the server (used after a devel pull, so the user installs deps and
+    restarts by hand). Returns whether the shutdown was scheduled."""
+    return _spawn_detached("stop", delay)
+
+
 def _connect_host(host: str) -> str:
     # 0.0.0.0 (all interfaces) isn't directly connectable; probe loopback.
     return "127.0.0.1" if host in ("0.0.0.0", "::", "") else host

@@ -36,6 +36,17 @@ export const api = {
   programs: () => req("/api/programs"),
   program: (name) => req(`/api/programs/${name}`),
   gpus: () => req("/api/gpus"),
+  updates: () => req("/api/updates"),
+  checkUpdates: () => req("/api/updates/check", { method: "POST" }),
+  updateRunState: () => req("/api/updates/run"),
+  runUpdate: (pkg, mode = "full") => req("/api/updates/run", { method: "POST", body: JSON.stringify({ package: pkg, mode }) }),
+  health: () => req("/api/health"),
+  // developer: git branches on editable (devel) installs
+  branches: () => req("/api/branches"),
+  fetchBranches: (pkg) => req("/api/branches/fetch", { method: "POST", body: JSON.stringify({ package: pkg }) }),
+  switchBranch: (pkg, branch) => req("/api/branches/switch", { method: "POST", body: JSON.stringify({ package: pkg, branch }) }),
+  setBranchSource: (pkg, path) => req("/api/branches/source", { method: "POST", body: JSON.stringify({ package: pkg, path: path || null }) }),
+  restartServer: () => req("/api/server/restart", { method: "POST" }),
   files: (path) => req(`/api/files${path ? `?path=${encodeURIComponent(path)}` : ""}`),
   jobs: () => req("/api/jobs"),
   job: (id) => req(`/api/jobs/${id}`),
@@ -95,10 +106,19 @@ export const api = {
 
 // Subscribe to a job's live log. Returns a close() function.
 export function subscribeLog(jobId, onMessage) {
+  return subscribeWS(`/ws/jobs/${jobId}/log`, onMessage);
+}
+
+// Subscribe to the live update-installer log. Returns a close() function.
+export function subscribeUpdateLog(onMessage) {
+  return subscribeWS(`/ws/updates/log`, onMessage);
+}
+
+function subscribeWS(path, onMessage) {
   const token = getToken();
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const q = token ? `?token=${encodeURIComponent(token)}` : "";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/jobs/${jobId}/log${q}`);
+  const ws = new WebSocket(`${proto}://${location.host}${path}${q}`);
   ws.onmessage = (e) => onMessage(JSON.parse(e.data));
   return () => { try { ws.close(); } catch { /* already closed */ } };
 }
