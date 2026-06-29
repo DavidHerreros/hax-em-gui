@@ -45,3 +45,22 @@ def projects_root() -> Path | None:
 def ssd_scratch_root() -> Path | None:
     raw = load().get("ssd_scratch_root")
     return Path(raw).expanduser() if raw else None
+
+
+def source_repos() -> dict[str, str]:
+    """User-configured source-clone paths per package, for the branch panel to
+    manage a dev checkout that the install itself doesn't point at (e.g. a PyPI
+    install plus a separate git clone)."""
+    raw = load().get("source_repos")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def set_source_repo(name: str, path: str | None) -> dict[str, str]:
+    """Set (or, with a falsy ``path``, clear) the source clone for ``name``."""
+    repos = source_repos()
+    if path:
+        repos[name] = path
+    else:
+        repos.pop(name, None)
+    update({"source_repos": repos})
+    return repos

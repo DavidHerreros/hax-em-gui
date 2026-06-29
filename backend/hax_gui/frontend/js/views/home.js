@@ -1,6 +1,7 @@
 // Landing page: logo hero, documentation links, and a "how to use the GUI" guide.
 import { h } from "../h.js";
 import { icon } from "../icons.js";
+import { UpdateBanner } from "../updates.js";
 
 const DOCS = "https://davidherreros.github.io/hax-em-docs/";
 
@@ -21,6 +22,7 @@ export function HomeView() {
   return h(
     "div",
     { class: "view" },
+    UpdateBanner(),
     hero(),
     section("Documentation", h("div", { class: "grid", style: { marginBottom: "36px" } }, ...DOC_CARDS.map(docCard))),
     section("Using the GUI", h("div", { class: "steps" }, ...STEPS.map(step)))

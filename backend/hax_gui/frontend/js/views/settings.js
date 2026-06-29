@@ -4,6 +4,7 @@ import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { errorBox, skeleton } from "./ui.js";
 import { openFilePicker } from "./filePicker.js";
+import { BranchPanel } from "./branchPanel.js";
 
 export function SettingsView() {
   const root = h("div", { class: "view form-container" },
@@ -15,7 +16,7 @@ export function SettingsView() {
   mount(body, skeleton("160px"));
 
   api.getSettings()
-    .then((s) => mount(body, form(s)))
+    .then((s) => mount(body, h("div", null, form(s), BranchPanel())))
     .catch((err) => mount(body, errorBox(err)));
 
   function pathField(label, help, current, onChange) {

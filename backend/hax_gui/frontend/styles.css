@@ -639,3 +639,72 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 /* label dots inside a workflow node header */
 .wf-node-labels { display: inline-flex; gap: 3px; align-items: center; }
 .wf-node-ldot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+/* ===== update notifications ===== */
+.update-banner {
+  display: flex; gap: 14px; align-items: flex-start;
+  border: 1px solid color-mix(in srgb, var(--brand-600) 45%, var(--border));
+  border-radius: 14px; padding: 16px 18px; margin-bottom: 24px;
+  background:
+    radial-gradient(120% 140% at 0% 0%, rgba(99, 102, 241, 0.1), transparent 60%),
+    var(--surface);
+  animation: fade-in .3s ease-out both;
+}
+.update-banner-icon { color: var(--brand-300); flex-shrink: 0; margin-top: 2px; }
+.update-banner-body { flex: 1; min-width: 0; }
+.update-banner-body > h3 { font-size: 15px; margin: 0 0 10px; }
+.update-item { padding-top: 10px; }
+.update-item + .update-item { border-top: 1px solid var(--border); margin-top: 4px; }
+.update-item-head { display: flex; align-items: center; gap: 10px; }
+.update-pkg { font-family: "JetBrains Mono", monospace; font-size: 13px; font-weight: 600; color: var(--accent); }
+.update-how { color: var(--muted); font-size: 12px; margin: 8px 0 6px; }
+.update-dismiss { margin-left: auto; background: none; border: none; color: var(--faint); padding: 4px; border-radius: 8px; flex-shrink: 0; }
+.update-dismiss:hover { background: var(--surface-hover); color: var(--text); }
+.update-warn { display: flex; align-items: center; gap: 5px; color: var(--warn); font-size: 12px; margin: 2px 0 0; }
+
+.update-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  background: rgba(99, 102, 241, 0.18); color: var(--brand-300);
+  box-shadow: inset 0 0 0 1px var(--active-ring);
+}
+.update-badge:hover { background: rgba(99, 102, 241, 0.28); }
+/* When the sidebar is collapsed the brand text hides; keep the badge legible. */
+.app.left-collapsed .update-badge { display: none !important; }
+
+.update-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
+.update-cmd-hint { font-size: 12px; }
+.update-cmd-hint code { font-family: "JetBrains Mono", monospace; color: var(--muted); }
+.update-modal-note { margin: 12px 0 0; font-size: 13px; }
+.update-modal-note.update-ok { color: var(--ok); }
+.update-modal-note.update-warn { color: var(--warn); }
+.modal .console { max-height: 320px; overflow: auto; }
+
+.update-depbox {
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  border-radius: 10px; padding: 12px 14px; margin: 12px 0;
+}
+.update-depbox p { margin: 0 0 6px; font-size: 13px; line-height: 1.5; }
+.update-depbox .icon { vertical-align: -2px; color: var(--warn); }
+.update-depbox code, .update-nextsteps code { font-family: "JetBrains Mono", monospace; }
+.update-nextsteps { margin-top: 12px; }
+.update-nextsteps .update-how { margin-top: 10px; }
+.modal-foot .ml-auto { flex: 1; }
+
+/* ===== developer / branch panel ===== */
+.branch-card { padding: 18px 20px; margin-bottom: 14px; }
+.branch-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.branch-repo { font-family: "JetBrains Mono", monospace; font-size: 12px; }
+.branch-status { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-top: 10px; }
+.branch-now { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 14px; }
+.branch-now .icon { color: var(--accent); }
+.branch-flag { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; }
+.branch-flag.clean { color: var(--ok); }
+.branch-flag.dirty { color: var(--warn); }
+.branch-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.branch-controls .gpu-select { min-width: 220px; }
+.branch-out:not(:empty) { margin-top: 12px; }
+.branch-source { margin: 8px 0 0; }
+.branch-link { color: var(--accent); cursor: pointer; }
+.branch-link:hover { text-decoration: underline; }
