@@ -5,11 +5,15 @@ import { api } from "../api.js";
 import { errorBox } from "./ui.js";
 
 export function openFilePicker(kind, onSelect) {
-  let current; // current directory listing
+  let current;            // current directory listing
+  let showHidden = false; // hide dotfiles by default
 
   const list = h("div", { class: "filelist" });
   const pathLabel = h("span", { class: "cur" }, "…");
   const upBtn = h("button", { class: "btn-icon", onclick: () => load(current && current.parent) }, icon("chevronUp", 16));
+  const hiddenToggle = h("label", { class: "fp-hidden", title: "Show hidden files (dotfiles)" },
+    h("input", { type: "checkbox", onchange: (e) => { showHidden = e.target.checked; renderList(); } }),
+    "Hidden");
 
   const foot =
     kind === "directory"
@@ -29,7 +33,7 @@ export function openFilePicker(kind, onSelect) {
       h("span", null, "Select " + kind),
       h("button", { class: "btn-icon", style: { border: "none" }, onclick: close }, icon("x", 18))
     ),
-    h("div", { class: "modal-path" }, upBtn, pathLabel),
+    h("div", { class: "modal-path" }, upBtn, pathLabel, hiddenToggle),
     list,
     foot
   );
@@ -51,14 +55,23 @@ export function openFilePicker(kind, onSelect) {
         current = data;
         pathLabel.textContent = data.path;
         upBtn.disabled = !data.parent;
-        const entries = data.entries.filter((e) => (kind === "directory" ? e.is_dir : true));
-        if (!entries.length) return mount(list, h("p", { class: "muted", style: { padding: "12px" } }, "Empty."));
-        mount(
-          list,
-          h("div", null, ...entries.map((e) => entryRow(e)))
-        );
+        renderList();
       })
       .catch((err) => mount(list, errorBox(err)));
+  }
+
+  // Render the current listing, hiding dotfiles unless "Hidden" is on. Toggling
+  // re-renders in place (no re-fetch).
+  function renderList() {
+    if (!current) return;
+    const entries = current.entries.filter((e) =>
+      (showHidden || !e.hidden) && (kind === "directory" ? e.is_dir : true));
+    if (!entries.length) {
+      const hiddenN = current.entries.filter((e) => e.hidden && (kind === "directory" ? e.is_dir : true)).length;
+      const msg = !showHidden && hiddenN ? `Empty (${hiddenN} hidden).` : "Empty.";
+      return mount(list, h("p", { class: "muted", style: { padding: "12px" } }, msg));
+    }
+    mount(list, h("div", null, ...entries.map((e) => entryRow(e))));
   }
 
   function entryRow(e) {

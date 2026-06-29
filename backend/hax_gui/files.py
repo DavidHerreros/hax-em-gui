@@ -55,6 +55,7 @@ def list_dir(path: str | None) -> dict[str, Any]:
                     "name": child.name,
                     "path": str(child),
                     "is_dir": is_dir,
+                    "hidden": child.name.startswith("."),   # dotfile; hidden by default in the UI
                     "size": None if is_dir else child.stat().st_size,
                 }
             )

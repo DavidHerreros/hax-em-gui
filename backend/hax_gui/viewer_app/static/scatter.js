@@ -15,7 +15,7 @@ export function createScatter(canvas, onSelect) {
   let selected = -1, hover = -1, pathSet = new Set(), selSet = new Set();
   let pathOrder = [], pathColor = "#f472b6";   // ordered morph path drawn as a polyline
   let freeCurves = [];   // [{ pts:[[x,y]...] data coords, color }] free-spline overlays
-  let densBandwidth = 6, pointAlpha = 1.0;
+  let densBandwidth = 6, pointAlpha = 1.0, bgColor = null;   // bgColor set => opaque fill (dark density backdrop)
   let cmap = [[15, 23, 42], [30, 64, 120], [13, 148, 136], [250, 204, 21]];   // density colormap stops
   let bounds = { minX: -1, minY: -1, maxX: 1, maxY: 1 };   // data extent (fit)
   let view = { minX: -1, minY: -1, maxX: 1, maxY: 1 };     // visible window (zoom/pan); == bounds when fit
@@ -75,16 +75,19 @@ export function createScatter(canvas, onSelect) {
   // Density color from the active colormap (alpha rises with t so faint→opaque). The
   // light theme needs a higher, more opaque range or the colormap washes out on the
   // pale background.
-  function ramp(t) {
+  function ramp(t, forceAlpha) {
     t = Math.max(0, Math.min(1, t));
     const f = t * (cmap.length - 1), i = Math.min(cmap.length - 2, Math.floor(f)), u = f - i;
     const c = (a, b) => Math.round(a + (b - a) * u);
-    const light = document.documentElement.dataset.theme === "light";
-    const alpha = light ? 0.5 + 0.48 * t : 0.25 + 0.6 * t;
+    // A dark backdrop (density mode) reads like the desktop app's inferno layer;
+    // a light page background needs a higher floor or the colormap washes out.
+    const light = !bgColor && document.documentElement.dataset.theme === "light";
+    const alpha = forceAlpha != null ? forceAlpha : (light ? 0.5 + 0.48 * t : 0.18 + 0.72 * t);
     return `rgba(${c(cmap[i][0], cmap[i + 1][0])},${c(cmap[i][1], cmap[i + 1][1])},${c(cmap[i][2], cmap[i + 1][2])},${alpha})`;
   }
 
-  function drawDensity() {
+  // Smoothed point-count grid (shared by the heatmap fill and per-point tinting).
+  function buildDensityGrid() {
     const G = 64, grid = new Float32Array(G * G);
     for (const [x, y] of points) {
       const gx = Math.min(G - 1, Math.max(0, Math.floor((x - bounds.minX) / (bounds.maxX - bounds.minX) * G)));
@@ -93,7 +96,17 @@ export function createScatter(canvas, onSelect) {
     }
     for (let p = 0; p < densBandwidth; p++) blur(grid, G);   // wider sigma = more passes
     let max = 0; for (let i = 0; i < grid.length; i++) max = Math.max(max, grid[i]);
-    if (max <= 0) return;
+    return { grid, G, max };
+  }
+  function densityAt(dg, x, y) {
+    if (!dg || dg.max <= 0) return 0;
+    const gx = Math.min(dg.G - 1, Math.max(0, Math.floor((x - bounds.minX) / (bounds.maxX - bounds.minX) * dg.G)));
+    const gy = Math.min(dg.G - 1, Math.max(0, Math.floor((y - bounds.minY) / (bounds.maxY - bounds.minY) * dg.G)));
+    return dg.grid[gy * dg.G + gx] / dg.max;
+  }
+  function drawDensity(dg) {
+    if (!dg || dg.max <= 0) return;
+    const { grid, G, max } = dg;
     const bw = bounds.maxX - bounds.minX, bh = bounds.maxY - bounds.minY;
     for (let gy = 0; gy < G; gy++) for (let gx = 0; gx < G; gx++) {
       const v = grid[gy * G + gx] / max; if (v < 0.02) continue;
@@ -108,7 +121,8 @@ export function createScatter(canvas, onSelect) {
   function paint(bg) {
     const w = canvas.width, h = canvas.height;
     if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, w, h); } else ctx.clearRect(0, 0, w, h);
-    if (showDensity) drawDensity();
+    const dg = showDensity ? buildDensityGrid() : null;
+    if (dg) drawDensity(dg);
     const r = 3 * dpr();
     for (let i = 0; i < points.length; i++) {
       const hl = i === selected || pathSet.has(i) || i === hover;
@@ -116,15 +130,20 @@ export function createScatter(canvas, onSelect) {
       const [sx, sy] = toScreen(points[i][0], points[i][1]);
       ctx.globalAlpha = hl ? 1 : pointAlpha;
       ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      // In density mode tint each point by its local density (lifted off the dark
+      // low end so sparse points stay visible) — the colored-sphere look.
       ctx.fillStyle = i === selected ? "#2dd4bf" : pathSet.has(i) ? "#f472b6" : i === hover ? "#e2e8f0"
-        : pointColors ? pointColors[i] : labels ? clusterColor(labels[i]) : "rgba(148,163,184,0.6)";
+        : pointColors ? pointColors[i]
+        : dg ? ramp(0.32 + 0.68 * densityAt(dg, points[i][0], points[i][1]), 1)
+        : labels ? clusterColor(labels[i]) : "rgba(148,163,184,0.6)";
       ctx.fill();
     }
     ctx.globalAlpha = 1;
     drawFreeCurves();
     drawPath();
-    // selection ring must contrast with the background -> dark on the light theme
-    const selCol = document.documentElement.dataset.theme === "light" ? "rgba(15,23,42,0.9)" : "rgba(241,245,249,0.9)";
+    // selection ring must contrast with the background -> dark only on a light
+    // backdrop (the density mode forces a dark canvas regardless of page theme)
+    const selCol = (!bgColor && document.documentElement.dataset.theme === "light") ? "rgba(15,23,42,0.9)" : "rgba(241,245,249,0.9)";
     for (const si of selSet) ring(si, selCol, 1.7, true);
     for (const pi of pathSet) ring(pi, "#f472b6");
     ring(selected, "#2dd4bf");
@@ -171,7 +190,7 @@ export function createScatter(canvas, onSelect) {
       }
     }
   }
-  function draw() { resize(); paint(null); if (onRenderCb) onRenderCb(); }
+  function draw() { resize(); paint(bgColor); if (onRenderCb) onRenderCb(); }
   let onRenderCb = null;
 
   function nearest(cx, cy) {
@@ -207,6 +226,7 @@ export function createScatter(canvas, onSelect) {
     setPoints(p) { points = p; setBounds(); draw(); },
     setLabels(l) { labels = l; draw(); },
     setPointColors(arr) { pointColors = arr; draw(); },   // per-point CSS color (layers mode); null clears
+    setBackground(css) { bgColor = css || null; draw(); },   // opaque dark fill in density mode; null = transparent (theme)
     setDensity(on) { showDensity = on; draw(); },
     setDensityBandwidth(b) { densBandwidth = Math.max(1, b | 0); if (showDensity) draw(); },
     setColormap(stops) { if (stops && stops.length >= 2) cmap = stops; if (showDensity) draw(); },
@@ -229,7 +249,7 @@ export function createScatter(canvas, onSelect) {
     async snapshot({ scale = 2, transparent = false } = {}) {
       const ow = canvas.width, oh = canvas.height;
       canvas.width = Math.floor(canvas.clientWidth * scale); canvas.height = Math.floor(canvas.clientHeight * scale);
-      paint(transparent ? null : "#020617");
+      paint(transparent ? null : (bgColor || "#020617"));
       const blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
       canvas.width = ow; canvas.height = oh; draw();
       return blob;

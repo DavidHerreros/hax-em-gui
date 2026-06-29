@@ -6,12 +6,14 @@ import { createScatter, clusterColor } from "./scatter.js";
 import { createCloud } from "./cloud.js";
 import { createHistogram } from "./histogram.js";
 
-// Density colormaps (RGB 0–255 control stops, low→high). Default viridis.
+// Density colormaps (RGB 0–255 control stops, low→high). Default inferno, to
+// match the desktop annotate_space landscape (napari "inferno" over a dark
+// canvas). Max 6 stops — the 3D glow shader's ramp array is sized 6.
 const COLORMAPS = {
   viridis: [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]],
   magma: [[0, 0, 4], [81, 18, 124], [183, 55, 121], [252, 137, 97], [252, 253, 191]],
   plasma: [[13, 8, 135], [126, 3, 168], [204, 71, 120], [248, 149, 64], [240, 249, 33]],
-  inferno: [[0, 0, 4], [87, 16, 110], [188, 55, 84], [249, 142, 9], [252, 255, 164]],
+  inferno: [[0, 0, 4], [50, 10, 94], [122, 28, 109], [188, 55, 84], [245, 135, 30], [252, 255, 164]],
   turbo: [[48, 18, 59], [33, 144, 141], [124, 211, 67], [253, 190, 61], [165, 14, 1]],
   cividis: [[0, 32, 76], [44, 70, 107], [124, 123, 120], [187, 175, 113], [255, 234, 70]],
   gray: [[20, 22, 30], [110, 114, 124], [180, 184, 192], [235, 237, 242]],
@@ -25,7 +27,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let renderer, scatter, cloud = null, hist;
 let L = null, umapData = null, points3 = [];
 const clusterCache = {};
-const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.22, densMap: "viridis", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 25, pointAlpha: 1, pathExpanded: false, smooth: 6 };
+const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 25, pointAlpha: 1, pathExpanded: false, smooth: 6 };
 const frameDelay = () => 1000 / Math.max(2, Math.min(30, state.fps));
 let decodeToken = 0;
 
@@ -62,6 +64,10 @@ const activeLand = () => (is3d() && cloud ? cloud : scatter);
 // via ?theme= on load and a postMessage on toggle. We mirror it onto <html> (CSS
 // vars do the chrome) and swap the 3D/volume canvas clear color to match.
 const THEME_BG = { dark: "#040610", light: "#e7ecf3" };
+// The density landscape always renders on a near-black backdrop (like the
+// desktop app's napari canvas) so the inferno ramp reads correctly — even when
+// the surrounding GUI is in light mode. Other color modes follow the theme.
+const DENSITY_BG = "#050409";
 function applyTheme(theme) {
   theme = theme === "light" ? "light" : "dark";
   document.documentElement.dataset.theme = theme;
@@ -70,11 +76,20 @@ function applyTheme(theme) {
   const c = hexToRgb(bg);
   renderer.setBackground(c);
   if (volRenderer) volRenderer.setBackground(c);
-  if (cloud) cloud.setBackground(c);
+  applyLandscapeBg();   // keeps the dark density backdrop across theme toggles
   // Selection rings / path use a theme-aware contrast color computed at draw time,
   // so the landscape must repaint when the theme toggles.
   if (scatter) scatter.draw();
   if (cloud) cloud.render();
+}
+
+// The latent landscape (2D scatter + 3D cloud) goes dark in density mode, else
+// follows the page theme. The molecular map view (renderer/volRenderer) is
+// independent and always follows the theme.
+function applyLandscapeBg() {
+  const dens = state.colorBy === "density";
+  if (scatter) scatter.setBackground(dens ? DENSITY_BG : null);
+  if (cloud) cloud.setBackground(hexToRgb(dens ? DENSITY_BG : $("bg").value));
 }
 
 async function boot() {
@@ -429,11 +444,17 @@ function toggleColorWraps() {
 
 async function applyColor() {
   const labels = state.colorBy === "cluster" ? await clusterLabels() : null;
+  applyLandscapeBg();   // dark backdrop in density mode, else the page theme
   if (is3d() && cloud) {
     const dens = state.colorBy === "density";
-    if (dens) { cloud.setDensityField(density3(points3, 0.04 + state.densBandwidth * 0.02)); cloud.setDensityIntensity(state.densIntensity); }
+    if (dens) {
+      const dv = density3(points3, 0.04 + state.densBandwidth * 0.02);
+      cloud.setDensityField(dv); cloud.setDensityIntensity(state.densIntensity);
+      cloud.setColors(densityRampColors(dv));   // inferno-tinted points, like the desktop app
+    } else {
+      cloud.setColors(computeColors(labels));
+    }
     cloud.showDensity(dens);
-    cloud.setColors(computeColors(labels));   // neutral-gray points under the density glow
     return;
   }
   if (state.colorBy === "layers") { scatter.setDensity(false); scatter.setLabels(null); scatter.setPointColors(layerColorsCSS()); return; }
@@ -441,6 +462,25 @@ async function applyColor() {
   if (state.colorBy === "density") { scatter.setLabels(null); scatter.setDensityBandwidth(state.densBandwidth); scatter.setDensity(true); return; }
   scatter.setDensity(false);
   scatter.setLabels(state.colorBy === "cluster" ? labels : null);
+}
+
+// Per-point RGB (0..1) from local density through the active colormap, lifted off
+// the dark low end so even sparse points stay visible (the 2D scatter does the
+// equivalent internally). Matches the colored spheres of the desktop landscape.
+function densityRampColors(dv) {
+  const stops = COLORMAPS[state.densMap] || COLORMAPS.inferno;
+  const out = new Float32Array(dv.length * 3);
+  for (let i = 0; i < dv.length; i++) {
+    const rgb = rampRGB(stops, 0.32 + 0.68 * dv[i]);
+    out[i * 3] = rgb[0] / 255; out[i * 3 + 1] = rgb[1] / 255; out[i * 3 + 2] = rgb[2] / 255;
+  }
+  return out;
+}
+function rampRGB(stops, t) {
+  t = Math.max(0, Math.min(1, t));
+  const f = t * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(f)), u = f - i;
+  const c = (a, b) => Math.round(a + (b - a) * u);
+  return [c(stops[i][0], stops[i + 1][0]), c(stops[i][1], stops[i + 1][1]), c(stops[i][2], stops[i + 1][2])];
 }
 
 // Per-point RGB for the 3D cloud (cluster palette / local-density ramp / gray).

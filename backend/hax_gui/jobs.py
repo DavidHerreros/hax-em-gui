@@ -11,7 +11,9 @@ import asyncio
 import codecs
 import contextlib
 import json
+import os
 import shutil
+import signal
 import sqlite3
 import uuid
 from collections import deque
@@ -300,6 +302,12 @@ class JobManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=cwd,
+                # Own session/process group: a hax program spawns its real workers
+                # via `forkserver` (JAX/CUDA), and those grandchildren inherit the
+                # stdout pipe. Cancelling must signal the whole group, or they keep
+                # the pipe open, the reader never sees EOF, and the job is stuck
+                # "cancelling" forever. start_new_session => pgid == proc.pid.
+                start_new_session=True,
             )
         except OSError as exc:
             self._exec(
@@ -352,14 +360,22 @@ class JobManager:
         if proc is None:
             return
         self._exec("UPDATE jobs SET status='cancelling' WHERE id=?", (job_id,))
-        # The process may exit on its own between our check and the signal.
-        with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
+        # Terminate the whole process group (workers + the launcher), not just the
+        # direct child — otherwise grandchildren keep the stdout pipe open and the
+        # reader never reaches the terminal-status update. SIGTERM first for a
+        # clean shutdown, then SIGKILL if it doesn't exit promptly.
+        self._signal_group(proc, signal.SIGTERM)
         try:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except asyncio.TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+            self._signal_group(proc, signal.SIGKILL)
+
+    @staticmethod
+    def _signal_group(proc: asyncio.subprocess.Process, sig: int) -> None:
+        # The process may exit on its own between our check and the signal; a group
+        # owned by another user (shouldn't happen here) raises PermissionError.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(os.getpgid(proc.pid), sig)
 
     def delete(self, job_id: str) -> None:
         """Remove a finished job: its DB record and its run folder (outputs+log)."""

@@ -57,7 +57,12 @@ export function JobDetailView(params) {
     } else if (running && job) {
       head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
         viewable(job) ? viewerBtn() : null,
-        h("button", { class: "btn ghost", style: { color: "var(--warn)" }, onclick: () => api.cancelJob(id).catch(() => {}) }, icon("ban", 15), "Cancel")));
+        h("button", { class: "btn ghost", style: { color: "var(--warn)" }, onclick: (e) => {
+          // immediate feedback; the terminal status still arrives over the WS once
+          // the process group has been torn down
+          const b = e.currentTarget; b.disabled = true; b.lastChild.textContent = "Cancelling…";
+          api.cancelJob(id).catch(() => { b.disabled = false; b.lastChild.textContent = "Cancel"; });
+        } }, icon("ban", 15), "Cancel")));
     } else if (job) {
       head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
         viewable(job) ? viewerBtn() : null,

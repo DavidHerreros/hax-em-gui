@@ -93,6 +93,7 @@ export function WorkflowsView() {
   const importBtn = h("button", { class: "btn small", title: "Open the active project as a live workflow (edits & runs change the project)", onclick: openProject }, icon("box", 14), "Open project");
   const asProjBtn = h("button", { class: "btn small", title: "Create a new project backed by this workflow", onclick: saveAsProject }, icon("plus", 14), "Save as project");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
+  const dupBtn = h("button", { class: "btn secondary", title: "Duplicate the selected step(s) as new, un-run steps (Ctrl/Cmd+D)", onclick: () => duplicateNodes([...selectedSet]) }, icon("copy", 15), "Duplicate");
   const runSelBtn = h("button", { class: "btn secondary", title: "Run the selected step(s) only", onclick: () => runNodes([...selectedSet]) }, icon("play", 15), "Run selected");
   const runBtn = h("button", { class: "btn", title: "Run the whole workflow", onclick: () => runNodes(null) }, icon("play", 15), "Run all");
   const delBtn = h("button", { class: "btn", title: "Delete this workflow", onclick: removeWorkflow }, icon("trash", 15));
@@ -100,7 +101,7 @@ export function WorkflowsView() {
     h("strong", null, "Workflow"), wfSelect,
     h("button", { class: "btn small", onclick: () => openWorkflow(null) }, "+ New"),
     importBtn, asProjBtn, nameInput, orientBtn, layoutBtn, pinBtn, restoreBtn, centerBtn, mmBtn, zoomLabel,
-    h("span", { style: { flex: "1" } }), statusEl, saveBtn, runSelBtn, runBtn, delBtn);
+    h("span", { style: { flex: "1" } }), statusEl, saveBtn, dupBtn, runSelBtn, runBtn, delBtn);
 
   // ── body: palette | canvas (+minimap) | inspector ──
   // Both side panels are resizable (drag the divider) and collapsible (chevron in
@@ -296,6 +297,40 @@ export function WorkflowsView() {
     if (selected === id) selected = selectedSet.size ? [...selectedSet][0] : null;
     dirty = true; renderNodes(); renderInspector();
   }
+
+  // Duplicate node(s) as fresh, un-run steps: copy program/args/gpu/name/labels at
+  // an offset and preserve edges internal to the set, leaving the copies unlinked
+  // (no job_id) so they become new jobs only when the workflow is run. The copies
+  // live in the graph and persist on Save.
+  function duplicateNodes(ids) {
+    const src = [...new Set(ids || [])].map(nodeById).filter(Boolean);
+    if (!src.length) { flash("Select a step to duplicate.", "muted"); return; }
+    const idMap = new Map(), made = [];
+    for (const n of src) {
+      const id = "n" + (nodeSeq++);
+      idMap.set(n.id, id);
+      graph.nodes.push({
+        id, program: n.program,
+        args: JSON.parse(JSON.stringify(n.args || {})),   // deep copy so edits don't bleed back
+        gpu: n.gpu || "0",
+        name: n.name ? n.name + " copy" : "",
+        labels: [...(n.labels || [])],
+        x: (n.x || 0) + 40, y: (n.y || 0) + 40,
+      });
+      made.push(id);
+    }
+    // re-create only the wiring whose both ends are in the duplicated set
+    const inSet = new Set(src.map((n) => n.id));
+    for (const e of graph.edges.slice()) {
+      if (inSet.has(e.from) && inSet.has(e.to)) {
+        graph.edges.push({ id: "e" + (edgeSeq++), from: idMap.get(e.from), to: idMap.get(e.to), field: e.field, kind: e.kind });
+      }
+    }
+    selectedSet.clear(); for (const id of made) selectedSet.add(id);
+    selected = made[made.length - 1];
+    dirty = true; renderNodes(); renderInspector();
+    flash(made.length === 1 ? "Step duplicated — Save to keep it." : `${made.length} steps duplicated — Save to keep them.`, "muted");
+  }
   const isMultiField = (program, field) => (byName[program]?.bindable_multi || []).includes(field);
 
   function addEdge(fromId, toId, field, kind) {
@@ -393,6 +428,7 @@ export function WorkflowsView() {
       labelDots.length ? h("span", { class: "wf-node-labels" }, ...labelDots.map((l) => h("span", { class: "wf-node-ldot", style: { background: l.color }, title: l.name }))) : null,
       st ? h("span", { class: "wf-node-st", style: { color: STATUS_COLOR[st] } }, st) : null,
       h("button", { class: "wf-node-run", title: "Run this step", disabled: running, onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon("play", 12)),
+      h("button", { class: "wf-node-run", title: "Duplicate this step (un-run copy)", onclick: (e) => { e.stopPropagation(); duplicateNodes([n.id]); } }, icon("copy", 12)),
       h("button", { class: "wf-node-x", title: "Remove step", onclick: (e) => { e.stopPropagation(); removeNode(n.id); } }, "×"));
     head.addEventListener("pointerdown", (e) => startNodeDrag(e, n));
     el.appendChild(head);
@@ -878,6 +914,16 @@ export function WorkflowsView() {
     catch (err) { flash("Delete failed: " + (err.detail || err.message), "err"); }
   }
 
+  // Ctrl/Cmd+D duplicates the current selection (unless typing in a field).
+  function onKey(e) {
+    if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "d") return;
+    const t = e.target;
+    if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+    e.preventDefault();
+    duplicateNodes([...selectedSet]);
+  }
+  document.addEventListener("keydown", onKey);
+
   boot();
-  return { el: root, cleanup: () => stopPolling() };
+  return { el: root, cleanup: () => { stopPolling(); document.removeEventListener("keydown", onKey); } };
 }
