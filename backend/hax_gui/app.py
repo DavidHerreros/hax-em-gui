@@ -992,7 +992,9 @@ def create_workflow(body: WorkflowBody) -> dict[str, Any]:
 
 @app.get("/api/workflows/{wid}", dependencies=[Depends(auth)])
 def get_workflow(wid: str) -> dict[str, Any]:
-    wf = wf_manager.get(wid)
+    # Reconcile a project workflow with its jobs' live statuses on load (no-op for
+    # standalone workflows / while running), so stale node states self-heal.
+    wf = wf_manager.reconcile(wid)
     if wf is None:
         raise HTTPException(status_code=404, detail="workflow not found")
     return wf

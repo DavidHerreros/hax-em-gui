@@ -108,6 +108,12 @@ class JobManager:
             "UPDATE jobs SET status='interrupted', finished_at=? WHERE status IN ('pending','running')",
             (_now(),),
         )
+        # A job left mid-cancel ('cancelling') also lost its process — finalise it
+        # as cancelled so it never sticks at 'cancelling' across a restart.
+        self._db.execute(
+            "UPDATE jobs SET status='cancelled', finished_at=? WHERE status='cancelling'",
+            (_now(),),
+        )
         self._db.commit()
 
     # -- creation / launch -------------------------------------------------

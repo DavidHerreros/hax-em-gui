@@ -196,6 +196,32 @@ class WorkflowManager:
         wf = self.save(project_id, name or "Project workflow", graph, kind="project")
         return self.seed_state(wf["id"], state)
 
+    def reconcile(self, wid: str) -> dict[str, Any] | None:
+        """Refresh a *project* workflow from its jobs' current statuses, so the
+        canvas is a true live view (a job that finished/cancelled outside a
+        workflow run no longer shows a stale node status, and downstream nodes
+        un-block once their inputs actually succeed). No-op for standalone
+        workflows and while a run is in progress."""
+        wf = self.get(wid)
+        if wf is None:
+            return None
+        if wf.get("kind") != "project" or not wf.get("project_id"):
+            return wf
+        if wf["status"] == "running" or (wid in self._running and not self._running[wid].done()):
+            return wf
+        graph, state = self._synced_graph(wf["graph"], wf["project_id"])
+        statuses = [s.get("status") for s in state.values()]
+        overall = ("failed" if "failed" in statuses
+                   else "running" if any(s in ("pending", "running", "cancelling") for s in statuses)
+                   else "succeeded" if statuses and all(s == "succeeded" for s in statuses)
+                   else "idle")
+        self._db.execute(
+            "UPDATE workflows SET graph=?, run_state=?, status=?, updated_at=? WHERE id=?",
+            (json.dumps(graph), json.dumps(state), overall, _now(), wid),
+        )
+        self._db.commit()
+        return self.get(wid)
+
     def _synced_graph(self, stored: dict[str, Any], project_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """Reconcile a stored project-workflow graph with the project's jobs:
         keep node positions / user-added (not-yet-run) nodes, drop nodes whose job
@@ -440,12 +466,15 @@ class WorkflowManager:
             self._running.pop(wid, None)
 
     async def _wait_job(self, job_id: str) -> str:
-        """Poll until the job leaves the active set; return its terminal status."""
+        """Poll until the job reaches a terminal status; return it. ``cancelling``
+        is transitional (the process is still being torn down), so keep waiting
+        through it — otherwise the step would be recorded as 'cancelling' forever
+        instead of its real terminal 'cancelled'."""
         while True:
             job = jobs.get(job_id)
             if job is None:
                 return "failed"
-            if job["status"] not in ACTIVE:
+            if job["status"] not in ACTIVE and job["status"] != "cancelling":
                 return job["status"]
             await asyncio.sleep(2.0)
 

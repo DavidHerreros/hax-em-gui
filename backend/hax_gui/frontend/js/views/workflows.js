@@ -24,7 +24,7 @@ const CONTENT_H = 3000;
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 // Concrete colors for the minimap (canvas 2D can't read CSS custom properties).
-const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", running: "#38bdf8", succeeded: "#22c55e", failed: "#ef4444", blocked: "#f59e0b", cancelled: "#94a3b8", idle: "#94a3b8" };
+const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", running: "#38bdf8", succeeded: "#22c55e", failed: "#ef4444", blocked: "#f59e0b", cancelling: "#f59e0b", cancelled: "#94a3b8", interrupted: "#f59e0b", idle: "#94a3b8" };
 
 // Programs that expose a train/predict mode — wiring their model output into
 // another node of the same program inherits the form parameters (mode aside).
@@ -36,8 +36,13 @@ const CATEGORY_ORDER = ["Networks", "Post-processing", "Metrics", "Viewers", "Ot
 const STATUS_COLOR = {
   saved: "#a78bfa", pending: "var(--muted)", running: "var(--accent)",
   succeeded: "#22c55e", failed: "var(--err)", blocked: "var(--warn)",
-  cancelled: "var(--muted)", interrupted: "var(--warn)", idle: "var(--muted)", skipped: "var(--muted)",
+  cancelling: "var(--warn)", cancelled: "var(--muted)", interrupted: "var(--warn)",
+  idle: "var(--muted)", skipped: "var(--muted)",
 };
+// Any status not in the map must still get a concrete color, or SVG strokes /
+// inline styles become "undefined" and render invisibly (e.g. a wire from a
+// 'cancelling' node would silently disappear).
+const statusColor = (st) => STATUS_COLOR[st] || "#64748b";
 
 function svgEl(tag, attrs = {}) {
   const el = document.createElementNS(SVG_NS, tag);
@@ -426,7 +431,7 @@ export function WorkflowsView() {
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
       labelDots.length ? h("span", { class: "wf-node-labels" }, ...labelDots.map((l) => h("span", { class: "wf-node-ldot", style: { background: l.color }, title: l.name }))) : null,
-      st ? h("span", { class: "wf-node-st", style: { color: STATUS_COLOR[st] } }, st) : null,
+      st ? h("span", { class: "wf-node-st", style: { color: statusColor(st) } }, st) : null,
       h("button", { class: "wf-node-run", title: "Run this step", disabled: running, onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon("play", 12)),
       h("button", { class: "wf-node-run", title: "Duplicate this step (un-run copy)", onclick: (e) => { e.stopPropagation(); duplicateNodes([n.id]); } }, icon("copy", 12)),
       h("button", { class: "wf-node-x", title: "Remove step", onclick: (e) => { e.stopPropagation(); removeNode(n.id); } }, "×"));
@@ -465,7 +470,7 @@ export function WorkflowsView() {
     const st = edge && runState && runState[edge.from] ? runState[edge.from].status : null;
     const path = svgEl("path", {
       d, fill: "none", "stroke-width": temp ? 2 : 2.5,
-      stroke: temp ? "var(--accent)" : (st ? STATUS_COLOR[st] : "#64748b"),
+      stroke: temp ? "var(--accent)" : statusColor(st),
       "stroke-dasharray": temp ? "5 4" : "",
     });
     if (edge && !temp) {
@@ -551,11 +556,22 @@ export function WorkflowsView() {
     }
     if (drag && drag.kind === "wire") {
       const tgt = document.elementFromPoint(e.clientX, e.clientY);
-      const port = tgt && tgt.closest && tgt.closest(".wf-port.in");
-      if (port && port.dataset.node && port.dataset.node !== drag.from) {
-        const srcProduces = byName[nodeById(drag.from).program]?.produces || [];
-        if (srcProduces.includes(port.dataset.kind)) addEdge(drag.from, port.dataset.node, port.dataset.field, port.dataset.kind);
-        else flash(`That step can't provide "${port.dataset.kind}".`);
+      const srcProduces = byName[nodeById(drag.from).program]?.produces || [];
+      const exact = tgt && tgt.closest && tgt.closest(".wf-port.in");
+      if (exact && exact.dataset.node && exact.dataset.node !== drag.from) {
+        // dropped right on an input dot
+        if (srcProduces.includes(exact.dataset.kind)) addEdge(drag.from, exact.dataset.node, exact.dataset.field, exact.dataset.kind);
+        else flash(`That step can't provide "${exact.dataset.kind}".`);
+      } else {
+        // forgiving: dropped anywhere on a node -> wire to its first compatible
+        // input (the 11px port dots are otherwise easy to miss)
+        const nodeEl = tgt && tgt.closest && tgt.closest(".wf-node");
+        const toId = nodeEl && nodeEl.dataset.node;
+        if (toId && toId !== drag.from) {
+          const hit = inputsOf(nodeById(toId).program).find(([, k]) => srcProduces.includes(k));
+          if (hit) addEdge(drag.from, toId, hit[0], hit[1]);
+          else flash("That step has no input this output can feed.");
+        }
       }
       redrawWires();
     } else if (drag && drag.kind === "node") {
