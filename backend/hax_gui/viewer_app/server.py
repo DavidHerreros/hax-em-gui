@@ -154,6 +154,14 @@ class Decoder:
         self._decode = None  # built lazily on first decode (defers the JAX import)
         self._cache: dict[int, np.ndarray] = {}
         self._cache_order: list[int] = []
+        # Small LRU for interpolated morph frames, keyed on a quantised (a, b, t):
+        # smooths the *first* pass of a morph (the GUI caches whole timelines
+        # client-side, so the server rarely sees a frame twice after that). Kept
+        # deliberately small — each entry is one full-resolution volume, so this
+        # is the cap that bounds server RAM here.
+        self._icache: dict[tuple, np.ndarray] = {}
+        self._icache_order: list[tuple] = []
+        self._icache_cap = 16
         self.extra: list[np.ndarray] = []   # centroid latents, addressed as indices n..n+m-1
 
     @property
@@ -167,6 +175,12 @@ class Decoder:
             if i >= self.landscape.n:
                 self._cache.pop(i, None)
         self._cache_order = [i for i in self._cache_order if i < self.landscape.n]
+        # interp frames touching a centroid index are likewise stale
+        n = self.landscape.n
+        for k in list(self._icache):
+            if k[0] >= n or k[1] >= n:
+                self._icache.pop(k, None)
+        self._icache_order = [k for k in self._icache_order if k[0] < n and k[1] < n]
         return self.landscape.n
 
     def _latent(self, index: int) -> np.ndarray:
@@ -221,9 +235,21 @@ class Decoder:
         return vol
 
     def volume_interp(self, a: int, b: int, t: float) -> np.ndarray:
-        """Decode the latent interpolated between states a and b (for morphs)."""
+        """Decode the latent interpolated between states a and b (for morphs).
+
+        Cached on a quantised (a, b, t) key so a looping / there-and-back morph
+        replays from the cache instead of re-running the JAX decode every frame."""
+        key = (a, b, round(float(t), 3))
+        hit = self._icache.get(key)
+        if hit is not None:
+            return hit
         latent = (1.0 - t) * self._latent(a) + t * self._latent(b)
-        return self._decode_latent(latent)
+        vol = self._decode_latent(latent)
+        self._icache[key] = vol
+        self._icache_order.append(key)
+        while len(self._icache_order) > self._icache_cap:
+            self._icache.pop(self._icache_order.pop(0), None)
+        return vol
 
 
 def _load_latents(path: str) -> np.ndarray:

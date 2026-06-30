@@ -27,12 +27,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let renderer, scatter, cloud = null, hist;
 let L = null, umapData = null, points3 = [];
 const clusterCache = {};
-const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 25, pointAlpha: 1, pathExpanded: false, smooth: 6 };
-const frameDelay = () => 1000 / Math.max(2, Math.min(30, state.fps));
+const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 60, pointAlpha: 1, pathExpanded: false, smooth: 6 };
+// `state.fps` is the *motion* rate: timeline frames advanced per second. We render
+// at most DISPLAY_FPS_CAP frames/sec; once the motion rate exceeds that we keep the
+// render rate at the cap and advance several frames per tick instead. That lets a
+// long (many-frame) morph traverse fast — the protein appears to move more per
+// second — without an absurd refresh rate. Below the cap, step == 1 (every frame
+// shown: maximally smooth, slower traversal).
+const DISPLAY_FPS_CAP = 30;
+function playCadence() {
+  const fps = Math.max(2, state.fps || 2);
+  const displayFps = Math.min(DISPLAY_FPS_CAP, fps);
+  return { delay: 1000 / displayFps, step: Math.max(1, Math.round(fps / displayFps)) };
+}
 let decodeToken = 0;
 
 // morph/series playback (a timeline of [a,b,t] frames; play/pause + scrubber)
 let playing = false, recording = false;
+// When a *drawn curve* drives the morph, its snap to the nearest states is an
+// internal implementation detail — we keep those "closest" picks out of the
+// scene (only the smooth curve overlay shows). Display-only: state.path still
+// holds the snapped indices that the decode walks.
+let hidePathPicks = false;
 
 // volume ray-marcher (created lazily on first switch to a Volume render mode)
 let volRenderer = null, curVolMeta = null;
@@ -186,7 +202,7 @@ function wireControls() {
   $("stop").addEventListener("click", stopPlayback);
   $("scrub").addEventListener("input", (e) => { setPlaying(false); if (!state.timeline.length) buildTimeline(); liveFrame(+e.target.value); });
   $("frames").addEventListener("change", () => { buildTimeline(); });
-  $("speed").addEventListener("input", (e) => { state.fps = +e.target.value; });
+  $("speed").addEventListener("input", (e) => { state.fps = +e.target.value; if (playing) backgroundFill(); });
   $("clearpath").addEventListener("click", clearPath);
   $("rendermode").addEventListener("change", (e) => setRenderMode(e.target.value));
   $("vgamma").addEventListener("input", (e) => { state.vGamma = +e.target.value; if (volRenderer) volRenderer.setGamma(state.vGamma); });
@@ -534,15 +550,20 @@ function applyColormap() {
 }
 
 function syncSelection() {
-  scatter.select(state.current); scatter.setPath(state.path); scatter.setSelection(state.selection);
-  const traj = [state.current, ...state.path].filter((v) => v >= 0);
+  // hidePathPicks: a curve-driven morph snaps to states only internally, so don't
+  // mark those picks (dots / rings / connecting polyline) — the drawn curve
+  // overlay still conveys the path. state.path is untouched, so decoding is fine.
+  const pathPts = hidePathPicks ? [] : state.path;
+  const traj = hidePathPicks ? [] : [state.current, ...state.path].filter((v) => v >= 0);
   const col = editingPathLayer ? editingPathLayer.color : "#f472b6";
+  scatter.select(state.current); scatter.setPath(pathPts); scatter.setSelection(state.selection);
   scatter.setPathOrder(traj, col);
-  if (cloud) { cloud.select(state.current); cloud.setPath(state.path); cloud.setSelection(state.selection); cloud.setPathOrder(traj, hexToRgb(col)); }
+  if (cloud) { cloud.select(state.current); cloud.setPath(pathPts); cloud.setSelection(state.selection); cloud.setPathOrder(traj, hexToRgb(col)); }
 }
 
 async function onSelect(i, opts) {
   if (playing) setPlaying(false);              // editing the path stops playback
+  hidePathPicks = false;                       // manual interaction -> show path picks again
   if (opts && opts.shift) {
     // shift-click toggles a waypoint: remove it if already on the path, else append
     const at = state.path.indexOf(i);
@@ -605,6 +626,7 @@ async function decode() {
 
 // ---- volume ray-marching mode ----
 function setRenderMode(mode) {
+  if (mode !== state.render) clearFrameCache();   // surface<->volume payloads differ
   state.render = mode; $("rendermode").value = mode;
   const surf = mode === "surface";
   $("gl").style.display = surf ? "" : "none";
@@ -657,6 +679,7 @@ function parseGrid(buf) {
 // so playback loops cleanly and the scrubber covers a full there-and-back). Cheap —
 // no network — so it's safe to call on every path edit.
 function buildTimeline() {
+  clearFrameCache();   // the frame list changed -> any cached frames are stale
   const path = trajectory();
   if (path.length < 2) { state.timeline = []; state.frame = 0; $("scrub").max = "0"; $("scrub").value = "0"; $("framelbl").textContent = "—"; return false; }
   const frames = Math.max(2, Math.min(120, +$("frames").value || 36));
@@ -670,6 +693,91 @@ function buildTimeline() {
   return true;
 }
 
+// ── decoded-frame cache + background fill ──────────────────────────────────
+// Each morph frame needs a server-side decode (JAX + marching cubes / grid),
+// which used to run synchronously inside the playback loop — so the speed
+// slider (which only sets the inter-frame sleep) couldn't outrun it. We now
+// decode off the critical path: a memory-budgeted LRU holds parsed frames keyed
+// by their decode query, and a background filler decodes the whole timeline (in
+// playhead order) as fast as the server allows, using the idle time during the
+// fps sleeps. Once the timeline fits the budget it stays fully cached, so every
+// loop after the first is pure cache hits and plays at the requested fps with
+// no mid-loop stalls. The budget is what bounds memory — sized by bytes (not a
+// frame count) because a 96³ grid and a marching-cubes mesh differ ~10×.
+const CACHE_BUDGET = 768 * 1024 * 1024;   // ~768 MB of decoded frames (tune freely)
+const frameCache = new Map();      // key -> { surface, payload, bytes }
+const frameInflight = new Map();   // key -> Promise (single-flight per key)
+const frameCacheKeys = [];         // insertion order, for LRU eviction
+let cacheBytes = 0;
+let fillToken = 0;                  // bumped to cancel an in-flight background fill
+
+function clearFrameCache() {
+  fillToken++;                     // cancel any running fill (its frames are stale)
+  frameCache.clear(); frameInflight.clear(); frameCacheKeys.length = 0; cacheBytes = 0;
+}
+
+// The decode request (query + cache key) for timeline frame i, or null.
+function frameRequest(i) {
+  if (!state.timeline.length) return null;
+  i = Math.max(0, Math.min(state.timeline.length - 1, i | 0));
+  const [a, b, t] = state.timeline[i];
+  const mass = state.refMass >= 0 ? state.refMass : null;
+  if (state.render === "surface") {
+    const q = `index=${a}&index2=${b}&t=${t.toFixed(4)}&smooth=${state.smooth}` + (mass != null ? `&mass=${mass}` : `&sigma=${state.sigma.toFixed(3)}`);
+    return { surface: true, url: `./api/decode?${q}`, key: `s|${q}` };
+  }
+  const q = `index=${a}&index2=${b}&t=${t.toFixed(4)}&size=96`;
+  return { surface: false, url: `./api/grid?${q}`, key: `v|${q}` };
+}
+
+// Decode (or reuse) frame i -> { surface, payload }. Caches the parsed result
+// and coalesces concurrent requests for the same key, so the prefetcher and the
+// render loop never fetch the same frame twice.
+function decodeFrame(i) {
+  const req = frameRequest(i);
+  if (!req) return Promise.resolve(null);
+  const hit = frameCache.get(req.key);
+  if (hit) return Promise.resolve(hit);
+  const flight = frameInflight.get(req.key);
+  if (flight) return flight;
+  const p = (async () => {
+    const buf = await (await fetch(req.url)).arrayBuffer();
+    const payload = req.surface ? parseMesh(buf) : parseGrid(buf);
+    const bytes = req.surface
+      ? payload.positions.byteLength + payload.normals.byteLength + payload.indices.byteLength
+      : payload.data.byteLength;
+    const entry = { surface: req.surface, payload, bytes };
+    frameCache.set(req.key, entry); frameCacheKeys.push(req.key); cacheBytes += bytes;
+    // evict oldest until under budget (never the entry we just added: it's at the tail)
+    while (cacheBytes > CACHE_BUDGET && frameCacheKeys.length > 1) {
+      const old = frameCacheKeys.shift();
+      const e = frameCache.get(old);
+      if (e) { cacheBytes -= e.bytes; frameCache.delete(old); }
+    }
+    return entry;
+  })();
+  p.finally(() => { if (frameInflight.get(req.key) === p) frameInflight.delete(req.key); });
+  frameInflight.set(req.key, p);
+  return p;
+}
+
+// Decode the whole timeline ahead of the playhead, as fast as the server allows
+// (one outstanding request; the fps sleeps leave plenty of idle time). Stops if
+// the cache fills the budget — past that point the look-ahead window is all we
+// can keep, so further filling would just thrash. Re-launched on each play.
+async function backgroundFill() {
+  const my = ++fillToken;
+  const n = state.timeline.length;
+  const { step } = playCadence();
+  const start = state.frame;                            // cover the frames the playhead will show
+  const count = Math.ceil(n / step) + 1;               // one stride past the wrap, in playhead order
+  for (let d = 0; d < count; d++) {
+    if (my !== fillToken || !playing) return;          // superseded / stopped / timeline rebuilt
+    if (cacheBytes > CACHE_BUDGET * 0.92) return;       // budget reached -> stop pre-filling
+    await decodeFrame((start + d * step) % n).catch(() => {});
+  }
+}
+
 // Render one timeline frame in the current render mode (mass-constant for surfaces).
 async function renderFrame(i) {
   if (!state.timeline.length) return;
@@ -677,19 +785,17 @@ async function renderFrame(i) {
   state.frame = i; $("scrub").value = String(i); $("framelbl").textContent = `${i + 1}/${state.timeline.length}`;
   $("stop").disabled = !(playing || i > 0);
   const [a, b, t] = state.timeline[i];
-  const mass = state.refMass >= 0 ? state.refMass : null;
   const col = lerpColor(colorForIndex(a), colorForIndex(b), t);   // smooth cluster-color transition
   const tok = ++decodeToken;
   try {
-    if (state.render === "surface") {
-      const q = `index=${a}&index2=${b}&t=${t.toFixed(4)}&smooth=${state.smooth}` + (mass != null ? `&mass=${mass}` : `&sigma=${state.sigma.toFixed(3)}`);
-      const m = parseMesh(await (await fetch(`./api/decode?${q}`)).arrayBuffer());
-      if (tok !== decodeToken) return;
+    const entry = await decodeFrame(i);
+    if (tok !== decodeToken || !entry) return;   // a newer frame superseded this one
+    if (entry.surface) {
+      const m = entry.payload;
       if (m.indices.length) renderer.setMesh(m.positions, m.normals, m.indices);
       renderer.setColor(col);
     } else if (volRenderer) {
-      const g = parseGrid(await (await fetch(`./api/grid?index=${a}&index2=${b}&t=${t.toFixed(4)}&size=96`)).arrayBuffer());
-      if (tok !== decodeToken) return;
+      const g = entry.payload;
       curVolMeta = g; volRenderer.setVolume(g.nx, g.ny, g.nz, g.data); volRenderer.setThreshold(normThreshold());
       volRenderer.setColor(col);
     }
@@ -707,13 +813,17 @@ async function togglePlay() {
   if (playing) { setPlaying(false); return; }
   if (!state.timeline.length && !buildTimeline()) { status("Build a path first (shift-click states).", "warn"); return; }
   setPlaying(true);
+  backgroundFill();                            // race ahead of the playhead, filling the cache
   while (playing) {
-    let next = state.frame + 1;
-    if (next >= state.timeline.length) next = 0;     // loop
+    const { delay, step } = playCadence();
+    let next = state.frame + step;
+    if (next >= state.timeline.length) next = 0;     // loop (wrap to start)
+    const t0 = performance.now();
     await renderFrame(next);
     if (!playing) break;
     status(`Playing… frame ${state.frame + 1}/${state.timeline.length}`, "busy");
-    await sleep(frameDelay());
+    // hold the display rate without double-counting the decode we just paid for
+    await sleep(Math.max(0, delay - (performance.now() - t0)));
   }
   if (!recording) status(`Paused at frame ${state.frame + 1}/${state.timeline.length}.`);
 }
@@ -736,8 +846,10 @@ async function recordSeries() {
     rec.start();
   } catch (err) { status("Recording unavailable: " + err.message, "err"); return; }
   recording = true; setPlaying(true);
+  backgroundFill();
   await renderFrame(0);
-  for (let i = 1; i < state.timeline.length && playing; i++) { await renderFrame(i); status(`Recording… ${i + 1}/${state.timeline.length}`, "busy"); await sleep(frameDelay()); }
+  const { delay: recDelay, step: recStep } = playCadence();   // record what playback shows
+  for (let i = recStep; i < state.timeline.length && playing; i += recStep) { await renderFrame(i); status(`Recording… ${i + 1}/${state.timeline.length}`, "busy"); await sleep(recDelay); }
   setPlaying(false); recording = false;
   rec.stop(); rec.onstop = () => downloadBlob(new Blob(chunks, { type: "video/webm" }), "morph.webm");
   status("Recording saved (morph.webm).");
@@ -1102,6 +1214,7 @@ async function playLayerSeries(ly) {
       : orderAlongAxis(ly.indices);
   if (ordered.length < 2) { status(ly.kind === "curve" ? "Draw the curve across at least two states." : "A series needs ≥2 states.", "warn"); return; }
   if (playing) setPlaying(false);
+  hidePathPicks = ly.kind === "curve";   // curve snap stays internal-only; other series show their picks
   state.current = ordered[0]; state.path = ordered.slice(1); state.frame = 0;
   syncSelection(); updatePathLabel(); $("sel").textContent = `state #${ordered[0]}`;
   try { const h = await (await fetch(`./api/histogram?index=${ordered[0]}`)).json(); hist.setData(h, h.mean + state.sigma * h.std); } catch { /* keep */ }
