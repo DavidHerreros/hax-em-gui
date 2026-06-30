@@ -302,6 +302,10 @@ class JobManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=cwd,
+                # hax colorizes output only on a TTY (honoring NO_COLOR/FORCE_COLOR).
+                # We capture stdout through a pipe (not a TTY), but the log viewer
+                # renders ANSI, so request colors explicitly with FORCE_COLOR.
+                env={**os.environ, "FORCE_COLOR": "1"},
                 # Own session/process group: a hax program spawns its real workers
                 # via `forkserver` (JAX/CUDA), and those grandchildren inherit the
                 # stdout pipe. Cancelling must signal the whole group, or they keep
