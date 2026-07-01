@@ -207,7 +207,12 @@ class WorkflowManager:
             return None
         if wf.get("kind") != "project" or not wf.get("project_id"):
             return wf
-        if wf["status"] == "running" or (wid in self._running and not self._running[wid].done()):
+        # Skip only while *this* process is genuinely running the workflow (its
+        # _execute task owns run_state then). A stored status of 'running' with no
+        # live task is stale — e.g. the run task ended abnormally, or the job was
+        # driven/finished outside a workflow run — so we must still reconcile from
+        # the jobs' real statuses instead of leaving nodes stuck on 'running'.
+        if wid in self._running and not self._running[wid].done():
             return wf
         graph, state = self._synced_graph(wf["graph"], wf["project_id"])
         statuses = [s.get("status") for s in state.values()]
