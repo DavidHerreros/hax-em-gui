@@ -31,6 +31,8 @@ from .workflows import WorkflowError, manager as wf_manager
 from .projects import ProjectsRootUnset
 from .tensorboard import tb_manager
 from .viewer import viewer_manager
+from .mrc_viewer import mrc_viewer_manager
+from .md_viewer import md_viewer_manager
 
 # Hop-by-hop headers must not be forwarded through the TensorBoard proxy.
 _HOP_BY_HOP = {
@@ -83,6 +85,8 @@ async def _shutdown() -> None:
         poller.cancel()
     tb_manager.shutdown()
     viewer_manager.shutdown()
+    mrc_viewer_manager.shutdown()
+    md_viewer_manager.shutdown()
     await app.state.http.aclose()
 
 
@@ -130,6 +134,9 @@ class JobCreate(BaseModel):
     bindings: dict[str, dict[str, Any]] = {}
     # When false, prepare the job but leave it "saved" (don't launch it yet).
     launch: bool = True
+    # Wipe the shared SSD scratch folder before launching so it's rebuilt fresh
+    # (no effect unless the program uses a scratch folder and a root is configured).
+    recreate_ssd: bool = False
 
 
 # -- catalog ---------------------------------------------------------------
@@ -344,7 +351,8 @@ def project_sources(project_id: str, kind: str) -> list[dict[str, Any]]:
 @app.post("/api/projects/{project_id}/jobs", dependencies=[Depends(auth)])
 async def create_project_job(project_id: str, body: JobCreate) -> dict[str, Any]:
     try:
-        return await manager.create(body.program, body.args, body.gpu, project_id, body.name, body.bindings, body.launch)
+        return await manager.create(body.program, body.args, body.gpu, project_id, body.name, body.bindings, body.launch,
+                                    recreate_ssd=body.recreate_ssd)
     except ProjectNotFound:
         raise HTTPException(status_code=404, detail=f"unknown project '{project_id}'")
     except ValidationError as exc:
@@ -474,17 +482,20 @@ async def job_log_ws(websocket: WebSocket, job_id: str) -> None:
         return
 
     await websocket.accept()
-    queue, snapshot = manager.subscribe(job_id)
+    # subscribe() registers our queue atomically; we then snapshot from the full
+    # persisted log (read_log runs with no await in between, so no streamed chunk is
+    # dropped or duplicated). The in-memory buffer is only a small tail and would
+    # lose the earliest lines once tqdm progress output has filled it.
+    queue, _ = manager.subscribe(job_id)
     try:
         if not job["active"]:
-            # Finished job: replay the full persisted log (the in-memory buffer is
-            # only a tail) and close — nothing more will stream.
+            # Finished job: replay the full log and close — nothing more will stream.
             manager.unsubscribe(job_id, queue)
             await websocket.send_json({"type": "snapshot", "data": manager.read_log(job_id), "status": job["status"]})
             await websocket.send_json({"type": "status", "status": job["status"], "return_code": job["return_code"]})
             return
 
-        await websocket.send_json({"type": "snapshot", "data": snapshot, "status": job["status"]})
+        await websocket.send_json({"type": "snapshot", "data": manager.read_log(job_id), "status": job["status"]})
         shutdown = websocket.app.state.shutdown
         while True:
             getter = asyncio.ensure_future(queue.get())
@@ -926,6 +937,272 @@ async def viewer_proxy(vid: str, path: str, request: Request) -> Response:
     if inst is None:
         raise HTTPException(status_code=404, detail="unknown viewer session")
     # The viewer subprocess serves at root; strip the /viewer/<id> prefix.
+    query = request.url.query
+    url = f"http://127.0.0.1:{inst['port']}/{path}" + (f"?{query}" if query else "")
+    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP and k.lower() != "host"}
+    body = await request.body()
+    upstream = await request.app.state.http.request(request.method, url, headers=fwd_headers, content=body)
+    out_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in _HOP_BY_HOP and k.lower() not in ("content-encoding", "content-length")
+    }
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=out_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+# -- Map (.mrc) viewer: inspect any volume a job produced -------------------
+_MAP_SUFFIXES = (".mrc", ".map", ".vol")
+_MD_SUFFIXES = (".xmd", ".star", ".cs")
+
+
+def _list_job_files(job_id: str, suffixes: tuple[str, ...]) -> dict[str, Any]:
+    """List a job's run-folder files whose suffix is in `suffixes` (recursive)."""
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    wd = job.get("workdir")
+    if not wd:
+        return {"workdir": None, "files": []}
+    root = Path(wd)
+    out: list[dict[str, Any]] = []
+    if root.is_dir():
+        for p in sorted(root.rglob("*")):
+            if p.is_file() and p.suffix.lower() in suffixes:
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                out.append({
+                    "path": str(p),
+                    "name": str(p.relative_to(root)),
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                })
+    return {"workdir": str(root), "files": out}
+
+
+def _job_arg_paths(job: dict[str, Any]) -> set[str]:
+    """Resolved file paths referenced in a job's argument values. Handles plain
+    strings, lists, whitespace-separated multi-values and the ``NAME:path`` form
+    (e.g. FlexConsensus input_space). Used to authorise viewing a run's *inputs*."""
+    out: set[str] = set()
+    args = job.get("args") or {}
+    for v in args.values():
+        items = v if isinstance(v, list) else [v]
+        for it in items:
+            if not isinstance(it, (str, int, float)):
+                continue
+            for tok in str(it).split():
+                cand = tok
+                if ":" in tok:
+                    after = tok.split(":", 1)[1]
+                    if after and Path(after).expanduser().exists():
+                        cand = after
+                try:
+                    p = Path(cand).expanduser()
+                    if p.is_file():
+                        out.add(str(p.resolve()))
+                except (OSError, RuntimeError):
+                    continue
+    return out
+
+
+def _list_job_input_files(job_id: str, suffixes: tuple[str, ...]) -> dict[str, Any]:
+    """List a job's *input* files (from its args) whose suffix is in `suffixes`."""
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    out: list[dict[str, Any]] = []
+    for path in sorted(_job_arg_paths(job)):
+        p = Path(path)
+        if p.suffix.lower() not in suffixes:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out.append({"path": path, "name": p.name, "size": st.st_size, "mtime": st.st_mtime})
+    return {"files": out}
+
+
+def _job_file(job_id: str, path: str, suffixes: tuple[str, ...]) -> tuple[dict[str, Any], Path]:
+    """Validate that `path` is a file of the given kind that this job legitimately
+    references — either an output inside its run folder or an input in its args
+    (so no arbitrary filesystem access is granted through the from-job routes)."""
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    try:
+        target = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail="invalid path")
+    wd = job.get("workdir")
+    in_workdir = False
+    if wd:
+        root = Path(wd).resolve()
+        in_workdir = root == target or root in target.parents
+    if not in_workdir and str(target) not in _job_arg_paths(job):
+        raise HTTPException(status_code=403, detail="path is not one of this job's inputs or outputs")
+    if not target.is_file() or target.suffix.lower() not in suffixes:
+        raise HTTPException(status_code=404, detail="file not found")
+    return job, target
+
+
+@app.get("/api/jobs/{job_id}/mrcs", dependencies=[Depends(auth)])
+def job_mrcs(job_id: str) -> dict[str, Any]:
+    """List the volume files (.mrc/.map/.vol) inside a job's run folder, so any map
+    it produced can be inspected (works while running and after it finishes)."""
+    return _list_job_files(job_id, _MAP_SUFFIXES)
+
+
+@app.get("/api/jobs/{job_id}/inputs", dependencies=[Depends(auth)])
+def job_inputs(job_id: str) -> dict[str, Any]:
+    """Volume + metadata files a job took as *inputs* (referenced in its args), so
+    they can be inspected in the same viewers as the outputs."""
+    return {
+        "maps": _list_job_input_files(job_id, _MAP_SUFFIXES)["files"],
+        "metadata": _list_job_input_files(job_id, _MD_SUFFIXES)["files"],
+    }
+
+
+async def _ensure_mrc_viewer(mrc: str, title: str) -> dict[str, Any]:
+    try:
+        return await mrc_viewer_manager.ensure(mrc, title)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (RuntimeError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail=f"map viewer failed to start: {exc}")
+
+
+class MrcViewerStart(BaseModel):
+    path: str
+    title: str | None = None
+
+
+@app.post("/api/mrcviewer", dependencies=[Depends(auth)])
+async def start_mrc_viewer(body: MrcViewerStart) -> dict[str, Any]:
+    """Open the map viewer for any .mrc within the sandboxed file roots."""
+    try:
+        path = filebrowser.resolve(body.path)   # confines to HAX_GUI_FILE_ROOTS
+    except filebrowser.AccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return await _ensure_mrc_viewer(str(path), body.title or path.name)
+
+
+@app.post("/api/mrcviewer/from-job/{job_id}", dependencies=[Depends(auth)])
+async def start_mrc_viewer_from_job(job_id: str, path: str) -> dict[str, Any]:
+    """Open the map viewer for a .mrc this job produced or used (the path must be
+    one of the job's inputs or outputs — no arbitrary filesystem access here)."""
+    job, target = _job_file(job_id, path, _MAP_SUFFIXES)
+    title = f"{job.get('name') or job.get('program') or 'map'} · {target.name}"
+    return await _ensure_mrc_viewer(str(target), title)
+
+
+@app.get("/api/mrcviewer", dependencies=[Depends(auth)])
+def list_mrc_viewers() -> list[dict[str, Any]]:
+    return mrc_viewer_manager.list()
+
+
+@app.delete("/api/mrcviewer/{vid}", dependencies=[Depends(auth)])
+def stop_mrc_viewer(vid: str) -> dict[str, bool]:
+    return {"stopped": mrc_viewer_manager.stop(vid)}
+
+
+@app.api_route("/mrcviewer/{vid}", methods=["GET"])
+def mrc_viewer_redirect(vid: str) -> RedirectResponse:
+    return RedirectResponse(url=f"/mrcviewer/{vid}/")
+
+
+@app.api_route("/mrcviewer/{vid}/{path:path}", methods=["GET", "POST", "OPTIONS", "HEAD"])
+async def mrc_viewer_proxy(vid: str, path: str, request: Request) -> Response:
+    inst = mrc_viewer_manager.get(vid)
+    if inst is None:
+        raise HTTPException(status_code=404, detail="unknown map-viewer session")
+    query = request.url.query
+    url = f"http://127.0.0.1:{inst['port']}/{path}" + (f"?{query}" if query else "")
+    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP and k.lower() != "host"}
+    body = await request.body()
+    upstream = await request.app.state.http.request(request.method, url, headers=fwd_headers, content=body)
+    out_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in _HOP_BY_HOP and k.lower() not in ("content-encoding", "content-length")
+    }
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=out_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+# -- Metadata (.xmd/.star/.cs) viewer: browse any table a job produced ------
+async def _ensure_md_viewer(md: str, title: str) -> dict[str, Any]:
+    try:
+        return await md_viewer_manager.ensure(md, title)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (RuntimeError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail=f"metadata viewer failed to start: {exc}")
+
+
+class MdViewerStart(BaseModel):
+    path: str
+    title: str | None = None
+
+
+@app.get("/api/jobs/{job_id}/metadata", dependencies=[Depends(auth)])
+def job_metadata(job_id: str) -> dict[str, Any]:
+    """List the metadata files (.xmd/.star/.cs) inside a job's run folder."""
+    return _list_job_files(job_id, _MD_SUFFIXES)
+
+
+@app.post("/api/mdviewer", dependencies=[Depends(auth)])
+async def start_md_viewer(body: MdViewerStart) -> dict[str, Any]:
+    """Open the metadata viewer for any .xmd/.star/.cs within the file roots."""
+    try:
+        path = filebrowser.resolve(body.path)   # confines to HAX_GUI_FILE_ROOTS
+    except filebrowser.AccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return await _ensure_md_viewer(str(path), body.title or path.name)
+
+
+@app.post("/api/mdviewer/from-job/{job_id}", dependencies=[Depends(auth)])
+async def start_md_viewer_from_job(job_id: str, path: str) -> dict[str, Any]:
+    """Open the metadata viewer for a table this job produced or used (the path must
+    be one of the job's inputs or outputs)."""
+    job, target = _job_file(job_id, path, _MD_SUFFIXES)
+    title = f"{job.get('name') or job.get('program') or 'metadata'} · {target.name}"
+    return await _ensure_md_viewer(str(target), title)
+
+
+@app.get("/api/mdviewer", dependencies=[Depends(auth)])
+def list_md_viewers() -> list[dict[str, Any]]:
+    return md_viewer_manager.list()
+
+
+@app.delete("/api/mdviewer/{vid}", dependencies=[Depends(auth)])
+def stop_md_viewer(vid: str) -> dict[str, bool]:
+    return {"stopped": md_viewer_manager.stop(vid)}
+
+
+@app.api_route("/mdviewer/{vid}", methods=["GET"])
+def md_viewer_redirect(vid: str) -> RedirectResponse:
+    return RedirectResponse(url=f"/mdviewer/{vid}/")
+
+
+@app.api_route("/mdviewer/{vid}/{path:path}", methods=["GET", "POST", "OPTIONS", "HEAD"])
+async def md_viewer_proxy(vid: str, path: str, request: Request) -> Response:
+    inst = md_viewer_manager.get(vid)
+    if inst is None:
+        raise HTTPException(status_code=404, detail="unknown metadata-viewer session")
     query = request.url.query
     url = f"http://127.0.0.1:{inst['port']}/{path}" + (f"?{query}" if query else "")
     fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP and k.lower() != "host"}

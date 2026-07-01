@@ -281,7 +281,17 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .filelist .entry:hover { background: var(--hover); }
 .filelist .entry .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .filelist .entry .sz { font-size: 12px; color: var(--faint); }
+.filelist .entry-map { display: flex; align-items: center; gap: 4px; padding-right: 8px; border-radius: 8px; }
+.filelist .entry-map:hover { background: var(--hover); }
+.filelist .entry-map .entry { flex: 1; }
+.filelist .entry-map .entry:hover { background: none; }
 .modal-foot { height: 48px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: flex-end; padding: 0 16px; }
+
+/* maps a run produced, listed in the job detail view */
+.job-maps { margin: -4px 0 16px; }
+.job-maps:empty { display: none; }
+.map-list { display: flex; flex-direction: column; gap: 4px; }
+.map-row { display: flex; align-items: center; gap: 10px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); font-size: 13px; }
 
 /* ---- misc ---- */
 .icon { display: inline-block; vertical-align: -2px; }
@@ -333,6 +343,9 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .launcher-body { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
 .launcher-fields { padding: 14px; flex: 1; }
 .managed-note { display: flex; align-items: center; gap: 8px; color: var(--accent); font-size: 12px; background: var(--active-bg); padding: 8px 10px; border-radius: 8px; margin: 0 0 14px; }
+.recreate-ssd { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 0 0 14px; cursor: pointer; }
+.recreate-ssd input { flex-shrink: 0; }
+.recreate-ssd .small { margin-left: auto; }
 .launcher-run { position: sticky; bottom: 0; padding: 12px 14px; border-top: 1px solid var(--border); background: var(--sidebar-bg); }
 .run-target { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
 .run-hint { display: flex; flex-direction: column; gap: 8px; }
@@ -549,6 +562,8 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .wf-topbar .btn.small.disabled, .wf-topbar .btn.small:disabled { opacity: .45; cursor: default; pointer-events: none; }
 .wf-canvas { flex: 1; position: relative; overflow: auto; background: var(--bg); cursor: grab; }
 .wf-canvas.panning { cursor: grabbing; }
+.wf-canvas.marquee-select { cursor: crosshair; }
+.wf-marquee { position: absolute; z-index: 4; pointer-events: none; border: 1px solid var(--brand, #2dd4bf); background: color-mix(in srgb, var(--brand, #2dd4bf) 14%, transparent); border-radius: 2px; }
 .wf-sizer { position: relative; }
 .wf-content { position: absolute; top: 0; left: 0; transform-origin: 0 0;
   background-image: radial-gradient(var(--border) 1px, transparent 1px); background-size: 22px 22px; }
@@ -611,6 +626,8 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
   background: color-mix(in srgb, var(--lc) 16%, transparent); border: 1px solid color-mix(in srgb, var(--lc) 45%, transparent); }
 .lbl-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--lc); flex-shrink: 0; }
 .lbl-name { white-space: nowrap; max-width: 130px; overflow: hidden; text-overflow: ellipsis; }
+/* tint the name with the label's own color (blended toward text for legibility) */
+.lbl-chip .lbl-name { color: color-mix(in srgb, var(--lc) 78%, var(--text)); font-weight: 600; }
 .lbl-x { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 13px; line-height: 1; padding: 0 0 0 1px; }
 .lbl-x:hover { color: var(--err); }
 .lbl-add { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%;
@@ -630,6 +647,8 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .lblpick-toggle .lbl-name { flex: 1; }
 .lblpick-edit { background: none; border: none; color: var(--muted); cursor: pointer; padding: 3px 5px; }
 .lblpick-edit:hover { color: var(--text); }
+.lblpick-del { background: none; border: none; color: var(--muted); cursor: pointer; padding: 3px 5px; }
+.lblpick-del:hover { color: var(--err); }
 .lblpick-create { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
 .lblpick-new { flex: 1; min-width: 0; padding: 5px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 12.5px; }
 .lblpick-swatch { width: 24px; height: 24px; border-radius: 6px; border: 1px solid var(--border); cursor: pointer; flex-shrink: 0; }
@@ -638,9 +657,11 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .lblpick-sw.on { border-color: var(--text); }
 .lblpick-editor .lblpick-new { width: 100%; margin-bottom: 4px; }
 
-/* label dots inside a workflow node header */
-.wf-node-labels { display: inline-flex; gap: 3px; align-items: center; }
-.wf-node-ldot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+/* named label chips shown at the bottom of a workflow node box */
+.wf-node-labels-strip { display: flex; align-items: center; gap: 4px; height: 28px; padding: 0 8px;
+  overflow: hidden; border-top: 1px solid var(--border); }
+.wf-node-labels-strip .lbl-chip { font-size: 10px; padding: 1px 6px 1px 5px; line-height: 1.4; }
+.wf-node-labels-strip .lbl-name { max-width: 96px; }
 
 /* ===== update notifications ===== */
 .update-banner {

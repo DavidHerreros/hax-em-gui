@@ -20,6 +20,8 @@ export function JobDetailView(params) {
   const progress = h("div", { class: "progress" });
   const cmd = h("pre", { class: "cmdline" }, "…");
   const wd = h("div", { class: "muted small", style: { margin: "-8px 0 16px" } });
+  const inputs = h("div", { class: "job-maps" });
+  const maps = h("div", { class: "job-maps" });
   const actionErr = h("div", { style: { marginBottom: "12px" } });
   const consoleEl = h("div", { class: "console" });
 
@@ -28,6 +30,8 @@ export function JobDetailView(params) {
   root.appendChild(progress);
   root.appendChild(cmd);
   root.appendChild(wd);
+  root.appendChild(inputs);
+  root.appendChild(maps);
   root.appendChild(actionErr);
   root.appendChild(consoleEl);
 
@@ -95,6 +99,66 @@ export function JobDetailView(params) {
     try { if (await launchViewerForJob(job)) navigate("/viewer"); }
     catch (err) { mount(actionErr, errorBox(err)); }
   }
+
+  // ── outputs this run produced: inspect maps (.mrc) and metadata (.xmd/.star/.cs) ──
+  function formatSize(bytes) {
+    const units = ["B", "KB", "MB", "GB", "TB"]; let n = bytes, i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+  }
+  async function loadOutputs() {
+    const [m, t] = await Promise.allSettled([api.jobMrcs(id), api.jobMetadata(id)]);
+    const mapsF = m.status === "fulfilled" ? (m.value.files || []) : [];
+    const tablesF = t.status === "fulfilled" ? (t.value.files || []) : [];
+    // While the run is active, keep the section (with a refresh) visible even when
+    // empty, so files show up as they're written without reopening the view.
+    const active = status === "running" || status === "pending";
+    renderGroup(maps, "produced", mapsF, tablesF, loadOutputs, active);
+  }
+  async function loadInputs() {
+    let mapsF = [], tablesF = [];
+    try { const r = await api.jobInputs(id); mapsF = r.maps || []; tablesF = r.metadata || []; } catch { /* none */ }
+    renderGroup(inputs, "inputs", mapsF, tablesF, loadInputs, false);
+  }
+  function renderGroup(container, kindWord, mapsF, tablesF, reload, showEmpty) {
+    clear(container);
+    const total = mapsF.length + tablesF.length;
+    if (!total && !showEmpty) return;
+    const parts = [];
+    if (mapsF.length) parts.push(`${mapsF.length} map${mapsF.length > 1 ? "s" : ""}`);
+    if (tablesF.length) parts.push(`${tablesF.length} metadata`);
+    const label = total ? `${parts.join(" · ")} ${kindWord}` : `no ${kindWord} yet`;
+    container.appendChild(h("div", { class: "row section-head", style: { margin: "0 0 8px" } },
+      h("span", { class: "muted small" }, icon("box", 13), " ", label),
+      h("button", { class: "btn-icon", title: "Refresh", style: { marginLeft: "auto" }, onclick: reload }, icon("refresh", 14))));
+    if (total) {
+      container.appendChild(h("div", { class: "map-list" },
+        ...mapsF.map((f) => fileRow(f, "map")),
+        ...tablesF.map((f) => fileRow(f, "table"))));
+    } else {
+      container.appendChild(h("div", { class: "muted small", style: { marginBottom: "10px" } }, "Maps and metadata appear here as the run writes them."));
+    }
+  }
+  function fileRow(f, kind) {
+    const isMap = kind === "map";
+    const btn = h("button", { class: "btn small", title: isMap ? "Open this map in the 3D / slice viewer" : "Browse this metadata as a table (with plots)", onclick: () => inspectOutput(f, kind, btn) },
+      icon(isMap ? "box" : "grid", 13), isMap ? "Inspect" : "Table");
+    return h("div", { class: "map-row" },
+      icon(isMap ? "box" : "grid", 13),
+      h("span", { class: "mono", style: { flex: "1", minWidth: "0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: f.path }, f.name),
+      h("span", { class: "muted small" }, formatSize(f.size)),
+      btn);
+  }
+  async function inspectOutput(f, kind, btn) {
+    clear(actionErr);
+    const orig = btn ? btn.lastChild.textContent : "";
+    if (btn) { btn.disabled = true; btn.lastChild.textContent = "Opening…"; }
+    try {
+      const v = kind === "map" ? await api.mrcViewerFromJob(id, f.path) : await api.mdViewerFromJob(id, f.path);
+      store.openViewer(v); navigate("/viewer");
+    } catch (err) { mount(actionErr, errorBox(err)); }
+    finally { if (btn) { btn.disabled = false; btn.lastChild.textContent = orig; } }
+  }
   const viewerBtn = () => h("button", { class: "btn secondary", onclick: openViewer, title: "Explore this run's conformational landscape in the embedded WebGL viewer" }, icon("box", 15), "3D viewer");
 
   async function startSaved() {
@@ -149,23 +213,36 @@ export function JobDetailView(params) {
       cmd.textContent = j.command.join(" ");
       if (j.cwd) wd.textContent = "Working directory: " + j.cwd;
       renderHead();
+      loadInputs();
+      loadOutputs();
+      updatePolling();
     })
     .catch((err) => mount(root, errorBox(err)));
+
+  // Poll the run folder while the job is active so new outputs appear without
+  // reopening the view; stop once it's finished.
+  let poll = null;
+  function updatePolling() {
+    const active = status === "running" || status === "pending";
+    if (active && !poll) poll = setInterval(loadOutputs, 4000);
+    else if (!active && poll) { clearInterval(poll); poll = null; }
+  }
 
   let closeLog = null;
   function connectLog() {
     if (closeLog) closeLog();
     closeLog = subscribeLog(id, (m) => {
-      if (m.type === "snapshot") { status = m.status; term.reset(); if (m.data) term.write(m.data); renderHead(); }
+      if (m.type === "snapshot") { status = m.status; term.reset(); if (m.data) term.write(m.data); renderHead(); loadOutputs(); updatePolling(); }
       else if (m.type === "chunk") { term.write(m.data); }
       else if (m.type === "status") {
         status = m.status;
-        if (m.status !== "running") api.job(id).then((j) => { job = j; renderHead(); }).catch(() => renderHead());
+        updatePolling();
+        if (m.status !== "running") api.job(id).then((j) => { job = j; renderHead(); loadOutputs(); }).catch(() => renderHead());
         else renderHead();
       }
     });
   }
   connectLog();
 
-  return { el: root, cleanup: () => { if (closeLog) closeLog(); } };
+  return { el: root, cleanup: () => { if (closeLog) closeLog(); if (poll) clearInterval(poll); } };
 }

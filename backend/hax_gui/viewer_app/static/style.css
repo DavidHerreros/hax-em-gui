@@ -117,6 +117,21 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .overlay { pointer-events: none; z-index: 3; }
 .overlay.armed { pointer-events: auto; cursor: crosshair; }
 
+/* ── orthogonal slices (mrc viewer) ── */
+.canvas-wrap > .slices {
+  position: absolute; inset: 0;
+  display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+  gap: 6px; padding: 6px; background: #04060f;
+}
+:root[data-theme="light"] .canvas-wrap > .slices { background: #e7ecf3; }
+.slice-cell { display: flex; flex-direction: column; min-width: 0; min-height: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
+.slice-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 8px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.slice-label { text-transform: uppercase; letter-spacing: .05em; }
+.slice-canvas { flex: 1; width: 100%; min-height: 0; display: block; cursor: crosshair; }
+.slice-foot { flex-shrink: 0; padding: 5px 8px; }
+.slice-slider { width: 100%; }
+.slice-info { align-items: center; justify-content: center; text-align: center; padding: 12px; line-height: 1.5; }
+
 /* ── contour histogram strip ── */
 .hist-strip { display: flex; align-items: center; gap: 8px; height: 50px; padding: 4px 12px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; }
 .hist-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; flex-shrink: 0; }
@@ -138,3 +153,40 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
   .divider { display: none; }
   .layers { width: 150px; }
 }
+
+/* ══════════════ metadata (.xmd/.star/.cs) viewer ══════════════ */
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.seg-btn { background: var(--panel); color: var(--muted); border: none; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+.seg-btn:hover { color: var(--text); }
+.seg-btn.active { background: rgba(45,212,191,0.14); color: var(--accent); }
+
+.md-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 7px 12px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; font-size: 12px; }
+.md-toolbar label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
+.md-toolbar .grow { flex: 1; }
+.md-main { flex: 1; min-height: 0; display: flex; }
+
+/* windowed table */
+.md-table { flex: 1; overflow: auto; position: relative; font-size: 12px; }
+.mdt-header { position: sticky; top: 0; z-index: 2; display: flex; background: var(--panel); border-bottom: 1px solid var(--border); }
+.mdt-body { position: relative; }
+.mdt-row { position: absolute; left: 0; display: flex; border-bottom: 1px solid var(--border); }
+.mdt-row:hover { background: var(--hover, rgba(148,163,184,0.06)); }
+.mdt-cell { flex-shrink: 0; padding: 0 8px; display: flex; align-items: center; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border-right: 1px solid var(--border); font-family: "JetBrains Mono", ui-monospace, monospace; }
+.mdt-cell.mdt-h { font-weight: 600; color: var(--accent); height: 30px; font-family: inherit; }
+.mdt-gutter { color: var(--muted); justify-content: flex-end; position: sticky; left: 0; background: var(--panel); z-index: 1; }
+.mdt-img { object-fit: contain; image-rendering: auto; background: #04060f; border-radius: 3px; }
+.mdt-skel { color: transparent; background: linear-gradient(90deg, transparent, rgba(148,163,184,0.12), transparent); }
+
+/* plot */
+.md-plot { flex: 1; min-height: 0; position: relative; }
+.md-plot > canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
+.md-plot > canvas:active { cursor: grabbing; }
+.plot-legend { position: absolute; top: 10px; right: 16px; display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; background: color-mix(in srgb, var(--panel) 82%, transparent); border: 1px solid var(--border); border-radius: 8px; font-size: 12px; pointer-events: none; }
+.leg-item { display: flex; align-items: center; gap: 6px; }
+.leg-swatch { width: 12px; height: 12px; border-radius: 3px; }
+
+/* Y-column chip multi-select */
+.chip-select { display: inline-flex; flex-wrap: wrap; gap: 4px; max-width: 46vw; }
+.chip { background: var(--panel); color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px; font-size: 11px; cursor: pointer; }
+.chip:hover { color: var(--text); border-color: var(--accent); }
+.chip.active { background: rgba(45,212,191,0.16); color: var(--accent); border-color: var(--accent); }

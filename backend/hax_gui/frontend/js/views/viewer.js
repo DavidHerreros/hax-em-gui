@@ -110,7 +110,9 @@ export function ViewerView() {
   }
 
   function closeViewer(id) {
-    api.stopViewer(id).catch(() => {});
+    const v = getState().openViewers.find((x) => x.id === id);
+    const stop = v && v.kind === "mrc" ? api.stopMrcViewer : v && v.kind === "md" ? api.stopMdViewer : api.stopViewer;
+    stop(id).catch(() => {});
     store.closeViewer(id);
   }
 

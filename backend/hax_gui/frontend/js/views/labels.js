@@ -29,6 +29,10 @@ export function labelsByIds(ids) { return (ids || []).map(labelById).filter(Bool
 // viewport (so it never spills off the right/bottom — the inspector sits at the
 // far right of the window). Measures the real size, so call after content renders.
 function placePopover(menu, anchorEl) {
+  // The host often rebuilds its chip row after a toggle/create, which detaches
+  // the anchor (the "+" button). A detached node reports a zero rect and would
+  // fling the popover into a corner — leave it where it is instead.
+  if (!anchorEl || !anchorEl.isConnected) return;
   const r = anchorEl.getBoundingClientRect();
   const mw = menu.offsetWidth || 240, mh = menu.offsetHeight || 0;
   let left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
@@ -123,9 +127,22 @@ function openPicker(anchorEl, adapter, onChange) {
           h("span", { class: "lbl-dot", style: { "--lc": l.color, background: l.color } }),
           h("span", { class: "lbl-name" }, l.name),
           on ? icon("check", 14) : null),
-        h("button", { class: "lblpick-edit", title: "Edit label", onclick: (e) => { e.stopPropagation(); openLabelEditor(e.currentTarget, l, async () => { await _refresh(); renderList(); onChange && onChange(); }); } }, icon("pencil", 13))));
+        h("button", { class: "lblpick-edit", title: "Edit label", onclick: (e) => { e.stopPropagation(); openLabelEditor(e.currentTarget, l, async () => { await _refresh(); renderList(); onChange && onChange(); }); } }, icon("pencil", 13)),
+        h("button", { class: "lblpick-del", title: "Delete label", onclick: (e) => { e.stopPropagation(); removeLabel(l); } }, icon("trash", 13))));
     }
     placePopover(menu, anchorEl);   // content height is now known — reposition/clamp
+  }
+  // Delete a label everywhere: the server drops it from all jobs (cascade), then
+  // we sync the currently-open job/node so its chip disappears immediately.
+  async function removeLabel(l) {
+    if (!confirm(`Delete label "${l.name}"? It will be removed from all jobs.`)) return;
+    try {
+      await api.deleteLabel(l.id);
+      await _refresh();
+      await adapter.setSelected([...selectedSet()].filter((id) => id !== l.id));
+      onChange && onChange();
+      renderList();
+    } catch { /* ignore */ }
   }
   async function toggle(l) {
     const sel = selectedSet();

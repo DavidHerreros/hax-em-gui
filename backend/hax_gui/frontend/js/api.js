@@ -87,6 +87,21 @@ export const api = {
   flexconsensusSpaces: (jobId) => req(`/api/viewer/flexconsensus/${jobId}`),
   stopViewer: (id) => req(`/api/viewer/${id}`, { method: "DELETE" }),
 
+  // Map (.mrc) viewer sessions — inspect any volume a job produced
+  jobMrcs: (jobId) => req(`/api/jobs/${jobId}/mrcs`),
+  mrcViewerFromJob: (jobId, path) => req(`/api/mrcviewer/from-job/${jobId}?path=${encodeURIComponent(path)}`, { method: "POST" }),
+  mrcViewer: (path, title) => req("/api/mrcviewer", { method: "POST", body: JSON.stringify({ path, title: title || null }) }),
+  stopMrcViewer: (id) => req(`/api/mrcviewer/${id}`, { method: "DELETE" }),
+
+  // Files a job took as inputs (maps + metadata referenced in its args)
+  jobInputs: (jobId) => req(`/api/jobs/${jobId}/inputs`),
+
+  // Metadata (.xmd/.star/.cs) viewer sessions — browse any table a job produced
+  jobMetadata: (jobId) => req(`/api/jobs/${jobId}/metadata`),
+  mdViewerFromJob: (jobId, path) => req(`/api/mdviewer/from-job/${jobId}?path=${encodeURIComponent(path)}`, { method: "POST" }),
+  mdViewer: (path, title) => req("/api/mdviewer", { method: "POST", body: JSON.stringify({ path, title: title || null }) }),
+  stopMdViewer: (id) => req(`/api/mdviewer/${id}`, { method: "DELETE" }),
+
   // settings + projects
   getSettings: () => req("/api/settings"),
   putSettings: (data) => req("/api/settings", { method: "PUT", body: JSON.stringify(data) }),
@@ -97,10 +112,10 @@ export const api = {
   project: (id) => req(`/api/projects/${id}`),
   projectJobs: (id) => req(`/api/projects/${id}/jobs`),
   projectSources: (id, kind) => req(`/api/projects/${id}/sources?kind=${encodeURIComponent(kind)}`),
-  createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true) =>
+  createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true, recreateSsd = false) =>
     req(`/api/projects/${projectId}/jobs`, {
       method: "POST",
-      body: JSON.stringify({ program, args, gpu, name: name || null, bindings: bindings || {}, launch }),
+      body: JSON.stringify({ program, args, gpu, name: name || null, bindings: bindings || {}, launch, recreate_ssd: recreateSsd }),
     }),
 };
 

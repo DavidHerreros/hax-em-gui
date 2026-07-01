@@ -13,7 +13,7 @@ import { store, getState } from "../store.js";
 import { errorBox } from "./ui.js";
 import { visibleFields } from "./formFields.js";
 import { openFilePicker } from "./filePicker.js";
-import { nodeLabelChips, loadLabels, labelsByIds } from "./labels.js";
+import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js";
 import { promptModal } from "./promptModal.js";
 
 const NODE_W = 196;     // node width (px)
@@ -99,7 +99,7 @@ export function WorkflowsView() {
   const asProjBtn = h("button", { class: "btn small", title: "Create a new project backed by this workflow", onclick: saveAsProject }, icon("plus", 14), "Save as project");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
   const dupBtn = h("button", { class: "btn secondary", title: "Duplicate the selected step(s) as new, un-run steps (Ctrl/Cmd+D)", onclick: () => duplicateNodes([...selectedSet]) }, icon("copy", 15), "Duplicate");
-  const runSelBtn = h("button", { class: "btn secondary", title: "Run the selected step(s) only", onclick: () => runNodes([...selectedSet]) }, icon("play", 15), "Run selected");
+  const runSelBtn = h("button", { class: "btn secondary", title: "Run the selected step(s) only. Select several by Shift-dragging a box on empty canvas (Ctrl/Cmd-drag adds to the selection), or Shift/Ctrl-click nodes.", onclick: () => runNodes([...selectedSet]) }, icon("play", 15), "Run selected");
   const runBtn = h("button", { class: "btn", title: "Run the whole workflow", onclick: () => runNodes(null) }, icon("play", 15), "Run all");
   const delBtn = h("button", { class: "btn", title: "Delete this workflow", onclick: removeWorkflow }, icon("trash", 15));
   const topbar = h("div", { class: "wf-topbar" },
@@ -131,6 +131,11 @@ export function WorkflowsView() {
   const canvas = h("div", { class: "wf-canvas" }, sizer);
   const minimap = h("canvas", { class: "wf-minimap", title: "Overview — click to jump" });
   const canvasWrap = h("div", { class: "wf-canvas-wrap" }, canvas, minimap);
+  // Rubber-band selection rectangle. Lives inside contentLayer (content units), so
+  // it scales/scrolls with the nodes; it survives renderNodes() (which only clears
+  // nodesLayer). Shown only while a Shift/Ctrl-drag marquee is in progress.
+  const marqueeEl = h("div", { class: "wf-marquee", style: { display: "none" } });
+  contentLayer.appendChild(marqueeEl);
 
   function applyZoom() {
     sizer.style.width = CONTENT_W * zoom + "px";
@@ -203,12 +208,22 @@ export function WorkflowsView() {
     window.addEventListener("pointerup", up);
   }
 
-  // empty-canvas drag pans the view (and a click without movement clears selection)
+  // Empty-canvas drag pans the view; a Shift/Ctrl/Cmd-drag instead draws a marquee
+  // to box-select nodes. A plain click without movement clears the selection.
   canvas.addEventListener("pointerdown", (e) => {
     if (e.target === canvas || e.target === nodesLayer || e.target === svg || e.target === sizer || e.target === contentLayer) {
       e.preventDefault();
-      drag = { kind: "pan", sx: e.clientX, sy: e.clientY, sl: canvas.scrollLeft, st: canvas.scrollTop, moved: false };
-      canvas.classList.add("panning");
+      if (e.shiftKey || e.ctrlKey || e.metaKey) {
+        const p = canvasPoint(e);
+        // Ctrl/Cmd adds to the current selection; Shift alone replaces it.
+        const add = e.ctrlKey || e.metaKey;
+        drag = { kind: "marquee", x0: p.x, y0: p.y, x1: p.x, y1: p.y, base: add ? new Set(selectedSet) : new Set() };
+        updateMarquee();
+        canvas.classList.add("marquee-select");
+      } else {
+        drag = { kind: "pan", sx: e.clientX, sy: e.clientY, sl: canvas.scrollLeft, st: canvas.scrollTop, moved: false };
+        canvas.classList.add("panning");
+      }
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
     }
@@ -386,7 +401,9 @@ export function WorkflowsView() {
 
   const nodeById = (id) => graph.nodes.find((n) => n.id === id);
   const inputsOf = (program) => Object.entries((byName[program] || {}).bindable || {});
-  const nodeHeight = (n) => HEADER_H + Math.max(1, inputsOf(n.program).length) * ROW_H + 8;
+  const LABELS_H = 28;    // bottom strip showing this node's named label chips
+  const nodeLabels = (n) => labelsByIds(n.labels);
+  const nodeHeight = (n) => HEADER_H + Math.max(1, inputsOf(n.program).length) * ROW_H + 8 + (nodeLabels(n).length ? LABELS_H : 0);
 
   // Port positions (canvas coords) — orientation-aware.
   function outPort(n) {
@@ -427,10 +444,8 @@ export function WorkflowsView() {
     el.dataset.node = n.id;
     if (st) el.style.borderColor = STATUS_COLOR[st] || "var(--border)";
     // header (drag handle + select + run + remove)
-    const labelDots = labelsByIds(n.labels);
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
-      labelDots.length ? h("span", { class: "wf-node-labels" }, ...labelDots.map((l) => h("span", { class: "wf-node-ldot", style: { background: l.color }, title: l.name }))) : null,
       st ? h("span", { class: "wf-node-st", style: { color: statusColor(st) } }, st) : null,
       h("button", { class: "wf-node-run", title: "Run this step", disabled: running, onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon("play", 12)),
       h("button", { class: "wf-node-run", title: "Duplicate this step (un-run copy)", onclick: (e) => { e.stopPropagation(); duplicateNodes([n.id]); } }, icon("copy", 12)),
@@ -449,6 +464,11 @@ export function WorkflowsView() {
       el.appendChild(portEl("in" + (wiredAll.length ? " wired" : "") + (multi ? " multi" : ""), n.x, n.y, inPort(n, i, ins.length),
         { node: n.id, field, kind }));
     });
+    // named label chips at the bottom of the box (colored to match each label)
+    const labels = nodeLabels(n);
+    if (labels.length) {
+      el.appendChild(h("div", { class: "wf-node-labels-strip" }, ...labels.map((l) => labelChip(l))));
+    }
     // single output port
     if ((byName[n.program]?.produces || []).length) {
       const op = portEl("out", n.x, n.y, outPort(n), { node: n.id, out: "1" });
@@ -522,8 +542,37 @@ export function WorkflowsView() {
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
+  // ── rubber-band (marquee) selection ──
+  function marqueeRect() {
+    const d = drag;
+    return { x0: Math.min(d.x0, d.x1), y0: Math.min(d.y0, d.y1), x1: Math.max(d.x0, d.x1), y1: Math.max(d.y0, d.y1) };
+  }
+  function updateMarquee() {
+    const r = marqueeRect();
+    marqueeEl.style.display = "block";
+    marqueeEl.style.left = r.x0 + "px"; marqueeEl.style.top = r.y0 + "px";
+    marqueeEl.style.width = (r.x1 - r.x0) + "px"; marqueeEl.style.height = (r.y1 - r.y0) + "px";
+  }
+  function applyMarquee() {
+    const r = marqueeRect();
+    selectedSet.clear();
+    for (const id of drag.base) selectedSet.add(id);
+    for (const n of graph.nodes) {                    // any node overlapping the box
+      if (n.x < r.x1 && n.x + NODE_W > r.x0 && n.y < r.y1 && n.y + nodeHeight(n) > r.y0) selectedSet.add(n.id);
+    }
+    selected = selectedSet.has(selected) ? selected : (selectedSet.size ? [...selectedSet][0] : null);
+    // Live class toggle (cheaper than a full renderNodes on every move).
+    for (const el of nodesLayer.querySelectorAll(".wf-node")) el.classList.toggle("sel", selectedSet.has(el.dataset.node));
+  }
+
   function onMove(e) {
     if (!drag) return;
+    if (drag.kind === "marquee") {
+      const p = canvasPoint(e);
+      drag.x1 = p.x; drag.y1 = p.y;
+      updateMarquee(); applyMarquee();
+      return;
+    }
     if (drag.kind === "pan") {
       canvas.scrollLeft = drag.sl - (e.clientX - drag.sx);
       canvas.scrollTop = drag.st - (e.clientY - drag.sy);
@@ -549,6 +598,13 @@ export function WorkflowsView() {
   function onUp(e) {
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onUp);
+    if (drag && drag.kind === "marquee") {
+      applyMarquee();
+      marqueeEl.style.display = "none";
+      canvas.classList.remove("marquee-select");
+      renderNodes(); renderInspector();   // finalize .primary highlight + inspector
+      drag = null; return;
+    }
     if (drag && drag.kind === "pan") {
       canvas.classList.remove("panning");
       if (!drag.moved) { selected = null; selectedSet.clear(); renderNodes(); renderInspector(); }  // a plain click clears the selection

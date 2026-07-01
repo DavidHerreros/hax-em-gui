@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hax — metadata</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <strong id="title">Metadata</strong>
+      <span id="meta" class="muted"></span>
+    </div>
+    <div class="topright">
+      <div class="seg" id="modeSeg">
+        <button class="seg-btn active" data-mode="table">Table</button>
+        <button class="seg-btn" data-mode="plot">Plot</button>
+      </div>
+      <span id="status" class="status" title="">Loading…</span>
+    </div>
+  </header>
+
+  <div class="md-toolbar" id="tableTools">
+    <label id="imgToggleWrap" style="display:none"><input id="renderImages" type="checkbox" /> render images</label>
+    <label id="imgSizeWrap" style="display:none">size <input id="imgSize" type="range" min="32" max="160" step="8" value="72" /></label>
+    <span class="grow"></span>
+    <span id="rowInfo" class="muted small"></span>
+    <button id="download" class="btn" title="Download the original metadata file">Download</button>
+  </div>
+
+  <div class="md-toolbar" id="plotTools" style="display:none">
+    <label>type
+      <select id="plotType">
+        <option value="scatter" selected>scatter</option>
+        <option value="line">line</option>
+        <option value="histogram">histogram</option>
+      </select>
+    </label>
+    <label id="xwrap">X <select id="xcol"></select></label>
+    <label id="ywrap">Y <span id="ycols" class="chip-select" title="Pick one or more numeric columns"></span></label>
+    <label id="binswrap" style="display:none">bins <input id="bins" type="range" min="8" max="200" value="60" /></label>
+    <button id="replot" class="btn">Plot</button>
+    <button id="resetZoom" class="btn" title="Reset pan / zoom">Reset zoom</button>
+    <span class="grow"></span>
+    <span id="plotInfo" class="muted small"></span>
+    <button id="savePlot" class="btn" title="Save plot as PNG">Save PNG</button>
+  </div>
+
+  <main class="md-main">
+    <div id="tableWrap" class="md-table"></div>
+    <div id="plotWrap" class="md-plot" style="display:none">
+      <canvas id="plot"></canvas>
+      <div id="legend" class="plot-legend"></div>
+    </div>
+  </main>
+
+  <script type="module" src="./md.js"></script>
+</body>
+</html>

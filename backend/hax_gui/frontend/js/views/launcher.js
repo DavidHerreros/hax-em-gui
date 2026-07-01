@@ -87,6 +87,7 @@ export function buildLauncher() {
     const values = initialValues(schema);
     const bindings = {};       // { field: { job_id, kind, label } } — inputs fed from a job
     let runName = "";          // optional custom name for this run
+    let recreateSsd = false;   // wipe + rebuild the shared SSD scratch before running
     // Default to the first GPU; "cpu" forces CUDA_VISIBLE_DEVICES="" (no GPU).
     let gpu = gpus && gpus.length ? String(gpus[0].index) : "";
 
@@ -117,6 +118,14 @@ export function buildLauncher() {
         ? "Output and SSD scratch folders are created automatically inside the project."
         : "Output folder is created automatically inside the project.";
       fields.appendChild(h("p", { class: "managed-note" }, icon("folder", 14), note));
+    }
+    // The SSD scratch is shared per project+program and reused across runs; offer to
+    // rebuild it from scratch (applies only when a scratch root is configured).
+    if (schema.ssd_arg) {
+      fields.appendChild(h("label", { class: "recreate-ssd", title: "Delete this program's cached scratch data (mmap / array-record shards) so it's rebuilt from the current inputs. Only applies when a scratch root is configured in Settings." },
+        h("input", { type: "checkbox", onchange: (e) => (recreateSsd = e.target.checked) }),
+        h("span", null, "Recreate the SSD scratch folder"),
+        h("span", { class: "muted small" }, "discard cached images and rebuild for this run")));
     }
     for (const f of visibleFields(schema)) fields.appendChild(fieldRow(f, values, errorEls, ctx));
     body.appendChild(formErr);
@@ -165,7 +174,7 @@ export function buildLauncher() {
         // also send any stale literal value for them.
         const payload = { ...values };
         for (const f of Object.keys(bindings)) delete payload[f];
-        await api.createProjectJob(proj.id, schema.name, payload, gpu || null, runName, bindings, launch);
+        await api.createProjectJob(proj.id, schema.name, payload, gpu || null, runName, bindings, launch, recreateSsd);
         store.setActiveProject(proj.id);
         navigate("/projects");
       } catch (err) {

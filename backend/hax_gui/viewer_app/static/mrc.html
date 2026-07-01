@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hax — map viewer</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <strong id="title">Map</strong>
+      <span id="meta" class="muted"></span>
+    </div>
+    <div class="topright">
+      <label class="muted">export
+        <select id="dpi" title="Image scale / DPI">
+          <option value="1">1×</option>
+          <option value="2" selected>2×</option>
+          <option value="3">3×</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+      <label class="muted"><input id="transparent" type="checkbox" /> transparent</label>
+      <span id="status" class="status" title="">Loading…</span>
+    </div>
+  </header>
+
+  <main class="split">
+    <section class="pane" id="volPane">
+      <div class="pane-head">
+        <div class="pane-title">Map <span id="sel" class="muted"></span></div>
+        <div class="toolbar">
+          <label>render
+            <select id="rendermode">
+              <option value="surface" selected>Surface</option>
+              <option value="mip">Volume · MIP</option>
+              <option value="emission">Volume · glow</option>
+              <option value="slices">Orthogonal slices</option>
+            </select>
+          </label>
+          <label id="lightlbl">light <select id="light"><option value="standard" selected>standard</option><option value="smooth">smooth</option><option value="raytraced">ray traced</option></select></label>
+          <label id="smoothlbl">smooth <input id="smooth" type="range" min="0" max="20" value="6" title="Surface mesh smoothing (Taubin iterations)" /></label>
+          <span id="volctrls" style="display:none">
+            <label>γ <input id="vgamma" type="range" min="0.3" max="3" step="0.1" value="1.4" title="Transfer-function gamma" /></label>
+            <label>bright <input id="vbright" type="range" min="0.2" max="3" step="0.1" value="1.2" title="Brightness / opacity" /></label>
+          </span>
+          <span id="slicectrls" style="display:none">
+            <label>map
+              <select id="slicemap" title="Slice colormap">
+                <option value="gray" selected>gray</option>
+                <option value="viridis">viridis</option>
+                <option value="magma">magma</option>
+                <option value="inferno">inferno</option>
+                <option value="hot">hot</option>
+              </select>
+            </label>
+            <label>low <input id="slicelo" type="range" min="0" max="1" step="0.01" value="0" title="Contrast — black point" /></label>
+            <label>high <input id="slicehi" type="range" min="0" max="1" step="0.01" value="1" title="Contrast — white point" /></label>
+            <label><input id="slicecross" type="checkbox" checked /> crosshair</label>
+            <button id="sliceReset" class="btn" title="Reset slice zoom / pan (mouse wheel zooms)">Reset zoom</button>
+          </span>
+          <label id="colorlbl">surface <input id="color" type="color" value="#dcdcdc" title="Surface / volume color" /></label>
+          <label>bg <input id="bg" type="color" value="#040610" title="Background color" /></label>
+          <button id="reset" class="btn">Reset view</button>
+          <button id="saveMap" class="btn" title="Save the current view as PNG">Save PNG</button>
+          <button id="mrc" class="btn" title="Download this map as .mrc">.mrc</button>
+        </div>
+      </div>
+      <div class="hist-strip" id="histStrip">
+        <span class="hist-label muted">contour</span>
+        <canvas id="hist"></canvas>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="gl"></canvas>
+        <canvas id="glvol" style="display:none"></canvas>
+        <div id="slices" class="slices" style="display:none"></div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="./mrc.js"></script>
+</body>
+</html>

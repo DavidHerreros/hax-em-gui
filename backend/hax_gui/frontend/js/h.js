@@ -8,7 +8,7 @@ export function h(tag, props, ...children) {
       if (v == null || v === false) continue;
       if (k === "class") el.className = v;
       else if (k === "html") el.innerHTML = v; // only for trusted inline SVG
-      else if (k === "style" && typeof v === "object") Object.assign(el.style, v);
+      else if (k === "style" && typeof v === "object") setStyle(el, v);
       else if (k.startsWith("on") && typeof v === "function") el.addEventListener(k.slice(2).toLowerCase(), v);
       else if (v === true) el.setAttribute(k, "");
       else el.setAttribute(k, String(v));
@@ -16,6 +16,16 @@ export function h(tag, props, ...children) {
   }
   append(el, children);
   return el;
+}
+
+// Apply a style object. CSS custom properties (`--foo`) must go through
+// setProperty — assigning them as named keys on el.style is silently ignored.
+function setStyle(el, style) {
+  for (const [k, v] of Object.entries(style)) {
+    if (v == null) continue;
+    if (k.startsWith("--")) el.style.setProperty(k, v);
+    else el.style[k] = v;
+  }
 }
 
 export function append(el, children) {

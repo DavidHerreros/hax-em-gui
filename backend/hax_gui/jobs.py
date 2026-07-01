@@ -33,6 +33,28 @@ LIVE_BUFFER_CHARS = 256_000
 ACTIVE = {"pending", "running"}
 
 
+def _collapse_progress(text: str) -> str:
+    """Collapse in-place progress frames for a log-replay snapshot.
+
+    A ``\\r`` that isn't followed by a newline rewrites the line from column 0
+    (how tqdm draws a progress bar), so the terminal only ever shows the *last*
+    frame. For a replay we keep just that last frame of each newline-delimited
+    segment — dropping the thousands of redundant progress writes that would
+    otherwise dominate the size cap and evict the earliest real lines (e.g.
+    "Creating Array Record…"). Fully-committed lines are untouched.
+    """
+    if "\r" not in text:
+        return text
+    out = []
+    for seg in text.split("\n"):
+        if seg.endswith("\r"):        # CRLF line ending: drop the lone trailing CR
+            seg = seg[:-1]
+        if "\r" in seg:               # in-place progress frames: keep the last
+            seg = seg.rsplit("\r", 1)[-1]
+        out.append(seg)
+    return "\n".join(out)
+
+
 class ProjectNotFound(Exception):
     def __init__(self, project_id: str):
         super().__init__(f"unknown project '{project_id}'")
@@ -127,6 +149,7 @@ class JobManager:
         bindings: dict[str, dict[str, Any]] | None = None,
         launch: bool = True,
         replace_job_id: str | None = None,
+        recreate_ssd: bool = False,
     ) -> dict[str, Any]:
         """Create a run. With ``launch=False`` the job is fully prepared (run
         folder, materialised inputs, validated command) but left in the ``saved``
@@ -170,6 +193,12 @@ class JobManager:
             shutil.rmtree(workdir, ignore_errors=True)
             raise
         if ssd_dir is not None:
+            # The SSD scratch is shared per project+program and reused across runs
+            # (the generator skips rebuilding when cached shards exist). Optionally
+            # discard it so it's rebuilt from the current inputs — only on an actual
+            # launch, so a merely-saved job can't clobber a concurrent run's scratch.
+            if recreate_ssd and launch and ssd_dir.exists():
+                shutil.rmtree(ssd_dir, ignore_errors=True)
             ssd_dir.mkdir(parents=True, exist_ok=True)
 
         # Launch from the metadata file's folder so relative image references in
@@ -445,20 +474,29 @@ class JobManager:
         if subs:
             subs.discard(queue)
 
-    def read_log(self, job_id: str, cap: int = 4_000_000) -> str:
-        """Full persisted log (tail-capped), used to replay finished jobs.
+    def read_log(self, job_id: str, cap: int = 4_000_000, raw_cap: int = 64_000_000) -> str:
+        """Full persisted log for replay, with tqdm progress frames collapsed.
 
-        The in-memory buffer is only a recent-tail, so reopening a long job must
-        replay from the file to keep the earliest lines.
+        The in-memory buffer is only a recent tail, so reopening a job (running or
+        finished) replays from the file to keep the earliest lines. We read up to
+        ``raw_cap`` bytes from the end (enough for any realistic run in full),
+        collapse repeated ``\\r`` progress frames to their final state, then cap the
+        result to ``cap`` characters — so early lines survive even when a run has
+        written megabytes of progress output.
         """
         job = self.get(job_id)
         if not job:
             return ""
         try:
-            data = Path(job["log_path"]).read_bytes()
+            p = Path(job["log_path"])
+            size = p.stat().st_size
+            with open(p, "rb") as f:
+                if size > raw_cap:
+                    f.seek(size - raw_cap)
+                data = f.read()
         except OSError:
             return "".join(self._buffers.get(job_id, ()))
-        return data[-cap:].decode("utf-8", errors="replace")
+        return _collapse_progress(data.decode("utf-8", errors="replace"))[-cap:]
 
     def _publish(self, job_id: str, message: dict[str, Any]) -> None:
         for queue in self._subscribers.get(job_id, set()):

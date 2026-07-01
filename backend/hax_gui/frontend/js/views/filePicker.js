@@ -2,7 +2,12 @@
 import { h, mount } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
+import { store } from "../store.js";
+import { navigate } from "../router.js";
 import { errorBox } from "./ui.js";
+
+const MAP_RX = /\.(mrc|map|vol)$/i;
+const MD_RX = /\.(xmd|star|cs)$/i;
 
 export function openFilePicker(kind, onSelect) {
   let current;            // current directory listing
@@ -75,7 +80,7 @@ export function openFilePicker(kind, onSelect) {
   }
 
   function entryRow(e) {
-    return h(
+    const row = h(
       "button",
       {
         class: "entry",
@@ -86,6 +91,29 @@ export function openFilePicker(kind, onSelect) {
       h("span", { class: "nm" + (e.is_dir ? " folder" : "") }, e.name),
       e.size != null ? h("span", { class: "sz" }, formatSize(e.size)) : null
     );
+    // Volume and metadata files get an inline "inspect" action that opens the
+    // matching standalone viewer without selecting the file into the current field.
+    if (!e.is_dir && MAP_RX.test(e.name)) {
+      const inspect = h("button",
+        { class: "btn-icon", title: "Inspect this map (3D / orthogonal slices)", onclick: (ev) => { ev.stopPropagation(); inspectFile(e.path, "map"); } },
+        icon("box", 15));
+      return h("div", { class: "entry-map" }, row, inspect);
+    }
+    if (!e.is_dir && MD_RX.test(e.name)) {
+      const inspect = h("button",
+        { class: "btn-icon", title: "Browse this metadata as a table (with plots)", onclick: (ev) => { ev.stopPropagation(); inspectFile(e.path, "md"); } },
+        icon("grid", 15));
+      return h("div", { class: "entry-map" }, row, inspect);
+    }
+    return row;
+  }
+
+  async function inspectFile(path, kind) {
+    try {
+      store.openViewer(kind === "md" ? await api.mdViewer(path) : await api.mrcViewer(path));
+      close();
+      navigate("/viewer");
+    } catch (err) { mount(list, errorBox(err)); }
   }
 
   load(undefined);
