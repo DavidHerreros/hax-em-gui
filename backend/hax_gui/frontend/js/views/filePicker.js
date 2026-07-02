@@ -3,7 +3,6 @@ import { h, mount } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store } from "../store.js";
-import { navigate } from "../router.js";
 import { errorBox } from "./ui.js";
 
 const MAP_RX = /\.(mrc|map|vol)$/i;
@@ -111,8 +110,7 @@ export function openFilePicker(kind, onSelect) {
   async function inspectFile(path, kind) {
     try {
       store.openViewer(kind === "md" ? await api.mdViewer(path) : await api.mrcViewer(path));
-      close();
-      navigate("/viewer");
+      close();   // opens in the floating viewer window
     } catch (err) { mount(list, errorBox(err)); }
   }
 

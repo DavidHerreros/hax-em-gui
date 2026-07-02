@@ -1,10 +1,10 @@
-// 3D viewer: launch the WebGL conformational-landscape viewer for a run that has
-// latents + a trained network, embedded as iframe tabs (sessions persist across
-// tab switches, like Metrics).
-import { h, mount, clear } from "../h.js";
+// 3D viewer launcher page: lists runs with a conformational landscape and opens
+// them. The viewers themselves (and mrc / metadata viewers) render in the shared
+// floating window (viewerWindow.js), so opening one pops it over the current page
+// as a movable/resizable tab rather than living on this route.
+import { h, mount } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
-import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
 import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
@@ -26,25 +26,10 @@ function viewable(job) {
 export function ViewerView() {
   const root = h("div", { class: "view viewer-view" });
   root.appendChild(h("header", { class: "page-head" }, h("h1", null, "3D viewer"),
-    h("p", { class: "subtitle" }, "Explore a conformational landscape in WebGL: pick a state, see its decoded map. Sessions open as tabs below.")));
+    h("p", { class: "subtitle" }, "Explore a conformational landscape in WebGL: pick a state, see its decoded map. Sessions open in a floating window you can move and resize.")));
 
-  const runsBox = h("div", { style: { marginBottom: "20px" } });
+  const runsBox = h("div");
   root.appendChild(runsBox);
-
-  const tabbar = h("div", { class: "tabbar", style: { marginTop: "8px" } });
-  const framesWrap = h("div", { class: "frames-wrap" });
-  root.appendChild(tabbar);
-  root.appendChild(framesWrap);
-  const frames = new Map();
-
-  // Mirror the GUI light/dark theme into each viewer iframe (initial ?theme= + live postMessage).
-  const themeOf = () => (document.documentElement.dataset.theme === "light" ? "light" : "dark");
-  const withTheme = (url) => url + (url.includes("?") ? "&" : "?") + "theme=" + themeOf();
-  function onTheme(e) {
-    const theme = e.detail === "light" ? "light" : "dark";
-    for (const f of frames.values()) { try { f.contentWindow.postMessage({ type: "hax-theme", theme }, "*"); } catch (_) {} }
-  }
-  window.addEventListener("hax-theme", onTheme);
 
   function loadRuns() {
     mount(runsBox, h("p", { class: "muted small", style: { margin: "8px 0" } }, "Loading runs…"));
@@ -75,7 +60,7 @@ export function ViewerView() {
   async function launch(job, btn) {
     if (btn) { btn.disabled = true; btn.lastChild.textContent = "Starting…"; }
     try {
-      await launchViewerForJob(job);   // handles the FlexConsensus space chooser
+      await launchViewerForJob(job);   // opens in the floating window (handles the FlexConsensus space chooser)
     } catch (err) {
       mount(runsBox, errorBox(err));
     } finally {
@@ -83,39 +68,6 @@ export function ViewerView() {
     }
   }
 
-  function sync() {
-    const { openViewers, activeViewerId } = getState();
-    clear(tabbar);
-    for (const v of openViewers) {
-      tabbar.appendChild(h("div", { class: "tab" + (v.id === activeViewerId ? " active" : ""), onclick: () => store.setActiveViewer(v.id) },
-        h("span", { class: "tab-label" }, v.title || "Viewer"),
-        h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); closeViewer(v.id); } }, icon("x", 14))));
-    }
-    for (const v of openViewers) {
-      if (!frames.has(v.id)) {
-        const f = h("iframe", { class: "tb-frame", src: withTheme(v.url), title: "Viewer " + v.id });
-        frames.set(v.id, f);
-        framesWrap.appendChild(f);
-      }
-    }
-    for (const id of [...frames.keys()]) {
-      if (!openViewers.some((v) => v.id === id)) { frames.get(id).remove(); frames.delete(id); }
-    }
-    for (const [id, f] of frames) f.style.display = id === activeViewerId ? "block" : "none";
-
-    if (!openViewers.length) mount(framesWrap, h("p", { class: "muted", style: { padding: "24px 0" } }, "No viewer open. Open a run above."));
-    else if (framesWrap.querySelector("p")) framesWrap.querySelector("p").remove();
-  }
-
-  function closeViewer(id) {
-    const v = getState().openViewers.find((x) => x.id === id);
-    const stop = v && v.kind === "mrc" ? api.stopMrcViewer : v && v.kind === "md" ? api.stopMdViewer : api.stopViewer;
-    stop(id).catch(() => {});
-    store.closeViewer(id);
-  }
-
-  const unsub = subscribe(sync);
   loadRuns();
-  sync();
-  return { el: root, cleanup: () => { unsub(); window.removeEventListener("hax-theme", onTheme); } };
+  return { el: root };
 }

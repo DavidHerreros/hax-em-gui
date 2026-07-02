@@ -32,6 +32,9 @@ LIVE_BUFFER_CHARS = 256_000
 
 ACTIVE = {"pending", "running"}
 
+# The subprocess' output streams, kept separate so the UI can show one tab each.
+STREAMS = ("out", "err")
+
 
 def _collapse_progress(text: str) -> str:
     """Collapse in-place progress frames for a log-replay snapshot.
@@ -88,8 +91,9 @@ class JobManager:
         self._db: sqlite3.Connection | None = None
         self._procs: dict[str, asyncio.subprocess.Process] = {}
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
-        self._buffers: dict[str, deque[str]] = {}  # job_id -> recent raw text chunks
-        self._buflens: dict[str, int] = {}
+        # Recent raw text tail per job, split by stream: job_id -> {stream: deque}.
+        self._buffers: dict[str, dict[str, deque[str]]] = {}
+        self._buflens: dict[str, dict[str, int]] = {}
 
     # -- lifecycle ---------------------------------------------------------
     def init(self) -> None:
@@ -233,8 +237,7 @@ class JobManager:
                 (job_id, program, name_val, json.dumps(values), gpu or None,
                  json.dumps(command), status, str(log_path), _now(), project_id, str(workdir), cwd, bindings_val),
             )
-        self._buffers[job_id] = deque()
-        self._buflens[job_id] = 0
+        self._init_buffers(job_id)
         if launch:
             await self._launch(job_id, command, str(log_path), cwd)
         return self.get(job_id)
@@ -248,8 +251,7 @@ class JobManager:
             raise JobActive(job_id)
         if job["status"] != "saved":
             raise JobNotSaved(job_id)
-        self._buffers[job_id] = deque()
-        self._buflens[job_id] = 0
+        self._init_buffers(job_id)
         self._exec("UPDATE jobs SET status='pending', return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
         await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"))
         return self.get(job_id)
@@ -335,7 +337,9 @@ class JobManager:
             proc = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                # Keep stderr on its own pipe so the UI can show it in a separate
+                # tab (its own log file, buffer and stream-tagged chunks).
+                stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 # hax colorizes output only on a TTY (honoring NO_COLOR/FORCE_COLOR).
                 # We capture stdout through a pipe (not a TTY), but the log viewer
@@ -353,7 +357,7 @@ class JobManager:
                 "UPDATE jobs SET status='failed', return_code=-1, finished_at=? WHERE id=?",
                 (_now(), job_id),
             )
-            self._publish(job_id, {"type": "chunk", "data": f"[launch error] {exc}\n"})
+            self._publish(job_id, {"type": "chunk", "stream": "err", "data": f"[launch error] {exc}\n"})
             self._publish(job_id, {"type": "status", "status": "failed", "return_code": -1})
             return
 
@@ -366,22 +370,13 @@ class JobManager:
         asyncio.create_task(self._reader(job_id, proc, log_path))
 
     async def _reader(self, job_id: str, proc: asyncio.subprocess.Process, log_path: str) -> None:
-        assert proc.stdout is not None
-        # Stream raw chunks (not lines) so carriage-return progress bars update
-        # live, and write raw bytes to the log so ANSI colors are preserved.
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        with open(log_path, "wb") as log:
-            while True:
-                data = await proc.stdout.read(4096)
-                if not data:
-                    break
-                log.write(data)
-                log.flush()
-                text = decoder.decode(data)
-                if text:
-                    self._buffer_append(job_id, text)
-                    self._publish(job_id, {"type": "chunk", "data": text})
-
+        # Drain stdout and stderr concurrently into their own log files, then wait
+        # for exit. Both pipes must reach EOF before proc.wait() returns — the hax
+        # program's forkserver workers inherit them, so a subset closing isn't done.
+        await asyncio.gather(
+            self._pump(job_id, proc.stdout, log_path, "out"),
+            self._pump(job_id, proc.stderr, self._err_path(log_path), "err"),
+        )
         return_code = await proc.wait()
         self._procs.pop(job_id, None)
         current = self.get(job_id)
@@ -393,6 +388,34 @@ class JobManager:
             (status, return_code, _now(), job_id),
         )
         self._publish(job_id, {"type": "status", "status": status, "return_code": return_code})
+
+    async def _pump(self, job_id: str, stream: asyncio.StreamReader | None, path: str, kind: str) -> None:
+        """Drain one output stream: raw bytes to its log file (ANSI preserved),
+        decoded text to the in-memory tail and to WS subscribers tagged by stream."""
+        if stream is None:
+            return
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        with open(path, "wb") as log:
+            while True:
+                data = await stream.read(4096)
+                if not data:
+                    break
+                log.write(data)
+                log.flush()
+                text = decoder.decode(data)
+                if text:
+                    self._buffer_append(job_id, text, kind)
+                    self._publish(job_id, {"type": "chunk", "stream": kind, "data": text})
+
+    @staticmethod
+    def _err_path(log_path: str) -> str:
+        """The stderr log file beside the stdout one: run.log -> run.err.log."""
+        p = Path(log_path)
+        return str(p.with_name(p.stem + ".err" + p.suffix))
+
+    def _init_buffers(self, job_id: str) -> None:
+        self._buffers[job_id] = {s: deque() for s in STREAMS}
+        self._buflens[job_id] = {s: 0 for s in STREAMS}
 
     async def cancel(self, job_id: str) -> None:
         proc = self._procs.get(job_id)
@@ -452,12 +475,14 @@ class JobManager:
         self._exec("DELETE FROM jobs WHERE project_id=?", (project_id,))
 
     # -- pub/sub for live logs --------------------------------------------
-    def _buffer_append(self, job_id: str, text: str) -> None:
-        buf = self._buffers.setdefault(job_id, deque())
+    def _buffer_append(self, job_id: str, text: str, stream: str) -> None:
+        bufs = self._buffers.setdefault(job_id, {s: deque() for s in STREAMS})
+        lens = self._buflens.setdefault(job_id, {s: 0 for s in STREAMS})
+        buf = bufs.setdefault(stream, deque())
         buf.append(text)
-        self._buflens[job_id] = self._buflens.get(job_id, 0) + len(text)
-        while self._buflens[job_id] > LIVE_BUFFER_CHARS and len(buf) > 1:
-            self._buflens[job_id] -= len(buf.popleft())
+        lens[stream] = lens.get(stream, 0) + len(text)
+        while lens[stream] > LIVE_BUFFER_CHARS and len(buf) > 1:
+            lens[stream] -= len(buf.popleft())
 
     def subscribe(self, job_id: str) -> tuple[asyncio.Queue, str]:
         """Register a live subscriber and atomically snapshot the buffered tail.
@@ -466,7 +491,7 @@ class JobManager:
         """
         queue: asyncio.Queue = asyncio.Queue()
         self._subscribers.setdefault(job_id, set()).add(queue)
-        snapshot = "".join(self._buffers.get(job_id, ()))
+        snapshot = "".join(self._buffers.get(job_id, {}).get("out", ()))
         return queue, snapshot
 
     def unsubscribe(self, job_id: str, queue: asyncio.Queue) -> None:
@@ -474,8 +499,8 @@ class JobManager:
         if subs:
             subs.discard(queue)
 
-    def read_log(self, job_id: str, cap: int = 4_000_000, raw_cap: int = 64_000_000) -> str:
-        """Full persisted log for replay, with tqdm progress frames collapsed.
+    def read_log(self, job_id: str, stream: str = "out", cap: int = 4_000_000, raw_cap: int = 64_000_000) -> str:
+        """Full persisted log for one stream ("out"/"err"), tqdm frames collapsed.
 
         The in-memory buffer is only a recent tail, so reopening a job (running or
         finished) replays from the file to keep the earliest lines. We read up to
@@ -487,15 +512,16 @@ class JobManager:
         job = self.get(job_id)
         if not job:
             return ""
+        log_path = job["log_path"] if stream == "out" else self._err_path(job["log_path"])
         try:
-            p = Path(job["log_path"])
+            p = Path(log_path)
             size = p.stat().st_size
             with open(p, "rb") as f:
                 if size > raw_cap:
                     f.seek(size - raw_cap)
                 data = f.read()
         except OSError:
-            return "".join(self._buffers.get(job_id, ()))
+            return "".join(self._buffers.get(job_id, {}).get(stream, ()))
         return _collapse_progress(data.decode("utf-8", errors="replace"))[-cap:]
 
     def _publish(self, job_id: str, message: dict[str, Any]) -> None:
@@ -532,15 +558,16 @@ class JobManager:
         )
         return [self._row(r) for r in rows]
 
-    def tail(self, job_id: str, max_lines: int | None = None) -> list[str]:
+    def tail(self, job_id: str, max_lines: int | None = None, stream: str = "out") -> list[str]:
         job = self.get(job_id)
         if not job:
             return []
+        log_path = job["log_path"] if stream == "out" else self._err_path(job["log_path"])
         try:
-            with open(job["log_path"], encoding="utf-8") as log:
+            with open(log_path, encoding="utf-8") as log:
                 lines = log.read().splitlines()
         except FileNotFoundError:
-            lines = list(self._buffers.get(job_id, ()))
+            lines = list(self._buffers.get(job_id, {}).get(stream, ()))
         return lines[-max_lines:] if max_lines else lines
 
     # -- helpers -----------------------------------------------------------

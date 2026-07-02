@@ -17,6 +17,8 @@ import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js"
 import { promptModal } from "./promptModal.js";
 import { loadProgramGroups, isModed } from "../programGroups.js";
 
+const LAST_WF_KEY = "hax_gui_last_workflow";   // reopen this workflow on next visit
+
 const NODE_W = 196;     // node width (px)
 const HEADER_H = 34;    // node header height
 const ROW_H = 26;       // per-input-port row height
@@ -265,16 +267,20 @@ export function WorkflowsView() {
     loadLabels().catch(() => {});
     loadProgramGroups().catch(() => {});
     await refreshList();
-    openWorkflow(null);
+    // Reopen the workflow left open last time (if it still exists), so entering the
+    // page resumes where you were instead of a blank canvas. Falls back to empty.
+    const last = localStorage.getItem(LAST_WF_KEY);
+    if (last && wfList.some((w) => w.id === last)) openWorkflow(last);
+    else openWorkflow(null);
   }
 
+  let wfList = [];   // last-fetched saved-workflow list (drives the reopen check)
   async function refreshList() {
     const pid = getState().activeProjectId;
-    let items = [];
-    try { items = await api.workflows(pid); } catch { items = []; }
+    try { wfList = await api.workflows(pid); } catch { wfList = []; }
     clear(wfSelect);
     wfSelect.appendChild(h("option", { value: "" }, "— saved workflows —"));
-    for (const w of items) wfSelect.appendChild(h("option", { value: w.id }, w.name || "Untitled"));
+    for (const w of wfList) wfSelect.appendChild(h("option", { value: w.id }, w.name || "Untitled"));
     if (wf) wfSelect.value = wf.id;
   }
 
@@ -905,7 +911,7 @@ export function WorkflowsView() {
     try {
       if (wf) wf = await api.updateWorkflow(wf.id, { name, graph: graphSnapshot() });
       else wf = await api.createWorkflow({ project_id: pid, name, graph: graphSnapshot() });
-      dirty = false; flash("Saved.", "muted"); await refreshList(); wfSelect.value = wf.id; syncProjectBtn();
+      dirty = false; rememberWorkflow(wf.id); flash("Saved.", "muted"); await refreshList(); wfSelect.value = wf.id; syncProjectBtn();
     } catch (err) { flash("Save failed: " + (err.detail || err.message), "err"); }
     return wf;
   }
@@ -965,12 +971,14 @@ export function WorkflowsView() {
     selectedSet.clear();
     if (!id) {
       wf = null; graph = { nodes: [], edges: [], orientation: "horizontal" }; runState = null; selected = null; nameInput.value = "";
-      wfSelect.value = ""; syncOrientBtn(); syncProjectBtn(); syncLayoutBtns(); renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
+      wfSelect.value = ""; rememberWorkflow(null);
+      syncOrientBtn(); syncProjectBtn(); syncLayoutBtns(); renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
     }
     try {
       wf = await api.workflow(id);
       adoptGraph(wf.graph || {});
       runState = wf.run_state || null; selected = null; nameInput.value = wf.name || ""; wfSelect.value = wf.id;
+      rememberWorkflow(wf.id);
       syncOrientBtn(); syncProjectBtn();
       // freshly imported / never-laid-out graphs have all-zero coords — tidy once
       if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
@@ -978,7 +986,15 @@ export function WorkflowsView() {
       renderInspector();
       flash(wf.status && wf.status !== "idle" ? `${wf.status} — ${countStatuses()}` : "Loaded.", "muted");
       if (wf.status === "running") startPolling();
-    } catch (err) { flash("Load failed: " + (err.detail || err.message), "err"); }
+    } catch (err) {
+      rememberWorkflow(null);   // stale/removed target — don't keep trying to reopen it
+      flash("Load failed: " + (err.detail || err.message), "err");
+    }
+  }
+
+  function rememberWorkflow(id) {
+    try { if (id) localStorage.setItem(LAST_WF_KEY, id); else localStorage.removeItem(LAST_WF_KEY); }
+    catch { /* storage unavailable — non-fatal */ }
   }
 
   async function removeWorkflow() {

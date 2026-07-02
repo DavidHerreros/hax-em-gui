@@ -8,6 +8,7 @@ import { store, getState, subscribe } from "./store.js";
 import { buildLauncher } from "./views/launcher.js";
 import { startUpdates, updateBadge } from "./updates.js";
 import { loadProgramGroups } from "./programGroups.js";
+import { mountViewerWindow } from "./views/viewerWindow.js";
 import { HomeView } from "./views/home.js";
 import { ProjectsView } from "./views/projects.js";
 import { SettingsView } from "./views/settings.js";
@@ -127,3 +128,4 @@ defineRoutes([
 startRouter();
 startUpdates();
 loadProgramGroups();   // derive program groupings (moded / predict-latents) from the backend
+mountViewerWindow();   // floating window that hosts all opened viewers as tabs

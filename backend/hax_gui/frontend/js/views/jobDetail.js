@@ -24,7 +24,13 @@ export function JobDetailView(params) {
   const inputs = h("div", { class: "job-maps" });
   const maps = h("div", { class: "job-maps" });
   const actionErr = h("div", { style: { marginBottom: "12px" } });
-  const consoleEl = h("div", { class: "console" });
+  // Terminal output split into stdout / stderr tabs.
+  const outConsole = h("div", { class: "console" });
+  const errConsole = h("div", { class: "console", style: { display: "none" } });
+  const errDot = h("span", { class: "tab-dot", title: "New stderr output" });
+  const tabOut = h("div", { class: "tab active", onclick: () => selectStream("out") }, h("span", { class: "tab-label" }, "stdout"));
+  const tabErr = h("div", { class: "tab", onclick: () => selectStream("err") }, h("span", { class: "tab-label" }, "stderr"), errDot);
+  const consoleTabs = h("div", { class: "tabbar console-tabs" }, tabOut, tabErr);
 
   root.appendChild(h("a", { class: "back", href: "#/jobs" }, icon("arrowLeft", 16), "Jobs"));
   root.appendChild(head);
@@ -34,11 +40,26 @@ export function JobDetailView(params) {
   root.appendChild(inputs);
   root.appendChild(maps);
   root.appendChild(actionErr);
-  root.appendChild(consoleEl);
+  root.appendChild(consoleTabs);
+  root.appendChild(outConsole);
+  root.appendChild(errConsole);
 
-  const term = createTerminal(consoleEl);
+  const termOut = createTerminal(outConsole);
+  const termErr = createTerminal(errConsole);
+  let activeStream = "out";
   let status = "pending";
   let job = null;
+
+  function selectStream(s) {
+    activeStream = s;
+    outConsole.style.display = s === "out" ? "" : "none";
+    errConsole.style.display = s === "err" ? "" : "none";
+    tabOut.classList.toggle("active", s === "out");
+    tabErr.classList.toggle("active", s === "err");
+    if (s === "err") tabErr.classList.remove("has-err");   // seen — clear the dot
+  }
+  // Flag the stderr tab when it gets output while it isn't the one on screen.
+  function markErr(text) { if (text && activeStream !== "err") tabErr.classList.add("has-err"); }
 
   function renderHead() {
     clear(head);
@@ -97,7 +118,7 @@ export function JobDetailView(params) {
   }
   async function openViewer() {
     clear(actionErr);
-    try { if (await launchViewerForJob(job)) navigate("/viewer"); }
+    try { await launchViewerForJob(job); }   // opens in the floating viewer window
     catch (err) { mount(actionErr, errorBox(err)); }
   }
 
@@ -156,7 +177,7 @@ export function JobDetailView(params) {
     if (btn) { btn.disabled = true; btn.lastChild.textContent = "Opening…"; }
     try {
       const v = kind === "map" ? await api.mrcViewerFromJob(id, f.path) : await api.mdViewerFromJob(id, f.path);
-      store.openViewer(v); navigate("/viewer");
+      store.openViewer(v);   // shows in the floating viewer window over this page
     } catch (err) { mount(actionErr, errorBox(err)); }
     finally { if (btn) { btn.disabled = false; btn.lastChild.textContent = orig; } }
   }
@@ -167,7 +188,7 @@ export function JobDetailView(params) {
     try {
       const j = await api.startJob(id);
       job = j; status = j.status;
-      term.reset();
+      termOut.reset(); termErr.reset();
       connectLog();      // re-open the stream now that the job is running
       renderHead();
     } catch (err) { mount(actionErr, errorBox(err)); }
@@ -236,8 +257,18 @@ export function JobDetailView(params) {
   function connectLog() {
     if (closeLog) closeLog();
     closeLog = subscribeLog(id, (m) => {
-      if (m.type === "snapshot") { status = m.status; term.reset(); if (m.data) term.write(m.data); renderHead(); loadOutputs(); updatePolling(); }
-      else if (m.type === "chunk") { term.write(m.data); }
+      if (m.type === "snapshot") {
+        status = m.status;
+        termOut.reset(); termErr.reset();
+        const s = m.streams || {};
+        if (s.out) termOut.write(s.out);
+        if (s.err) { termErr.write(s.err); markErr(s.err); }
+        renderHead(); loadOutputs(); updatePolling();
+      }
+      else if (m.type === "chunk") {
+        if (m.stream === "err") { termErr.write(m.data); markErr(m.data); }
+        else termOut.write(m.data);
+      }
       else if (m.type === "status") {
         status = m.status;
         updatePolling();

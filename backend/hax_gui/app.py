@@ -419,10 +419,10 @@ def get_job(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/log", dependencies=[Depends(auth)])
-def job_log(job_id: str, max_lines: int | None = None) -> dict[str, Any]:
+def job_log(job_id: str, max_lines: int | None = None, stream: str = "out") -> dict[str, Any]:
     if manager.get(job_id) is None:
         raise HTTPException(status_code=404, detail="job not found")
-    return {"lines": manager.tail(job_id, max_lines)}
+    return {"lines": manager.tail(job_id, max_lines, stream)}
 
 
 class JobRename(BaseModel):
@@ -500,14 +500,21 @@ async def job_log_ws(websocket: WebSocket, job_id: str) -> None:
     # lose the earliest lines once tqdm progress output has filled it.
     queue, _ = manager.subscribe(job_id)
     try:
+        # One snapshot carrying both streams' full replay, so the UI seeds its
+        # stdout / stderr tabs; live chunks that follow are tagged per stream.
+        def _snapshot() -> dict[str, Any]:
+            return {"type": "snapshot", "status": job["status"],
+                    "streams": {"out": manager.read_log(job_id, "out"),
+                                "err": manager.read_log(job_id, "err")}}
+
         if not job["active"]:
             # Finished job: replay the full log and close — nothing more will stream.
             manager.unsubscribe(job_id, queue)
-            await websocket.send_json({"type": "snapshot", "data": manager.read_log(job_id), "status": job["status"]})
+            await websocket.send_json(_snapshot())
             await websocket.send_json({"type": "status", "status": job["status"], "return_code": job["return_code"]})
             return
 
-        await websocket.send_json({"type": "snapshot", "data": manager.read_log(job_id), "status": job["status"]})
+        await websocket.send_json(_snapshot())
         shutdown = websocket.app.state.shutdown
         while True:
             getter = asyncio.ensure_future(queue.get())
