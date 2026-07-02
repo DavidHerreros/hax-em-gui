@@ -6,12 +6,14 @@ Schemas are produced by :mod:`hax_gui.introspect`. We prefer the cached JSON
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from . import adapters
 from .config import settings
 
 # Human-facing category per hax subpackage, plus display order.
@@ -31,8 +33,7 @@ def _category(module_path: str) -> str:
     return "Other"
 
 
-@lru_cache(maxsize=1)
-def _load() -> dict[str, Any]:
+def _load_cached() -> dict[str, Any]:
     if settings.schema_cache.exists():
         return json.loads(settings.schema_cache.read_text())
     # No user cache yet: use the seed shipped inside the package, if present.
@@ -45,6 +46,74 @@ def _load() -> dict[str, Any]:
     data = extract_all()
     settings.schema_cache.parent.mkdir(parents=True, exist_ok=True)
     settings.schema_cache.write_text(json.dumps(data, indent=2, default=str))
+    return data
+
+
+def _declared_programs() -> dict[str, tuple[str, str]] | None:
+    """Read hax's ``MODULES_DICT`` straight from ``hax/cli/cli.py`` source via
+    ``ast`` — no ``import hax`` (which would pull in JAX). Returns ``{name:
+    (module_path, description)}`` or ``None`` if hax isn't found / the dict isn't a
+    plain literal (in which case auto-discovery quietly no-ops)."""
+    pkg = _hax_package_dir()
+    if pkg is None:
+        return None
+    cli = pkg / "cli" / "cli.py"
+    try:
+        tree = ast.parse(cli.read_text())
+    except (OSError, SyntaxError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "MODULES_DICT" for t in node.targets
+        ):
+            try:
+                raw = ast.literal_eval(node.value)
+            except (ValueError, SyntaxError):
+                return None
+            return {k: (v[0], v[1]) for k, v in raw.items()
+                    if isinstance(v, (list, tuple)) and len(v) >= 2}
+    return None
+
+
+def _autodiscover(data: dict[str, Any]) -> None:
+    """Reconcile the loaded schema cache with hax's current ``MODULES_DICT``:
+    live-introspect programs that were added since the cache was built and drop
+    ones that were removed, then persist to the user cache. This keeps the GUI in
+    step with new hax programs automatically — the only manual step left is
+    regenerating (``hax-gui schemas``) when an existing program's *arguments*
+    change, which source inspection can't detect. Only imports JAX when a genuinely
+    new program must be extracted."""
+    declared = _declared_programs()
+    if not declared:
+        return
+    progs: dict[str, Any] = data.setdefault("programs", {})
+    errs: dict[str, Any] = data.setdefault("errors", {})
+    missing = [n for n in declared if n not in progs and n not in errs]
+    removed = [n for n in list(progs) if n not in declared]
+    if not missing and not removed:
+        return
+    for name in removed:
+        progs.pop(name, None)
+    if missing:
+        from .introspect import schema_for_program   # imports JAX; keep lazy
+
+        for name in missing:
+            module_path, desc = declared[name]
+            try:
+                progs[name] = schema_for_program(name, module_path, desc)
+            except Exception as exc:  # noqa: BLE001 - record & skip, like extract_all
+                errs[name] = str(exc)
+    try:
+        settings.schema_cache.parent.mkdir(parents=True, exist_ok=True)
+        settings.schema_cache.write_text(json.dumps(data, indent=2, default=str))
+    except OSError:
+        pass
+
+
+@lru_cache(maxsize=1)
+def _load() -> dict[str, Any]:
+    data = _load_cached()
+    _autodiscover(data)
     return data
 
 
@@ -103,8 +172,24 @@ def get_schema(name: str) -> dict[str, Any] | None:
     return {**raw, "fields": fields}
 
 
+def _has_train_predict_mode(schema: dict[str, Any]) -> bool:
+    """True if the program exposes a ``--mode`` with both ``train`` and ``predict``
+    (so a train→predict wiring can inherit the training run's parameters)."""
+    for f in schema.get("fields", []):
+        if f.get("name") == "mode":
+            choices = set(f.get("choices") or [])
+            return "train" in choices and "predict" in choices
+    return False
+
+
 def list_programs() -> list[dict[str, Any]]:
-    """Lightweight catalog entries (no fields), sorted by category then name."""
+    """Lightweight catalog entries (no fields), sorted by category then name.
+
+    ``moded`` (has a train/predict ``--mode``) and ``latents_decoder`` (a predict
+    run yields latents + a reloadable decoder) are derived flags so the frontend
+    can group programs without hardcoding their names — new programs registered in
+    :mod:`hax_gui.adapters` are picked up automatically."""
+    latents_decoders = set(adapters.latents_decoder_programs())
     out = []
     for name, schema in all_programs().items():
         out.append(
@@ -113,6 +198,8 @@ def list_programs() -> list[dict[str, Any]]:
                 "description": schema.get("description", ""),
                 "category": _category(schema.get("module", "")),
                 "field_count": len(schema.get("fields", [])),
+                "moded": _has_train_predict_mode(schema),
+                "latents_decoder": name in latents_decoders,
             }
         )
     out.sort(key=lambda p: (_CATEGORY_ORDER.index(p["category"]) if p["category"] in _CATEGORY_ORDER else 99, p["name"]))

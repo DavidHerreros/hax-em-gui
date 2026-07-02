@@ -34,6 +34,7 @@ BINDABLE_FIELDS: dict[str, dict[str, str]] = {
     "hetsiren": {"reload": "hetsiren_model"},
     "zernike3deep": {"reload": "zernike3deep_model"},
     "reconsiren": {"reload": "reconsiren_model"},
+    "reconsiren_het_only": {"reload": "reconsiren_het_only_model"},
     # FlexConsensus consensuates many input latent spaces, so `--input_space` is a
     # *multi-valued* input: wire one latents source per program you want included.
     "flexconsensus": {"reload": "flexconsensus_model", "input_space": "latents"},
@@ -64,6 +65,7 @@ _CHECKPOINT_DIR: dict[str, str] = {
     "hetsiren": "HetSIREN",
     "zernike3deep": "Zernike3Deep",
     "reconsiren": "ReconSIREN",
+    "reconsiren_het_only": "ReconSIREN",   # het-only variant saves under the same subfolder
     "flexconsensus": "FlexConsensus",
     "latent_space_deconvolution": "deconvolver",
     "image_gray_scale_adjustment": "imageAdjustment",
@@ -83,19 +85,21 @@ _MODEL_KINDS: dict[str, dict[str, Any]] = {
     "hetsiren_model": {"programs": ["hetsiren"], "form": "parent"},
     "zernike3deep_model": {"programs": ["zernike3deep"], "form": "parent"},
     "reconsiren_model": {"programs": ["reconsiren"], "form": "parent"},
+    "reconsiren_het_only_model": {"programs": ["reconsiren_het_only"], "form": "parent"},
     "flexconsensus_model": {"programs": ["flexconsensus"], "form": "parent"},
     "deconvolver_model": {"programs": ["latent_space_deconvolution"], "form": "parent"},
     "image_adjust_model": {"programs": ["image_gray_scale_adjustment"], "form": "parent"},
     "volume_adjust_model": {"programs": ["volume_gray_scale_adjustment"], "form": "parent"},
-    "decoder_model": {"programs": ["hetsiren", "zernike3deep", "reconsiren"], "form": "dir"},
+    "decoder_model": {"programs": ["hetsiren", "zernike3deep", "reconsiren", "reconsiren_het_only"], "form": "dir"},
 }
 
 # Latents producers: a predict metadata column, or a ready filtered .npy.
 _LATENT_PRODUCERS: list[dict[str, Any]] = [
     {
         "style": "metadata",
-        "programs": {"hetsiren", "zernike3deep", "reconsiren"},
-        "globs": ["predicted_latents.xmd", "predicted_latents.star", "predicted_latents.*"],
+        "programs": {"hetsiren", "zernike3deep", "reconsiren", "reconsiren_het_only"},
+        "globs": ["predicted_latents.xmd", "predicted_latents.star", "predicted_latents.*",
+                  "predicted_pose_shifts.xmd", "predicted_pose_shifts.star", "predicted_pose_shifts.*"],
         "column": "latent_space",
     },
     {
@@ -141,6 +145,14 @@ def producer_programs(kind: str) -> list[str]:
     for spec in _specs_for_kind(kind):
         progs |= spec["programs"]
     return sorted(progs)
+
+
+def latents_decoder_programs() -> list[str]:
+    """Programs whose *predict* run yields latents AND a reloadable decoder network
+    (so a finished run is directly viewable / decodable). Derived from the maps
+    above, so a new such program is picked up automatically once registered here —
+    no hardcoded program lists elsewhere to keep in sync."""
+    return sorted(set(producer_programs("latents")) & set(_MODEL_KINDS["decoder_model"]["programs"]))
 
 
 def produces(program: str) -> list[str]:

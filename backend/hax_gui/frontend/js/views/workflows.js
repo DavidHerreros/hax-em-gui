@@ -15,6 +15,7 @@ import { visibleFields } from "./formFields.js";
 import { openFilePicker } from "./filePicker.js";
 import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js";
 import { promptModal } from "./promptModal.js";
+import { loadProgramGroups, isModed } from "../programGroups.js";
 
 const NODE_W = 196;     // node width (px)
 const HEADER_H = 34;    // node header height
@@ -26,9 +27,9 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 // Concrete colors for the minimap (canvas 2D can't read CSS custom properties).
 const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", running: "#38bdf8", succeeded: "#22c55e", failed: "#ef4444", blocked: "#f59e0b", cancelling: "#f59e0b", cancelled: "#94a3b8", interrupted: "#f59e0b", idle: "#94a3b8" };
 
-// Programs that expose a train/predict mode — wiring their model output into
-// another node of the same program inherits the form parameters (mode aside).
-const MODED_PROGRAMS = new Set(["hetsiren", "zernike3deep", "reconsiren"]);
+// Programs that expose a train/predict mode (derived from the backend, see
+// programGroups.js) — wiring their model output into another node of the same
+// program inherits the form parameters (mode aside).
 
 // Same grouping/order as the right-menu program launcher.
 const CATEGORY_ORDER = ["Networks", "Post-processing", "Metrics", "Viewers", "Other"];
@@ -262,6 +263,7 @@ export function WorkflowsView() {
     renderPalette(); syncOrientBtn();
     mmBtn.classList.toggle("on", minimapOn);
     loadLabels().catch(() => {});
+    loadProgramGroups().catch(() => {});
     await refreshList();
     openWorkflow(null);
   }
@@ -375,7 +377,7 @@ export function WorkflowsView() {
   function inheritParams(fromId, toId, kind) {
     const src = nodeById(fromId), dst = nodeById(toId);
     if (!src || !dst || src.program !== dst.program) return;
-    if (!MODED_PROGRAMS.has(dst.program) || !String(kind || "").endsWith("_model")) return;
+    if (!isModed(dst.program) || !String(kind || "").endsWith("_model")) return;
     const wiredFields = new Set(graph.edges.filter((e) => e.to === toId).map((e) => e.field));
     for (const [k, v] of Object.entries(src.args || {})) {
       if (k === "mode" || wiredFields.has(k)) continue;

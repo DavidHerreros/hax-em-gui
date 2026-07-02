@@ -7,13 +7,11 @@ import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
-
-// Predict runs of these programs expose latents as output (predicted_latents),
-// so they become viewable once finished even without a latents input field.
-const PREDICT_LATENT_PROGS = new Set(["hetsiren", "zernike3deep", "reconsiren"]);
+import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
 
 // A job is viewable if it has a network checkpoint plus latents — either a
-// latents input, or a finished predict run whose output provides them. A finished
+// latents input, or a finished predict run whose output provides them (which
+// programs is derived from the backend, see programGroups.js). A finished
 // FlexConsensus run is viewable too: the user picks a consensus space and its
 // decoder is auto-detected.
 function viewable(job) {
@@ -22,7 +20,7 @@ function viewable(job) {
   const reload = a.pickled_nn || a.reload;
   if (!reload) return null;
   if (a.z_space || a.latents || a.latents_file) return true;
-  return PREDICT_LATENT_PROGS.has(job.program) && job.status === "succeeded" ? true : null;
+  return isPredictLatents(job.program) && job.status === "succeeded" ? true : null;
 }
 
 export function ViewerView() {
@@ -50,8 +48,8 @@ export function ViewerView() {
 
   function loadRuns() {
     mount(runsBox, h("p", { class: "muted small", style: { margin: "8px 0" } }, "Loading runs…"));
-    api.jobs()
-      .then((jobs) => mount(runsBox, renderRuns(jobs.filter((j) => viewable(j)))))
+    Promise.all([loadProgramGroups().catch(() => {}), api.jobs()])
+      .then(([, jobs]) => mount(runsBox, renderRuns(jobs.filter((j) => viewable(j)))))
       .catch((err) => mount(runsBox, errorBox(err)));
   }
 
@@ -61,7 +59,7 @@ export function ViewerView() {
       h("button", { class: "btn-icon", title: "Refresh", style: { marginLeft: "auto" }, onclick: loadRuns }, icon("refresh", 15)));
     if (!jobs.length) {
       return h("div", null, header,
-        h("p", { class: "muted small" }, "None yet. Open the viewer from an ", h("span", { class: "mono" }, "annotate_space"), " run, or from a finished ", h("span", { class: "mono" }, "hetsiren/zernike3deep/reconsiren"), " predict run (its latents + network), then refresh."));
+        h("p", { class: "muted small" }, "None yet. Open the viewer from an ", h("span", { class: "mono" }, "annotate_space"), " run, or from a finished network ", h("span", { class: "mono" }, "predict"), " run (its latents + network), then refresh."));
     }
     return h("div", null, header, ...jobs.map((j) => {
       const btn = h("button", { class: "run-row", onclick: () => launch(j, btn) },

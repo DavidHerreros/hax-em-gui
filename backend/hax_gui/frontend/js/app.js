@@ -7,6 +7,7 @@ import { getToken, setToken } from "./api.js";
 import { store, getState, subscribe } from "./store.js";
 import { buildLauncher } from "./views/launcher.js";
 import { startUpdates, updateBadge } from "./updates.js";
+import { loadProgramGroups } from "./programGroups.js";
 import { HomeView } from "./views/home.js";
 import { ProjectsView } from "./views/projects.js";
 import { SettingsView } from "./views/settings.js";
@@ -125,3 +126,4 @@ defineRoutes([
 
 startRouter();
 startUpdates();
+loadProgramGroups();   // derive program groupings (moded / predict-latents) from the backend

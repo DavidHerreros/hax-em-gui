@@ -819,7 +819,10 @@ def _find_latent_metadata(project_dir: "Path | None", latents: str) -> str | Non
     return None
 
 
-_PREDICT_PROGRAMS = {"hetsiren", "zernike3deep", "reconsiren"}
+# Programs whose predict run yields latents + a decoder — derived from the
+# adapters maps (single source of truth), so new such programs need no edit here.
+def _predict_programs() -> set[str]:
+    return set(adapters.latents_decoder_programs())
 
 
 def _load_latents_array(path: str):
@@ -880,7 +883,7 @@ def _flexconsensus_spaces(job: dict[str, Any]) -> list[dict[str, Any]]:
     entries = raw if isinstance(raw, list) else (str(raw).split() if raw else [])
     workdir = Path(job.get("workdir") or ".")
     pid = job.get("project_id")
-    predict = [j for j in (manager.list_for_project(pid) if pid else []) if j["program"] in _PREDICT_PROGRAMS]
+    predict = [j for j in (manager.list_for_project(pid) if pid else []) if j["program"] in _predict_programs()]
     spaces = []
     for i, entry in enumerate(entries):
         entry = str(entry)

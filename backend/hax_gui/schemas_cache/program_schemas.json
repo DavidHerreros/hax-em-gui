@@ -253,6 +253,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -487,6 +498,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -594,6 +616,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "file"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -748,6 +781,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -959,6 +1003,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -1170,6 +1225,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -1252,6 +1318,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -1299,6 +1376,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -1375,6 +1463,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -1508,6 +1607,251 @@
     "reconsiren": {
       "name": "reconsiren",
       "module": "hax.networks.reconsiren",
+      "description": "Ab initio estimation of particle pose, shifts and initial volume with neural networks",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "vol",
+          "flags": [
+            "--vol"
+          ],
+          "flag": "--vol",
+          "required": false,
+          "help": "If provided, the neural network will start from this volume when assigning the angles and shifts to the images.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "mask",
+          "flags": [
+            "--mask"
+          ],
+          "flag": "--mask",
+          "required": false,
+          "help": "ReconSIREN reconstruction mask (the mask provided must be binary - NOTE: since this is a reconstruction mask, it should be defined such that it covers the volume were the motions of interest are expected to happen)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "num_gaussians",
+          "flags": [
+            "--num_gaussians"
+          ],
+          "flag": "--num_gaussians",
+          "required": false,
+          "help": "Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians so that the reproduce the reference volume as well as possible.",
+          "default": 10000,
+          "type": "integer"
+        },
+        {
+          "name": "load_images_to_ram",
+          "flags": [
+            "--load_images_to_ram"
+          ],
+          "flag": "--load_images_to_ram",
+          "required": false,
+          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "do_not_learn_volume",
+          "flags": [
+            "--do_not_learn_volume"
+          ],
+          "flag": "--do_not_learn_volume",
+          "required": false,
+          "help": "When this parameter is provided, ReconSIREN will just learn an angular assignment with shifts without learning any map. This is usually useful when a reference volume with high resolution is provided (e.g. coming from an atomic model) and no refinement of the map is needed.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "refine_current_assignment",
+          "flags": [
+            "--refine_current_assignment"
+          ],
+          "flag": "--refine_current_assignment",
+          "required": false,
+          "help": "If your input metadata has already and angular assignment and shifts, you can provide this option to refine those angles instead of finding an ab initio alignment.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "symmetry_group",
+          "flags": [
+            "--symmetry_group"
+          ],
+          "flag": "--symmetry_group",
+          "required": false,
+          "help": "If your protein has any kind of symmetry, you may pass it here so that it is considered while learning the angular assignment and the volume (NOTE: only c* and d* symmetry groups are currently supported - the parameter is lower case sensitive - even if symmetry is provided, the network will learn a symmetry broken set of angles in c1. Therefore, the angles can be directly used in a reconstruction/refinement.)",
+          "default": "c1",
+          "type": "string"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "mode",
+          "flags": [
+            "--mode"
+          ],
+          "flag": "--mode",
+          "required": true,
+          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the latent vectors from the input images (reload parameter is mandatory in this case)",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "train",
+            "predict",
+            "send_to_pickle"
+          ]
+        },
+        {
+          "name": "epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "flag": "--epochs",
+          "required": false,
+          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
+          "default": 50,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "learning_rate",
+          "flags": [
+            "--learning_rate"
+          ],
+          "flag": "--learning_rate",
+          "required": false,
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "default": 0.0001,
+          "type": "number"
+        },
+        {
+          "name": "dataset_split_fraction",
+          "flags": [
+            "--dataset_split_fraction"
+          ],
+          "flag": "--dataset_split_fraction",
+          "required": false,
+          "help": "Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: training_fraction,validation_fraction. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. NOTE: the sum of training_fraction and validation_fraction must be equal to one.",
+          "default": [
+            0.8,
+            0.2
+          ],
+          "type": "string",
+          "custom_type": "list_of_floats",
+          "widget": "csv"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, new metadata...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "reload",
+          "flags": [
+            "--reload"
+          ],
+          "flag": "--reload",
+          "required": false,
+          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data).",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
+        }
+      ]
+    },
+    "reconsiren_het_only": {
+      "name": "reconsiren_het_only",
+      "module": "hax.networks.reconsiren_het_only",
       "description": "Ab initio estimation of particle pose, shifts and initial volume with neural networks",
       "summary": "",
       "fields": [
@@ -1725,6 +2069,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
         }
       ]
     },
@@ -1881,6 +2236,48 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
+        }
+      ]
+    },
+    "update": {
+      "name": "update",
+      "module": "hax.cli.updater",
+      "description": "Check for and apply hax updates (PyPI release, or new commits for a devel/git install)",
+      "summary": "Check for and apply updates to hax-em (PyPI release or development git branch).",
+      "fields": [
+        {
+          "name": "check",
+          "flags": [
+            "--check"
+          ],
+          "flag": "--check",
+          "required": false,
+          "help": "Only check for updates and report; do not modify anything.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "yes",
+          "flags": [
+            "-y",
+            "--yes"
+          ],
+          "flag": "--yes",
+          "required": false,
+          "help": "Assume 'yes' to all prompts and apply the full update automatically (including dependency reinstall for development installs).",
+          "default": false,
+          "type": "boolean"
         }
       ]
     }

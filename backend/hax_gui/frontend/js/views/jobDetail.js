@@ -11,6 +11,7 @@ import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
 import { promptModal } from "./promptModal.js";
 import { createTerminal } from "./terminal.js";
+import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
 
 export function JobDetailView(params) {
   const id = params.id;
@@ -90,9 +91,9 @@ export function JobDetailView(params) {
     const reload = a.pickled_nn || a.reload;
     if (!reload) return false;
     if (a.z_space || a.latents || a.latents_file) return true;
-    // predict runs expose latents as output once finished
-    const PREDICT_LATENT_PROGS = ["hetsiren", "zernike3deep", "reconsiren"];
-    return PREDICT_LATENT_PROGS.includes(j.program) && j.status === "succeeded";
+    // predict runs expose latents as output once finished (which programs is
+    // derived from the backend, see programGroups.js)
+    return isPredictLatents(j.program) && j.status === "succeeded";
   }
   async function openViewer() {
     clear(actionErr);
@@ -216,6 +217,9 @@ export function JobDetailView(params) {
       loadInputs();
       loadOutputs();
       updatePolling();
+      // groups drive the "viewable" check; re-render once they're known (no-op if
+      // already cached, and the fallback keeps known programs correct meanwhile)
+      loadProgramGroups().then(() => renderHead()).catch(() => {});
     })
     .catch((err) => mount(root, errorBox(err)));
 
