@@ -101,9 +101,10 @@ export const store = {
   clearProgram() { state.selectedProgram = null; state.formNonce++; emit(); },
 
   // Open the launcher form for `job`'s program, preloaded with its inputs, so the
-  // user can edit and launch a new run. Targets the job's project.
+  // user can edit and re-run it. `jobId` is carried so Save/Run reuse the same job
+  // (edit in place) instead of creating a duplicate. Targets the job's project.
   editFrom(job) {
-    state.prefill = { program: job.program, values: { ...(job.args || {}) }, gpu: job.gpu || "" };
+    state.prefill = { program: job.program, values: { ...(job.args || {}) }, gpu: job.gpu || "", jobId: job.id };
     state.selectedProgram = job.program;
     state.rightOpen = true;
     state.formNonce++;

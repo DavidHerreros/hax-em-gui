@@ -137,6 +137,10 @@ class JobCreate(BaseModel):
     # Wipe the shared SSD scratch folder before launching so it's rebuilt fresh
     # (no effect unless the program uses a scratch folder and a root is configured).
     recreate_ssd: bool = False
+    # Reuse an existing job (same id / list position) instead of inserting a new
+    # one — set when editing a saved/finished job or re-running a job just saved
+    # from the launcher, so Save-then-Run and Edit don't spawn duplicates.
+    replace_job_id: str | None = None
 
 
 # -- catalog ---------------------------------------------------------------
@@ -350,9 +354,17 @@ def project_sources(project_id: str, kind: str) -> list[dict[str, Any]]:
 
 @app.post("/api/projects/{project_id}/jobs", dependencies=[Depends(auth)])
 async def create_project_job(project_id: str, body: JobCreate) -> dict[str, Any]:
+    # Reuse an existing job in place only when it's a real, non-active job of this
+    # project; otherwise fall back to creating a fresh one (e.g. it was deleted or
+    # is already running), so a stale replace target can never error or clobber a run.
+    replace = body.replace_job_id
+    if replace:
+        existing = manager.get(replace)
+        if existing is None or existing.get("project_id") != project_id or existing.get("active"):
+            replace = None
     try:
         return await manager.create(body.program, body.args, body.gpu, project_id, body.name, body.bindings, body.launch,
-                                    recreate_ssd=body.recreate_ssd)
+                                    replace_job_id=replace, recreate_ssd=body.recreate_ssd)
     except ProjectNotFound:
         raise HTTPException(status_code=404, detail=f"unknown project '{project_id}'")
     except ValidationError as exc:

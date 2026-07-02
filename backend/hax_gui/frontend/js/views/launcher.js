@@ -91,13 +91,19 @@ export function buildLauncher() {
     // Default to the first GPU; "cpu" forces CUDA_VISIBLE_DEVICES="" (no GPU).
     let gpu = gpus && gpus.length ? String(gpus[0].index) : "";
 
-    // Preload from a past job ("Edit & rerun"), keeping only visible fields so the
-    // auto-managed output/SSD dirs regenerate.
+    // The job this form edits in place (same id), so Save/Run reuse it instead of
+    // creating duplicates: set when editing an existing job, and also after the
+    // first Save so a following Run launches that same saved job. null = create new.
+    let targetJobId = null;
+
+    // Preload from a past job ("Edit" / "Edit & rerun"), keeping only visible fields
+    // so the auto-managed output/SSD dirs regenerate. Editing reuses the source job.
     const prefill = getState().prefill;
     if (prefill && prefill.program === schema.name) {
       const visible = new Set(visibleFields(schema).map((f) => f.name));
       for (const [k, v] of Object.entries(prefill.values || {})) if (visible.has(k)) values[k] = v;
       if (prefill.gpu) gpu = String(prefill.gpu);
+      if (prefill.jobId) targetJobId = prefill.jobId;
       store.clearPrefill();
     }
 
@@ -174,7 +180,12 @@ export function buildLauncher() {
         // also send any stale literal value for them.
         const payload = { ...values };
         for (const f of Object.keys(bindings)) delete payload[f];
-        await api.createProjectJob(proj.id, schema.name, payload, gpu || null, runName, bindings, launch, recreateSsd);
+        // Reuse the edited / just-saved job in place (no duplicate). The server
+        // ignores a stale target (deleted / already running) and creates fresh.
+        const created = await api.createProjectJob(proj.id, schema.name, payload, gpu || null, runName, bindings, launch, recreateSsd, targetJobId);
+        // Remember the id so a subsequent Run/Save in this same form keeps reusing
+        // it (e.g. Save job → Run launches that saved job rather than a new one).
+        if (created && created.id) targetJobId = created.id;
         store.setActiveProject(proj.id);
         navigate("/projects");
       } catch (err) {

@@ -112,10 +112,10 @@ export const api = {
   project: (id) => req(`/api/projects/${id}`),
   projectJobs: (id) => req(`/api/projects/${id}/jobs`),
   projectSources: (id, kind) => req(`/api/projects/${id}/sources?kind=${encodeURIComponent(kind)}`),
-  createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true, recreateSsd = false) =>
+  createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true, recreateSsd = false, replaceJobId = null) =>
     req(`/api/projects/${projectId}/jobs`, {
       method: "POST",
-      body: JSON.stringify({ program, args, gpu, name: name || null, bindings: bindings || {}, launch, recreate_ssd: recreateSsd }),
+      body: JSON.stringify({ program, args, gpu, name: name || null, bindings: bindings || {}, launch, recreate_ssd: recreateSsd, replace_job_id: replaceJobId }),
     }),
 };
 

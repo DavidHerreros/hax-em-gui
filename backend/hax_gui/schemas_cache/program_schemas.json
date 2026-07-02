@@ -286,6 +286,17 @@
           "type": "boolean"
         },
         {
+          "name": "kl_lambda",
+          "flags": [
+            "--kl_lambda"
+          ],
+          "flag": "--kl_lambda",
+          "required": false,
+          "help": "Weight (beta) of the VAE KL divergence, which regularizes the latent posterior towards a standard normal prior. The KL is now reduced with a per-element mean, so this weight is invariant to the batch size and latent dimension (unlike the previous summed KL). Increase it for a smoother, more regularized latent space at the cost of reconstruction detail; decrease it (or set to 0) to let the encoder use the latent more freely. (NOTE: because the reduction changed, this is not comparable to any previously used constant)",
+          "default": 0.001,
+          "type": "number"
+        },
+        {
           "name": "decoupling_lambda",
           "flags": [
             "--decoupling_lambda"
