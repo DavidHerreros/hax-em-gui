@@ -242,6 +242,72 @@
           "type": "boolean"
         },
         {
+          "name": "pose_refine_reg",
+          "flags": [
+            "--pose_refine_reg"
+          ],
+          "flag": "--pose_refine_reg",
+          "required": false,
+          "help": "Strength of the geodesic anchor that keeps the per-image rigid pose refinement close to the input poses (penalizes 1 - cos(theta) of the refinement rotation). Larger values keep the refinement smaller/more conservative; set to 0 to disable it. (NOTE: this is the only regularizer acting on the rigid pose refinement in the default M=1 sampling regime)",
+          "default": 0.1,
+          "type": "number"
+        },
+        {
+          "name": "pose_refine_warmup_epochs",
+          "flags": [
+            "--pose_refine_warmup_epochs"
+          ],
+          "flag": "--pose_refine_warmup_epochs",
+          "required": false,
+          "help": "Number of initial epochs over which the rigid pose refinement is ramped in from the identity. During this warmup the input poses are kept (almost) untouched so the conformation latent and decoder can settle before poses start being refined. Set to 0 to refine from the first step.",
+          "default": 3.0,
+          "type": "number"
+        },
+        {
+          "name": "train_inverse",
+          "flags": [
+            "--train_inverse"
+          ],
+          "flag": "--train_inverse",
+          "required": false,
+          "help": "When set, HetSIREN will additionally train an inverse decoder that maps the output Gaussian positions (the deformed point cloud produced by the decoder) back to latent vectors. This provides a direct point-cloud -> latent encoding that complements the image-based encoder. NOTE: this is only meaningful when mass transport is enabled (--transport_mass), since the Gaussian positions only move in that mode; if set without mass transport it is ignored.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "point_transformer",
+          "flags": [
+            "--point_transformer"
+          ],
+          "flag": "--point_transformer",
+          "required": false,
+          "help": "When set, HetSIREN will use a point transformer architecture in the decoder (operating directly on the Gaussian point cloud) instead of the default decoder. NOTE: this option and --implicit_network are mutually exclusive; if both are provided, the implicit network takes precedence and this flag is ignored. Like the implicit network, it only takes effect with mass transport (--transport_mass).",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "decoupling_lambda",
+          "flags": [
+            "--decoupling_lambda"
+          ],
+          "flag": "--decoupling_lambda",
+          "required": false,
+          "help": "Weight of the decoupling regularization (encourages the latent/conformation representation to be invariant to pose and CTF). Increase it to enforce stronger pose/CTF decoupling, decrease it (or set to 0) to relax it.",
+          "default": 0.0001,
+          "type": "number"
+        },
+        {
+          "name": "distance_preservation_lambda",
+          "flags": [
+            "--distance_preservation_lambda"
+          ],
+          "flag": "--distance_preservation_lambda",
+          "required": false,
+          "help": "Weight of the local distance preservation regularization (penalizes deviations of the mass-weighted point positions from the consensus/mean state, keeping local distances consistent). Increase it for stiffer, more locally rigid deformations, decrease it (or set to 0) for more flexibility.",
+          "default": 0.0001,
+          "type": "number"
+        },
+        {
           "name": "ssd_scratch_folder",
           "flags": [
             "--ssd_scratch_folder"
