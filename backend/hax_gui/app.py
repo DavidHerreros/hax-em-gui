@@ -7,6 +7,7 @@ Run (inside the hax conda env):
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import adapters
+from . import assistant as assistant_bridge
+from . import chats as chat_store
+from . import ollama as ollama_manager_mod
 from . import files as filebrowser
 from . import branches, gpus, projects, registry, settings_store, updates
 from .branches import BranchError
@@ -71,10 +75,23 @@ def _startup() -> None:
     manager.init()
     label_manager.init()
     wf_manager.init()
+    chat_store.manager.init()
     app.state.http = httpx.AsyncClient(timeout=None)
     app.state.shutdown = asyncio.Event()
+    app.state.keep_ollama = False  # set true across an in-place restart (see restart_server)
     app.state.updates = {"checked_at": None, "checking": False, "packages": []}
     app.state.update_poller = asyncio.create_task(_poll_updates())
+
+    # Optionally bring up a local Ollama for the assistant (only if not already
+    # running); shutdown stops only an instance we started. See ollama.py.
+    app.state.ollama = {"managed": False}
+    if settings.manage_ollama and assistant_bridge.available():
+        try:
+            base_url = assistant_bridge.status().get("base_url", "")
+            if base_url:
+                app.state.ollama = ollama_manager_mod.manager.ensure_started(base_url)
+        except Exception:  # noqa: BLE001 - never block startup on Ollama
+            app.state.ollama = {"managed": False, "reason": "startup error"}
 
 
 @app.on_event("shutdown")
@@ -87,6 +104,13 @@ async def _shutdown() -> None:
     viewer_manager.shutdown()
     mrc_viewer_manager.shutdown()
     md_viewer_manager.shutdown()
+    # Stop the Ollama we started — but not across an in-place restart, so the new
+    # process can reclaim it (avoids a costly model reload). A real shutdown stops it.
+    if not getattr(app.state, "keep_ollama", False):
+        try:
+            ollama_manager_mod.manager.stop_if_owned()
+        except Exception:  # noqa: BLE001
+            pass
     await app.state.http.aclose()
 
 
@@ -147,6 +171,209 @@ class JobCreate(BaseModel):
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "programs": len(registry.all_programs()), "schema_errors": registry.errors()}
+
+
+# -- optional AI assistant -------------------------------------------------
+@app.get("/api/assistant/status", dependencies=[Depends(auth)])
+def assistant_status() -> dict[str, Any]:
+    """Availability + config of the optional hax-em-assistant. Always present so
+    the SPA can decide whether to show the chat panel; reports available=False
+    (never errors) when the package is not installed."""
+    return assistant_bridge.status()
+
+
+@app.get("/api/assistant/run-preview/{job_id}", dependencies=[Depends(auth)])
+def assistant_run_preview(job_id: str) -> dict[str, Any]:
+    """Which artifacts a job exposes to the assistant (metrics/latents/volumes),
+    so the chat's attach-run picker can show what a summary will be able to cover."""
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    art = _resolve_run_artifacts(job)
+    return {
+        "job_id": job_id,
+        "label": art["label"],
+        "has_metrics": art["has_metrics"],
+        "has_latents": art["latents"] is not None,
+        "has_volumes": art["volumes"] is not None,
+        "latents_from": art["latents_from"],  # sibling run name, if borrowed
+    }
+
+
+@app.get("/api/ollama/status", dependencies=[Depends(auth)])
+def ollama_status() -> dict[str, Any]:
+    """Whether a local Ollama is running and whether the GUI is managing it."""
+    base_url = ""
+    if assistant_bridge.available():
+        try:
+            base_url = assistant_bridge.status().get("base_url", "")
+        except Exception:  # noqa: BLE001
+            base_url = ""
+    out: dict[str, Any] = {"manage_enabled": settings.manage_ollama,
+                           "startup": getattr(app.state, "ollama", {})}
+    if base_url:
+        out.update(ollama_manager_mod.manager.status(base_url))
+    return out
+
+
+@app.websocket("/ws/assistant/chat")
+async def assistant_chat_ws(websocket: WebSocket) -> None:
+    if settings.auth_token and websocket.query_params.get("token") != settings.auth_token:
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    if not assistant_bridge.available():
+        await websocket.send_json({"error": "assistant not installed"})
+        await websocket.close()
+        return
+
+    loop = asyncio.get_running_loop()
+
+    # A single long-lived receiver owns websocket.receive_json(); every client
+    # message lands in `inbox`. This matters because real uvicorn/websockets does
+    # not tolerate a receive() being cancelled and then re-issued (which a
+    # per-turn stop-watcher would do) — the second turn's message would be lost.
+    # Here the only thing ever cancelled is inbox.get(), which is always safe.
+    # A None sentinel in the inbox signals disconnect.
+    inbox: asyncio.Queue = asyncio.Queue()
+
+    async def receiver() -> None:
+        try:
+            while True:
+                inbox.put_nowait(await websocket.receive_json())
+        except Exception:  # noqa: BLE001 - disconnect or malformed frame
+            inbox.put_nowait(None)
+
+    recv = asyncio.ensure_future(receiver())
+    try:
+        while True:
+            req = await inbox.get()
+            if req is None:  # client disconnected
+                break
+            if not isinstance(req, dict) or "messages" not in req:
+                continue  # stray message with no active turn (e.g. a late stop)
+            messages = req.get("messages", [])
+            grounded = bool(req.get("grounded", True))
+            # Optional attached run: resolve the job id to artifact paths server-side
+            # (the client never handles filesystem paths).
+            run = None
+            run_job_id = req.get("run_job_id")
+            if run_job_id:
+                job = manager.get(run_job_id)
+                if job is not None:
+                    run = _resolve_run_artifacts(job)
+
+            # Run the blocking LLM stream off the event loop, funnel events back.
+            # A cancel Event lets a client "stop" actually halt generation (the
+            # worker closes the generator, which tears down the model request).
+            out: asyncio.Queue = asyncio.Queue()
+            cancel = threading.Event()
+
+            def _worker(messages=messages, grounded=grounded, run=run, cancel=cancel, out=out) -> None:
+                gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run)
+                try:
+                    for ev in gen:
+                        if cancel.is_set():
+                            break
+                        kind = "status" if ev["type"] == "status" else "token"
+                        loop.call_soon_threadsafe(out.put_nowait, (kind, ev.get("text", ev.get("delta"))))
+                except Exception as exc:  # noqa: BLE001 - report, keep socket alive
+                    loop.call_soon_threadsafe(out.put_nowait, ("error", str(exc)))
+                finally:
+                    gen.close()  # stop the underlying model stream promptly on cancel
+                    loop.call_soon_threadsafe(out.put_nowait, ("done", None))
+
+            loop.run_in_executor(None, _worker)
+
+            # Forward events while watching the inbox for a client stop message
+            # (any inbound message during a turn = stop). Keep draining after a
+            # stop until the worker reports done, but stop forwarding tokens.
+            get_task = asyncio.ensure_future(out.get())
+            inbox_task = asyncio.ensure_future(inbox.get())
+            stopped = False
+            disconnected = False
+            try:
+                while True:
+                    waiters = {get_task} | ({inbox_task} if inbox_task else set())
+                    done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                    if inbox_task and inbox_task in done:
+                        msg = inbox_task.result()
+                        cancel.set()
+                        stopped = True
+                        if msg is None:            # disconnect mid-turn
+                            disconnected = True
+                            inbox_task = None      # stop re-arming; drain to done then exit
+                        else:
+                            inbox_task = asyncio.ensure_future(inbox.get())
+                    if get_task in done:
+                        kind, value = get_task.result()
+                        if kind == "done":
+                            break
+                        if not stopped:
+                            await websocket.send_json({kind: value})
+                        get_task = asyncio.ensure_future(out.get())
+            finally:
+                get_task.cancel()
+                if inbox_task:
+                    inbox_task.cancel()
+            if disconnected:
+                break
+            await websocket.send_json({"done": True})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        recv.cancel()
+
+
+# -- assistant chat history (plain data; exists even without the assistant) --
+class ChatCreate(BaseModel):
+    project_id: str | None = None
+    title: str | None = None
+
+
+class ChatUpdate(BaseModel):
+    title: str | None = None
+    project_id: str | None = None
+    messages: list | None = None
+
+
+@app.get("/api/chats", dependencies=[Depends(auth)])
+def list_chats(project_id: str | None = None) -> list[dict[str, Any]]:
+    return chat_store.manager.list(project_id)
+
+
+@app.post("/api/chats", dependencies=[Depends(auth)])
+def create_chat(body: ChatCreate) -> dict[str, Any]:
+    return chat_store.manager.create(body.project_id, body.title)
+
+
+@app.get("/api/chats/{cid}", dependencies=[Depends(auth)])
+def get_chat(cid: str) -> dict[str, Any]:
+    chat = chat_store.manager.get(cid)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="chat not found")
+    return chat
+
+
+@app.put("/api/chats/{cid}", dependencies=[Depends(auth)])
+def update_chat(cid: str, body: ChatUpdate) -> dict[str, Any]:
+    chat = chat_store.manager.update(
+        cid,
+        title=body.title,
+        project_id=body.project_id,
+        project_id_set="project_id" in body.model_fields_set,
+        messages=body.messages,
+    )
+    if chat is None:
+        raise HTTPException(status_code=404, detail="chat not found")
+    return chat
+
+
+@app.delete("/api/chats/{cid}", dependencies=[Depends(auth)])
+def delete_chat(cid: str) -> dict[str, Any]:
+    if not chat_store.manager.delete(cid):
+        raise HTTPException(status_code=404, detail="chat not found")
+    return {"ok": True}
 
 
 @app.get("/api/programs", dependencies=[Depends(auth)])
@@ -595,6 +822,9 @@ def restart_server() -> dict[str, Any]:
     health-polls and reloads. False when launched outside ``hax-gui start``."""
     from . import cli
 
+    # Preserve the Ollama we started across the restart (the new process reclaims
+    # it via the pidfile) instead of killing and reloading the model.
+    app.state.keep_ollama = True
     return {"scheduled": cli.spawn_restart()}
 
 
@@ -1005,6 +1235,83 @@ def _list_job_files(job_id: str, suffixes: tuple[str, ...]) -> dict[str, Any]:
                     "mtime": st.st_mtime,
                 })
     return {"workdir": str(root), "files": out}
+
+
+def _find_latents_file(root: Path) -> str | None:
+    """A .xmd/.star under ``root`` carrying a `_latent_space` column (name-hint first)."""
+    mds = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in (".xmd", ".star")]
+    mds.sort(key=lambda p: ("latent" not in p.name.lower(), str(p)))
+    for cand in mds:
+        try:
+            head = cand.read_text(errors="ignore")[:20000]
+        except OSError:
+            continue
+        if "_latent_space" in head:
+            return str(cand)
+    return None
+
+
+def _find_sibling_latents(job: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Look for latents in other runs of the same project (same program first, then
+    any), newest first — so attaching a *train* run (metrics+volumes) can still pull
+    the landscape from the matching *predict* run. Returns (path, source_label)."""
+    pid = job.get("project_id")
+    if not pid:
+        return None, None
+    try:
+        siblings = [j for j in manager.list_for_project(pid) if j.get("id") != job.get("id")]
+    except Exception:  # noqa: BLE001
+        return None, None
+    prog = job.get("program")
+    siblings.sort(key=lambda j: j.get("program") != prog)  # same-program first (stable: keeps recency)
+    for sib in siblings:
+        wd = sib.get("workdir")
+        if not wd or not Path(wd).is_dir():
+            continue
+        found = _find_latents_file(Path(wd))
+        if found:
+            return found, (sib.get("name") or sib.get("program") or "sibling run")
+    return None, None
+
+
+def _resolve_run_artifacts(job: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a job's run folder into the artifact paths the assistant reads:
+    the run dir (metrics + config), a latents metadata file, and a decoded-volume
+    series directory. Best-effort — any of latents/volumes may be None. When the
+    attached run has no latents of its own, they are pulled from a sibling run in
+    the same project (e.g. train run ← its predict run)."""
+    wd = job.get("workdir")
+    run_dir = wd if wd and Path(wd).is_dir() else None
+    latents: str | None = None
+    latents_from: str | None = None
+    volumes: str | None = None
+    has_metrics = False
+    if run_dir:
+        root = Path(run_dir)
+        # metrics = a *_metrics dir, or event files somewhere under the run folder
+        has_metrics = bool(next(root.glob("*_metrics"), None)) or \
+            next(root.rglob("events.out.tfevents*"), None) is not None
+        latents = _find_latents_file(root)
+        # volumes: the directory holding the most .mrc (≥2), preferring volume-ish names
+        counts: dict[Path, int] = {}
+        for p in root.rglob("*.mrc"):
+            counts[p.parent] = counts.get(p.parent, 0) + 1
+        series = [(d, n) for d, n in counts.items() if n >= 2]
+        if series:
+            def _score(item: tuple[Path, int]) -> tuple[bool, int]:
+                nm = item[0].name.lower()
+                return ("volume" in nm or "intermediate" in nm, item[1])
+            volumes = str(max(series, key=_score)[0])
+    if latents is None:
+        latents, latents_from = _find_sibling_latents(job)
+    return {
+        "run_dir": run_dir,
+        "latents": latents,
+        "latents_from": latents_from,  # sibling run label, when latents came from one
+        "volumes": volumes,
+        "has_metrics": has_metrics,
+        "label": f"{job.get('name') or job.get('program') or 'run'} run",
+    }
 
 
 def _job_arg_paths(job: dict[str, Any]) -> set[str]:

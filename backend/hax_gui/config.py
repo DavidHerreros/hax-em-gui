@@ -40,6 +40,12 @@ class Settings:
     )
     # Shared auth token. Empty disables auth (dev only).
     auth_token: str = field(default_factory=lambda: os.environ.get("HAX_GUI_TOKEN", ""))
+    # Whether the GUI may start a local Ollama when one isn't already running, and
+    # stop that (and only that) instance on shutdown. A user-run Ollama is never
+    # touched. Off with HAX_GUI_MANAGE_OLLAMA=0.
+    manage_ollama: bool = field(
+        default_factory=lambda: os.environ.get("HAX_GUI_MANAGE_OLLAMA", "1") not in ("0", "false", "no", "")
+    )
     # CORS origins for the SPA during dev (Vite default is 5173).
     cors_origins: list[str] = field(
         default_factory=lambda: _env_list("HAX_GUI_CORS_ORIGINS", ["http://localhost:5173", "http://127.0.0.1:5173"])

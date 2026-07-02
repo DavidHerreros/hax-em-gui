@@ -3,7 +3,7 @@
 import { h, mount } from "./h.js";
 import { icon } from "./icons.js";
 import { defineRoutes, setOutlet, onRoute, startRouter } from "./router.js";
-import { getToken, setToken } from "./api.js";
+import { api, getToken, setToken } from "./api.js";
 import { store, getState, subscribe } from "./store.js";
 import { buildLauncher } from "./views/launcher.js";
 import { startUpdates, updateBadge } from "./updates.js";
@@ -17,6 +17,7 @@ import { ViewerView } from "./views/viewer.js";
 import { JobsView } from "./views/jobs.js";
 import { JobDetailView } from "./views/jobDetail.js";
 import { WorkflowsView } from "./views/workflows.js";
+import { AssistantView } from "./views/assistant.js";
 
 const DOCS_URL = "https://davidherreros.github.io/hax-em-docs/";
 const THEME_KEY = "hax_gui_theme";
@@ -29,6 +30,18 @@ const NAV = [
   { path: "/viewer", label: "3D viewer", icon: "orbit", match: (p) => p.startsWith("/viewer") },
   { path: "/workflows", label: "Workflows", icon: "workflow", match: (p) => p.startsWith("/workflows") },
 ];
+
+// The AI assistant is an optional, separately-installed package. Probe once at
+// startup (top-level await); when it's absent the nav item and route are simply
+// never added, so the GUI is unchanged. Failure to reach the endpoint => hidden.
+let ASSISTANT_AVAILABLE = false;
+try {
+  const s = await api.assistantStatus();
+  ASSISTANT_AVAILABLE = !!s.available;
+} catch { /* server offline or endpoint missing: leave the assistant hidden */ }
+if (ASSISTANT_AVAILABLE) {
+  NAV.push({ path: "/assistant", label: "Assistant", icon: "chat", match: (p) => p.startsWith("/assistant") });
+}
 
 // ---- theme ----
 function initTheme() { document.documentElement.dataset.theme = localStorage.getItem(THEME_KEY) || "dark"; }
@@ -123,6 +136,7 @@ defineRoutes([
   { path: "/viewer", view: ViewerView },
   { path: "/settings", view: SettingsView },
   { path: "/workflows", view: WorkflowsView },
+  ...(ASSISTANT_AVAILABLE ? [{ path: "/assistant", view: AssistantView }] : []),
 ]);
 
 startRouter();

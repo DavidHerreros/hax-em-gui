@@ -119,6 +119,54 @@ export const api = {
     }),
 };
 
+// Optional AI assistant. status() is always safe to call (reports
+// {available:false} when the hax-em-assistant package isn't installed).
+api.assistantStatus = () => req("/api/assistant/status");
+// Which artifacts a job exposes to the assistant (metrics/latents/volumes).
+api.assistantRunPreview = (jobId) => req(`/api/assistant/run-preview/${jobId}`);
+
+// Persisted assistant chats (optionally grouped by project).
+api.chats = () => req("/api/chats");
+api.chat = (id) => req(`/api/chats/${id}`);
+api.createChat = (projectId, title) =>
+  req("/api/chats", { method: "POST", body: JSON.stringify({ project_id: projectId || null, title: title || null }) });
+api.updateChat = (id, body) => req(`/api/chats/${id}`, { method: "PUT", body: JSON.stringify(body) });
+api.deleteChat = (id) => req(`/api/chats/${id}`, { method: "DELETE" });
+
+// Open a chat socket. Send full-history requests via send({messages, grounded});
+// tokens arrive through onToken, then onDone; onError on failure. Returns
+// { send, close }.
+export function assistantChat({ onToken, onStatus, onDone, onError }) {
+  const token = getToken();
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const q = token ? `?token=${encodeURIComponent(token)}` : "";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/assistant/chat${q}`);
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.token != null) onToken(m.token);
+    else if (m.status != null) { if (onStatus) onStatus(m.status); }
+    else if (m.error) { if (onError) onError(m.error); }
+    else if (m.done) onDone();
+  };
+  ws.onerror = () => { if (onError) onError("connection error"); };
+
+  // `new WebSocket()` returns in CONNECTING state; calling send() before the
+  // socket is OPEN throws InvalidStateError. Queue payloads until onopen flushes.
+  let pending = [];
+  const raw = (payload) => {
+    const data = JSON.stringify(payload);
+    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    else if (ws.readyState === WebSocket.CONNECTING) pending.push(data);
+    // CLOSING/CLOSED: drop silently
+  };
+  ws.onopen = () => { const queued = pending; pending = []; for (const d of queued) ws.send(d); };
+  return {
+    send: (payload) => raw(payload),
+    stop: () => raw({ stop: true }),
+    close: () => { pending = []; try { ws.close(); } catch { /* already closed */ } },
+  };
+}
+
 // Subscribe to a job's live log. Returns a close() function.
 export function subscribeLog(jobId, onMessage) {
   return subscribeWS(`/ws/jobs/${jobId}/log`, onMessage);

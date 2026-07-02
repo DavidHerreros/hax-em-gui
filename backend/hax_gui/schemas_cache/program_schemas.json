@@ -292,8 +292,41 @@
           ],
           "flag": "--kl_lambda",
           "required": false,
-          "help": "Weight (beta) of the VAE KL divergence, which regularizes the latent posterior towards a standard normal prior. The KL is now reduced with a per-element mean, so this weight is invariant to the batch size and latent dimension (unlike the previous summed KL). Increase it for a smoother, more regularized latent space at the cost of reconstruction detail; decrease it (or set to 0) to let the encoder use the latent more freely. (NOTE: because the reduction changed, this is not comparable to any previously used constant)",
+          "help": "Weight (beta) of the VAE KL divergence, which regularizes the latent posterior towards a standard normal prior. Increase it for a smoother, more regularized latent space at the cost of reconstruction detail; decrease it (or set to 0) to let the encoder use the latent more freely. (NOTE: because the reduction changed, this is not comparable to any previously used constant)",
           "default": 0.001,
+          "type": "number"
+        },
+        {
+          "name": "grad_clip_norm",
+          "flags": [
+            "--grad_clip_norm"
+          ],
+          "flag": "--grad_clip_norm",
+          "required": false,
+          "help": "Global-norm gradient clipping threshold for the HetSIREN optimizer. Gradients whose global norm exceeds this value are rescaled down, which prevents occasional gradient spikes. Set to 0 to disable clipping.",
+          "default": 1.0,
+          "type": "number"
+        },
+        {
+          "name": "use_frc_loss",
+          "flags": [
+            "--use_frc_loss"
+          ],
+          "flag": "--use_frc_loss",
+          "required": false,
+          "help": "When set, HetSIREN uses a Fourier Ring Correlation (FRC) reconstruction loss instead of the default image-space MSE. Because the FRC normalizes the error per resolution shell, it pushes the network to reproduce high-frequency detail and typically yields sharper decoded volumes (MSE is dominated by low frequencies and tends to blur them). NOTE: the point transformer decoder always uses the FRC loss regardless of this flag.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "deformation_lambda",
+          "flags": [
+            "--deformation_lambda"
+          ],
+          "flag": "--deformation_lambda",
+          "required": false,
+          "help": "Weight of the graph-based deformation regularization (deformation regularity + repulsion) that keeps the local geometry of the moving Gaussians consistent during mass transport. Lower it (e.g. 0.3-0.5) to allow sharper/larger motions at the risk of less regular deformations, raise it for stiffer, more regular motions. Only active with mass transport and a reference volume; ignored otherwise.",
+          "default": 0.9,
           "type": "number"
         },
         {
