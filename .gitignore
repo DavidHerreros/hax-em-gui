@@ -22,3 +22,6 @@ backend/.hax_gui/
 # MD files
 VIEWER_PLAN.md
 TODO.md
+
+# IDE
+.idea
