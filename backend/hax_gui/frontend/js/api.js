@@ -124,6 +124,36 @@ export const api = {
 api.assistantStatus = () => req("/api/assistant/status");
 // Which artifacts a job exposes to the assistant (metrics/latents/volumes).
 api.assistantRunPreview = (jobId) => req(`/api/assistant/run-preview/${jobId}`);
+// Expand an assistant job proposal (program + path) into a draft spec + path facts.
+api.assistantPreviewJob = (program, path) =>
+  req("/api/assistant/actions/preview-job", { method: "POST", body: JSON.stringify({ program, path: path || null }) });
+
+// Generate a PDF run report and trigger a browser download. Returns nothing;
+// throws ApiError on failure. Blocking on the server (figures + narration).
+api.assistantRunReport = async (jobId, narrate = true) => {
+  const token = getToken();
+  const res = await fetch(`/api/assistant/run-report/${jobId}?narrate=${narrate ? "true" : "false"}`, {
+    method: "POST",
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  });
+  if (!res.ok) {
+    let detail;
+    try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
+    throw new ApiError(res.status, detail);
+  }
+  const blob = await res.blob();
+  const cd = res.headers.get("content-disposition") || "";
+  const m = /filename="?([^"]+)"?/.exec(cd);
+  const name = m ? m[1] : `report_${jobId}.pdf`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+};
 
 // Persisted assistant chats (optionally grouped by project).
 api.chats = () => req("/api/chats");
@@ -136,7 +166,7 @@ api.deleteChat = (id) => req(`/api/chats/${id}`, { method: "DELETE" });
 // Open a chat socket. Send full-history requests via send({messages, grounded});
 // tokens arrive through onToken, then onDone; onError on failure. Returns
 // { send, close }.
-export function assistantChat({ onToken, onStatus, onDone, onError }) {
+export function assistantChat({ onToken, onStatus, onAction, onDone, onError }) {
   const token = getToken();
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const q = token ? `?token=${encodeURIComponent(token)}` : "";
@@ -145,6 +175,7 @@ export function assistantChat({ onToken, onStatus, onDone, onError }) {
     const m = JSON.parse(e.data);
     if (m.token != null) onToken(m.token);
     else if (m.status != null) { if (onStatus) onStatus(m.status); }
+    else if (m.action != null) { if (onAction) onAction(m.action); }
     else if (m.error) { if (onError) onError(m.error); }
     else if (m.done) onDone();
   };

@@ -46,6 +46,12 @@ class Settings:
     manage_ollama: bool = field(
         default_factory=lambda: os.environ.get("HAX_GUI_MANAGE_OLLAMA", "1") not in ("0", "false", "no", "")
     )
+    # Whether the assistant may propose GUI actions (create draft jobs from a data
+    # path). Off by default — opt in with HAX_GUI_ASSISTANT_ACTIONS=1. Proposals
+    # are always draft-only (never launched) and require the user to confirm.
+    assistant_actions: bool = field(
+        default_factory=lambda: os.environ.get("HAX_GUI_ASSISTANT_ACTIONS", "0") in ("1", "true", "yes")
+    )
     # CORS origins for the SPA during dev (Vite default is 5173).
     cors_origins: list[str] = field(
         default_factory=lambda: _env_list("HAX_GUI_CORS_ORIGINS", ["http://localhost:5173", "http://127.0.0.1:5173"])

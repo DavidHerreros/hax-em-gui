@@ -106,7 +106,11 @@ function openPicker(anchorEl, adapter, onChange) {
     h("div", { class: "lblpick-head" }, "Labels"),
     listEl,
     h("div", { class: "lblpick-create" }, swatch, newName, addBtn));
-  const overlay = h("div", { class: "ctx-overlay", onclick: close }, menu);
+  const overlay = h("div", { class: "ctx-overlay" }, menu);
+  // Dismiss on an outside press, but only when the gesture *starts* outside the
+  // menu — so selecting text in the inputs (a drag that may release over the
+  // overlay) doesn't close the popover.
+  overlay.addEventListener("pointerdown", (e) => { if (!menu.contains(e.target)) close(); });
   document.body.appendChild(overlay);
   document.addEventListener("keydown", onKey, true);
   placePopover(menu, anchorEl);
@@ -194,7 +198,10 @@ function openLabelEditor(anchorEl, label, onDone) {
   const menu = h("div", { class: "lblpick lblpick-editor", onclick: (e) => e.stopPropagation() },
     h("div", { class: "lblpick-head" }, "Edit label"),
     nameI, swatches, h("div", { class: "lblpick-create" }, save, h("span", { style: { flex: "1" } }), del));
-  const overlay = h("div", { class: "ctx-overlay", onclick: close }, menu);
+  const overlay = h("div", { class: "ctx-overlay" }, menu);
+  // Close only when the press starts outside the menu, so selecting text in the
+  // name field (a drag that may release over the overlay) doesn't dismiss it.
+  overlay.addEventListener("pointerdown", (e) => { if (!menu.contains(e.target)) close(); });
   document.body.appendChild(overlay);
   document.addEventListener("keydown", onKey, true);
   placePopover(menu, anchorEl);

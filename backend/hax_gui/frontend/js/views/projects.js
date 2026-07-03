@@ -85,6 +85,7 @@ function projectPanel(project) {
 
   let stop = false;
   let lastSig = null;
+  let animatedOnce = false;
   loadLabels().catch(() => {});
   async function refresh() {
     try {
@@ -94,6 +95,10 @@ function projectPanel(project) {
       if (sig === lastSig) return; // unchanged -> skip rebuild (avoids flicker)
       lastSig = sig;
       mount(execWrap, jobs.length ? execList(jobs) : h("p", { class: "muted" }, "No runs yet."));
+      // Animate rows only on first paint; later refreshes rebuild the list and
+      // re-animating them (e.g. after adding a label) makes it visibly "jump".
+      execWrap.classList.toggle("no-anim", animatedOnce);
+      animatedOnce = true;
     } catch (err) {
       if (!stop) mount(execWrap, errorBox(err));
     }

@@ -112,4 +112,16 @@ export const store = {
     else { persist(); emit(); }
   },
   clearPrefill() { state.prefill = null; }, // consumed by the launcher; no emit
+
+  // Open the launcher for `program` preloaded with `values` (an assistant
+  // proposal). No jobId → a NEW job: the user completes any required fields and
+  // launches it themselves. Nothing runs from this call.
+  prefillProgram({ program, values, projectId, projectName }) {
+    state.prefill = { program, values: { ...(values || {}) }, gpu: "" };
+    state.selectedProgram = program;
+    state.rightOpen = true;
+    state.formNonce++;
+    if (projectId) this.openProject({ id: projectId, name: projectName || projectId });
+    else { persist(); emit(); }
+  },
 };

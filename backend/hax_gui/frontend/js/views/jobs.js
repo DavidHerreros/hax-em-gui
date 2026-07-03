@@ -40,15 +40,24 @@ export function JobsView() {
   let allJobs = [];
   let stop = false;
   let lastSig = null;
+  let animatedOnce = false;
 
   function renderBody() {
-    if (!allJobs.length) { mount(body, h("p", { class: "muted" }, "No jobs yet. Pick a program from the right menu.")); return; }
-    const jobs = allJobs.filter((j) =>
-      (!filters.project || projectKey(j) === filters.project) &&
-      (!filters.program || j.program === filters.program) &&
-      (!filters.status || j.status === filters.status) &&
-      (!filters.label || (j.labels || []).some((l) => l.id === filters.label)));
-    mount(body, jobs.length ? groupedList(jobs) : h("p", { class: "muted" }, "No jobs match the current filters."));
+    let content;
+    if (!allJobs.length) content = h("p", { class: "muted" }, "No jobs yet. Pick a program from the right menu.");
+    else {
+      const jobs = allJobs.filter((j) =>
+        (!filters.project || projectKey(j) === filters.project) &&
+        (!filters.program || j.program === filters.program) &&
+        (!filters.status || j.status === filters.status) &&
+        (!filters.label || (j.labels || []).some((l) => l.id === filters.label)));
+      content = jobs.length ? groupedList(jobs) : h("p", { class: "muted" }, "No jobs match the current filters.");
+    }
+    mount(body, content);
+    // Animate the row entrance only on the first paint; later refreshes (every 3s)
+    // rebuild the list, and re-animating them makes the list visibly "jump".
+    body.classList.toggle("no-anim", animatedOnce);
+    animatedOnce = true;
   }
 
   function syncFilters() {

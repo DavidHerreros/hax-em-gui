@@ -48,11 +48,40 @@ def stream_reply(messages: list[dict], grounded: bool = True,
 
 
 def stream_events(messages: list[dict], grounded: bool = True,
-                  run: Optional[dict] = None) -> Iterator[dict]:
-    """Yield typed events (status activity + content tokens) for a conversation.
+                  run: Optional[dict] = None, allow_actions: bool = False) -> Iterator[dict]:
+    """Yield typed events (status activity + content tokens + action proposals).
 
     ``run`` (optional) is a dict of resolved artifact paths for an attached run:
     ``{"run_dir", "latents", "volumes", "label"}`` — the session loads those
     deterministically and injects a features summary for the model to narrate.
+    ``allow_actions`` lets the session emit deterministic action proposals (create
+    a draft job from a data path); the GUI confirms before anything happens.
     """
-    return _get().stream_events(messages, grounded=grounded, run=run)
+    return _get().stream_events(messages, grounded=grounded, run=run, allow_actions=allow_actions)
+
+
+def generate_report(out_path: str, *, run_dir: Optional[str] = None,
+                    latents: Optional[str] = None, volumes: Optional[str] = None,
+                    title: str = "hax-em run report", subtitle: str = "",
+                    narrate: bool = True) -> dict:
+    """Build a deterministic run-report PDF at ``out_path`` (figures + measured
+    values), optionally with an AI-generated discussion section. Returns the
+    report manifest (included/skipped sections). Requires the assistant package."""
+    from hax_assistant.report import ReportInputs, build_report
+
+    session = _get()
+    measured, _steps = session.build_run_context(run_dir=run_dir, latents=latents, volumes=volumes)
+    # Request only the discussion sections whose data is present, so each
+    # paragraph lines up with the figure it introduces in the report.
+    keys = ["overview"]
+    if latents:
+        keys.append("landscape")
+    if run_dir:
+        keys.append("metrics")
+    if volumes:
+        keys.append("motion")
+    sections = (session.narrate_run_sections(measured, keys)
+                if (narrate and measured) else {})
+    inp = ReportInputs(title=title, subtitle=subtitle, run_dir=run_dir, latents=latents,
+                       volumes=volumes, measured_text=measured, sections=sections)
+    return build_report(out_path, inp)

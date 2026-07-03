@@ -6,6 +6,7 @@ import { h, mount } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { errorBox } from "./ui.js";
+import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
 import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
 
@@ -51,6 +52,7 @@ export function ViewerView() {
         h("span", { class: "run-prog mono" }, j.name || j.program),
         j.project_name ? h("span", { class: "proj-chip" }, icon("box", 12), j.project_name) : null,
         h("span", { class: "run-folder mono" }, j.program),
+        (j.labels && j.labels.length) ? jobLabelChips(j) : null,
         h("span", { class: "run-time" }, new Date(j.created_at).toLocaleString()),
         h("span", { class: "run-open" }, icon("box", 14), "Open viewer"));
       return btn;

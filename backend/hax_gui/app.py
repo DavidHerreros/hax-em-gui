@@ -15,12 +15,13 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import adapters
 from . import assistant as assistant_bridge
+from . import assistant_actions
 from . import chats as chat_store
 from . import ollama as ollama_manager_mod
 from . import files as filebrowser
@@ -179,7 +180,29 @@ def assistant_status() -> dict[str, Any]:
     """Availability + config of the optional hax-em-assistant. Always present so
     the SPA can decide whether to show the chat panel; reports available=False
     (never errors) when the package is not installed."""
-    return assistant_bridge.status()
+    st = assistant_bridge.status()
+    st["actions_enabled"] = assistant_actions.actions_enabled()
+    return st
+
+
+class JobProposal(BaseModel):
+    program: str
+    path: str | None = None
+
+
+@app.post("/api/assistant/actions/preview-job", dependencies=[Depends(auth)])
+def assistant_preview_job(body: JobProposal) -> dict[str, Any]:
+    """Deterministically expand an assistant job proposal (program + data path)
+    into a draft spec (registry defaults + path→input arg) plus facts about the
+    path, so the confirmation card can show exactly what will be created. Builds
+    nothing and launches nothing."""
+    if not assistant_actions.actions_enabled():
+        raise HTTPException(status_code=403, detail="assistant actions are disabled")
+    spec = assistant_actions.build_draft_spec(body.program, body.path)
+    if spec.get("error"):
+        raise HTTPException(status_code=422, detail=spec["error"])
+    inspect = assistant_actions.inspect_path(body.path) if body.path else None
+    return {"spec": spec, "inspect": inspect}
 
 
 @app.get("/api/assistant/run-preview/{job_id}", dependencies=[Depends(auth)])
@@ -198,6 +221,34 @@ def assistant_run_preview(job_id: str) -> dict[str, Any]:
         "has_volumes": art["volumes"] is not None,
         "latents_from": art["latents_from"],  # sibling run name, if borrowed
     }
+
+
+@app.post("/api/assistant/run-report/{job_id}", dependencies=[Depends(auth)])
+def assistant_run_report(job_id: str, narrate: bool = True) -> FileResponse:
+    """Generate a PDF run report (deterministic figures + measured values, plus an
+    optional AI-generated discussion) for a job's run and return it for download.
+    Blocking (figures + optional narration); FastAPI runs it in a threadpool."""
+    if not assistant_bridge.available():
+        raise HTTPException(status_code=400, detail="assistant not installed")
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    art = _resolve_run_artifacts(job)
+    if not (art["run_dir"] or art["latents"] or art["volumes"]):
+        raise HTTPException(status_code=422, detail="run has no readable artifacts to report on")
+    reports_dir = settings.data_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    out = reports_dir / f"{job_id}.pdf"
+    program = job.get("program") or "run"
+    subtitle = " · ".join(x for x in (job.get("project_id"), program, job.get("name")) if x)
+    try:
+        assistant_bridge.generate_report(
+            str(out), run_dir=art["run_dir"], latents=art["latents"], volumes=art["volumes"],
+            title=f"{program} run report", subtitle=subtitle, narrate=narrate)
+    except Exception as exc:  # noqa: BLE001 - surface a clean error to the client
+        raise HTTPException(status_code=500, detail=f"report generation failed: {exc}")
+    return FileResponse(str(out), media_type="application/pdf",
+                        filename=f"{program}_{job_id}_report.pdf")
 
 
 @app.get("/api/ollama/status", dependencies=[Depends(auth)])
@@ -262,6 +313,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                 job = manager.get(run_job_id)
                 if job is not None:
                     run = _resolve_run_artifacts(job)
+            allow_actions = assistant_actions.actions_enabled()
 
             # Run the blocking LLM stream off the event loop, funnel events back.
             # A cancel Event lets a client "stop" actually halt generation (the
@@ -269,14 +321,22 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             out: asyncio.Queue = asyncio.Queue()
             cancel = threading.Event()
 
-            def _worker(messages=messages, grounded=grounded, run=run, cancel=cancel, out=out) -> None:
-                gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run)
+            def _worker(messages=messages, grounded=grounded, run=run,
+                        allow_actions=allow_actions, cancel=cancel, out=out) -> None:
+                gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run,
+                                                     allow_actions=allow_actions)
                 try:
                     for ev in gen:
                         if cancel.is_set():
                             break
-                        kind = "status" if ev["type"] == "status" else "token"
-                        loop.call_soon_threadsafe(out.put_nowait, (kind, ev.get("text", ev.get("delta"))))
+                        etype = ev.get("type")
+                        if etype == "status":
+                            payload = ("status", ev.get("text"))
+                        elif etype == "action":
+                            payload = ("action", ev.get("action"))
+                        else:
+                            payload = ("token", ev.get("delta"))
+                        loop.call_soon_threadsafe(out.put_nowait, payload)
                 except Exception as exc:  # noqa: BLE001 - report, keep socket alive
                     loop.call_soon_threadsafe(out.put_nowait, ("error", str(exc)))
                 finally:
