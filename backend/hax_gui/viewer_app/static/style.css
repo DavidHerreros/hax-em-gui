@@ -133,9 +133,11 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .slice-info { align-items: center; justify-content: center; text-align: center; padding: 12px; line-height: 1.5; }
 
 /* ── contour histogram strip ── */
-.hist-strip { display: flex; align-items: center; gap: 8px; height: 50px; padding: 4px 12px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; }
+.hist-strip { display: flex; align-items: center; gap: 8px; height: 50px; padding: 4px 12px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; min-width: 0; }
 .hist-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; flex-shrink: 0; }
-#hist { flex: 1; height: 42px; cursor: ew-resize; }
+/* min-width:0 lets the canvas shrink below its intrinsic 300px width; without it
+   the flex item forces the pane wider than the window (horizontal scrollbar). */
+#hist { flex: 1; width: 0; min-width: 0; height: 42px; cursor: ew-resize; }
 
 /* ── morph bar ── */
 .morph-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-height: 44px; padding: 6px 12px; border-top: 1px solid var(--border); background: var(--panel); flex-shrink: 0; font-size: 13px; }

@@ -148,8 +148,12 @@ function groupedList(jobs) {
 }
 
 // A change signature for a job list: re-render only when ids/statuses/names change.
+// Signature to decide whether a background refresh needs to rebuild the list.
+// Labels are deliberately excluded: they're edited inline and applied to the job
+// object locally (the chip updates immediately), so a label change shouldn't force
+// a full list rebuild — which otherwise causes a visible ~refresh-tick "jump".
 export function jobsSignature(jobs) {
-  return jobs.map((j) => `${j.id}:${j.status}:${j.name || ""}:${(j.labels || []).map((l) => l.id).join(",")}`).join("|");
+  return jobs.map((j) => `${j.id}:${j.status}:${j.name || ""}`).join("|");
 }
 
 // What to show as a run's title: its custom name, falling back to the program.

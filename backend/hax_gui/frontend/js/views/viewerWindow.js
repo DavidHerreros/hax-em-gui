@@ -39,8 +39,10 @@ export function mountViewerWindow() {
   const btnClose = h("button", { class: "vwin-btn", title: "Close all viewers", onclick: closeAll }, icon("x", 16));
   const bar = h("div", { class: "vwin-bar" },
     h("span", { class: "vwin-title" }, "Viewers"), h("span", { class: "vwin-spacer" }), btnMin, btnMax, btnClose);
-  const resizeH = h("div", { class: "vwin-resize", title: "Drag to resize" });
-  const win = h("div", { class: "vwin" }, bar, tabs, body, resizeH);
+  // Invisible resize handles on every edge and corner (the cursor signals them).
+  const RESIZE_DIRS = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
+  const resizeHandles = RESIZE_DIRS.map((dir) => h("div", { class: "vwin-rz vwin-rz-" + dir }));
+  const win = h("div", { class: "vwin" }, bar, tabs, body, ...resizeHandles);
   document.body.appendChild(win);
 
   // ── theme: mirror the GUI light/dark into each viewer iframe ──
@@ -91,10 +93,22 @@ export function mountViewerWindow() {
     const sx = e.clientX, sy = e.clientY, l = geom.left, t = geom.top;
     return (ev) => { geom.left = l + ev.clientX - sx; geom.top = t + ev.clientY - sy; applyGeom(); };
   });
-  gesture(resizeH, (e) => {
-    if (maximized) return null;
-    const sx = e.clientX, sy = e.clientY, w = geom.width, ht = geom.height;
-    return (ev) => { geom.width = Math.max(MIN_W, w + ev.clientX - sx); geom.height = Math.max(MIN_H, ht + ev.clientY - sy); applyGeom(); };
+  // Resize from any edge/corner: e/s grow width/height; w/n also move the top-left
+  // corner so the opposite edge stays put (min-size honoured on all sides).
+  resizeHandles.forEach((el, i) => {
+    const dir = RESIZE_DIRS[i];
+    gesture(el, (e) => {
+      if (maximized) return null;
+      const sx = e.clientX, sy = e.clientY, l0 = geom.left, t0 = geom.top, w0 = geom.width, h0 = geom.height;
+      return (ev) => {
+        const dx = ev.clientX - sx, dy = ev.clientY - sy;
+        if (dir.includes("e")) geom.width = Math.max(MIN_W, w0 + dx);
+        if (dir.includes("s")) geom.height = Math.max(MIN_H, h0 + dy);
+        if (dir.includes("w")) { const nw = Math.max(MIN_W, w0 - dx); geom.left = l0 + (w0 - nw); geom.width = nw; }
+        if (dir.includes("n")) { const nh = Math.max(MIN_H, h0 - dy); geom.top = t0 + (h0 - nh); geom.height = nh; }
+        applyGeom();
+      };
+    });
   });
   window.addEventListener("resize", () => { if (win.style.display !== "none") applyGeom(); });
 

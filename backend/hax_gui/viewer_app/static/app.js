@@ -1140,11 +1140,31 @@ function renderLayers() {
     if (isCurve) li.append(iconBtn(editing ? "✓" : "✎", editing ? "Finish editing this curve" : "Edit the curve (drag handles · alt-click delete · tap to insert)", () => editCurveLayer(ly)));
     li.append(iconBtn("▶", isCurve ? "Morph along this curve (snaps to nearest states)" : ly.kind === "path" ? "Morph along this path" : "Morph through this layer as a volume series", () => playLayerSeries(ly)));
     if (exportAvailable && !isCurve) li.append(iconBtn("⤓", "Save layer (metadata + average volume) to the project", () => saveLayer(ly)));
-    li.append(iconBtn("✕", "Delete layer", () => { if (editingPathLayer === ly) { editingPathLayer = null; setPathDrawArmed(false); } if (editCurve === ly) { editCurve = null; setPathDrawArmed(false); } layers.splice(layers.indexOf(ly), 1); renderLayers(); refreshFreeCurves(); if (state.colorBy === "layers") applyColor(); }));
+    li.append(iconBtn("✕", "Delete layer", () => removeLayer(ly)));
     ul.appendChild(li);
   });
   refreshFreeCurves();
 }
+
+// Delete a layer. Removing a cluster layer also drops its matching point from the
+// Centroids layer (and prunes the centroid's color/coords); if that empties the
+// Centroids layer, it's removed too.
+function removeLayer(ly) {
+  if (editingPathLayer === ly) { editingPathLayer = null; setPathDrawArmed(false); }
+  if (editCurve === ly) { editCurve = null; setPathDrawArmed(false); }
+  if (ly.kind === "cluster" && ly.centroid != null) {
+    const cen = layers.find((x) => x.kind === "centroid");
+    if (cen) {
+      const at = cen.indices.indexOf(ly.centroid);
+      if (at >= 0) cen.indices.splice(at, 1);
+      delete indexColor[ly.centroid]; delete centroidPCA[ly.centroid];
+      if (!cen.indices.length) layers.splice(layers.indexOf(cen), 1);
+    }
+  }
+  layers.splice(layers.indexOf(ly), 1);
+  renderLayers(); refreshFreeCurves(); if (state.colorBy === "layers") applyColor();
+}
+
 const coordOf = (i) => (i >= L.n ? (centroidPCA[i] ? centroidPCA[i][state.x] : 0) : (activeCoords() || L.pca)[i][state.x]);
 const orderAlongAxis = (idx) => [...idx].sort((a, b) => coordOf(a) - coordOf(b));
 
@@ -1158,8 +1178,11 @@ function clusterFromPicks() {
 async function computeClusters(seeds) {
   const seeded = Array.isArray(seeds) && seeds.length >= 2;
   const k = Math.max(2, Math.min(20, +$("clusterK").value || 5));
-  const url = seeded ? `./api/kmeans?seeds=${seeds.join(",")}` : `./api/kmeans?k=${k}`;
-  const label = seeded ? `seeded KMeans (${seeds.length} picks)` : `KMeans (k=${k})`;
+  const space = $("clusterSpace").value === "network" ? "network" : "view";
+  const q = (seeded ? `seeds=${seeds.join(",")}` : `k=${k}`) + `&space=${space}`;
+  const url = `./api/kmeans?${q}`;
+  const spaceLbl = space === "network" ? "full network space" : "viewed space";
+  const label = (seeded ? `seeded KMeans (${seeds.length} picks)` : `KMeans (k=${k})`) + ` on ${spaceLbl}`;
   status(`Computing ${label}…`, "busy");
   let d;
   try { d = await (await fetch(url)).json(); }
@@ -1170,13 +1193,15 @@ async function computeClusters(seeds) {
   indexColor = {}; centroidPCA = {};
   const groups = Array.from({ length: d.k }, () => []);
   d.labels.forEach((lab, i) => groups[lab] && groups[lab].push(i));
-  groups.forEach((idxs, j) => layers.push({ name: `Cluster ${j + 1}`, color: clusterColor(j), indices: idxs, visible: true, kind: "cluster" }));
+  // Tag each cluster with its centroid's virtual index so deleting the cluster
+  // can drop the matching point from the Centroids layer.
+  groups.forEach((idxs, j) => layers.push({ name: `Cluster ${j + 1}`, color: clusterColor(j), indices: idxs, visible: true, kind: "cluster", centroid: d.base + j }));
   const cents = [];
   for (let j = 0; j < d.k; j++) { const idx = d.base + j; cents.push(idx); indexColor[idx] = clusterColor(j); centroidPCA[idx] = d.centroid_pca[j]; }
   layers.push({ name: "Centroids", color: "#ffffff", indices: cents, visible: true, kind: "centroid" });
   $("colorby").value = "layers"; state.colorBy = "layers"; toggleColorWraps();
   renderLayers(); applyColor();
-  status(`${seeded ? "Seeded KMeans" : "KMeans"} k=${d.k}: ${d.k} cluster layers + a centroid layer (▶ to morph between clusters).`);
+  status(`${seeded ? "Seeded KMeans" : "KMeans"} k=${d.k} on ${spaceLbl}: ${d.k} cluster layers + a centroid layer (▶ to morph between clusters).`);
 }
 
 // Surface/volume color for a decoded state: cluster color for centroids, else the picker.

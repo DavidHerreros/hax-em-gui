@@ -107,10 +107,14 @@ function openPicker(anchorEl, adapter, onChange) {
     listEl,
     h("div", { class: "lblpick-create" }, swatch, newName, addBtn));
   const overlay = h("div", { class: "ctx-overlay" }, menu);
-  // Dismiss on an outside press, but only when the gesture *starts* outside the
-  // menu — so selecting text in the inputs (a drag that may release over the
-  // overlay) doesn't close the popover.
-  overlay.addEventListener("pointerdown", (e) => { if (!menu.contains(e.target)) close(); });
+  // Dismiss on an outside *click*, but only when the gesture also started outside
+  // the menu. Closing on the click (not pointerdown) lets the overlay swallow the
+  // event so it doesn't bleed through to the element beneath (which would e.g.
+  // navigate a job row); the start-outside check keeps text selection inside the
+  // inputs (a drag that may release on the overlay) from closing the popover.
+  let downOutside = false;
+  overlay.addEventListener("pointerdown", (e) => { downOutside = !menu.contains(e.target); });
+  overlay.addEventListener("click", () => { if (downOutside) close(); });
   document.body.appendChild(overlay);
   document.addEventListener("keydown", onKey, true);
   placePopover(menu, anchorEl);
@@ -199,9 +203,13 @@ function openLabelEditor(anchorEl, label, onDone) {
     h("div", { class: "lblpick-head" }, "Edit label"),
     nameI, swatches, h("div", { class: "lblpick-create" }, save, h("span", { style: { flex: "1" } }), del));
   const overlay = h("div", { class: "ctx-overlay" }, menu);
-  // Close only when the press starts outside the menu, so selecting text in the
-  // name field (a drag that may release over the overlay) doesn't dismiss it.
-  overlay.addEventListener("pointerdown", (e) => { if (!menu.contains(e.target)) close(); });
+  // Close on an outside click that also started outside the menu — closing on the
+  // click (not pointerdown) keeps the event from bleeding to the element beneath,
+  // and the start-outside check keeps text selection in the name field from
+  // dismissing it.
+  let downOutside = false;
+  overlay.addEventListener("pointerdown", (e) => { downOutside = !menu.contains(e.target); });
+  overlay.addEventListener("click", () => { if (downOutside) close(); });
   document.body.appendChild(overlay);
   document.addEventListener("keydown", onKey, true);
   placePopover(menu, anchorEl);
