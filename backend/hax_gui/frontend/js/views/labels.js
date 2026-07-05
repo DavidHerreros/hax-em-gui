@@ -74,18 +74,22 @@ export function jobLabelChips(job, { editable = false, onChange } = {}) {
 }
 
 // A node's label chips (workflow builder). `node.labels` is a list of label ids;
-// resolves them against the cache and offers a "+" to pick (no server call —
-// the labels are applied to the job when the node runs).
-export function nodeLabelChips(node, { onChange } = {}) {
+// resolves them against the cache and offers a "+" to pick. If the node is
+// already linked to a job — either directly (`node.job_id`, a project-canvas
+// node) or via the run mapping (pass its `jobId`, a standalone workflow that has
+// run) — every change (add *and* remove) is persisted to that job immediately;
+// otherwise the labels are applied to the job when the node runs.
+export function nodeLabelChips(node, { onChange, jobId } = {}) {
+  const persist = (ids) => { const jid = jobId || node.job_id; if (jid) api.setJobLabels(jid, ids).catch(() => {}); };
   const wrap = h("span", { class: "lbl-chips" });
   const render = () => {
     clear(wrap);
     for (const l of labelsByIds(node.labels)) wrap.appendChild(labelChip(l, (lab) => {
-      node.labels = (node.labels || []).filter((id) => id !== lab.id); render(); onChange && onChange();
+      node.labels = (node.labels || []).filter((id) => id !== lab.id); persist(node.labels); render(); onChange && onChange();
     }));
     wrap.appendChild(h("button", {
       class: "lbl-add", title: "Add label",
-      onclick: (e) => { e.preventDefault(); e.stopPropagation(); openNodeLabelPicker(e.currentTarget, node, () => { render(); onChange && onChange(); }); },
+      onclick: (e) => { e.preventDefault(); e.stopPropagation(); openNodeLabelPicker(e.currentTarget, node, () => { render(); onChange && onChange(); }, jobId); },
     }, icon("plus", 12)));
   };
   render();
@@ -182,12 +186,14 @@ export function openLabelPicker(anchorEl, job, onChange) {
 }
 
 // Anchored popover for a workflow node. Labels live on the node (applied to its
-// job when it runs); if the node is already linked to a job (a live project
-// workflow), the change is also pushed to that job immediately.
-export function openNodeLabelPicker(anchorEl, node, onChange) {
+// job when it runs); if the node is already linked to a job — directly
+// (`node.job_id`) or via the run mapping (`jobId`) — the change is also pushed to
+// that job immediately so it survives a canvas reconcile and shows in the job list.
+export function openNodeLabelPicker(anchorEl, node, onChange, jobId) {
+  const jid = jobId || node.job_id;
   openPicker(anchorEl, {
     selected: () => node.labels || [],
-    setSelected: (ids) => { node.labels = ids; if (node.job_id) api.setJobLabels(node.job_id, ids).catch(() => {}); },
+    setSelected: (ids) => { node.labels = ids; if (jid) api.setJobLabels(jid, ids).catch(() => {}); },
   }, onChange);
 }
 

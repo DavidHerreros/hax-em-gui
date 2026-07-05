@@ -7,6 +7,7 @@ import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
 import { openFilePicker } from "./filePicker.js";
+import { jobLabelChips } from "./labels.js";
 
 export function MetricsView() {
   const root = h("div", { class: "view metrics-view" });
@@ -42,6 +43,7 @@ export function MetricsView() {
       h("span", { class: "run-prog mono" }, j.program),
       j.project_name ? h("span", { class: "proj-chip" }, icon("box", 12), j.project_name) : null,
       h("span", { class: "run-folder mono" }, folderName(j.workdir)),
+      (j.labels && j.labels.length) ? jobLabelChips(j) : null,
       h("span", { class: "run-time" }, new Date(j.created_at).toLocaleString()),
       h("span", { class: "run-open" }, icon("chart", 14), "Open"))));
   }

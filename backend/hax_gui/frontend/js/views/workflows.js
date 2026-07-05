@@ -409,9 +409,28 @@ export function WorkflowsView() {
 
   const nodeById = (id) => graph.nodes.find((n) => n.id === id);
   const inputsOf = (program) => Object.entries((byName[program] || {}).bindable || {});
-  const LABELS_H = 28;    // bottom strip showing this node's named label chips
+  const LABEL_ROW_H = 22;   // height of one wrapped row of label chips
   const nodeLabels = (n) => labelsByIds(n.labels);
-  const nodeHeight = (n) => HEADER_H + Math.max(1, inputsOf(n.program).length) * ROW_H + 8 + (nodeLabels(n).length ? LABELS_H : 0);
+  // Estimate how many rows the label chips wrap into within NODE_W so the node
+  // grows to fit them (instead of clipping). Deterministic — same on every
+  // render — so the computed nodeHeight keeps the output port aligned.
+  const labelRowCount = (labels) => {
+    const avail = NODE_W - 16;                 // strip inner width (8px padding each side)
+    let rows = 1, cur = 0;
+    for (const l of labels) {
+      const nameW = Math.min(96, (l.name || "").length * 5.3);
+      const w = 26 + nameW;                    // dot + gaps + padding + border + name
+      if (cur === 0) cur = w;
+      else if (cur + 4 + w <= avail) cur += 4 + w;
+      else { rows += 1; cur = w; }
+    }
+    return rows;
+  };
+  const nodeHeight = (n) => {
+    const labels = nodeLabels(n);
+    return HEADER_H + Math.max(1, inputsOf(n.program).length) * ROW_H + 8
+      + (labels.length ? labelRowCount(labels) * LABEL_ROW_H + 8 : 0);
+  };
 
   // Port positions (canvas coords) — orientation-aware.
   function outPort(n) {
@@ -661,7 +680,12 @@ export function WorkflowsView() {
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "Name", nameI));
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "GPU", gpuI));
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "Labels",
-      nodeLabelChips(n, { onChange: () => { dirty = true; const el = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"]`); if (el) renderNodes(); } })));
+      nodeLabelChips(n, {
+        // Persist to the linked job whether the link is on the node (project
+        // canvas) or only in the run mapping (a standalone workflow that has run).
+        jobId: n.job_id || (runState && runState[n.id] && runState[n.id].job_id),
+        onChange: () => { dirty = true; const el = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"]`); if (el) renderNodes(); },
+      })));
 
     const schema = schemaCache[n.program];
     if (!schema) { loadSchema(n.program).then(() => { if (selected === n.id) renderInspector(); }); inspBody.appendChild(h("div", { class: "muted small" }, "Loading parameters…")); return; }

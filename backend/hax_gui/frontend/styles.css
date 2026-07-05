@@ -703,10 +703,11 @@ body.vwin-dragging iframe { pointer-events: none; }
 .lblpick-sw.on { border-color: var(--text); }
 .lblpick-editor .lblpick-new { width: 100%; margin-bottom: 4px; }
 
-/* named label chips shown at the bottom of a workflow node box */
-.wf-node-labels-strip { display: flex; align-items: center; gap: 4px; height: 28px; padding: 0 8px;
-  overflow: hidden; border-top: 1px solid var(--border); }
-.wf-node-labels-strip .lbl-chip { font-size: 10px; padding: 1px 6px 1px 5px; line-height: 1.4; }
+/* named label chips shown at the bottom of a workflow node box — wrap onto
+   multiple rows when there are many (the node grows to fit; see labelRowCount) */
+.wf-node-labels-strip { display: flex; flex-wrap: wrap; align-content: center; align-items: center;
+  gap: 4px; padding: 5px 8px; border-top: 1px solid var(--border); }
+.wf-node-labels-strip .lbl-chip { font-size: 10px; padding: 1px 6px 1px 5px; line-height: 1.4; max-width: 100%; }
 .wf-node-labels-strip .lbl-name { max-width: 96px; }
 
 /* ===== update notifications ===== */
