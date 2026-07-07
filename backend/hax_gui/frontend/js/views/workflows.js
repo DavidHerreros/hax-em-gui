@@ -102,6 +102,7 @@ export function WorkflowsView() {
   const asProjBtn = h("button", { class: "btn small", title: "Create a new project backed by this workflow", onclick: saveAsProject }, icon("plus", 14), "Save as project");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
   const dupBtn = h("button", { class: "btn secondary", title: "Duplicate the selected step(s) as new, un-run steps (Ctrl/Cmd+D)", onclick: () => duplicateNodes([...selectedSet]) }, icon("copy", 15), "Duplicate");
+  const rmSelBtn = h("button", { class: "btn secondary", title: "Remove the selected step(s) from the canvas (Delete / Backspace). Save to persist.", onclick: () => removeNodes([...selectedSet]) }, icon("x", 15), "Remove selected");
   const runSelBtn = h("button", { class: "btn secondary", title: "Run the selected step(s) only. Select several by Shift-dragging a box on empty canvas (Ctrl/Cmd-drag adds to the selection), or Shift/Ctrl-click nodes.", onclick: () => runNodes([...selectedSet]) }, icon("play", 15), "Run selected");
   const runBtn = h("button", { class: "btn", title: "Run the whole workflow", onclick: () => runNodes(null) }, icon("play", 15), "Run all");
   const delBtn = h("button", { class: "btn", title: "Delete this workflow", onclick: removeWorkflow }, icon("trash", 15));
@@ -109,7 +110,7 @@ export function WorkflowsView() {
     h("strong", null, "Workflow"), wfSelect,
     h("button", { class: "btn small", onclick: () => openWorkflow(null) }, "+ New"),
     importBtn, asProjBtn, nameInput, orientBtn, layoutBtn, pinBtn, restoreBtn, centerBtn, mmBtn, zoomLabel,
-    h("span", { style: { flex: "1" } }), statusEl, saveBtn, dupBtn, runSelBtn, runBtn, delBtn);
+    h("span", { style: { flex: "1" } }), statusEl, saveBtn, dupBtn, rmSelBtn, runSelBtn, runBtn, delBtn);
 
   // ── body: palette | canvas (+minimap) | inspector ──
   // Both side panels are resizable (drag the divider) and collapsible (chevron in
@@ -318,12 +319,39 @@ export function WorkflowsView() {
     renderNodes(); renderInspector();
     return node;
   }
-  function removeNode(id) {
-    graph.nodes = graph.nodes.filter((n) => n.id !== id);
-    graph.edges = graph.edges.filter((e) => e.from !== id && e.to !== id);
-    selectedSet.delete(id);
-    if (selected === id) selected = selectedSet.size ? [...selectedSet][0] : null;
+  // The job backing a node, if any: project-canvas nodes carry `job_id`; a
+  // standalone workflow that has run maps its nodes to jobs via runState.
+  const jobIdOf = (id) => nodeById(id)?.job_id || (runState && runState[id] && runState[id].job_id) || null;
+
+  // Remove every step in `ids` (and any edges touching them) at once, and delete
+  // the jobs those steps produced (DB record + output/log folder). Deleting the
+  // job is also what makes removal *stick* on a project canvas, whose nodes are
+  // reconciled back from the project's jobs on every load. Confirms first — this
+  // permanently discards outputs and can't be undone.
+  async function removeNodes(ids) {
+    const set = new Set((ids || []).filter(Boolean));
+    if (!set.size) { flash("Select step(s) to remove.", "muted"); return; }
+    const jobIds = [...set].map(jobIdOf).filter(Boolean);
+    const n = set.size;
+    let msg = n > 1 ? `Remove ${n} selected steps from the canvas?` : "Remove this step from the canvas?";
+    if (jobIds.length) msg += `\n\nThis also permanently deletes ${jobIds.length} associated job${jobIds.length > 1 ? "s" : ""} — their output folders and logs — and cannot be undone.`;
+    if ((n > 1 || jobIds.length) && !confirm(msg)) return;
+
+    // drop the boxes + their wiring from the canvas
+    graph.nodes = graph.nodes.filter((nd) => !set.has(nd.id));
+    graph.edges = graph.edges.filter((e) => !set.has(e.from) && !set.has(e.to));
+    for (const id of set) { selectedSet.delete(id); if (runState) delete runState[id]; }
+    if (set.has(selected)) selected = selectedSet.size ? [...selectedSet][0] : null;
     dirty = true; renderNodes(); renderInspector();
+
+    if (!jobIds.length) { flash(n === 1 ? "Step removed — Save to persist." : `${n} steps removed — Save to persist.`, "muted"); return; }
+    // delete the backing jobs (best-effort: an active job can't be deleted, so it
+    // is reported rather than silently skipped)
+    const results = await Promise.allSettled(jobIds.map((jid) => api.deleteJob(jid)));
+    const failed = results.filter((r) => r.status === "rejected").length;
+    const okJobs = jobIds.length - failed;
+    if (failed) flash(`Removed ${n === 1 ? "step" : n + " steps"}; deleted ${okJobs} job(s), but ${failed} could not be deleted (still running? cancel them first).`, "warn");
+    else flash(`Removed ${n === 1 ? "step" : n + " steps"} and deleted ${okJobs} job(s).`, "muted");
   }
 
   // Duplicate node(s) as fresh, un-run steps: copy program/args/gpu/name/labels at
@@ -476,7 +504,7 @@ export function WorkflowsView() {
       st ? h("span", { class: "wf-node-st", style: { color: statusColor(st) } }, st) : null,
       h("button", { class: "wf-node-run", title: "Run this step", disabled: running, onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon("play", 12)),
       h("button", { class: "wf-node-run", title: "Duplicate this step (un-run copy)", onclick: (e) => { e.stopPropagation(); duplicateNodes([n.id]); } }, icon("copy", 12)),
-      h("button", { class: "wf-node-x", title: "Remove step", onclick: (e) => { e.stopPropagation(); removeNode(n.id); } }, "×"));
+      h("button", { class: "wf-node-x", title: "Remove step (deletes its job + outputs)", onclick: (e) => { e.stopPropagation(); removeNodes([n.id]); } }, "×"));
     head.addEventListener("pointerdown", (e) => startNodeDrag(e, n));
     el.appendChild(head);
     // input ports (label rows in the body + an absolutely-placed dot per port)
@@ -1028,13 +1056,18 @@ export function WorkflowsView() {
     catch (err) { flash("Delete failed: " + (err.detail || err.message), "err"); }
   }
 
-  // Ctrl/Cmd+D duplicates the current selection (unless typing in a field).
+  // Keyboard shortcuts (ignored while typing in a field): Ctrl/Cmd+D duplicates
+  // the selection, Delete / Backspace removes it.
   function onKey(e) {
-    if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "d") return;
     const t = e.target;
     if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
-    e.preventDefault();
-    duplicateNodes([...selectedSet]);
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+      e.preventDefault();
+      duplicateNodes([...selectedSet]);
+    } else if ((e.key === "Delete" || e.key === "Backspace") && selectedSet.size) {
+      e.preventDefault();
+      removeNodes([...selectedSet]);
+    }
   }
   document.addEventListener("keydown", onKey);
 

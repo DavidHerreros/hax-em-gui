@@ -701,6 +701,11 @@ body.vwin-dragging iframe { pointer-events: none; }
 .lblpick-swatches { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 2px; }
 .lblpick-sw { width: 22px; height: 22px; border-radius: 6px; border: 2px solid transparent; cursor: pointer; }
 .lblpick-sw.on { border-color: var(--text); }
+/* Native color input styled as a swatch (a dashed border marks it as "any custom color"). */
+.lblpick-custom { width: 22px; height: 22px; padding: 0; border-radius: 6px; border: 2px dashed var(--muted); cursor: pointer; background: none; flex-shrink: 0; -webkit-appearance: none; -moz-appearance: none; appearance: none; }
+.lblpick-custom::-webkit-color-swatch-wrapper { padding: 0; }
+.lblpick-custom::-webkit-color-swatch { border: none; border-radius: 4px; }
+.lblpick-custom::-moz-color-swatch { border: none; border-radius: 4px; }
 .lblpick-editor .lblpick-new { width: 100%; margin-bottom: 4px; }
 
 /* named label chips shown at the bottom of a workflow node box — wrap onto

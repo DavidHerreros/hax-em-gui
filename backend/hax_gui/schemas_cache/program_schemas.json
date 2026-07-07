@@ -162,9 +162,11 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions - pass auto to let hax estimate the largest batch size that fits on your GPU (this maximizes GPU utilization, not necessarily accuracy)",
           "default": 8,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "learning_rate",
@@ -308,15 +310,96 @@
           "type": "number"
         },
         {
-          "name": "use_frc_loss",
+          "name": "loss_type",
           "flags": [
-            "--use_frc_loss"
+            "--loss_type"
           ],
-          "flag": "--use_frc_loss",
+          "flag": "--loss_type",
           "required": false,
-          "help": "When set, HetSIREN uses a Fourier Ring Correlation (FRC) reconstruction loss instead of the default image-space MSE. Because the FRC normalizes the error per resolution shell, it pushes the network to reproduce high-frequency detail and typically yields sharper decoded volumes (MSE is dominated by low frequencies and tends to blur them). NOTE: the point transformer decoder always uses the FRC loss regardless of this flag.",
+          "help": "Reconstruction (representation) loss. mse (default): image-space L2 (robust on noise but blurs high frequencies). frc: Fourier Ring Correlation (sharp on clean data, but weights noise-dominated shells equally, so on experimental data it must be band-limited to a trusted resolution to avoid overfitting noise - see --freq_anneal_epochs and --sigma_anneal_factor, which together reproduce the EMAN2/e2gmm recipe of a band-limited FRC over a band-limited Gaussian representation). NOTE: the point transformer decoder always uses a Fourier-space loss (frc) regardless of this setting.",
+          "default": "mse",
+          "type": "enum",
+          "choices": [
+            "mse",
+            "frc"
+          ]
+        },
+        {
+          "name": "freq_anneal_epochs",
+          "flags": [
+            "--freq_anneal_epochs"
+          ],
+          "flag": "--freq_anneal_epochs",
+          "required": false,
+          "help": "Coarse-to-fine annealing: number of initial epochs over which the effective resolution is ramped in. During this window the decoder's first-SIREN-layer frequency (w0) and the upper limit of the FRC loss band are scaled up from --freq_anneal_start to full resolution (and, if --sigma_anneal_factor > 1, the Gaussian render width is annealed on the same clock). This forces the network to fit low-frequency structure before high-frequency detail, which strongly stabilizes training on noisy data (it prevents the SIREN from overfitting high-frequency noise early). Set to 0 to disable (train at full resolution from the first step). NOTE: does not affect the point transformer decoder's w0 (it has no SIREN first layer), but still anneals its loss band.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "freq_anneal_start",
+          "flags": [
+            "--freq_anneal_start"
+          ],
+          "flag": "--freq_anneal_start",
+          "required": false,
+          "help": "Starting fraction (in (0, 1]) for --freq_anneal_epochs: freq_alpha begins at this value and ramps linearly to 1.0. Smaller values start coarser (lower resolution). Ignored when --freq_anneal_epochs is 0.",
+          "default": 0.2,
+          "type": "number"
+        },
+        {
+          "name": "sigma_anneal_factor",
+          "flags": [
+            "--sigma_anneal_factor"
+          ],
+          "flag": "--sigma_anneal_factor",
+          "required": false,
+          "help": "EMAN2/e2gmm-style band-limited representation for the FRC loss. The Gaussian render width used in the training loss starts at sigma_anneal_factor x base_sigma (broad, low-resolution blobs) and shrinks back to the base width on the SAME coarse-to-fine clock as --freq_anneal_epochs. Broadening the Gaussians makes the density itself intrinsically band-limited early on, so the amplitude-invariant FRC cannot pour gradient into high-resolution noise shells the model is not yet allowed to represent (this is the safeguard that lets EMAN2 use FRC on experimental data). Only affects mass-transport rendering. Requires --freq_anneal_epochs > 0 (it shares that clock). Set to 1.0 to disable (default; fixed base width). Typical: 2-2.5 - the render blur uses a fixed 9-px kernel, so a broadened width beyond ~2.5x the base sigma is progressively truncated (still broadens, just sub-linearly), which bounds the useful range.",
+          "default": 1.0,
+          "type": "number"
+        },
+        {
+          "name": "arap_lambda",
+          "flags": [
+            "--arap_lambda"
+          ],
+          "flag": "--arap_lambda",
+          "required": false,
+          "help": "Weight of the as-rigid-as-possible (ARAP) deformation prior. Unlike the distance-preservation term, ARAP factors out the best local rotation per Gaussian before penalizing the deformation, so locally rigid motions (hinges, domain rotations) are NOT over-stiffened while noise-driven non-rigid shear is still resisted. Only active with mass transport and a reference volume. Set to 0 to disable (default); a small value (e.g. 0.05-0.2) is a good starting point, tuned together with --deformation_lambda/--distance_preservation_lambda.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "geometric_lambda",
+          "flags": [
+            "--geometric_lambda"
+          ],
+          "flag": "--geometric_lambda",
+          "required": false,
+          "help": "Weight of the geometric-correction loss. It penalises the local volume distortion of the heterogeneity decoder via the Gram determinant det(J_D(z)^T J_D(z)) of its Jacobian (the derivative of the decoded deformation w.r.t. the latent), pushing the decoded latent-to-shape map towards a locally volume-preserving (isometric) embedding. Set to 0 to disable (default). NOTE: computing the decoder Jacobian is expensive (it runs the decoder once per latent dimension and is differentiated again by the optimizer), so only enable it when the geometric term is actually needed.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "lr_schedule",
+          "flags": [
+            "--lr_schedule"
+          ],
+          "flag": "--lr_schedule",
+          "required": false,
+          "help": "Use a warmup + cosine-decay learning-rate schedule for the HetSIREN optimizer instead of a constant learning rate. The LR ramps linearly from 1e-5 to --learning_rate over the first 10%% of training, then follows a cosine decay down to 0 by the final epoch. This warms up the SIREN safely (avoiding early high-frequency instabilities) and anneals the step size at the end for a sharper, more stable final model. Resumes correctly from a checkpoint (the schedule follows the optimizer step count). Default: off (constant learning rate).",
           "default": false,
           "type": "boolean"
+        },
+        {
+          "name": "ema_decay",
+          "flags": [
+            "--ema_decay"
+          ],
+          "flag": "--ema_decay",
+          "required": false,
+          "help": "Exponential moving average (Polyak averaging) of the trainable weights. When > 0 (typical: 0.999), a running average ema = decay*ema + (1-decay)*weights is maintained during training and the AVERAGED weights (not the last raw ones) are exported as the final model. This smooths out the noise in the late-training weight trajectory and typically yields a cleaner, higher-resolution reconstruction on noisy data. The averaged forward model is also used as the (frozen) target when training the decoder inverse. Set to 0 to disable (default). NOTE: the EMA buffer is checkpointed, so a training resume restores the running average exactly (legacy checkpoints without an EMA buffer fall back to re-seeding it from the resumed weights).",
+          "default": 0.0,
+          "type": "number"
         },
         {
           "name": "deformation_lambda",
@@ -539,9 +622,11 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions - pass auto to let hax estimate the largest batch size that fits on your GPU (this maximizes GPU utilization, not necessarily accuracy)",
           "default": 8,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "learning_rate",
@@ -686,9 +771,11 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions - pass auto to let hax estimate the largest batch size that fits on your GPU (this maximizes GPU utilization, not necessarily accuracy)",
           "default": 1024,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "learning_rate",
@@ -840,7 +927,9 @@
           "required": false,
           "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
           "default": 1024,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "output_path",
@@ -1046,7 +1135,9 @@
           "required": false,
           "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
           "default": 64,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "learning_rate",
@@ -1268,7 +1359,9 @@
           "required": false,
           "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
           "default": 64,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "learning_rate",
@@ -1390,7 +1483,9 @@
           "required": false,
           "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
           "default": 64,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "output_path",
@@ -1826,6 +1921,17 @@
           "type": "string"
         },
         {
+          "name": "num_components",
+          "flags": [
+            "--num_components"
+          ],
+          "flag": "--num_components",
+          "required": false,
+          "help": "Number of candidate pose hypotheses the pose encoder proposes per image during the ab initio search. For every image the network evaluates this many orientations (anchored on a spherical grid), renders a projection for each and keeps the best-matching one. A larger value covers orientation space more densely, making the pose search more robust to local minima, but increases GPU memory and compute roughly linearly (this is the main driver of ReconSIREN's training footprint). Set it lower to fit a smaller GPU at the cost of a coarser pose search. Default: 18.",
+          "default": 18,
+          "type": "integer"
+        },
+        {
           "name": "ctf_type",
           "flags": [
             "--ctf_type"
@@ -1876,9 +1982,11 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions - pass auto to let hax estimate the largest batch size that fits on your GPU (this maximizes GPU utilization, not necessarily accuracy)",
           "default": 8,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "learning_rate",
@@ -2060,6 +2168,17 @@
           "type": "string"
         },
         {
+          "name": "num_components",
+          "flags": [
+            "--num_components"
+          ],
+          "flag": "--num_components",
+          "required": false,
+          "help": "Number of candidate pose hypotheses the pose encoder proposes per image during the ab initio search. For every image the network evaluates this many orientations (anchored on a spherical grid), renders a projection for each and keeps the best-matching one. A larger value covers orientation space more densely, making the pose search more robust to local minima, but increases GPU memory and compute roughly linearly (this is the main driver of ReconSIREN's training footprint). Set it lower to fit a smaller GPU at the cost of a coarser pose search. Default: 18.",
+          "default": 18,
+          "type": "integer"
+        },
+        {
           "name": "ctf_type",
           "flags": [
             "--ctf_type"
@@ -2110,9 +2229,11 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions - pass auto to let hax estimate the largest batch size that fits on your GPU (this maximizes GPU utilization, not necessarily accuracy)",
           "default": 8,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "learning_rate",
@@ -2295,9 +2416,11 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions",
+          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions - pass auto to let hax estimate the largest batch size that fits on your GPU (this maximizes GPU utilization, not necessarily accuracy)",
           "default": 8,
-          "type": "integer"
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "reconstruct_halves",

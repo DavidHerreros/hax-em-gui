@@ -8,6 +8,18 @@ import { api } from "../api.js";
 
 const PALETTE = ["#ef4444", "#f59e0b", "#eab308", "#22c55e", "#14b8a6", "#3b82f6", "#8b5cf6", "#ec4899", "#64748b", "#0ea5e9"];
 
+// A native color picker rendered as a swatch — lets the user choose *any* color,
+// not just the presets. `onInput` (optional) fires live while dragging; `onCommit`
+// fires once when the OS picker closes (its selected value is final). `<input
+// type=color>` needs a 7-char #rrggbb value, so coerce anything else.
+const normHex = (c) => (/^#[0-9a-fA-F]{6}$/.test(c || "") ? c : "#64748b");
+function customSwatch(current, { onInput, onCommit } = {}) {
+  const input = h("input", { type: "color", class: "lblpick-custom", value: normHex(current), title: "Custom color…" });
+  if (onInput) input.oninput = (e) => onInput(e.target.value);
+  if (onCommit) input.onchange = (e) => onCommit(e.target.value);
+  return input;
+}
+
 let _cache = null;                 // [{id,name,color,count}]
 const _subs = new Set();
 
@@ -202,7 +214,8 @@ function openLabelEditor(anchorEl, label, onDone) {
   const nameI = h("input", { class: "lblpick-new", value: label.name, maxLength: 40 });
   const swatches = h("div", { class: "lblpick-swatches" },
     ...PALETTE.map((c) => h("button", { class: "lblpick-sw" + (c === label.color ? " on" : ""), style: { background: c }, title: c,
-      onclick: async () => { await api.updateLabel(label.id, { color: c }); await onDone(); close(); } })));
+      onclick: async () => { await api.updateLabel(label.id, { color: c }); await onDone(); close(); } })),
+    customSwatch(label.color, { onCommit: async (c) => { await api.updateLabel(label.id, { color: c }); await onDone(); close(); } }));
   const save = h("button", { class: "btn small", onclick: async () => { await api.updateLabel(label.id, { name: nameI.value }); await onDone(); close(); } }, icon("check", 13), "Save");
   const del = h("button", { class: "btn small ghost", style: { color: "var(--err)" }, onclick: async () => { if (!confirm(`Delete label "${label.name}"? It will be removed from all jobs.`)) return; await api.deleteLabel(label.id); await onDone(); close(); } }, icon("trash", 13));
   const menu = h("div", { class: "lblpick lblpick-editor", onclick: (e) => e.stopPropagation() },
@@ -227,7 +240,8 @@ function openColorMenu(anchorEl, current, onPick) {
   const menu = h("div", { class: "lblpick", onclick: (e) => e.stopPropagation() },
     h("div", { class: "lblpick-swatches" },
       ...PALETTE.map((c) => h("button", { class: "lblpick-sw" + (c === current ? " on" : ""), style: { background: c },
-        onclick: (e) => { e.preventDefault(); onPick(c); close(); } }))));
+        onclick: (e) => { e.preventDefault(); onPick(c); close(); } })),
+      customSwatch(current, { onInput: onPick, onCommit: (c) => { onPick(c); close(); } })));
   const overlay = h("div", { class: "ctx-overlay", onclick: close }, menu);
   document.body.appendChild(overlay);
   placePopover(menu, anchorEl);
