@@ -282,8 +282,8 @@ export function createRenderer(canvas) {
   function camera() {
     const aspect = canvas.width / Math.max(1, canvas.height);
     const proj = perspective((45 * Math.PI) / 180, aspect, 0.01, 100);
-    const view = lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]);   // camera fixed; model carries the trackball rotation
-    return { proj, view, model: orbit.rotation };
+    const view = lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]);   // camera fixed; model carries the trackball rotation + pan
+    return { proj, view, model: orbit.model };
   }
   function drawMesh() { gl.bindVertexArray(vao); gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_INT, 0); gl.bindVertexArray(null); }
   function drawQuad() { gl.bindVertexArray(quadVao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null); }

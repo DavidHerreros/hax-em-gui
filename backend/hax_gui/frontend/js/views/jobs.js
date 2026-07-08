@@ -6,6 +6,7 @@ import { errorBox, skeleton } from "./ui.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
 import { jobLabelChips, loadLabels } from "./labels.js";
+import { store } from "../store.js";
 
 export function badge(status) {
   const animated = status === "running" || status === "pending";
@@ -42,6 +43,11 @@ export function JobsView() {
   let lastSig = null;
   let animatedOnce = false;
 
+  // A rename mutates the job object in place (which lives in `allJobs`), so realign
+  // the signature to what we already show — otherwise the next 3s poll sees the name
+  // change, rebuilds the whole list, and the scroll jumps back to the top.
+  const hooks = { afterLocalRename() { lastSig = jobsSignature(allJobs); } };
+
   function renderBody() {
     let content;
     if (!allJobs.length) content = h("p", { class: "muted" }, "No jobs yet. Pick a program from the right menu.");
@@ -51,7 +57,7 @@ export function JobsView() {
         (!filters.program || j.program === filters.program) &&
         (!filters.status || j.status === filters.status) &&
         (!filters.label || (j.labels || []).some((l) => l.id === filters.label)));
-      content = jobs.length ? groupedList(jobs) : h("p", { class: "muted" }, "No jobs match the current filters.");
+      content = jobs.length ? groupedList(jobs, hooks) : h("p", { class: "muted" }, "No jobs match the current filters.");
     }
     mount(body, content);
     // Animate the row entrance only on the first paint; later refreshes (every 3s)
@@ -127,7 +133,7 @@ function syncOptions(sel, values, filters, key) {
 }
 
 // Group jobs under their project (alphabetical; "(no project)" last).
-function groupedList(jobs) {
+function groupedList(jobs, hooks) {
   const groups = new Map();
   for (const j of jobs) {
     const k = projectKey(j);
@@ -143,7 +149,7 @@ function groupedList(jobs) {
         icon("box", 14),
         h("span", { class: "jobs-group-name" }, k),
         h("span", { class: "jobs-group-count" }, String(items.length))),
-      h("div", null, ...items.map((j, i) => row(j, i))));
+      h("div", null, ...items.map((j, i) => row(j, i, hooks))));
   }));
 }
 
@@ -185,7 +191,7 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
   async function rename() {
     const name = await promptModal({ title: "Rename run", label: "Run name", value: job.name || "", placeholder: job.program, okText: "Rename" });
     if (name === null) return;
-    try { const u = await api.renameJob(job.id, name); job.name = u.name; if (onRenamed) onRenamed(u); } catch { /* ignore */ }
+    try { const u = await api.renameJob(job.id, name); job.name = u.name; store.renameViewerForJob(job.id, u.name); if (onRenamed) onRenamed(u); } catch { /* ignore */ }
   }
   async function del() {
     if (!window.confirm("Delete this job and its run folder (outputs + log)? This cannot be undone.")) return;
@@ -200,7 +206,7 @@ export function gpuLabel(gpu) {
   return gpu === "cpu" ? "CPU" : "GPU " + gpu;
 }
 
-function row(job, i) {
+function row(job, i, hooks) {
   const title = h("span", { class: "prog" }, jobDisplayName(job));
   const a = h(
     "a",
@@ -211,7 +217,7 @@ function row(job, i) {
     jobLabelChips(job, { editable: true }),
     gpuLabel(job.gpu) ? h("span", { class: "muted", style: { fontSize: "12px" } }, gpuLabel(job.gpu)) : null,
     h("span", { class: "time" }, new Date(job.created_at).toLocaleString()),
-    jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); }, onDeleted: () => a.remove() })
+    jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); hooks?.afterLocalRename?.(); }, onDeleted: () => a.remove() })
   );
   return a;
 }

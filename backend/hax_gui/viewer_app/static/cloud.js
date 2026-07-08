@@ -160,8 +160,8 @@ export function createCloud(canvas, onSelect) {
   function matrices() {
     const aspect = canvas.width / Math.max(1, canvas.height);
     const proj = perspective((45 * Math.PI) / 180, aspect, 0.01, 100);
-    // camera fixed on +Z; the model is rotated by the trackball matrix (baked into view).
-    const view = multiply(lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]), orbit.rotation);
+    // camera fixed on +Z; the model transform (trackball rotation + pan) is baked into view.
+    const view = multiply(lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]), orbit.model);
     return { proj, view };
   }
   function resize() {
@@ -371,6 +371,7 @@ export function createCloud(canvas, onSelect) {
     setBackground(rgb) { bg = rgb; render(); },
     onRender(cb) { onRenderCb = cb; },   // called after every render (overlay re-syncs to the camera)
     orbitRotate(dx, dy) { orbit.drag(dx, dy); },   // rotate the camera from an external drag (overlay edit mode)
+    orbitPan(dx, dy) { orbit.pan(dx, dy); },       // pan the camera from an external drag (overlay / middle-mouse)
     orbitZoom(deltaY) { orbit.zoom(deltaY); },     // wheel-zoom forwarded from the overlay
     resetView() { orbit.reset(); },
     render,

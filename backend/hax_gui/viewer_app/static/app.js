@@ -885,6 +885,28 @@ function sizeLasso() {
 function setupLasso() {
   const lc = $("lassoCanvas"); lctx = lc.getContext("2d"); sizeLasso();
   window.addEventListener("resize", sizeLasso);
+  // Middle-mouse drag pans the active landscape even while a tool is armed (the
+  // overlay otherwise swallows drags for lasso / draw). Capture phase + stop-
+  // propagation so it beats the tool handlers below; routes to the 2D or 3D view.
+  let overlayPanning = false, panLX = 0, panLY = 0;
+  lc.addEventListener("pointerdown", (e) => {
+    if (e.button !== 1) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    overlayPanning = true; panLX = e.clientX; panLY = e.clientY; lc.setPointerCapture(e.pointerId);
+  }, true);
+  lc.addEventListener("pointermove", (e) => {
+    if (!overlayPanning) return;
+    e.stopImmediatePropagation();
+    const dx = e.clientX - panLX, dy = e.clientY - panLY; panLX = e.clientX; panLY = e.clientY;
+    if (is3d() && cloud) cloud.orbitPan(dx, dy); else scatter.panBy(dx, dy);
+  }, true);
+  const endOverlayPan = (e) => {
+    if (!overlayPanning) return;
+    e.stopImmediatePropagation(); overlayPanning = false;
+    try { lc.releasePointerCapture(e.pointerId); } catch {}
+  };
+  lc.addEventListener("pointerup", endOverlayPan, true);
+  lc.addEventListener("auxclick", (e) => { if (e.button === 1) e.preventDefault(); });
   // The overlay only receives wheel events while armed (else pointer-events:none lets
   // them fall through to the landscape canvas, which zooms itself). Forward to the
   // active landscape so the wheel zooms even mid-lasso / mid-edit.

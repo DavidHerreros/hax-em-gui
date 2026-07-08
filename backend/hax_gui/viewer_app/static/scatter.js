@@ -206,7 +206,8 @@ export function createScatter(canvas, onSelect) {
   // toward the cursor; double-click refits. (When the lasso/draw overlay is armed it
   // sits on top and intercepts these — the app forwards the wheel there instead.)
   let panning = false, panned = false, plx = 0, ply = 0;
-  canvas.addEventListener("pointerdown", (e) => { panning = true; panned = false; plx = e.clientX; ply = e.clientY; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener("pointerdown", (e) => { if (e.button === 1) e.preventDefault(); panning = true; panned = false; plx = e.clientX; ply = e.clientY; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener("auxclick", (e) => { if (e.button === 1) e.preventDefault(); });
   canvas.addEventListener("pointermove", (e) => {
     if (!panning) return;
     const dx = e.clientX - plx, dy = e.clientY - ply;
@@ -240,6 +241,7 @@ export function createScatter(canvas, onSelect) {
     projectData(pts) { const r = dpr(); return pts.map(([x, y]) => { const [sx, sy] = toScreen(x, y); return [sx / r, sy / r]; }); },
     unproject,
     zoomAt,   // app forwards the wheel here when the overlay is armed
+    panBy,    // app forwards middle-mouse drags here when the overlay is armed (CSS px)
     resetView() { view = { ...bounds }; draw(); },
     setSelection(arr) { selSet = new Set(arr || []); draw(); },
     // CSS-space screen coords of every point (for app-driven lasso enclosure)

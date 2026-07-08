@@ -198,7 +198,7 @@ export function JobDetailView(params) {
     if (!job) return;
     const name = await promptModal({ title: "Rename run", label: "Run name", value: job.name || "", placeholder: job.program, okText: "Rename" });
     if (name === null) return;
-    try { const u = await api.renameJob(id, name); job = { ...job, name: u.name }; renderHead(); }
+    try { const u = await api.renameJob(id, name); job = { ...job, name: u.name }; store.renameViewerForJob(id, u.name); renderHead(); }
     catch (err) { mount(actionErr, errorBox(err)); }
   }
 

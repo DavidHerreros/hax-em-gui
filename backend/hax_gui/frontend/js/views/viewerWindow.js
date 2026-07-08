@@ -11,6 +11,7 @@ import { h, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
+import { promptModal } from "./promptModal.js";
 
 const GEO_KEY = "hax_gui_viewer_window";
 const MIN_W = 380, MIN_H = 260;
@@ -120,6 +121,18 @@ export function mountViewerWindow() {
   }
   function closeAll() { for (const v of [...getState().openViewers]) closeOne(v.id); }
 
+  // Rename the run behind a viewer tab (double-click its label). Renames the job on
+  // the server and updates the tab title; the Jobs list picks it up on its next poll.
+  async function renameTab(v) {
+    if (!v.jobId) return;
+    const sep = (v.title || "").indexOf(" · ");
+    const current = sep >= 0 ? v.title.slice(0, sep) : (v.title || "");
+    const name = await promptModal({ title: "Rename run", label: "Run name", value: current, okText: "Rename" });
+    if (name === null || !name) return;
+    try { const u = await api.renameJob(v.jobId, name); store.renameViewerForJob(v.jobId, u.name); }
+    catch { /* ignore */ }
+  }
+
   function render() {
     const { openViewers, activeViewerId } = getState();
     if (!openViewers.length) { win.style.display = "none"; knownIds = new Set(); return; }
@@ -139,8 +152,13 @@ export function mountViewerWindow() {
 
     clear(tabs);
     for (const v of openViewers) {
+      const label = h("span", {
+        class: "tab-label",
+        title: v.jobId ? "Double-click to rename the run" : (v.title || "Viewer"),
+        ondblclick: v.jobId ? (e) => { e.stopPropagation(); renameTab(v); } : null,
+      }, v.title || "Viewer");
       tabs.appendChild(h("div", { class: "tab" + (v.id === activeViewerId ? " active" : ""), onclick: () => store.setActiveViewer(v.id) },
-        h("span", { class: "tab-label" }, v.title || "Viewer"),
+        label,
         h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); closeOne(v.id); } }, icon("x", 14))));
     }
     for (const v of openViewers) {

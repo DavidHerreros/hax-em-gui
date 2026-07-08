@@ -109,13 +109,13 @@ export function createVolume(canvas) {
     gl.clear(gl.COLOR_BUFFER_BIT);
     if (!hasTex) return;
     const aspect = canvas.width / Math.max(1, canvas.height);
-    const eye = orbit.eye, R = orbit.rotation;
-    // march in MODEL space: transform = proj·view·R, so invert(mvp) maps clip→model
-    // and the eye in model space is R⁻¹·eye_world (camera is fixed on +Z).
-    const mvp = multiply(multiply(perspective((45 * Math.PI) / 180, aspect, 0.01, 100), lookAt(eye, [0, 0, 0], [0, 1, 0])), R);
+    const eye = orbit.eye, M = orbit.model;
+    // march in MODEL space: transform = proj·view·M, so invert(mvp) maps clip→model
+    // and the eye in model space is M⁻¹·eye_world (M = translate(pan)·R; camera is fixed on +Z).
+    const mvp = multiply(multiply(perspective((45 * Math.PI) / 180, aspect, 0.01, 100), lookAt(eye, [0, 0, 0], [0, 1, 0])), M);
     const ivp = invert(mvp); if (!ivp) return;
-    const Rinv = invert(R); if (!Rinv) return;
-    const em = mulVec4(Rinv, [eye[0], eye[1], eye[2], 1]);
+    const Minv = invert(M); if (!Minv) return;
+    const em = mulVec4(Minv, [eye[0], eye[1], eye[2], 1]);
     gl.useProgram(prog);
     gl.uniformMatrix4fv(uInvVP, false, ivp);
     gl.uniform3fv(uEye, [em[0], em[1], em[2]]);

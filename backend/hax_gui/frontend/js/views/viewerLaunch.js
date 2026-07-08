@@ -20,11 +20,11 @@ export async function launchViewerForJob(job) {
       if (index == null) return null;
     }
     const v = await api.viewerFromJob(job.id, index);
-    store.openViewer(v);
+    store.openViewer({ ...v, jobId: job.id });   // jobId links the tab back to the job for renaming
     return v;
   }
   const v = await api.viewerFromJob(job.id);
-  store.openViewer(v);
+  store.openViewer({ ...v, jobId: job.id });   // jobId links the tab back to the job for renaming
   return v;
 }
 

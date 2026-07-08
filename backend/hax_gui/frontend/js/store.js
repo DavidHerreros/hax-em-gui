@@ -96,6 +96,18 @@ export const store = {
     emit();
   },
   setActiveViewer(id) { state.activeViewerId = id; emit(); },
+  // Reflect a job rename in any open viewer tab launched from that job. Keeps a
+  // " · suffix" (e.g. a FlexConsensus space) intact, replacing only the name part.
+  renameViewerForJob(jobId, name) {
+    let changed = false;
+    for (const v of state.openViewers) {
+      if (v.jobId !== jobId) continue;
+      const sep = (v.title || "").indexOf(" · ");
+      v.title = sep >= 0 ? name + v.title.slice(sep) : name;
+      changed = true;
+    }
+    if (changed) emit();
+  },
 
   selectProgram(name) { state.selectedProgram = name; state.rightOpen = true; state.formNonce++; persist(); emit(); },
   clearProgram() { state.selectedProgram = null; state.formNonce++; emit(); },

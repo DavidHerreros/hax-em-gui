@@ -5,10 +5,19 @@ import { icon } from "../icons.js";
 
 export function promptModal({ title, label, value = "", placeholder = "", okText = "Save" } = {}) {
   return new Promise((resolve) => {
-    const input = h("input", { class: "input", value, placeholder,
-      onkeydown: (e) => { if (e.key === "Enter") done(input.value); } });
+    const input = h("input", { class: "input", value, placeholder });
 
-    const modal = h("div", { class: "modal prompt-modal", onclick: (e) => e.stopPropagation() },
+    // Keep every keystroke inside the modal: commit on Enter, cancel on Escape, and
+    // stop it from reaching the view underneath. Otherwise global view shortcuts
+    // (workflows Ctrl+D / Delete, other close-on-key handlers) would steal keys —
+    // including Ctrl+C / Ctrl+V — and dismiss the popup while you're editing.
+    const onModalKey = (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") { e.preventDefault(); done(input.value); }
+      else if (e.key === "Escape") { e.preventDefault(); done(null); }
+    };
+
+    const modal = h("div", { class: "modal prompt-modal", onclick: (e) => e.stopPropagation(), onkeydown: onModalKey },
       h("div", { class: "modal-head" }, h("span", null, title || "Edit"),
         h("button", { class: "btn-icon", style: { border: "none" }, onclick: () => done(null) }, icon("x", 18))),
       h("div", { class: "prompt-body" },
@@ -20,13 +29,15 @@ export function promptModal({ title, label, value = "", placeholder = "", okText
 
     const overlay = h("div", { class: "overlay", onclick: () => done(null) }, modal);
     document.body.appendChild(overlay);
-    document.addEventListener("keydown", onKey);
+    // Escape fallback for the rare case focus has left the modal subtree (in-modal
+    // Escape is handled above and stops there, so this never double-fires).
+    document.addEventListener("keydown", onDocKey);
     queueMicrotask(() => { input.focus(); input.select(); });
 
-    function onKey(e) { if (e.key === "Escape") done(null); }
+    function onDocKey(e) { if (e.key === "Escape") done(null); }
     function done(v) {
       overlay.remove();
-      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("keydown", onDocKey);
       resolve(v == null ? null : v.trim());
     }
   });
