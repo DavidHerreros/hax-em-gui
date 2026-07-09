@@ -1,111 +1,71 @@
 # Hax Web GUI
 
-A modern web GUI to run every `hax-em` program (and, later, chained workflows)
-against a GPU server from any browser. See [PLAN.md](PLAN.md) for the full design,
-roadmap, and the remote-ChimeraX evaluation.
+A web interface for running the `hax-em` programs on a GPU server from any
+browser — no command line required. Fill in a form, launch a job, and watch it
+run, all from the same page.
 
-## Status
+## What you can do
 
-| Area | State |
-|---|---|
-| **argparse → form-schema introspector** | ✅ done & verified (all 13 programs, 0 errors) |
-| **Backend: catalog / jobs / live logs / files / GPUs** | ✅ done & verified end-to-end |
-| **Frontend: home, catalog, auto-forms, job console** | ✅ built (pure vanilla JS, served by backend) — pending in-browser check |
-| **Home page** (logo, docs cards, GUI guide) + **dark/light theme** | ✅ built |
-| **display_metrics (TensorBoard) embed** | ✅ done & verified (launched + reverse-proxied end-to-end) |
-| **Project manager** (settings root, projects, per-run output folders) | ✅ done & verified (backend) / built (frontend) |
-| **Collapsible left menu + right program launcher** | ✅ built |
-| **Project tabs + multiple TensorBoard tabs** | ✅ built |
-| annotate_space + interactive 3D | ⬜ Phase 2 |
-| Workflow builder | ⬜ Phase 3 |
-| Remote ChimeraX (WebRTC) | ⬜ Phase 0 spike pending |
+- **Run any `hax-em` program** through an auto-generated form, with the same
+  options you'd pass on the command line — no need to remember argument names.
+- **Launch and monitor jobs**, with live logs streamed to your browser as they run.
+- **View training metrics** with an embedded TensorBoard (the `display_metrics` tool).
+- **Organise your work into projects**, each keeping its own runs and output folders.
+- **Browse server files** to pick inputs and outputs without leaving the interface.
 
-## No build tools — by design
-
-The frontend is **pure ES modules + hand-written CSS**: no npm, no Node, no
-`node_modules`, no bundler, no CDN. The FastAPI backend serves the static files
-directly, so the browser only ever talks to your server. This eliminates the
-npm supply-chain install-time risk entirely — the only frontend code is the
-small, readable set of files in `frontend/`.
-
-## Layout
-
-```
-backend/
-  hax_gui/
-    introspect.py   # argparse -> JSON form-schema (keystone; no hax source changes)
-    registry.py     # loads cached schemas, groups programs by category
-    command.py      # form values -> hax_project_manager argv (+ validation)
-    jobs.py         # async subprocess manager, SQLite, live log pub/sub
-    tensorboard.py  # per-logdir TensorBoard launcher (for display_metrics)
-    files.py        # sandboxed server file browser
-    gpus.py         # nvidia-smi discovery
-    app.py          # FastAPI: REST + WebSocket + TensorBoard proxy + static SPA
-  scripts/generate_schemas.py
-  schemas_cache/program_schemas.json   # generated; served by the backend
-frontend/                  # pure ES modules + CSS, served statically by the backend
-  index.html
-  styles.css               # hand-written design system (no Tailwind)
-  js/
-    h.js                   # ~30-line hyperscript/DOM helper
-    api.js                 # REST + WebSocket client
-    router.js              # hash router (no server fallback needed)
-    icons.js               # inline SVG icons
-    app.js                 # app shell + routing + docs link + theme toggle
-    views/                 # home, catalog, programForm, metrics, jobs, jobDetail, filePicker, ui
-```
+It runs on the GPU server; your browser can be anywhere. Because everything is
+served from a single address, there is nothing to install in the browser — no
+Node, no npm, no build step.
 
 ## Install
 
-Just the backend — it serves the frontend too. In the conda env that has
-`hax-em` installed:
+Install it into the same Conda environment that already has `hax-em`:
 
 ```bash
-pip install hax-em-gui            # from PyPI (installs deps + the `hax-gui` command)
-# or from a clone, for development:
-pip install -e .                  # editable install from the repo root
+pip install hax-em-gui
 ```
 
-The SPA, the WebGL viewer and a seed schema cache are bundled inside the package,
-so plain, editable, and `pip install git+<url>` installs all work. After
-installing, regenerate the schema cache whenever a hax program's CLI changes
-(it imports JAX, so it's not done automatically):
+This adds the `hax-gui` command and everything the interface needs.
+
+Whenever a `hax-em` program's options change (for example after upgrading
+`hax-em`), refresh the form definitions once:
 
 ```bash
-hax-gui schemas       # or, from a clone: python backend/scripts/generate_schemas.py
+hax-gui schemas
 ```
 
 ## Run it
 
 ```bash
-hax-gui start                 # background, on http://127.0.0.1:8000 by default
+hax-gui start                 # start in the background, on http://127.0.0.1:8000
 hax-gui status                # is it running? where? pid + health
 hax-gui restart               # relaunch (keeps the current host/port)
 hax-gui stop                  # stop it
 ```
 
-Pick a different address with `hax-gui start --host 0.0.0.0 --port 8051`, run it
-attached to the terminal with `--foreground`, or auto-reload on edits with
-`--reload`. Every command reports whether the server is running. (The classic
-`uvicorn hax_gui.app:app --host 0.0.0.0 --port 8000` still works too.)
+To reach the interface from other machines, bind it to a public address:
 
-Then open **http://&lt;server&gt;:&lt;port&gt;** in any browser, on any machine. No
-Node, no npm, no build step, no second server. Because the page and the API share
-an origin, there is no CORS or proxy to configure.
+```bash
+hax-gui start --host 0.0.0.0 --port 8051
+```
 
-## Configuration (backend env vars)
+Then open **http://&lt;server&gt;:&lt;port&gt;** in any browser. Add `--foreground`
+to keep the server attached to your terminal instead of running in the background.
 
-| Var | Default | Purpose |
+## Configuration
+
+The server reads a few optional environment variables:
+
+| Variable | Default | Purpose |
 |---|---|---|
-| `HAX_GUI_DATA_DIR` | `~/.hax_gui` | SQLite DB + per-job log files |
-| `HAX_GUI_SCHEMA_CACHE` | `backend/schemas_cache/program_schemas.json` | cached form-schemas |
-| `HAX_PROJECT_MANAGER` | `hax_project_manager` | launcher (supports multi-token, e.g. `python -m hax.cli`) |
-| `HAX_GUI_FILE_ROOTS` | `$HOME` | colon-separated roots the file browser may expose |
-| `HAX_GUI_TOKEN` | _(empty)_ | shared bearer token; empty = open (dev only) |
-| `HAX_GUI_CORS_ORIGINS` | `localhost:5173` | dev SPA origins |
+| `HAX_GUI_DATA_DIR` | `~/.hax_gui` | Where job logs and the run database are stored |
+| `HAX_GUI_FILE_ROOTS` | `$HOME` | Colon-separated folders the file browser is allowed to show |
+| `HAX_GUI_TOKEN` | _(empty)_ | Shared access token; set one when exposing the server beyond your own machine |
+| `HAX_PROJECT_MANAGER` | `hax_project_manager` | The `hax-em` launcher command to use |
 
 ## Remote use & security
 
-Single-tenant (one shared token behind TLS — see PLAN.md §10). Put a reverse
-proxy (Caddy/nginx) in front to terminate TLS and route `/api`, `/ws`, and the
-SPA. The backend runs on the GPU server; the browser can be anywhere.
+When you expose the interface beyond `localhost`, protect it: set an access
+token with `HAX_GUI_TOKEN` and put a reverse proxy (such as Caddy or nginx) in
+front to terminate HTTPS. The backend stays on the GPU server; the browser can
+be anywhere.
