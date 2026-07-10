@@ -68,8 +68,10 @@ function parseGrid(buf) {
   const dv = new DataView(buf);
   const nx = dv.getInt32(0, true), ny = dv.getInt32(4, true), nz = dv.getInt32(8, true);
   const vmin = dv.getFloat32(12, true), vmax = dv.getFloat32(16, true), mean = dv.getFloat32(20, true), std = dv.getFloat32(24, true);
-  const data = new Uint8Array(buf, 28, nx * ny * nz);
-  return { nx, ny, nz, vmin, vmax, mean, std, data };
+  const boxLo = [dv.getFloat32(28, true), dv.getFloat32(32, true), dv.getFloat32(36, true)];
+  const boxHi = [dv.getFloat32(40, true), dv.getFloat32(44, true), dv.getFloat32(48, true)];
+  const data = new Uint8Array(buf, 52, nx * ny * nz);
+  return { nx, ny, nz, vmin, vmax, mean, std, boxLo, boxHi, data };
 }
 
 async function fetchGrid(size) {
@@ -106,7 +108,7 @@ async function loadVolume() {
   status("Loading volume…", "busy");
   try {
     if (!gridVol) gridVol = await fetchGrid(96);
-    volRenderer.setVolume(gridVol.nx, gridVol.ny, gridVol.nz, gridVol.data);
+    volRenderer.setVolume(gridVol.nx, gridVol.ny, gridVol.nz, gridVol.data, gridVol.boxLo, gridVol.boxHi);
     volRenderer.setThreshold(normThreshold());
     status(`Volume ${gridVol.nx}×${gridVol.ny}×${gridVol.nz} · ${state.render === "emission" ? "glow" : "MIP"}`);
   } catch (err) { status("Volume load failed: " + err.message, "err"); }

@@ -59,6 +59,7 @@ export const api = {
   startJob: (id) => req(`/api/jobs/${id}/start`, { method: "POST" }),
   cancelJob: (id) => req(`/api/jobs/${id}/cancel`, { method: "POST" }),
   rerunJob: (id) => req(`/api/jobs/${id}/rerun`, { method: "POST" }),
+  continueJob: (id) => req(`/api/jobs/${id}/continue`, { method: "POST" }),
   deleteJob: (id) => req(`/api/jobs/${id}`, { method: "DELETE" }),
   // labels (colored tags on jobs)
   labels: () => req("/api/labels"),
@@ -118,10 +119,10 @@ export const api = {
   project: (id) => req(`/api/projects/${id}`),
   projectJobs: (id) => req(`/api/projects/${id}/jobs`),
   projectSources: (id, kind) => req(`/api/projects/${id}/sources?kind=${encodeURIComponent(kind)}`),
-  createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true, recreateSsd = false, replaceJobId = null) =>
+  createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true, recreateSsd = false, replaceJobId = null, resume = false) =>
     req(`/api/projects/${projectId}/jobs`, {
       method: "POST",
-      body: JSON.stringify({ program, args, gpu, name: name || null, bindings: bindings || {}, launch, recreate_ssd: recreateSsd, replace_job_id: replaceJobId }),
+      body: JSON.stringify({ program, args, gpu, name: name || null, bindings: bindings || {}, launch, recreate_ssd: recreateSsd, replace_job_id: replaceJobId, resume }),
     }),
 };
 

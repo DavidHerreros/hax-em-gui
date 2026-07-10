@@ -31,7 +31,7 @@ from .branches import BranchError
 from .updater import UpdateBlocked, UpdateBusy, updater
 from .command import ValidationError
 from .config import settings
-from .jobs import JobActive, JobNotFound, JobNotSaved, ProjectNotFound, manager
+from .jobs import JobActive, JobNotFound, JobNotResumable, JobNotSaved, ProjectNotFound, manager
 from .labels import manager as label_manager
 from .workflows import WorkflowError, manager as wf_manager
 from .projects import ProjectsRootUnset
@@ -167,6 +167,9 @@ class JobCreate(BaseModel):
     # one — set when editing a saved/finished job or re-running a job just saved
     # from the launcher, so Save-then-Run and Edit don't spawn duplicates.
     replace_job_id: str | None = None
+    # "Edit & continue": reuse replace_job_id's run folder (don't wipe it) so the
+    # program resumes from the checkpoint it left there, with the edited args.
+    resume: bool = False
 
 
 # -- catalog ---------------------------------------------------------------
@@ -688,7 +691,7 @@ async def create_project_job(project_id: str, body: JobCreate) -> dict[str, Any]
             replace = None
     try:
         return await manager.create(body.program, body.args, body.gpu, project_id, body.name, body.bindings, body.launch,
-                                    replace_job_id=replace, recreate_ssd=body.recreate_ssd)
+                                    replace_job_id=replace, recreate_ssd=body.recreate_ssd, resume=body.resume and bool(replace))
     except ProjectNotFound:
         raise HTTPException(status_code=404, detail=f"unknown project '{project_id}'")
     except ValidationError as exc:
@@ -739,6 +742,11 @@ def get_job(job_id: str) -> dict[str, Any]:
     job = manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    # Whether this run left an intermediate checkpoint its program will auto-resume from
+    # (drives the "Continue" buttons). Only meaningful once the run has finished, so
+    # skip the disk check for active/saved jobs.
+    job["resumable"] = False if job.get("active") or job["status"] == "saved" else \
+        adapters.is_resumable(job["program"], job.get("workdir"))
     return _with_project_names([job])[0]
 
 
@@ -769,6 +777,22 @@ async def rerun_job(job_id: str) -> dict[str, Any]:
         return await manager.rerun(job_id)
     except JobActive:
         raise HTTPException(status_code=409, detail="job is already running")
+    except ProjectNotFound:
+        raise HTTPException(status_code=409, detail="the job's project no longer exists")
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+
+
+@app.post("/api/jobs/{job_id}/continue", dependencies=[Depends(auth)])
+async def continue_job(job_id: str) -> dict[str, Any]:
+    if manager.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    try:
+        return _with_project_names([await manager.continue_job(job_id)])[0]
+    except JobActive:
+        raise HTTPException(status_code=409, detail="job is already running")
+    except JobNotResumable:
+        raise HTTPException(status_code=409, detail="this run has no checkpoint to continue from")
     except ProjectNotFound:
         raise HTTPException(status_code=409, detail="the job's project no longer exists")
     except ValidationError as exc:

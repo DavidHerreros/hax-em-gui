@@ -115,8 +115,12 @@ export const store = {
   // Open the launcher form for `job`'s program, preloaded with its inputs, so the
   // user can edit and re-run it. `jobId` is carried so Save/Run reuse the same job
   // (edit in place) instead of creating a duplicate. Targets the job's project.
-  editFrom(job) {
-    state.prefill = { program: job.program, values: { ...(job.args || {}) }, gpu: job.gpu || "", jobId: job.id };
+  // `opts.resume` turns this into "edit & continue": Save/Run reuse the same run
+  // folder (not wiped) so the program resumes from the checkpoint it left there, with
+  // the edited args. Plain edit (no opts) replaces the run for a fresh start.
+  editFrom(job, opts = {}) {
+    state.prefill = { program: job.program, values: { ...(job.args || {}) }, gpu: job.gpu || "",
+                      jobId: job.id, resume: !!opts.resume };
     state.selectedProgram = job.program;
     state.rightOpen = true;
     state.formNonce++;

@@ -82,6 +82,12 @@ class JobNotSaved(Exception):
         self.job_id = job_id
 
 
+class JobNotResumable(Exception):
+    def __init__(self, job_id: str):
+        super().__init__(f"job '{job_id}' has no loadable checkpoint to continue from")
+        self.job_id = job_id
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -154,6 +160,7 @@ class JobManager:
         launch: bool = True,
         replace_job_id: str | None = None,
         recreate_ssd: bool = False,
+        resume: bool = False,
     ) -> dict[str, Any]:
         """Create a run. With ``launch=False`` the job is fully prepared (run
         folder, materialised inputs, validated command) but left in the ``saved``
@@ -168,8 +175,17 @@ class JobManager:
             raise ProjectNotFound(project_id)
 
         # One uniquely-named folder per run holds its outputs + log (CryoSPARC-style).
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        workdir = project_dir / f"{program}_{stamp}_{uuid.uuid4().hex[:4]}"
+        # An in-place continue (resume) instead reuses the interrupted run's folder, so
+        # the program finds the checkpoint it left there and picks up where it stopped.
+        workdir = None
+        if resume and replace_job_id:
+            prev = self.get(replace_job_id)
+            if prev and prev.get("workdir") and Path(prev["workdir"]).is_dir():
+                workdir = Path(prev["workdir"])
+        if workdir is None:
+            resume = False   # nothing to resume from -> fall back to a fresh run
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            workdir = project_dir / f"{program}_{stamp}_{uuid.uuid4().hex[:4]}"
 
         # Auto-fill the program's output-dir argument with the (future) run folder.
         values = dict(values)
@@ -239,7 +255,10 @@ class JobManager:
             )
         self._init_buffers(job_id)
         if launch:
-            await self._launch(job_id, command, str(log_path), cwd)
+            if resume:
+                # Reused folder: clear metrics and mark the resume point in the kept log.
+                self._prepare_resume(program, str(workdir), str(log_path))
+            await self._launch(job_id, command, str(log_path), cwd, append_out=resume)
         return self.get(job_id)
 
     async def start(self, job_id: str) -> dict[str, Any]:
@@ -316,6 +335,38 @@ class JobManager:
         return await self.create(program, args, job["gpu"], job["project_id"],
                                  name=job.get("name"), bindings=bindings, replace_job_id=job_id)
 
+    async def continue_job(self, job_id: str) -> dict[str, Any]:
+        """Resume a finished run **in place**: relaunch its exact command so the program
+        picks up the intermediate checkpoint it wrote inside its own output folder
+        (restoring weights + optimizer + epoch — no ``--reload``, that is the network's
+        own auto-resume).
+
+        The job row and run folder are kept: only the metrics are cleared (so the curves
+        restart cleanly) and stdout is appended to (its history is preserved); stderr
+        starts fresh. Contrast :meth:`rerun`, which wipes the folder for a clean run."""
+        job = self.get(job_id)
+        if job is None:
+            raise JobNotFound(job_id)
+        if job["status"] in ACTIVE:
+            raise JobActive(job_id)
+        if not adapters.is_resumable(job["program"], job.get("workdir")):
+            raise JobNotResumable(job_id)
+        self._prepare_resume(job["program"], job.get("workdir"), job["log_path"])
+        self._init_buffers(job_id)
+        self._exec("UPDATE jobs SET status='pending', return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
+        await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"), append_out=True)
+        return self.get(job_id)
+
+    def _prepare_resume(self, program: str, workdir: str | None, log_path: str) -> None:
+        """Ready a run folder for an in-place continue: drop its metrics so they don't
+        overlap the resumed run, and mark the resume point in the preserved stdout log."""
+        metrics = adapters.resume_metrics_dir(program, workdir)
+        if metrics is not None and metrics.exists():
+            shutil.rmtree(metrics, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            with open(log_path, "ab") as f:
+                f.write(f"\n\n──────── resumed {_now()} ────────\n".encode())
+
     def rename(self, job_id: str, name: str) -> dict[str, Any]:
         """Set (or clear) a job's custom display name."""
         if self.get(job_id) is None:
@@ -337,7 +388,8 @@ class JobManager:
                 return str(md.parent)
         return str(workdir)
 
-    async def _launch(self, job_id: str, command: list[str], log_path: str, cwd: str | None = None) -> None:
+    async def _launch(self, job_id: str, command: list[str], log_path: str, cwd: str | None = None,
+                      append_out: bool = False) -> None:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
@@ -372,14 +424,17 @@ class JobManager:
             (proc.pid, _now(), job_id),
         )
         self._publish(job_id, {"type": "status", "status": "running", "pid": proc.pid})
-        asyncio.create_task(self._reader(job_id, proc, log_path))
+        asyncio.create_task(self._reader(job_id, proc, log_path, append_out))
 
-    async def _reader(self, job_id: str, proc: asyncio.subprocess.Process, log_path: str) -> None:
+    async def _reader(self, job_id: str, proc: asyncio.subprocess.Process, log_path: str,
+                      append_out: bool = False) -> None:
         # Drain stdout and stderr concurrently into their own log files, then wait
         # for exit. Both pipes must reach EOF before proc.wait() returns — the hax
         # program's forkserver workers inherit them, so a subset closing isn't done.
+        # On an in-place continue stdout is appended (its history is kept); stderr
+        # always starts fresh.
         await asyncio.gather(
-            self._pump(job_id, proc.stdout, log_path, "out"),
+            self._pump(job_id, proc.stdout, log_path, "out", append=append_out),
             self._pump(job_id, proc.stderr, self._err_path(log_path), "err"),
         )
         return_code = await proc.wait()
@@ -394,13 +449,15 @@ class JobManager:
         )
         self._publish(job_id, {"type": "status", "status": status, "return_code": return_code})
 
-    async def _pump(self, job_id: str, stream: asyncio.StreamReader | None, path: str, kind: str) -> None:
+    async def _pump(self, job_id: str, stream: asyncio.StreamReader | None, path: str, kind: str,
+                    append: bool = False) -> None:
         """Drain one output stream: raw bytes to its log file (ANSI preserved),
-        decoded text to the in-memory tail and to WS subscribers tagged by stream."""
+        decoded text to the in-memory tail and to WS subscribers tagged by stream.
+        ``append`` keeps the existing file (an in-place continue) instead of truncating."""
         if stream is None:
             return
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        with open(path, "wb") as log:
+        with open(path, "ab" if append else "wb") as log:
             while True:
                 data = await stream.read(4096)
                 if not data:

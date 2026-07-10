@@ -294,10 +294,32 @@ def level_for_mass(vol: np.ndarray, target_mass: float) -> float:
     return 0.5 * (lo + hi)
 
 
-def _downsample(vol: np.ndarray, size: int) -> np.ndarray:
-    """Stride-downsample so the largest edge is <= `size` (cheap, dependency-free)."""
+def _downsample(vol: np.ndarray, size: int) -> tuple[np.ndarray, int]:
+    """Stride-downsample so the largest edge is <= `size` (cheap, dependency-free).
+
+    Returns the strided grid and the stride, so callers can place it in the very same
+    normalized cube `mesh_at` uses (see `grid_box`)."""
     step = max(1, int(np.ceil(max(vol.shape) / float(size))))
-    return np.ascontiguousarray(vol[::step, ::step, ::step], dtype=np.float32)
+    return np.ascontiguousarray(vol[::step, ::step, ::step], dtype=np.float32), step
+
+
+def grid_box(full_shape, ds_shape, step: int):
+    """Model-space corners of a strided grid inside the `[-1,1]` cube `mesh_at`
+    normalizes into, so the volume ray-marcher and the marching-cubes surface frame
+    the map identically.
+
+    `mesh_at` maps voxel `i` (any axis) to `(i - S/2)/(S/2)`, `S = max(full_shape)`.
+    The strided grid samples voxels `{0, step, 2*step, ...}`, so its sample `j` sits at
+    `2*j*step/S - 1` — exactly where the mesh puts that voxel. Corners are edge-extended
+    by half a cell so a ray-marcher recovers the texture coord with a plain
+    `(p - lo)/(hi - lo)`. Returned per **model axis** = numpy axis (X=axis 0, Y=axis 1,
+    Z=axis 2), matching the marching-cubes vertex order — the ray-marcher swaps to its
+    own texture-axis order itself."""
+    S = float(max(full_shape))
+    half = step / S                                   # half a strided cell, model units
+    lo = [-1.0 - half] * 3
+    hi = [(2 * n - 1) * step / S - 1.0 for n in ds_shape]
+    return lo, hi
 
 
 def _vertex_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
@@ -536,21 +558,25 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         """Decoded density as a compact uint8 3D-texture payload for ray-marching.
 
         Layout: int32 nx, ny, nz (texture width/height/depth, x fastest), then
-        float32 vmin, vmax, mean, std, then nx*ny*nz uint8 voxels (C order)."""
+        float32 vmin, vmax, mean, std, then float32 boxLo[3], boxHi[3] (the model-space
+        cube the grid occupies, matching the surface mesh), then nx*ny*nz uint8 voxels
+        (C order)."""
         try:
             vol = _resolve_volume(index, index2 if index2 >= 0 else None, t)
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
-        ds = _downsample(vol, int(max(16, min(160, size))))
+        ds, step = _downsample(vol, int(max(16, min(160, size))))
         vmin, vmax = float(ds.min()), float(ds.max())
         u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)
         # numpy C order has the last axis varying fastest -> that is the texture x.
         nx, ny, nz = ds.shape[2], ds.shape[1], ds.shape[0]
+        lo, hi = grid_box(vol.shape, ds.shape, step)
         header = (
             np.array([nx, ny, nz], dtype="<i4").tobytes()
             + np.array([vmin, vmax, float(vol.mean()), float(vol.std())], dtype="<f4").tobytes()
+            + np.array(lo + hi, dtype="<f4").tobytes()
         )
         return Response(content=header + np.ascontiguousarray(u8).tobytes(), media_type="application/octet-stream")
 

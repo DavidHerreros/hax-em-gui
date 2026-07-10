@@ -235,6 +235,48 @@ def _is_loadable_checkpoint(path: Path) -> bool:
     return (cp / "config").is_file() and (cp / "state").exists()
 
 
+# Programs whose training loop auto-resumes from an *intermediate* checkpoint it wrote
+# inside its own output folder — restoring weights + optimizer + epoch, with no
+# --reload needed (the loop keys off the folder's existence). Maps program -> the
+# checkpoint and metrics subfolders it uses, plus an optional "phase_done" marker whose
+# presence means the auto-resuming phase already finished (HetSIREN's inverse phase does
+# NOT auto-resume, so a run past that point must not advertise "Continue").
+_RESUMABLE: dict[str, dict[str, str]] = {
+    "hetsiren":            {"checkpoint": "HetSIREN_CHECKPOINT",     "metrics": "HetSIREN_metrics",     "phase_done": "HetSIREN_No_Inv"},
+    "zernike3deep":        {"checkpoint": "Zernike3Deep_CHECKPOINT", "metrics": "Zernike3Deep_metrics"},
+    "reconsiren":          {"checkpoint": "ReconSIREN_CHECKPOINT",   "metrics": "ReconSIREN_metrics"},
+    "reconsiren_het_only": {"checkpoint": "ReconSIREN_CHECKPOINT",   "metrics": "ReconSIREN_metrics"},
+}
+
+
+def is_resumable(program: str, workdir: str | None) -> bool:
+    """True when ``program`` left a loadable intermediate checkpoint in ``workdir``
+    that its own training loop will pick up if relaunched with the same output folder.
+
+    Drives the "Continue" button, so it must not promise a resume the program won't
+    actually perform: a run has to have committed its first intermediate checkpoint,
+    and (HetSIREN) must not already be in its non-resuming inverse phase.
+    """
+    spec = _RESUMABLE.get(program)
+    if not spec or not workdir:
+        return False
+    wd = Path(workdir)
+    done = spec.get("phase_done")
+    if done and (wd / done).is_dir():
+        return False
+    return _is_loadable_checkpoint(wd / spec["checkpoint"])
+
+
+def resume_metrics_dir(program: str, workdir: str | None) -> Path | None:
+    """The metrics / TensorBoard folder to clear before a continued run starts, so its
+    curves restart cleanly instead of overlapping the interrupted run's. None when the
+    program/workdir has none."""
+    spec = _RESUMABLE.get(program)
+    if not spec or not workdir:
+        return None
+    return Path(workdir) / spec["metrics"]
+
+
 def _find_artifact(workdir: Path, spec: dict[str, Any], program: str) -> Path | None:
     if spec["style"] == "dir":
         name = _CHECKPOINT_DIR.get(program)

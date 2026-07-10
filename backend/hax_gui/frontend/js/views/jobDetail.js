@@ -7,6 +7,7 @@ import { navigate, reload } from "../router.js";
 import { store } from "../store.js";
 import { errorBox } from "./ui.js";
 import { badge, jobDisplayName } from "./jobs.js";
+import { openContextMenu } from "./contextMenu.js";
 import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
 import { promptModal } from "./promptModal.js";
@@ -90,10 +91,19 @@ export function JobDetailView(params) {
           api.cancelJob(id).catch(() => { b.disabled = false; b.lastChild.textContent = "Cancel"; });
         } }, icon("ban", 15), "Cancel")));
     } else if (job) {
+      // A cancelled/failed/interrupted run that already committed an intermediate
+      // checkpoint can be resumed in place (backend sets job.resumable). Paired
+      // actions (Continue/Rerun + their "Edit &" variant) collapse into split buttons.
+      const canResume = job.resumable &&
+        (status === "failed" || status === "cancelled" || status === "interrupted");
       head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
         viewable(job) ? viewerBtn() : null,
-        h("button", { class: "btn secondary", onclick: editRerun, title: "Open the form preloaded with these inputs to edit and launch a new run" }, icon("copy", 15), "Edit & rerun"),
-        h("button", { class: "btn secondary", onclick: rerun, title: "Re-launch immediately with the same inputs" }, icon("play", 15), "Rerun"),
+        canResume ? splitButton(
+          { icon: "restore", label: "Continue", title: "Resume from the last saved checkpoint with the same inputs", onClick: continueRun },
+          [{ icon: icon("sliders", 15), label: "Edit & continue", onClick: editContinue }]) : null,
+        splitButton(
+          { icon: "play", label: "Rerun", title: "Re-launch immediately with the same inputs (a fresh run)", onClick: rerun },
+          [{ icon: icon("copy", 15), label: "Edit & rerun", onClick: editRerun }]),
         h("button", { class: "btn ghost", style: { color: "var(--err)" }, onclick: del }, icon("trash", 15), "Delete")));
     }
     renderProgress(running);
@@ -101,6 +111,21 @@ export function JobDetailView(params) {
 
   function editRerun() {
     store.editFrom(job);
+    navigate("/projects");
+  }
+
+  // Resume this run in place: continue_job relaunches the same job (same folder), so
+  // the program picks up its checkpoint. Re-render the current route to reset the view.
+  async function continueRun() {
+    clear(actionErr);
+    try { await api.continueJob(id); reload(); }
+    catch (err) { mount(actionErr, errorBox(err)); }
+  }
+
+  // Same resume, but open the form first so the user can change parameters (e.g. a
+  // smaller batch size to get past an OOM) before continuing from the checkpoint.
+  function editContinue() {
+    store.editFrom(job, { resume: true });
     navigate("/projects");
   }
 
@@ -182,6 +207,16 @@ export function JobDetailView(params) {
     finally { if (btn) { btn.disabled = false; btn.lastChild.textContent = orig; } }
   }
   const viewerBtn = () => h("button", { class: "btn secondary", onclick: openViewer, title: "Explore this run's conformational landscape in the embedded WebGL viewer" }, icon("box", 15), "3D viewer");
+
+  // A primary action + a caret that opens its variant(s) as a menu, so paired actions
+  // (e.g. Continue / Edit & continue) read as one control. `items` are context-menu
+  // entries: { icon, label, onClick, danger? }.
+  function splitButton(main, items) {
+    return h("div", { class: "btn-split" },
+      h("button", { class: "btn secondary split-main", title: main.title || "", onclick: main.onClick }, icon(main.icon, 15), main.label),
+      h("button", { class: "btn secondary split-caret", title: "More…", onclick: (e) => { e.stopPropagation(); openContextMenu(e.currentTarget, items); } },
+        h("span", { class: "split-chevron" }, icon("chevronUp", 13))));
+  }
 
   async function startSaved() {
     clear(actionErr);
