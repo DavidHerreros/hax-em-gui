@@ -34,10 +34,14 @@ class Settings:
     data_dir: Path = field(default_factory=lambda: _env_path("HAX_GUI_DATA_DIR", Path.home() / ".hax_gui"))
     # Console entry point used to launch programs (on PATH inside the hax env).
     hax_cli: str = field(default_factory=lambda: os.environ.get("HAX_PROJECT_MANAGER", "hax_project_manager"))
-    # Roots the file browser is allowed to expose (path-traversal sandbox).
-    file_roots: list[str] = field(
-        default_factory=lambda: _env_list("HAX_GUI_FILE_ROOTS", [str(Path.home())])
-    )
+    # Folders the file browser may reach. Empty (the default) means unrestricted: it
+    # can show anything the server process can read, which is what makes shared
+    # storage like /data/<you>/... browsable with no setup. Set this to confine it.
+    # It was never a security boundary — path-typed job arguments accept any path
+    # (see command.py) — so confining it buys hygiene, not protection.
+    file_roots: list[str] = field(default_factory=lambda: _env_list("HAX_GUI_FILE_ROOTS", []))
+    # Where the file browser opens when no path is given. Not a restriction.
+    browse_home: Path = field(default_factory=lambda: _env_path("HAX_GUI_BROWSE_HOME", Path.home()))
     # Shared auth token. Empty disables auth (dev only).
     auth_token: str = field(default_factory=lambda: os.environ.get("HAX_GUI_TOKEN", ""))
     # Whether the GUI may start a local Ollama when one isn't already running, and

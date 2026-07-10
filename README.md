@@ -59,7 +59,8 @@ The server reads a few optional environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `HAX_GUI_DATA_DIR` | `~/.hax_gui` | Where job logs and the run database are stored |
-| `HAX_GUI_FILE_ROOTS` | `$HOME` | Colon-separated folders the file browser is allowed to show. Symlinks inside a root are followed, so `~/scratch -> /mnt/fast/scratch` needs no extra entry |
+| `HAX_GUI_FILE_ROOTS` | _(unrestricted)_ | Colon-separated folders to **confine** the file browser to. Unset, it shows anything the server can read. Not a security boundary: job arguments accept any path either way |
+| `HAX_GUI_BROWSE_HOME` | `$HOME` | Folder the file browser opens at |
 | `HAX_GUI_TOKEN` | _(empty)_ | Shared access token; set one when exposing the server beyond your own machine |
 | `HAX_PROJECT_MANAGER` | `hax_project_manager` | The `hax-em` launcher command to use |
 

@@ -1,13 +1,18 @@
-"""Sandboxed server-side file browser for path-typed arguments.
+"""Server-side file browser for path-typed arguments.
 
-Listings are confined to the configured ``file_roots``: the SPA can never climb
-above them with ``..``, which is collapsed lexically before the check.
+By default the browser is **unrestricted**: it lists anything the server process can
+read, so shared storage (``/data/<you>/...``) and other mounts work with no setup.
+The browser is not a security boundary and never was — path-typed job arguments are
+never confined (see ``command.py``), so confining the browser protects nothing while
+making legitimate paths unreachable.
 
+Setting ``file_roots`` opts in to confinement, for hygiene or for a shared box.
+Then ``..`` cannot climb above a root: it is collapsed lexically before the check.
 Containment is judged on the path the user *navigated*, not on where it finally
 points, so a symlink placed inside a root (``~/scratch -> /mnt/fast/scratch``) is
-followed like any other folder — as a file manager would. Note this is a usability
-guardrail, not a security boundary: path-typed job arguments are never confined to
-the roots (see ``command.py``), so the browser is not the thing keeping anyone out.
+followed like any other folder, as a file manager would.
+
+``browse_home`` is where the picker opens, and is independent of the roots.
 """
 
 from __future__ import annotations
@@ -41,22 +46,33 @@ def _contains(root: Path, target: Path) -> bool:
 
 
 def _within_roots(target: Path) -> bool:
-    """True when ``target`` (already lexically normalized) sits under a root.
+    """True when ``target`` (already lexically normalized) is reachable.
 
-    Compared as navigated, so symlinks under a root stay under it. The resolved
-    forms are compared too, which lets a root that is *itself* a symlink still
-    match requests naming its real location.
+    With no roots configured the browser is unrestricted, so everything is. Otherwise
+    containment is compared as navigated, so symlinks under a root stay under it. The
+    resolved forms are compared too, which lets a root that is *itself* a symlink
+    still match requests naming its real location.
     """
     roots = _roots()
+    if not roots:
+        return True
     if any(_contains(root, target) for root in roots):
         return True
     resolved = target.resolve()
     return any(_contains(root.resolve(), resolved) for root in roots)
 
 
+def _default_dir() -> Path:
+    """Where a listing starts when no path is given."""
+    home = _norm(settings.browse_home)
+    if _within_roots(home):
+        return home
+    return _roots()[0]   # a home outside the configured roots would be unlistable
+
+
 def resolve(path: str | None) -> Path:
-    """Normalize a request path, defaulting to (and confined within) the roots."""
-    target = _roots()[0] if not path else _norm(path)
+    """Normalize a request path, and reject it if the roots put it out of reach."""
+    target = _default_dir() if not path else _norm(path)
     if not _within_roots(target):
         raise AccessDenied(f"path outside allowed roots: {target}")
     return target
@@ -66,9 +82,9 @@ def _start_dir(path: str | None, fallback: bool) -> Path:
     """Locate the directory a listing should start from.
 
     With ``fallback`` (used when opening the picker at a path a form field already
-    holds, which may be an output that does not exist yet, or lie outside the roots)
-    an unusable path degrades to the nearest existing ancestor inside a root, or to
-    the first root — rather than erroring. Plain navigation keeps erroring, so a
+    holds, which may be an output that does not exist yet, or lie out of reach) an
+    unusable path degrades to the nearest existing reachable ancestor, or to the
+    default directory — rather than erroring. Plain navigation keeps erroring, so a
     stale entry reports itself instead of silently showing somewhere else.
     """
     try:
@@ -76,7 +92,7 @@ def _start_dir(path: str | None, fallback: bool) -> Path:
     except AccessDenied:
         if not fallback:
             raise
-        return _roots()[0]
+        return _default_dir()
 
     if target.exists():
         return target
@@ -88,7 +104,7 @@ def _start_dir(path: str | None, fallback: bool) -> Path:
             break
         if parent.is_dir():
             return parent
-    return _roots()[0]
+    return _default_dir()
 
 
 def list_dir(path: str | None, fallback: bool = False) -> dict[str, Any]:
@@ -121,7 +137,12 @@ def list_dir(path: str | None, fallback: bool = False) -> dict[str, Any]:
         except OSError:
             continue
 
-    parent = target.parent if _within_roots(target.parent) and target not in _roots() else None
+    # "Up" stops at a configured root, and at "/" when unrestricted (whose parent is
+    # itself, so it would otherwise never terminate).
+    parent = target.parent
+    if parent == target or not _within_roots(parent) or target in _roots():
+        parent = None
+
     return {
         "path": str(target),
         "parent": str(parent) if parent else None,
