@@ -5,9 +5,13 @@
 // onClick so renderers can still pick.
 //
 // Panning (shift-drag or middle-mouse drag) translates the model in the view plane.
-// The pan offset is carried through every subsequent rotation, so the camera keeps
-// orbiting the point that is currently centred in the viewport — after you pan (or
-// zoom) to a feature, rotation happens around that feature rather than the data origin.
+//
+// Centre of rotation follows ChimeraX's `cofr frontCenter` (its default): while the
+// whole model still fits in the window, rotate about the model's centre; once you
+// have zoomed in past it, rotate about the front-most surface at the centre of the
+// window, so the feature you are looking at stays under the crosshair instead of
+// swinging away. The depth of that surface is supplied by the renderer, which is the
+// only thing that knows the geometry — see `opts.probeDepth`.
 import { identity, axisAngle, multiply, mulVec4 } from "./mat4.js";
 
 export function createOrbit(canvas, onChange, onClick, opts = {}) {
@@ -18,10 +22,16 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
   // surface — and inside it — and still pull far enough back to see the whole box.
   const minDist = opts.minDist || 0.05;
   const maxDist = opts.maxDist || 60;
+  const modelWidth = opts.modelWidth || 2;   // extent of the normalized model, for the zoomed-out test
+  // () -> distance from the eye to the front-most surface along the view axis, or
+  // null when the centre of the window is empty (or the renderer cannot tell).
+  const probeDepth = opts.probeDepth || null;
   const clampDist = (d) => Math.max(minDist, Math.min(maxDist, d));
   let R = identity();
   let dist = dist0;
   let offset = [0, 0, 0];   // world-space model translation (pan + carried orbit pivot)
+  let pivotZ = 0;           // world Z of the centre of rotation; it always lies on the view axis
+  let pivotStale = true;
   let dragging = false, moved = false, mode = "rotate", lx = 0, ly = 0, downX = 0, downY = 0;
 
   // Full model matrix = translate(offset) · R. R is a pure rotation (last column
@@ -32,27 +42,63 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
     return m;
   }
 
+  // The eye sits on the world +Z axis looking at the origin, so the ray through the
+  // centre of the window *is* the world Z axis. Renderers hold their geometry
+  // untransformed, so hand them that ray in model space: p_model = R⁻¹·(p_world - offset),
+  // and R⁻¹ = Rᵀ because R is orthonormal.
+  function axisRay() {
+    const rt = (v) => [
+      R[0] * v[0] + R[1] * v[1] + R[2] * v[2],
+      R[4] * v[0] + R[5] * v[1] + R[6] * v[2],
+      R[8] * v[0] + R[9] * v[1] + R[10] * v[2],
+    ];
+    return { origin: rt([-offset[0], -offset[1], dist - offset[2]]), dir: rt([0, 0, -1]) };
+  }
+
+  // ChimeraX recomputes the centre of rotation after translations only, never during
+  // a rotation — otherwise the pivot would crawl across the surface as you drag and
+  // the model would wander. So this runs at most once per rotate gesture.
+  function updatePivot() {
+    pivotStale = false;
+    const centre = offset[2];                          // the model's centre sits at `offset`
+    const depth = Math.max(minDist, dist - centre);    // eye -> model centre
+    if (2 * depth * Math.tan(FOV / 2) >= modelWidth) { pivotZ = centre; return; }   // zoomed out: it all fits
+    const t = probeDepth && probeDepth();
+    if (t == null || !isFinite(t)) return;             // nothing at the centre: keep the depth we had
+    pivotZ = Math.min(dist - t, dist - minDist);       // never let the pivot fall behind the eye
+  }
+
   function rotateBy(dx, dy) {
     const len = Math.hypot(dx, dy);
     if (len < 1e-4) return;
+    if (pivotStale) updatePivot();
     // axis ⟂ to the drag in camera space (== world space: camera looks down -Z);
     // pre-multiply so each drag composes onto the current orientation.
     const dR = axisAngle([dy / len, dx / len, 0], len * 0.008);
     R = multiply(dR, R);
-    // Carry the pan offset through the same incremental rotation. This keeps the
-    // world origin (== the viewport centre) fixed under rotation, so the orbit
-    // pivot tracks whatever the pan/zoom brought to the centre of the view.
-    const o = mulVec4(dR, [offset[0], offset[1], offset[2], 1]);
-    offset = [o[0], o[1], o[2]];
+    // Turn the model about the pivot rather than the world origin:
+    //     offset' = P + dR·(offset - P)
+    // which makes P a fixed point of translate(offset')·dR·R. P lies on the view axis,
+    // so it stays pinned to the centre of the window for the whole drag.
+    const o = mulVec4(dR, [offset[0], offset[1], offset[2] - pivotZ, 1]);
+    offset = [o[0], o[1], o[2] + pivotZ];
   }
   function panBy(dxCss, dyCss) {
-    // CSS px -> world units on the plane through the origin (the orbit centre).
-    const wpp = (2 * dist * Math.tan(FOV / 2)) / Math.max(1, canvas.clientHeight);
+    // CSS px -> world units on the plane through the centre of rotation, so whatever
+    // you grabbed there tracks the cursor.
+    const depth = Math.max(minDist, dist - pivotZ);
+    const wpp = (2 * depth * Math.tan(FOV / 2)) / Math.max(1, canvas.clientHeight);
     offset = [offset[0] + dxCss * wpp, offset[1] - dyCss * wpp, offset[2]];   // screen y-down -> world y-up
+    pivotStale = true;   // a translation changed what sits at the centre of the window
+  }
+  function zoomBy(deltaY) {
+    dist = clampDist(dist * Math.exp(deltaY * 0.001));
+    pivotStale = true;
   }
 
   canvas.addEventListener("pointerdown", (e) => {
     dragging = true; moved = false; lx = downX = e.clientX; ly = downY = e.clientY;
+    if (pivotStale) updatePivot();   // once per gesture: a pan slides the plane through the pivot too
     mode = (e.button === 1 || e.shiftKey) ? "pan" : "rotate";   // middle-mouse or shift = pan
     if (e.button === 1) e.preventDefault();                     // suppress middle-click autoscroll
     canvas.setPointerCapture(e.pointerId);
@@ -71,7 +117,7 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
   canvas.addEventListener("auxclick", (e) => { if (e.button === 1) e.preventDefault(); });
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
-    dist = clampDist(dist * Math.exp(e.deltaY * 0.001));
+    zoomBy(e.deltaY);
     onChange();
   }, { passive: false });
 
@@ -80,9 +126,22 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
     get model() { return modelMatrix(); },   // translate(offset) · R — use for the model transform
     get dist() { return dist; },
     get eye() { return [0, 0, dist]; },
+    get pivot() { return [0, 0, pivotZ]; },  // world-space centre of rotation
+    axisRay,                                          // model-space ray through the window centre
+    // Each renderer owns a camera, but the map is one object. Switching render mode
+    // hands the outgoing camera to the incoming one, so the view survives the switch.
+    // Safe across renderers: they all frame the same [-1,1] cube through the same FOV.
+    getState() { return { R: R.slice(), dist, offset: offset.slice(), pivotZ }; },
+    setState(s) {
+      if (!s) return;
+      R = s.R.slice(); dist = clampDist(s.dist); offset = s.offset.slice(); pivotZ = s.pivotZ;
+      pivotStale = true;   // a different renderer may put a different surface at the centre
+      onChange();
+    },
     drag(dx, dy) { rotateBy(dx, dy); onChange(); },   // externally driven rotation (e.g. an overlay)
     pan(dx, dy) { panBy(dx, dy); onChange(); },       // externally driven pan (CSS px)
-    zoom(deltaY) { dist = clampDist(dist * Math.exp(deltaY * 0.001)); onChange(); },
-    reset() { R = identity(); dist = dist0; offset = [0, 0, 0]; onChange(); },
+    zoom(deltaY) { zoomBy(deltaY); onChange(); },
+    invalidatePivot() { pivotStale = true; },         // the geometry changed under the camera
+    reset() { R = identity(); dist = dist0; offset = [0, 0, 0]; pivotZ = 0; pivotStale = true; onChange(); },
   };
 }

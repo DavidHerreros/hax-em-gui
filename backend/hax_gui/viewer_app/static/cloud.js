@@ -156,7 +156,29 @@ export function createCloud(canvas, onSelect) {
   let showDens = false, hasDens = false, densIntensity = 0.22, pointAlpha = 1.0;
   let selected = -1, pathArr = [], selArr = [];
 
-  const orbit = createOrbit(canvas, () => render(), (e) => { const i = pick(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); });
+  // Distance from the eye to the nearest point under the centre of the window, which the
+  // camera turns into a ChimeraX-style centre of rotation: zoom into a lobe of the
+  // landscape and rotation happens about that lobe rather than the cloud's centre.
+  // Null when the centre is empty, which leaves the camera on the pivot it already had.
+  const COFR_TOL_PX = 24;   // a point cloud is sparse, so accept points a little off-centre
+  function centreDepth() {
+    if (!norm || !count) return null;
+    const { view } = matrices();   // view = lookAt · model, so this lands straight in view space
+    const tanF = Math.tan((45 * Math.PI) / 180 / 2);
+    const halfH = Math.max(1, canvas.clientHeight) / 2;
+    let best = null;
+    for (let i = 0; i < count; i++) {
+      const v = mulVec4(view, [norm[i * 3], norm[i * 3 + 1], norm[i * 3 + 2], 1]);
+      const t = -v[2];                              // view-space z is negative in front of the eye
+      if (t <= 0 || (best !== null && t >= best)) continue;
+      const r = (COFR_TOL_PX / halfH) * tanF * t;   // that pixel radius, in world units at this depth
+      if (v[0] * v[0] + v[1] * v[1] <= r * r) best = t;
+    }
+    return best;
+  }
+
+  const orbit = createOrbit(canvas, () => render(), (e) => { const i = pick(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); },
+    { probeDepth: centreDepth, modelWidth: 1.8 });   // normalizePoints() scales the largest extent to 1.8
   function matrices() {
     const aspect = canvas.width / Math.max(1, canvas.height);
     const proj = perspective((45 * Math.PI) / 180, aspect, 0.01, 100);
@@ -283,6 +305,7 @@ export function createCloud(canvas, onSelect) {
   return {
     setPoints(pts) {
       norm = normalizePoints(pts); count = pts.length;
+      orbit.invalidatePivot();   // a new cloud is a new front surface
       gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, norm, gl.STATIC_DRAW);
       // (re)seed colors so a fresh point set is never drawn black before applyColor()
       if (!colorData || colorData.length !== count * 3) { colorData = new Float32Array(count * 3); for (let i = 0; i < count * 3; i++) colorData[i] = [0.58, 0.64, 0.74][i % 3]; }

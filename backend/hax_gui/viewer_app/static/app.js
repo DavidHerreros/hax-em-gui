@@ -627,6 +627,10 @@ async function decode() {
 // ---- volume ray-marching mode ----
 function setRenderMode(mode) {
   if (mode !== state.render) clearFrameCache();   // surface<->volume payloads differ
+  // The surface and the ray-marcher live on different canvases, each with its own
+  // camera. Hand the outgoing one over so the map does not jump back to a default view.
+  const from = state.render === "surface" ? renderer : volRenderer;
+  const camera = from ? from.getCamera() : null;
   state.render = mode; $("rendermode").value = mode;
   const surf = mode === "surface";
   $("gl").style.display = surf ? "" : "none";
@@ -639,6 +643,8 @@ function setRenderMode(mode) {
     catch (err) { status("Volume rendering unavailable: " + err.message, "err"); setRenderMode("surface"); return; }
   }
   if (volRenderer) volRenderer.setMode(mode === "emission" ? "emission" : "mip");
+  const to = surf ? renderer : volRenderer;
+  if (to && to !== from && camera) to.setCamera(camera);
   if (state.timeline.length && state.frame > 0) renderFrame(state.frame);
   else if (state.current >= 0) decode();
 }

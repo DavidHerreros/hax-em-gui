@@ -229,7 +229,46 @@ export function createRenderer(canvas) {
   let color = [0.863, 0.863, 0.863];   // ChimeraX-style near-white neutral gray
   let bg = [0.016, 0.024, 0.06];
   let light = { ...LIGHTING.standard };
-  const orbit = createOrbit(canvas, () => render(), null, { dist: 3.2 });
+  // Distance from the eye to the front-most surface at the centre of the window, which
+  // is what the camera turns into a ChimeraX-style centre of rotation. The SSAO
+  // geometry prepass already parks view-space positions in `posTex` (w=1 marks
+  // geometry) for exactly the camera we are looking at, so this costs a small readback
+  // rather than another pass. Null on the forward fallback (no G-buffer) or over
+  // background, which leaves the camera on the pivot it already had.
+  function centreDepth() {
+    const W = canvas.width, H = canvas.height, N = 5;   // a few px wide, so a 1px gap doesn't read as "empty"
+    if (!ssaoOK || !indexCount || !gFbo || W < N || H < N) return null;
+    const x = (W >> 1) - (N >> 1), y = (H >> 1) - (N >> 1);
+    let px;
+    try {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, gFbo);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      // An RGBA16F attachment is only readable through the pair the driver advertises.
+      if (gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT) !== gl.RGBA) return null;
+      const type = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE);
+      if (type === gl.FLOAT) {
+        px = new Float32Array(4 * N * N);
+        gl.readPixels(x, y, N, N, gl.RGBA, gl.FLOAT, px);
+      } else if (type === gl.HALF_FLOAT) {
+        const half = new Uint16Array(4 * N * N);
+        gl.readPixels(x, y, N, N, gl.RGBA, gl.HALF_FLOAT, half);
+        px = Float32Array.from(half, fromHalf);
+      } else return null;
+    } catch {
+      return null;
+    } finally {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    }
+    let best = null;
+    for (let i = 0; i < N * N; i++) {
+      if (px[i * 4 + 3] < 0.5) continue;   // pos.w = 0 => background
+      const t = -px[i * 4 + 2];            // view-space z is negative in front of the eye
+      if (t > 0 && (best === null || t < best)) best = t;
+    }
+    return best;
+  }
+
+  const orbit = createOrbit(canvas, () => render(), null, { dist: 3.2, probeDepth: centreDepth });
 
   function resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -388,6 +427,7 @@ export function createRenderer(canvas) {
     gl.bindBuffer(gl.ARRAY_BUFFER, normBuf); gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
     indexCount = indices.length;
+    orbit.invalidatePivot();   // a new contour is a new front surface
     render();
   }
 
@@ -400,6 +440,8 @@ export function createRenderer(canvas) {
     setBackground(rgb) { bg = rgb; render(); },
     setLighting(mode) { light = { ...(LIGHTING[mode] || LIGHTING.standard) }; render(); },
     resetView() { orbit.reset(); },
+    getCamera() { return orbit.getState(); },   // handed to the other renderer on a render-mode switch
+    setCamera(cam) { orbit.setState(cam); },
     captureStream(fps) { return canvas.captureStream(fps); },
     async snapshot({ scale = 2, transparent = false } = {}) {
       const ow = canvas.width, oh = canvas.height;
@@ -412,6 +454,15 @@ export function createRenderer(canvas) {
       return blob;
     },
   };
+}
+
+// IEEE half -> float. readPixels only hands back the type the driver advertises, and
+// on some drivers that is HALF_FLOAT rather than FLOAT.
+function fromHalf(h) {
+  const sign = h & 0x8000 ? -1 : 1, exp = (h >> 10) & 0x1f, frac = h & 0x3ff;
+  if (exp === 0) return sign * 2 ** -14 * (frac / 1024);
+  if (exp === 31) return frac ? NaN : sign * Infinity;
+  return sign * 2 ** (exp - 15) * (1 + frac / 1024);
 }
 
 // Hemisphere kernel: points in the +z half, packed toward the origin so nearby
