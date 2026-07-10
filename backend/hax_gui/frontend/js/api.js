@@ -48,6 +48,7 @@ export const api = {
   setBranchSource: (pkg, path) => req("/api/branches/source", { method: "POST", body: JSON.stringify({ package: pkg, path: path || null }) }),
   restartServer: () => req("/api/server/restart", { method: "POST" }),
   files: (path) => req(`/api/files${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+  mkdir: (path, name) => req("/api/files/mkdir", { method: "POST", body: JSON.stringify({ path: path || null, name }) }),
   jobs: () => req("/api/jobs"),
   job: (id) => req(`/api/jobs/${id}`),
   jobLog: (id) => req(`/api/jobs/${id}/log`),
@@ -105,6 +106,8 @@ export const api = {
   // settings + projects
   getSettings: () => req("/api/settings"),
   putSettings: (data) => req("/api/settings", { method: "PUT", body: JSON.stringify(data) }),
+  setupNotice: () => req("/api/setup-notice"),
+  silenceSetupNotice: () => req("/api/setup-notice/silence", { method: "POST" }),
   projects: () => req("/api/projects"),
   createProject: (name) => req("/api/projects", { method: "POST", body: JSON.stringify({ name }) }),
   renameProject: (id, name) => req(`/api/projects/${id}`, { method: "PUT", body: JSON.stringify({ name }) }),

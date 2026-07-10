@@ -15,9 +15,11 @@ export function openFilePicker(kind, onSelect) {
   const list = h("div", { class: "filelist" });
   const pathLabel = h("span", { class: "cur" }, "…");
   const upBtn = h("button", { class: "btn-icon", onclick: () => load(current && current.parent) }, icon("chevronUp", 16));
-  const hiddenToggle = h("label", { class: "fp-hidden", title: "Show hidden files (dotfiles)" },
-    h("input", { type: "checkbox", onchange: (e) => { showHidden = e.target.checked; renderList(); } }),
-    "Hidden");
+  const hiddenCheck = h("input", { type: "checkbox", onchange: (e) => { showHidden = e.target.checked; renderList(); } });
+  const hiddenToggle = h("label", { class: "fp-hidden", title: "Show hidden files (dotfiles)" }, hiddenCheck, "Hidden");
+
+  // Creating folders only makes sense when picking one; a file picker stays read-only.
+  const newDir = kind === "directory" ? newDirRow() : null;
 
   const foot =
     kind === "directory"
@@ -37,7 +39,8 @@ export function openFilePicker(kind, onSelect) {
       h("span", null, "Select " + kind),
       h("button", { class: "btn-icon", style: { border: "none" }, onclick: close }, icon("x", 18))
     ),
-    h("div", { class: "modal-path" }, upBtn, pathLabel, hiddenToggle),
+    h("div", { class: "modal-path" }, upBtn, pathLabel, newDir && newDir.toggle, hiddenToggle),
+    newDir && newDir.row,
     list,
     foot
   );
@@ -52,6 +55,7 @@ export function openFilePicker(kind, onSelect) {
   function finish(path) { close(); onSelect(path); }
 
   function load(path) {
+    if (newDir) newDir.show(false);
     mount(list, h("p", { class: "muted", style: { padding: "12px" } }, "Loading…"));
     api
       .files(path || undefined)
@@ -59,9 +63,62 @@ export function openFilePicker(kind, onSelect) {
         current = data;
         pathLabel.textContent = data.path;
         upBtn.disabled = !data.parent;
+        if (newDir) newDir.toggle.disabled = false;
         renderList();
       })
-      .catch((err) => mount(list, errorBox(err)));
+      .catch((err) => {
+        if (newDir) newDir.toggle.disabled = true;   // nothing to create into
+        mount(list, errorBox(err));
+      });
+  }
+
+  // Toggle button for the path bar, plus the name row it expands beneath it.
+  // The new folder is created inside whatever directory is currently listed.
+  function newDirRow() {
+    const err = h("span", { class: "fp-err" });
+    const input = h("input", {
+      class: "input",
+      placeholder: "New folder name",
+      onkeydown: (e) => {
+        if (e.key === "Enter") { e.preventDefault(); create(); }
+        // Escape cancels the row; don't let it bubble up and close the modal.
+        else if (e.key === "Escape") { e.stopPropagation(); show(false); }
+      },
+    });
+    const createBtn = h("button", { class: "btn", onclick: create }, icon("check", 16), "Create");
+    const row = h("div", { class: "fp-newdir", hidden: true },
+      input,
+      createBtn,
+      h("button", { class: "btn-icon", title: "Cancel", onclick: () => show(false) }, icon("x", 16)),
+      err);
+    const toggle = h("button", { class: "btn-icon", title: "Create a new folder here", onclick: () => show(row.hidden) }, icon("folderPlus", 16));
+    toggle.disabled = true;   // enabled once a directory has listed
+
+    function show(on) {
+      row.hidden = !on;
+      err.textContent = "";
+      if (on) { input.value = ""; input.focus(); }
+    }
+
+    async function create() {
+      const name = input.value.trim();
+      if (!name || !current) return;
+      createBtn.disabled = true;
+      err.textContent = "";
+      try {
+        current = await api.mkdir(current.path, name);
+        // A dotted name would otherwise vanish straight behind the "Hidden" filter.
+        if (name.startsWith(".") && !showHidden) showHidden = hiddenCheck.checked = true;
+        show(false);
+        renderList();
+      } catch (e) {
+        err.textContent = e.message || String(e);
+      } finally {
+        createBtn.disabled = false;
+      }
+    }
+
+    return { row, toggle, show };
   }
 
   // Render the current listing, hiding dotfiles unless "Hidden" is on. Toggling

@@ -13,6 +13,11 @@ from typing import Any
 from .config import settings
 
 
+# The shared roots the first-run setup notice nags about.
+SETUP_KEYS = ("projects_root", "ssd_scratch_root")
+_SILENCED_KEY = "setup_notice_silenced"
+
+
 def _path() -> Path:
     return settings.data_dir / "settings.json"
 
@@ -33,8 +38,51 @@ def update(data: dict[str, Any]) -> dict[str, Any]:
     for k, v in data.items():
         if v is not None:
             current[k] = v
+    # A root that now has a value loses its "silenced" mark, so if it is ever
+    # cleared again the setup notice comes back instead of staying hidden.
+    silenced = current.get(_SILENCED_KEY)
+    if isinstance(silenced, list):
+        current[_SILENCED_KEY] = [k for k in silenced if not current.get(k)]
     _path().write_text(json.dumps(current, indent=2))
     return current
+
+
+def setup_status() -> dict[str, Any]:
+    """Which shared roots still need the user's attention.
+
+    ``unset``   — never configured. These are what "close forever" silences.
+    ``missing`` — configured, but the folder is gone from disk. Always surfaced,
+                  silenced or not: a vanished root breaks every run pointing at it.
+    """
+    data = load()
+    raw_silenced = data.get(_SILENCED_KEY)
+    silenced = [k for k in raw_silenced if k in SETUP_KEYS] if isinstance(raw_silenced, list) else []
+
+    unset: list[str] = []
+    missing: list[str] = []
+    values: dict[str, str] = {}
+    for key in SETUP_KEYS:
+        raw = data.get(key)
+        if not raw:
+            unset.append(key)
+        elif not Path(raw).expanduser().is_dir():
+            missing.append(key)
+            values[key] = str(raw)
+
+    return {
+        "unset": unset,
+        "missing": missing,
+        "values": values,
+        "silenced": silenced,
+        "show": bool(missing) or any(k not in silenced for k in unset),
+    }
+
+
+def silence_setup_notice() -> dict[str, Any]:
+    """Permanently silence the notice for the roots that are currently unset."""
+    status = setup_status()
+    update({_SILENCED_KEY: sorted(set(status["unset"]) | set(status["silenced"]))})
+    return setup_status()
 
 
 def projects_root() -> Path | None:

@@ -16,6 +16,10 @@ class AccessDenied(PermissionError):
     pass
 
 
+class InvalidName(ValueError):
+    pass
+
+
 def _roots() -> list[Path]:
     return [Path(r).expanduser().resolve() for r in settings.file_roots]
 
@@ -69,3 +73,31 @@ def list_dir(path: str | None) -> dict[str, Any]:
         "roots": [str(r) for r in _roots()],
         "entries": entries,
     }
+
+
+def make_dir(path: str | None, name: str) -> dict[str, Any]:
+    """Create one sub-directory `name` under `path`, and return the fresh listing."""
+    name = name.strip()
+    # Exactly one path component: rejects "", ".", "..", "a/b", "/abs" — anything
+    # that could climb out of `path`. Note Path("..").name is ".." (not ""), so the
+    # dot names need calling out explicitly.
+    if not name or name in {".", ".."} or Path(name).name != name:
+        raise InvalidName(f"not a valid directory name: {name!r}")
+
+    base = resolve(path)
+    if not base.exists():
+        raise FileNotFoundError(str(base))
+    if not base.is_dir():
+        raise NotADirectoryError(str(base))
+
+    target = base / name
+    # Resolved, so an existing symlink pointing out of the roots is caught here
+    # rather than surfacing as a confusing "already exists".
+    if not _within_roots(target.resolve()):
+        raise AccessDenied(f"path outside allowed roots: {target}")
+    try:
+        target.mkdir()   # non-recursive, and errors if the name is already taken
+    except PermissionError as exc:
+        raise AccessDenied(str(exc)) from exc
+
+    return {"created": str(target), **list_dir(str(base))}

@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -548,6 +549,25 @@ def browse(path: str | None = None) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+class DirCreate(BaseModel):
+    path: str | None = None   # parent directory; defaults to the first file root
+    name: str
+
+
+@app.post("/api/files/mkdir", dependencies=[Depends(auth)])
+def make_directory(body: DirCreate) -> dict[str, Any]:
+    try:
+        return filebrowser.make_dir(body.path, body.name)
+    except filebrowser.AccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except filebrowser.InvalidName as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail=f"already exists: {body.name}")
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 # -- settings --------------------------------------------------------------
 class SettingsUpdate(BaseModel):
     projects_root: str | None = None
@@ -562,6 +582,23 @@ def get_settings() -> dict[str, Any]:
 @app.put("/api/settings", dependencies=[Depends(auth)])
 def put_settings(body: SettingsUpdate) -> dict[str, Any]:
     return settings_store.update(body.model_dump(exclude_none=True))
+
+
+# Identifies this server process. The SPA scopes "remind me later" to it, so the
+# setup notice returns after a restart (or in a fresh browser session), but not
+# on a plain page reload.
+_SERVER_ID = uuid4().hex
+
+
+@app.get("/api/setup-notice", dependencies=[Depends(auth)])
+def setup_notice() -> dict[str, Any]:
+    return {**settings_store.setup_status(), "server_id": _SERVER_ID}
+
+
+@app.post("/api/setup-notice/silence", dependencies=[Depends(auth)])
+def silence_setup_notice() -> dict[str, Any]:
+    """Stop nagging about the roots that are currently unset ("close forever")."""
+    return {**settings_store.silence_setup_notice(), "server_id": _SERVER_ID}
 
 
 # -- projects --------------------------------------------------------------
