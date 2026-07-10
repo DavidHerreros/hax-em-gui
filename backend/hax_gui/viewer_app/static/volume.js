@@ -96,7 +96,39 @@ export function createVolume(canvas) {
   let color = [0.784, 0.784, 0.784], bg = [0.016, 0.024, 0.06];
   let threshold = 0.45, gamma = 1.4, bright = 1.2, mode = 0, steps = 160;
   let hasTex = false;
-  const orbit = createOrbit(canvas, () => render(), null, { dist: 3.4 });
+  let grid = null;   // { nx, ny, nz, data } kept on the CPU so the ray-march can be repeated here
+
+  // Distance from the eye to the first voxel at or above the display threshold along
+  // the view axis — the surface you see at the centre of the window. There is no
+  // geometry to read back here, so re-walk the ray the shader walks, on the coarse
+  // grid it is drawing. The camera turns this into a ChimeraX-style centre of rotation.
+  function centreDepth() {
+    if (!grid) return null;
+    const { origin, dir } = orbit.axisRay();   // model space, where the volume is the [-1,1] box
+    let tn = 0, tf = Infinity;                 // slab test against that box
+    for (let a = 0; a < 3; a++) {
+      if (Math.abs(dir[a]) < 1e-6) { if (origin[a] < -1 || origin[a] > 1) return null; continue; }
+      let t0 = (-1 - origin[a]) / dir[a], t1 = (1 - origin[a]) / dir[a];
+      if (t0 > t1) { const s = t0; t0 = t1; t1 = s; }
+      tn = Math.max(tn, t0); tf = Math.min(tf, t1);
+    }
+    if (tf <= tn) return null;                 // the box is behind us, or we missed it
+
+    const { nx, ny, nz, data } = grid;
+    const cut = threshold * 255;               // the shader compares the sample in [0,1] against uThreshold
+    const steps3 = 2 * Math.max(nx, ny, nz);   // Nyquist-ish along the ray
+    const texel = (v, n) => Math.min(n - 1, Math.max(0, Math.round((v * 0.5 + 0.5) * n - 0.5)));
+    for (let i = 0; i <= steps3; i++) {
+      const t = tn + ((tf - tn) * i) / steps3;
+      const ix = texel(origin[0] + dir[0] * t, nx);
+      const iy = texel(origin[1] + dir[1] * t, ny);
+      const iz = texel(origin[2] + dir[2] * t, nz);
+      if (data[(iz * ny + iy) * nx + ix] >= cut) return t;
+    }
+    return null;                               // the ray passed through empty space
+  }
+
+  const orbit = createOrbit(canvas, () => render(), null, { dist: 3.4, probeDepth: centreDepth });
 
   function resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -131,7 +163,8 @@ export function createVolume(canvas) {
     gl.bindTexture(gl.TEXTURE_3D, tex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, nx, ny, nz, 0, gl.RED, gl.UNSIGNED_BYTE, u8);
-    hasTex = true; render();
+    grid = { nx, ny, nz, data: u8 };
+    hasTex = true; orbit.invalidatePivot(); render();
   }
 
   window.addEventListener("resize", render);
@@ -139,12 +172,14 @@ export function createVolume(canvas) {
   return {
     setVolume, render,
     setMode(m) { mode = m === "emission" ? 1 : 0; render(); },
-    setThreshold(v) { threshold = Math.max(0, Math.min(1, v)); render(); },
+    setThreshold(v) { threshold = Math.max(0, Math.min(1, v)); orbit.invalidatePivot(); render(); },   // a new contour is a new front surface
     setGamma(g) { gamma = Math.max(0.2, g); render(); },
     setBrightness(b) { bright = Math.max(0.1, b); render(); },
     setColor(rgb) { color = rgb; render(); },
     setBackground(rgb) { bg = rgb; render(); },
     resetView() { orbit.reset(); },
+    getCamera() { return orbit.getState(); },   // handed to the other renderer on a render-mode switch
+    setCamera(cam) { orbit.setState(cam); },
     captureStream(fps) { return canvas.captureStream(fps); },
     async snapshot({ scale = 2, transparent = false } = {}) {
       const ow = canvas.width, oh = canvas.height;

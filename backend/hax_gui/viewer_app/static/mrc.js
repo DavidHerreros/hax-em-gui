@@ -137,7 +137,16 @@ function onLevel(level) {
 // ---- render-mode switching ----------------------------------------------
 function show(el, on) { el.style.display = on ? "" : "none"; }
 
+// Surface and volume are drawn on different canvases, each holding its own camera, so a
+// mode switch would otherwise drop you at that renderer's default view. Carry the camera
+// across instead. `camera` outlives the cameraless slice view; "Reset view" drops it so a
+// reset is not undone by the next switch.
+const camera3d = (mode) => (mode === "surface" ? renderer : mode === "mip" || mode === "emission" ? volRenderer : null);
+let camera = null;
+
 function setMode(mode) {
+  const from = camera3d(state.render);
+  if (from) camera = from.getCamera();
   state.render = mode;
   const isSurface = mode === "surface";
   const isVolume = mode === "mip" || mode === "emission";
@@ -146,6 +155,9 @@ function setMode(mode) {
   show($("gl"), isSurface);
   show($("glvol"), isVolume);
   $("slices").style.display = isSlices ? "grid" : "none";
+
+  const to = camera3d(mode);
+  if (to && to !== from && camera) to.setCamera(camera);
 
   show($("lightlbl"), isSurface);
   show($("smoothlbl"), isSurface);
@@ -172,7 +184,7 @@ $("slicecross").addEventListener("change", (e) => slices.setCrosshair(e.target.c
 $("sliceReset").addEventListener("click", () => slices.resetZoom());
 $("color").addEventListener("input", (e) => { const rgb = hexToRgb(e.target.value); renderer.setColor(rgb); volRenderer.setColor(rgb); });
 $("bg").addEventListener("input", (e) => { const rgb = hexToRgb(e.target.value); renderer.setBackground(rgb); volRenderer.setBackground(rgb); slices.setBackground(e.target.value); });
-$("reset").addEventListener("click", () => { renderer.resetView(); volRenderer.resetView(); slices.resetZoom(); });
+$("reset").addEventListener("click", () => { camera = null; renderer.resetView(); volRenderer.resetView(); slices.resetZoom(); });
 $("mrc").addEventListener("click", () => { window.location.href = "./api/mrc"; });
 $("saveMap").addEventListener("click", saveMap);
 
