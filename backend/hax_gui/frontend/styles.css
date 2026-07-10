@@ -320,6 +320,10 @@ body.vwin-dragging iframe { pointer-events: none; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; height: 48px; padding: 0 16px; border-bottom: 1px solid var(--border); font-weight: 500; }
 .modal-path { display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--border); font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--muted); }
 .modal-path .cur { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+/* the path is an input: click to edit, paste a path, Enter to jump there */
+.modal-path input.cur { min-width: 0; border: none; background: none; color: var(--muted); font: inherit; padding: 4px 6px; border-radius: 6px; }
+.modal-path input.cur:hover { background: var(--hover); }
+.modal-path input.cur:focus { outline: none; background: var(--modal-bg); color: var(--text); box-shadow: 0 0 0 1px var(--border-2); }
 .fp-hidden { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; cursor: pointer; user-select: none; }
 .fp-hidden input { cursor: pointer; margin: 0; }
 .fp-newdir { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
@@ -332,6 +336,9 @@ body.vwin-dragging iframe { pointer-events: none; }
 .filelist .entry:hover { background: var(--hover); }
 .filelist .entry .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .filelist .entry .sz { font-size: 12px; color: var(--faint); }
+/* the entry a pasted/pre-filled file path pointed at */
+.filelist .hit, .filelist .hit .entry { background: color-mix(in srgb, var(--brand-600) 22%, transparent); }
+.filelist .hit .nm { color: var(--text); font-weight: 500; }
 .filelist .entry-map { display: flex; align-items: center; gap: 4px; padding-right: 8px; border-radius: 8px; }
 .filelist .entry-map:hover { background: var(--hover); }
 .filelist .entry-map .entry { flex: 1; }

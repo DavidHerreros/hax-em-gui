@@ -106,7 +106,7 @@ export function BranchPanel() {
   }
 
   function configuredControls(p) {
-    const change = h("a", { class: "branch-link", onclick: () => openFilePicker("directory", (path) => save(p, path, null)) }, "change");
+    const change = h("a", { class: "branch-link", onclick: () => openFilePicker("directory", (path) => save(p, path, null), p.repo) }, "change");
     const clear = h("a", { class: "branch-link", onclick: async () => { await api.setBranchSource(p.name, null); load(); } }, "clear");
     return h("span", null, "  (", change, " · ", clear, ")");
   }

@@ -47,7 +47,10 @@ export const api = {
   switchBranch: (pkg, branch) => req("/api/branches/switch", { method: "POST", body: JSON.stringify({ package: pkg, branch }) }),
   setBranchSource: (pkg, path) => req("/api/branches/source", { method: "POST", body: JSON.stringify({ package: pkg, path: path || null }) }),
   restartServer: () => req("/api/server/restart", { method: "POST" }),
-  files: (path) => req(`/api/files${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+  // `fallback` degrades an unusable start path to the nearest listable folder
+  // instead of erroring — used when opening the picker at a field's current value.
+  files: (path, fallback) =>
+    req(`/api/files${path ? `?path=${encodeURIComponent(path)}${fallback ? "&fallback=true" : ""}` : ""}`),
   mkdir: (path, name) => req("/api/files/mkdir", { method: "POST", body: JSON.stringify({ path: path || null, name }) }),
   jobs: () => req("/api/jobs"),
   job: (id) => req(`/api/jobs/${id}`),

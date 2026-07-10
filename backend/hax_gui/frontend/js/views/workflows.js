@@ -762,7 +762,7 @@ export function WorkflowsView() {
     // file/dir parameters get a "browse the server" button (same picker as the form)
     if (f.widget === "path") {
       const browse = h("button", { class: "wf-browse btn-icon", type: "button", title: "Browse server",
-        onclick: () => openFilePicker(f.path_kind || "file", (p) => { inp.value = p; set(p); }) }, icon("folderOpen", 15));
+        onclick: () => openFilePicker(f.path_kind || "file", (p) => { inp.value = p; set(p); }, inp.value) }, icon("folderOpen", 15));
       return h("div", { class: "wf-path-row" }, inp, browse);
     }
     return inp;

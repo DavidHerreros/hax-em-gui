@@ -62,11 +62,42 @@ def resolve(path: str | None) -> Path:
     return target
 
 
-def list_dir(path: str | None) -> dict[str, Any]:
-    target = resolve(path)
-    if not target.exists():
+def _start_dir(path: str | None, fallback: bool) -> Path:
+    """Locate the directory a listing should start from.
+
+    With ``fallback`` (used when opening the picker at a path a form field already
+    holds, which may be an output that does not exist yet, or lie outside the roots)
+    an unusable path degrades to the nearest existing ancestor inside a root, or to
+    the first root — rather than erroring. Plain navigation keeps erroring, so a
+    stale entry reports itself instead of silently showing somewhere else.
+    """
+    try:
+        target = resolve(path)
+    except AccessDenied:
+        if not fallback:
+            raise
+        return _roots()[0]
+
+    if target.exists():
+        return target
+    if not fallback:
         raise FileNotFoundError(str(target))
-    if target.is_file():
+
+    for parent in target.parents:
+        if not _within_roots(parent):
+            break
+        if parent.is_dir():
+            return parent
+    return _roots()[0]
+
+
+def list_dir(path: str | None, fallback: bool = False) -> dict[str, Any]:
+    target = _start_dir(path, fallback)
+
+    # Naming a file lists its folder, and tells the client which entry was meant so
+    # it can scroll to it — this is what makes pasting a copied file path useful.
+    named_file = str(target) if target.is_file() else None
+    if named_file:
         target = target.parent
 
     entries: list[dict[str, Any]] = []
@@ -95,6 +126,7 @@ def list_dir(path: str | None) -> dict[str, Any]:
         "path": str(target),
         "parent": str(parent) if parent else None,
         "roots": [str(r) for r in _roots()],
+        "file": named_file,
         "entries": entries,
     }
 

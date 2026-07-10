@@ -540,9 +540,9 @@ async def update_log_ws(websocket: WebSocket) -> None:
 
 
 @app.get("/api/files", dependencies=[Depends(auth)])
-def browse(path: str | None = None) -> dict[str, Any]:
+def browse(path: str | None = None, fallback: bool = False) -> dict[str, Any]:
     try:
-        return filebrowser.list_dir(path)
+        return filebrowser.list_dir(path, fallback=fallback)
     except filebrowser.AccessDenied as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     except FileNotFoundError as exc:

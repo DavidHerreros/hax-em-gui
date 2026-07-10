@@ -41,7 +41,7 @@ export function SettingsView() {
   function pathField(key, label, help, current, onChange) {
     let value = current || "";
     const input = h("input", { class: "input", value, placeholder: "/path/to/folder", oninput: (e) => { value = e.target.value; onChange(value); } });
-    const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; value = p; onChange(p); }) }, icon("folderOpen", 16));
+    const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; value = p; onChange(p); }, input.value) }, icon("folderOpen", 16));
     onChange(value);
     return h("div", { class: "card", id: `setting-${key}`, style: { padding: "22px", marginBottom: "16px" } },
       h("h2", { class: "section" }, label),

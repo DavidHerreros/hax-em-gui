@@ -210,7 +210,7 @@ export function buildLauncher() {
     clear(body);
     let logdir = "";
     const input = h("input", { class: "input", placeholder: "server log directory", oninput: (e) => (logdir = e.target.value) });
-    const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; logdir = p; }) }, icon("folderOpen", 16));
+    const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; logdir = p; }, input.value) }, icon("folderOpen", 16));
     const openBtn = h("button", { class: "btn", style: { width: "100%", marginTop: "10px", justifyContent: "center" }, onclick: open }, icon("chart", 18), h("span", null, "Open TensorBoard"));
     const err = h("div", { style: { marginTop: "10px" } });
     body.appendChild(h("div", { class: "launcher-fields" },

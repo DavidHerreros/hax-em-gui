@@ -14,7 +14,7 @@ export function MetricsView() {
 
   let logdir = "";
   const input = h("input", { class: "input", placeholder: "server log directory (manual)", oninput: (e) => (logdir = e.target.value) });
-  const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; logdir = p; }) }, icon("folderOpen", 16));
+  const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; logdir = p; }, input.value) }, icon("folderOpen", 16));
   const openBtn = h("button", { class: "btn", onclick: () => launch(logdir.trim()) }, icon("plus", 18), "Open");
   const launchErr = h("div");
 

@@ -87,7 +87,7 @@ function fieldInput(field, values) {
     const input = h("input", { class: "input", value: get() ?? "", placeholder: `server ${field.path_kind || "file"} path`, oninput: (e) => set(e.target.value) });
     const browse = h(
       "button",
-      { class: "btn-icon", type: "button", title: "Browse server", onclick: () => openFilePicker(field.path_kind || "file", (p) => { input.value = p; set(p); }) },
+      { class: "btn-icon", type: "button", title: "Browse server", onclick: () => openFilePicker(field.path_kind || "file", (p) => { input.value = p; set(p); }, input.value) },
       icon("folderOpen", 16)
     );
     return h("div", { class: "path-row" }, input, browse);

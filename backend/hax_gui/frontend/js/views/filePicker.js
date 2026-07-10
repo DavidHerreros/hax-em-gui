@@ -8,13 +8,26 @@ import { errorBox } from "./ui.js";
 const MAP_RX = /\.(mrc|map|vol)$/i;
 const MD_RX = /\.(xmd|star|cs)$/i;
 
-export function openFilePicker(kind, onSelect) {
+// `startPath` opens the modal at a folder (or at a file's folder) instead of at the
+// first root — pass a field's current value so Browse resumes where the user left off.
+export function openFilePicker(kind, onSelect, startPath) {
   let current;            // last *successfully* listed directory
   let ok = false;         // is `current` what the modal is showing right now?
   let showHidden = false; // hide dotfiles by default
 
   const list = h("div", { class: "filelist" });
-  const pathLabel = h("span", { class: "cur" }, "…");
+  // Editable: type or paste a path and press Enter to jump straight there. Pasting a
+  // *file* path lands in its folder with that file scrolled into view.
+  const pathInput = h("input", {
+    class: "cur", spellcheck: "false", autocomplete: "off",
+    title: "Type or paste a path, then press Enter",
+    onfocus: () => pathInput.select(),
+    onkeydown: (e) => {
+      e.stopPropagation();   // keep Escape (and typing) away from the modal's handler
+      if (e.key === "Enter") { const v = pathInput.value.trim(); if (v) load(v); }
+      else if (e.key === "Escape") { pathInput.value = (current && current.path) || ""; pathInput.blur(); }
+    },
+  });
   // After a failed listing, "up" returns to the last good directory (the one the
   // failing entry was clicked in); otherwise it walks to the parent as usual.
   const upBtn = h("button", { class: "btn-icon", onclick: () => load(current && (ok ? current.parent : current.path)) }, icon("chevronUp", 16));
@@ -39,7 +52,7 @@ export function openFilePicker(kind, onSelect) {
       h("span", null, "Select " + kind),
       h("button", { class: "btn-icon", style: { border: "none" }, onclick: close }, icon("x", 18))
     ),
-    h("div", { class: "modal-path" }, upBtn, pathLabel, newDir && newDir.toggle, hiddenToggle),
+    h("div", { class: "modal-path" }, upBtn, pathInput, newDir && newDir.toggle, hiddenToggle),
     newDir && newDir.row,
     list,
     foot
@@ -61,16 +74,23 @@ export function openFilePicker(kind, onSelect) {
     if (newDir) newDir.toggle.disabled = !on;
   }
 
-  function load(path) {
+  // `fallback` is for the opening listing only: a start path that no longer exists
+  // (or sits outside the roots) should quietly open somewhere sensible, whereas a
+  // path the user navigated to or typed must report why it failed.
+  function load(path, fallback) {
     if (newDir) newDir.show(false);
     setUsable(false);
     mount(list, h("p", { class: "muted", style: { padding: "12px" } }, "Loading…"));
     api
-      .files(path || undefined)
+      .files(path || undefined, fallback)
       .then((data) => {
         current = data;
-        pathLabel.textContent = data.path;
+        pathInput.value = data.path;
         upBtn.disabled = !data.parent;
+        // A named dotfile would otherwise sit behind the "Hidden" filter, unfindable.
+        if (data.file && data.file.split("/").pop().startsWith(".") && !showHidden) {
+          showHidden = hiddenCheck.checked = true;
+        }
         setUsable(true);
         renderList();
       })
@@ -78,7 +98,7 @@ export function openFilePicker(kind, onSelect) {
         // `current` still holds the last good directory so "up" can go back — but the
         // modal is no longer showing it, so it must not be selectable. Naming the
         // attempted path here keeps the label honest about what actually failed.
-        if (path) pathLabel.textContent = path;
+        if (path) pathInput.value = path;
         upBtn.disabled = !current;
         mount(list, errorBox(err));
       });
@@ -144,7 +164,16 @@ export function openFilePicker(kind, onSelect) {
       const msg = !showHidden && hiddenN ? `Empty (${hiddenN} hidden).` : "Empty.";
       return mount(list, h("p", { class: "muted", style: { padding: "12px" } }, msg));
     }
-    mount(list, h("div", null, ...entries.map((e) => entryRow(e))));
+    const rows = entries.map((e) => entryRow(e));
+    mount(list, h("div", null, ...rows));
+
+    // The listing was reached by naming a file (a pasted path, or a field's value):
+    // point at it rather than making the user hunt down the list.
+    const i = current.file ? entries.findIndex((e) => e.path === current.file) : -1;
+    if (i >= 0) {
+      rows[i].classList.add("hit");
+      rows[i].scrollIntoView({ block: "center" });
+    }
   }
 
   function entryRow(e) {
@@ -183,7 +212,7 @@ export function openFilePicker(kind, onSelect) {
     } catch (err) { mount(list, errorBox(err)); }
   }
 
-  load(undefined);
+  load(startPath && String(startPath).trim() ? String(startPath).trim() : undefined, true);
 }
 
 function formatSize(bytes) {
