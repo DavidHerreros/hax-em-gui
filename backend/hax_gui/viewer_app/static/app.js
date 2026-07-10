@@ -665,7 +665,7 @@ async function loadVolume(index) {
     const g = parseGrid(await res.arrayBuffer());
     if (token !== decodeToken) return;
     curVolMeta = g;
-    volRenderer.setVolume(g.nx, g.ny, g.nz, g.data);
+    volRenderer.setVolume(g.nx, g.ny, g.nz, g.data, g.boxLo, g.boxHi);
     volRenderer.setThreshold(normThreshold());
     volRenderer.setColor(colorForIndex(index));
     status(`Volume ${g.nx}×${g.ny}×${g.nz} · ${state.render === "emission" ? "glow" : "MIP"}`);
@@ -676,8 +676,10 @@ function parseGrid(buf) {
   const dv = new DataView(buf);
   const nx = dv.getInt32(0, true), ny = dv.getInt32(4, true), nz = dv.getInt32(8, true);
   const vmin = dv.getFloat32(12, true), vmax = dv.getFloat32(16, true), mean = dv.getFloat32(20, true), std = dv.getFloat32(24, true);
-  const data = new Uint8Array(buf, 28, nx * ny * nz);
-  return { nx, ny, nz, vmin, vmax, mean, std, data };
+  const boxLo = [dv.getFloat32(28, true), dv.getFloat32(32, true), dv.getFloat32(36, true)];
+  const boxHi = [dv.getFloat32(40, true), dv.getFloat32(44, true), dv.getFloat32(48, true)];
+  const data = new Uint8Array(buf, 52, nx * ny * nz);
+  return { nx, ny, nz, vmin, vmax, mean, std, boxLo, boxHi, data };
 }
 
 // ---- morph / volume series as a scrubbable timeline ----
@@ -802,7 +804,7 @@ async function renderFrame(i) {
       renderer.setColor(col);
     } else if (volRenderer) {
       const g = entry.payload;
-      curVolMeta = g; volRenderer.setVolume(g.nx, g.ny, g.nz, g.data); volRenderer.setThreshold(normThreshold());
+      curVolMeta = g; volRenderer.setVolume(g.nx, g.ny, g.nz, g.data, g.boxLo, g.boxHi); volRenderer.setThreshold(normThreshold());
       volRenderer.setColor(col);
     }
   } catch (err) { if (tok === decodeToken) status("Frame decode failed: " + err.message, "err"); }

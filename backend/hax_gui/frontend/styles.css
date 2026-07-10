@@ -225,6 +225,13 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .btn.secondary:hover { background: var(--surface-hover); }
 .btn.ghost { background: transparent; color: var(--muted); }
 .btn.ghost:hover { color: var(--text); background: var(--hover); }
+/* split button: a primary action joined to a caret that reveals its "Edit &" variant,
+   so paired actions read as one control instead of crowding the row. */
+.btn-split { display: inline-flex; }
+.btn-split > .btn { border-radius: 0; }
+.btn-split > .btn:first-child { border-top-left-radius: 10px; border-bottom-left-radius: 10px; }
+.btn-split > .split-caret { border-top-right-radius: 10px; border-bottom-right-radius: 10px; border-left: none; padding-left: 9px; padding-right: 9px; }
+.btn-split .split-chevron { display: inline-flex; transform: rotate(180deg); }
 .ml-auto { margin-left: auto; }
 .back { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 14px; margin-bottom: 16px; }
 .back:hover { color: var(--text); }

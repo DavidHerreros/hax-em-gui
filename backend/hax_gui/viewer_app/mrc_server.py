@@ -33,7 +33,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from server import _downsample, level_for_mass, level_for_sigma, mesh_at  # noqa: E402
+from server import _downsample, grid_box, level_for_mass, level_for_sigma, mesh_at  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -105,14 +105,17 @@ def build_app(volume: np.ndarray, title: str = "Map", filename: str = "") -> Fas
     @app.get("/api/grid")
     def grid(size: int = Query(96)) -> Response:
         """Density as a compact uint8 3D-texture payload (same layout as server.py):
-        int32 nx, ny, nz, then float32 vmin, vmax, mean, std, then nx*ny*nz uint8."""
-        ds = _downsample(vol, int(max(16, min(256, size))))
+        int32 nx, ny, nz, then float32 vmin, vmax, mean, std, then float32 boxLo[3],
+        boxHi[3] (the model-space cube the grid occupies), then nx*ny*nz uint8."""
+        ds, step = _downsample(vol, int(max(16, min(256, size))))
         vmin, vmax = float(ds.min()), float(ds.max())
         u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)
         nx, ny, nz = ds.shape[2], ds.shape[1], ds.shape[0]
+        lo, hi = grid_box(vol.shape, ds.shape, step)
         header = (
             np.array([nx, ny, nz], dtype="<i4").tobytes()
             + np.array([vmin, vmax, stats["mean"], stats["std"]], dtype="<f4").tobytes()
+            + np.array(lo + hi, dtype="<f4").tobytes()
         )
         return Response(content=header + np.ascontiguousarray(u8).tobytes(),
                         media_type="application/octet-stream")

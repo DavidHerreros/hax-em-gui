@@ -95,6 +95,9 @@ export function buildLauncher() {
     // creating duplicates: set when editing an existing job, and also after the
     // first Save so a following Run launches that same saved job. null = create new.
     let targetJobId = null;
+    // "Edit & continue": reuse targetJobId's folder (resume from its checkpoint) rather
+    // than replacing it with a fresh run.
+    let resume = false;
 
     // Preload from a past job ("Edit" / "Edit & rerun"), keeping only visible fields
     // so the auto-managed output/SSD dirs regenerate. Editing reuses the source job.
@@ -104,6 +107,7 @@ export function buildLauncher() {
       for (const [k, v] of Object.entries(prefill.values || {})) if (visible.has(k)) values[k] = v;
       if (prefill.gpu) gpu = String(prefill.gpu);
       if (prefill.jobId) targetJobId = prefill.jobId;
+      resume = !!prefill.resume;
       store.clearPrefill();
     }
 
@@ -182,7 +186,7 @@ export function buildLauncher() {
         for (const f of Object.keys(bindings)) delete payload[f];
         // Reuse the edited / just-saved job in place (no duplicate). The server
         // ignores a stale target (deleted / already running) and creates fresh.
-        const created = await api.createProjectJob(proj.id, schema.name, payload, gpu || null, runName, bindings, launch, recreateSsd, targetJobId);
+        const created = await api.createProjectJob(proj.id, schema.name, payload, gpu || null, runName, bindings, launch, recreateSsd, targetJobId, resume);
         // Remember the id so a subsequent Run/Save in this same form keeps reusing
         // it (e.g. Save job → Run launches that saved job rather than a new one).
         if (created && created.id) targetJobId = created.id;
