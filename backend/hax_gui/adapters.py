@@ -26,27 +26,33 @@ class AdapterError(Exception):
 
 # Form fields that may be fed from a previous job: {program: {field: kind}}.
 # `latents` -> a (N, latent_dim) .npy; the various `*_model` kinds -> a saved
-# network checkpoint directory passed straight to `--reload`.
+# network checkpoint directory passed straight to `--reload`; `particles` -> the
+# metadata a preprocess_particles run wrote; `volume` -> a preprocessed map.
 BINDABLE_FIELDS: dict[str, dict[str, str]] = {
     "annotate_space": {"z_space": "latents", "z_space_reduced": "latents", "pickled_nn": "decoder_model"},
     "filter_latents": {"latents": "latents"},
     "decode_states_from_latents": {"latents_file": "latents", "reload": "decoder_model"},
-    "hetsiren": {"reload": "hetsiren_model"},
-    "zernike3deep": {"reload": "zernike3deep_model"},
-    "reconsiren": {"reload": "reconsiren_model"},
-    "reconsiren_het_only": {"reload": "reconsiren_het_only_model"},
+    "hetsiren": {"reload": "hetsiren_model", "md": "particles", "vol": "volume"},
+    "zernike3deep": {"reload": "zernike3deep_model", "md": "particles", "vol": "volume"},
+    "reconsiren": {"reload": "reconsiren_model", "md": "particles", "vol": "volume"},
+    "reconsiren_het_only": {"reload": "reconsiren_het_only_model", "md": "particles", "vol": "volume"},
     # FlexConsensus consensuates many input latent spaces, so `--input_space` is a
     # *multi-valued* input: wire one latents source per program you want included.
     "flexconsensus": {"reload": "flexconsensus_model", "input_space": "latents"},
-    "latent_space_deconvolution": {"reload": "deconvolver_model"},
-    "image_gray_scale_adjustment": {"reload": "image_adjust_model"},
-    "volume_gray_scale_adjustment": {"reload": "volume_adjust_model"},
+    "latent_space_deconvolution": {"reload": "deconvolver_model", "md": "particles"},
+    "image_gray_scale_adjustment": {"reload": "image_adjust_model", "md": "particles", "vol": "volume"},
+    "volume_gray_scale_adjustment": {"reload": "volume_adjust_model", "md": "particles", "vol": "volume"},
+    "estimate_latent_covariances": {"md": "particles"},
+    "modart": {"md": "particles", "vol": "volume"},
+    "preprocess_particles": {"md": "particles"},
+    "preprocess_volumes": {"vol": "volume"},
 }
 
 # Bindable fields that accept *several* sources (the program's flag is nargs="+").
 # Each wired source is materialised into its own file and passed as a list.
 MULTI_BINDABLE: dict[str, set[str]] = {
     "flexconsensus": {"input_space"},
+    "preprocess_volumes": {"vol"},
 }
 
 
@@ -93,6 +99,31 @@ _MODEL_KINDS: dict[str, dict[str, Any]] = {
     "decoder_model": {"programs": ["hetsiren", "zernike3deep", "reconsiren", "reconsiren_het_only"], "form": "dir"},
 }
 
+# Artifacts referenced *in place* (no copy): the consumer is handed the producer's
+# own file. Particle metadata must not be copied out of its run folder -- it points
+# at the stack sitting next to it.
+#
+# "unique_glob" yields a source only when the glob matches exactly one file. A
+# preprocess_volumes run may emit a map *and* its mask; silently binding whichever
+# sorts first would be worse than offering nothing, so a multi-volume run simply
+# exposes no volume port and the user picks the file with the normal path picker.
+_ARTIFACT_PRODUCERS: dict[str, list[dict[str, Any]]] = {
+    "particles": [
+        {
+            "style": "path",
+            "programs": {"preprocess_particles"},
+            "globs": ["preprocessed_particles.xmd", "preprocessed_particles.star"],
+        },
+    ],
+    "volume": [
+        {
+            "style": "unique_glob",
+            "programs": {"preprocess_volumes"},
+            "globs": ["*_preprocessed.mrc"],
+        },
+    ],
+}
+
 # Latents producers: a predict metadata column, or a ready filtered .npy.
 _LATENT_PRODUCERS: list[dict[str, Any]] = [
     {
@@ -125,6 +156,10 @@ def bindable_fields(program: str) -> dict[str, str]:
 def _pretty_kind(kind: str) -> str:
     if kind == "latents":
         return "latents"
+    if kind == "particles":
+        return "a preprocessed particle set"
+    if kind == "volume":
+        return "a preprocessed volume"
     if kind.endswith("_model"):
         return "a saved network"
     return kind
@@ -133,6 +168,8 @@ def _pretty_kind(kind: str) -> str:
 def _specs_for_kind(kind: str) -> list[dict[str, Any]]:
     if kind == "latents":
         return _LATENT_PRODUCERS
+    if kind in _ARTIFACT_PRODUCERS:
+        return _ARTIFACT_PRODUCERS[kind]
     if kind in _MODEL_KINDS:
         info = _MODEL_KINDS[kind]
         return [{"style": "dir", "programs": set(info["programs"]), "form": info["form"]}]
@@ -163,6 +200,9 @@ def produces(program: str) -> list[str]:
     for spec in _LATENT_PRODUCERS:
         if program in spec["programs"]:
             kinds.add("latents")
+    for kind, specs in _ARTIFACT_PRODUCERS.items():
+        if any(program in spec["programs"] for spec in specs):
+            kinds.add(kind)
     for kind, info in _MODEL_KINDS.items():
         if program in info["programs"]:
             kinds.add(kind)
@@ -202,6 +242,9 @@ def _find_artifact(workdir: Path, spec: dict[str, Any], program: str) -> Path | 
             return None
         path = workdir / name
         return path if path.is_dir() and _is_loadable_checkpoint(path) else None
+    if spec["style"] == "unique_glob":
+        hits = [hit for pattern in spec["globs"] for hit in sorted(workdir.glob(pattern)) if hit.is_file()]
+        return hits[0] if len(hits) == 1 else None
     for pattern in spec["globs"]:
         hit = next(iter(sorted(workdir.glob(pattern))), None)
         if hit is not None and hit.is_file():
@@ -270,7 +313,12 @@ def produce(kind: str, source_job: dict[str, Any], dest_dir: Path, field: str) -
         raise AdapterError(f"a '{program}' run cannot provide {_pretty_kind(kind)}")
     src = source_file_for(kind, source_job)
     if src is None:
-        hint = "did it finish training?" if spec["style"] == "dir" else "did it finish?"
+        if spec["style"] == "dir":
+            hint = "did it finish training?"
+        elif spec["style"] == "unique_glob":
+            hint = "did it finish, and did it write exactly one volume?"
+        else:
+            hint = "did it finish?"
         raise AdapterError(f"the selected run hasn't produced {_pretty_kind(kind)} yet ({hint})")
 
     # Checkpoints are referenced in place (no copy). `src` is the checkpoint
@@ -278,6 +326,11 @@ def produce(kind: str, source_job: dict[str, Any], dest_dir: Path, field: str) -
     # name themselves, so hand them the run folder instead to avoid <run>/X/X.
     if spec["style"] == "dir":
         return str(src.parent if spec.get("form") == "parent" else src)
+
+    # Also referenced in place: particle metadata resolves its image stack from a
+    # sibling path, and volumes are large binaries not worth duplicating per job.
+    if spec["style"] in ("path", "unique_glob"):
+        return str(src)
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     out = dest_dir / f"{field}.npy"

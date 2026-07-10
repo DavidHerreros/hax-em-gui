@@ -1,5 +1,263 @@
 {
   "programs": {
+    "preprocess_particles": {
+      "name": "preprocess_particles",
+      "module": "hax.preprocessing.preprocess_particles",
+      "description": "Resize/crop a particle stack and optionally correct it for the CTF, to cut VRAM usage and speed up training",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the input images, in Angstrom/pixel",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "crop_box_size",
+          "flags": [
+            "--crop_box_size"
+          ],
+          "flag": "--crop_box_size",
+          "required": false,
+          "help": "Real-space centred crop applied first. It trims the field of view without touching the sampling rate, which is useful to remove the empty padding around a particle before downsampling. A value larger than the input box zero-pads instead. NOTE: make sure the crop is wide enough to still contain the particle once its in-plane shift is applied.",
+          "default": null,
+          "type": "integer"
+        },
+        {
+          "name": "new_box_size",
+          "flags": [
+            "--new_box_size"
+          ],
+          "flag": "--new_box_size",
+          "required": false,
+          "help": "Box size after Fourier resizing, applied after the crop. This is the parameter that trades resolution for speed and VRAM: halving the box divides the number of pixels (and roughly the memory a network needs) by four, while the new Nyquist frequency becomes 2 x sr x box_in / box_out Angstrom. The output sampling rate and the in-plane shifts stored in the metadata are updated accordingly.",
+          "default": null,
+          "type": "integer"
+        },
+        {
+          "name": "ctf_correction",
+          "flags": [
+            "--ctf_correction"
+          ],
+          "flag": "--ctf_correction",
+          "required": false,
+          "help": "none: leave the images untouched (default)\nwiener: regularized CTF inversion, restoring amplitudes and phases\nphase_flip: flip the sign of the frequencies where the CTF is negative, correcting phases only\nNOTE: if you correct the CTF here, the images are already corrected, so downstream programs must be run with --ctf_type None to avoid correcting them twice.",
+          "default": "none",
+          "type": "enum",
+          "choices": [
+            "none",
+            "wiener",
+            "phase_flip"
+          ]
+        },
+        {
+          "name": "wiener_epsilon",
+          "flags": [
+            "--wiener_epsilon"
+          ],
+          "flag": "--wiener_epsilon",
+          "required": false,
+          "help": "Fixed regularization constant for the Wiener filter. If not provided, an adaptive, per-image and frequency-dependent regularizer is estimated from the spectral SNR of each image, which is the recommended behaviour.",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "How many images are processed at once (set by default to 1024). The CTF steps zero-pad each image by a factor of 2, so device memory scales with batch_size x (2 x box_out)^2; lower this value if you run out of memory, and monitor it with tools like nvidia-smi. Pass auto to let hax pick the largest batch that safely fits on your GPU (estimated analytically, without running anything, and capped at 2048). NOTE: use auto to make a large box fit, not to go faster. Unlike a training program, this one is bound by how fast images are read from disk, and its throughput is already flat above a batch of ~1024 - so on a box that fits comfortably, auto only adds a few seconds of extra compilation.",
+          "default": 1024,
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
+        },
+        {
+          "name": "device",
+          "flags": [
+            "--device"
+          ],
+          "flag": "--device",
+          "required": false,
+          "help": "Where the images are processed. auto (default) uses the GPU when one is visible and falls back to the CPU otherwise. The GPU is several times faster than a many-core CPU here even counting the host/device transfers, so there is normally no reason to force cpu unless the GPU is busy with another job.",
+          "default": "auto",
+          "type": "enum",
+          "choices": [
+            "auto",
+            "gpu",
+            "cpu"
+          ]
+        },
+        {
+          "name": "num_read_workers",
+          "flags": [
+            "--num_read_workers"
+          ],
+          "flag": "--num_read_workers",
+          "required": false,
+          "help": "Threads reading batches of images from disk ahead of the device. Raise it if the progress bar stalls on a slow or networked filesystem.",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "num_write_workers",
+          "flags": [
+            "--num_write_workers"
+          ],
+          "flag": "--num_write_workers",
+          "required": false,
+          "help": "Threads streaming the processed batches into the output stack.",
+          "default": 4,
+          "type": "integer"
+        },
+        {
+          "name": "relative_image_paths",
+          "flags": [
+            "--relative_image_paths"
+          ],
+          "flag": "--relative_image_paths",
+          "required": false,
+          "help": "Reference the output stack by its file name instead of its absolute path, so the output folder can be moved or shared. Metadata image paths are resolved against the working directory, not the metadata file, so with this flag downstream programs must be launched from inside output_path.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the preprocessed stack and its metadata",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
+        }
+      ]
+    },
+    "preprocess_volumes": {
+      "name": "preprocess_volumes",
+      "module": "hax.preprocessing.preprocess_volumes",
+      "description": "Resize/crop volumes (reference maps, masks) to match a preprocessed particle set",
+      "summary": "",
+      "fields": [
+        {
+          "name": "vol",
+          "flags": [
+            "--vol"
+          ],
+          "flag": "--vol",
+          "required": true,
+          "help": "One or more volumes to preprocess (reference maps, masks, initial volumes...). Pass several paths to process them all with the same settings, which is the way to keep a map and its mask consistent.",
+          "default": null,
+          "type": "string",
+          "multiple": true,
+          "nargs": "+",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": false,
+          "help": "Sampling rate of the input volumes, in Angstrom/pixel. If not provided, it is read from each volume's header.",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "crop_box_size",
+          "flags": [
+            "--crop_box_size"
+          ],
+          "flag": "--crop_box_size",
+          "required": false,
+          "help": "Real-space centred crop applied first. It trims the field of view without touching the sampling rate, which is how you remove the empty solvent padding around a map. A value larger than the input box zero-pads instead.",
+          "default": null,
+          "type": "integer"
+        },
+        {
+          "name": "new_box_size",
+          "flags": [
+            "--new_box_size"
+          ],
+          "flag": "--new_box_size",
+          "required": false,
+          "help": "Cube size after Fourier resizing, applied after the crop. Use the same value you passed to preprocess_particles so that the volume and the images share a box size and a sampling rate.",
+          "default": null,
+          "type": "integer"
+        },
+        {
+          "name": "num_workers",
+          "flags": [
+            "--num_workers"
+          ],
+          "flag": "--num_workers",
+          "required": false,
+          "help": "Threads used by the CPU FFT (-1, the default, uses every available core).",
+          "default": -1,
+          "type": "integer"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the preprocessed volumes",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
+        }
+      ]
+    },
     "hetsiren": {
       "name": "hetsiren",
       "module": "hax.networks.hetsiren",
@@ -140,8 +398,7 @@
           "type": "enum",
           "choices": [
             "train",
-            "predict",
-            "send_to_pickle"
+            "predict"
           ]
         },
         {
@@ -358,6 +615,50 @@
           "type": "number"
         },
         {
+          "name": "schedule_recon_split",
+          "flags": [
+            "--schedule_recon_split"
+          ],
+          "flag": "--schedule_recon_split",
+          "required": false,
+          "help": "Schedule the mass-transport reconstruction split instead of using the fixed 0.1 / 0.9 weighting. The reconstruction loss is a blend of an amplitude pathway (learned densities at frozen positions) and a mass-transport pathway (fixed reference densities at learned positions); the weight of the amplitude term ramps linearly from --recon_split_start to --recon_split_final over --recon_split_epochs (the motion term takes the complement). Starting near 0 makes early training explain the data almost purely by moving mass, so large-amplitude motions emerge and converge faster before the amplitude head is allowed to absorb residual density changes. Only meaningful with mass transport (--transport_mass). Default: off (fixed --recon_split_final throughout, i.e. the historical 0.1 / 0.9).",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "recon_split_start",
+          "flags": [
+            "--recon_split_start"
+          ],
+          "flag": "--recon_split_start",
+          "required": false,
+          "help": "Amplitude-term weight at the START of training when --schedule_recon_split is on. 0.0 (default) means pure mass transport early (the reconstruction is explained entirely by motion). Ignored when scheduling is off.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "recon_split_final",
+          "flags": [
+            "--recon_split_final"
+          ],
+          "flag": "--recon_split_final",
+          "required": false,
+          "help": "Amplitude-term weight at the END of the ramp (and the fixed weight used throughout when --schedule_recon_split is off). 0.1 (default) reproduces the historical 0.1 / 0.9 split. The motion term always takes the complement (1 - this).",
+          "default": 0.1,
+          "type": "number"
+        },
+        {
+          "name": "recon_split_epochs",
+          "flags": [
+            "--recon_split_epochs"
+          ],
+          "flag": "--recon_split_epochs",
+          "required": false,
+          "help": "Number of initial epochs over which the amplitude-term weight ramps from --recon_split_start to --recon_split_final when --schedule_recon_split is on. If left at 0, it rides the coarse-to-fine clock and reuses --freq_anneal_epochs (amplitude is introduced as the resolution is refined); if both are 0 the weight jumps straight to --recon_split_final.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
           "name": "arap_lambda",
           "flags": [
             "--arap_lambda"
@@ -367,6 +668,21 @@
           "help": "Weight of the as-rigid-as-possible (ARAP) deformation prior. Unlike the distance-preservation term, ARAP factors out the best local rotation per Gaussian before penalizing the deformation, so locally rigid motions (hinges, domain rotations) are NOT over-stiffened while noise-driven non-rigid shear is still resisted. Only active with mass transport and a reference volume. Set to 0 to disable (default); a small value (e.g. 0.05-0.2) is a good starting point, tuned together with --deformation_lambda/--distance_preservation_lambda.",
           "default": 0.0,
           "type": "number"
+        },
+        {
+          "name": "arap_rotation",
+          "flags": [
+            "--arap_rotation"
+          ],
+          "flag": "--arap_rotation",
+          "required": false,
+          "help": "How the per-Gaussian optimal rotation in the ARAP prior (--arap_lambda) is recovered. polar (default) uses a matmul-only scaled polar iteration that is ~15-20x faster than the SVD path on GPU (batched 3x3 SVD is a severe XLA:GPU bottleneck) and numerically matches it to ~1e-6. svd uses the exact SVD; keep it as a reference/fallback (run both and compare the ARAP loss to self-check). No effect unless --arap_lambda > 0.",
+          "default": "polar",
+          "type": "enum",
+          "choices": [
+            "polar",
+            "svd"
+          ]
         },
         {
           "name": "geometric_lambda",
@@ -584,13 +900,12 @@
           ],
           "flag": "--mode",
           "required": true,
-          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the latent vectors from the input images (reload parameter is mandatory in this case)\nsend_to_pickle: save the network in pickle format. (reload parameter is mandatory in this case - needed by program estimate_latent_covariances)",
+          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the latent vectors from the input images (reload parameter is mandatory in this case)",
           "default": null,
           "type": "enum",
           "choices": [
             "train",
-            "predict",
-            "send_to_pickle"
+            "predict"
           ]
         },
         {
@@ -749,8 +1064,7 @@
           "type": "enum",
           "choices": [
             "train",
-            "predict",
-            "send_to_pickle"
+            "predict"
           ]
         },
         {
@@ -1910,6 +2224,17 @@
           "type": "boolean"
         },
         {
+          "name": "do_not_use_anchor_rotations",
+          "flags": [
+            "--do_not_use_anchor_rotations"
+          ],
+          "flag": "--do_not_use_anchor_rotations",
+          "required": false,
+          "help": "By default the poses proposed by the encoder are composed with a fixed set of anchor rotations spread on a spherical grid (one per pose hypothesis), which biases the ab initio pose search to cover orientation space more evenly. Provide this option to disable that composition.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "symmetry_group",
           "flags": [
             "--symmetry_group"
@@ -1960,8 +2285,7 @@
           "type": "enum",
           "choices": [
             "train",
-            "predict",
-            "send_to_pickle"
+            "predict"
           ]
         },
         {
@@ -2157,6 +2481,17 @@
           "type": "boolean"
         },
         {
+          "name": "do_not_use_anchor_rotations",
+          "flags": [
+            "--do_not_use_anchor_rotations"
+          ],
+          "flag": "--do_not_use_anchor_rotations",
+          "required": false,
+          "help": "By default the poses proposed by the encoder are composed with a fixed set of anchor rotations spread on a spherical grid (one per pose hypothesis), which biases the ab initio pose search to cover orientation space more evenly. Provide this option to disable that composition.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "symmetry_group",
           "flags": [
             "--symmetry_group"
@@ -2207,8 +2542,7 @@
           "type": "enum",
           "choices": [
             "train",
-            "predict",
-            "send_to_pickle"
+            "predict"
           ]
         },
         {

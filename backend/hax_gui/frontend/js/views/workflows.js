@@ -34,7 +34,7 @@ const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", running: "#38bdf8", 
 // program inherits the form parameters (mode aside).
 
 // Same grouping/order as the right-menu program launcher.
-const CATEGORY_ORDER = ["Networks", "Post-processing", "Metrics", "Viewers", "Other"];
+const CATEGORY_ORDER = ["Preprocessing", "Networks", "Post-processing", "Metrics", "Viewers", "Other"];
 
 const STATUS_COLOR = {
   saved: "#a78bfa", pending: "var(--muted)", running: "var(--accent)",

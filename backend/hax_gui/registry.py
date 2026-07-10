@@ -16,14 +16,18 @@ from typing import Any
 from . import adapters
 from .config import settings
 
-# Human-facing category per hax subpackage, plus display order.
+# Human-facing category per hax subpackage, plus display order. Matched in order,
+# first hit wins, so a more specific prefix must precede the one it extends.
 _CATEGORY_BY_PREFIX = [
+    ("hax.preprocessing", "Preprocessing"),
     ("hax.networks", "Networks"),
     ("hax.programs", "Post-processing"),
     ("hax.metrics", "Metrics"),
     ("hax.viewers", "Viewers"),
 ]
-_CATEGORY_ORDER = ["Networks", "Post-processing", "Metrics", "Viewers", "Other"]
+# Preprocessing leads: it is the first thing you run on a project.
+# Keep in sync with CATEGORY_ORDER in frontend/js/views/{launcher,workflows}.js.
+_CATEGORY_ORDER = ["Preprocessing", "Networks", "Post-processing", "Metrics", "Viewers", "Other"]
 
 
 def _category(module_path: str) -> str:

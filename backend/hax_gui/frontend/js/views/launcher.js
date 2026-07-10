@@ -9,7 +9,7 @@ import { errorBox } from "./ui.js";
 import { openFilePicker } from "./filePicker.js";
 import { initialValues, visibleFields, fieldRow } from "./formFields.js";
 
-const CATEGORY_ORDER = ["Networks", "Post-processing", "Metrics", "Viewers", "Other"];
+const CATEGORY_ORDER = ["Preprocessing", "Networks", "Post-processing", "Metrics", "Viewers", "Other"];
 
 export function buildLauncher() {
   const content = h("div", { class: "launcher-content" });
