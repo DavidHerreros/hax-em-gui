@@ -30,29 +30,70 @@
     <button id="download" class="btn" title="Download the original metadata file">Download</button>
   </div>
 
-  <div class="md-toolbar" id="plotTools" style="display:none">
-    <label>type
-      <select id="plotType">
-        <option value="scatter" selected>scatter</option>
-        <option value="line">line</option>
-        <option value="histogram">histogram</option>
-      </select>
-    </label>
-    <label id="xwrap">X <select id="xcol"></select></label>
-    <label id="ywrap">Y <span id="ycols" class="chip-select" title="Pick one or more numeric columns"></span></label>
-    <label id="binswrap" style="display:none">bins <input id="bins" type="range" min="8" max="200" value="60" /></label>
-    <button id="replot" class="btn">Plot</button>
-    <button id="resetZoom" class="btn" title="Reset pan / zoom">Reset zoom</button>
-    <span class="grow"></span>
-    <span id="plotInfo" class="muted small"></span>
-    <button id="savePlot" class="btn" title="Save plot as PNG">Save PNG</button>
-  </div>
-
   <main class="md-main">
     <div id="tableWrap" class="md-table"></div>
+
     <div id="plotWrap" class="md-plot" style="display:none">
-      <canvas id="plot"></canvas>
-      <div id="legend" class="plot-legend"></div>
+      <aside class="md-rail">
+        <div class="rail-grp">
+          <span class="rail-lbl">Chart type</span>
+          <div class="type-seg" id="plotType">
+            <button class="type-btn active" data-type="scatter" title="Scatter">
+              <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="6" cy="15" r="2"/><circle cx="12" cy="8" r="2"/><circle cx="17" cy="16" r="2"/><circle cx="10" cy="17" r="1.6"/></svg>
+              Scatter
+            </button>
+            <button class="type-btn" data-type="line" title="Line">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3,16 9,10 13,13 21,5"/></svg>
+              Line
+            </button>
+            <button class="type-btn" data-type="histogram" title="Histogram">
+              <svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="11" width="3.4" height="9" rx="1"/><rect x="10.3" y="6" width="3.4" height="14" rx="1"/><rect x="16.6" y="13" width="3.4" height="7" rx="1"/></svg>
+              Histogram
+            </button>
+          </div>
+        </div>
+
+        <div class="rail-grp" id="xgrp">
+          <span class="rail-lbl">X axis</span>
+          <select id="xcol" class="rail-select"></select>
+        </div>
+
+        <div class="rail-grp" id="ygrp">
+          <div class="rail-lbl-row">
+            <span class="rail-lbl">Y axis</span>
+            <span class="ycount" id="ycount"></span>
+          </div>
+          <div class="ysearch">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5" stroke-linecap="round"/></svg>
+            <input id="yfilter" placeholder="Filter columns…" aria-label="Filter Y columns" />
+          </div>
+          <div class="ylist" id="ycols" title="Pick one or more numeric columns"></div>
+          <button class="yclear" id="yclear" type="button">Clear selection</button>
+        </div>
+
+        <div class="rail-grp" id="binsgrp" style="display:none">
+          <span class="rail-lbl">Bins</span>
+          <div class="bins-row"><input id="bins" type="range" min="8" max="200" value="60" /><span class="bins-val" id="binsVal">60</span></div>
+        </div>
+      </aside>
+
+      <div class="md-plotarea">
+        <div class="md-plothead">
+          <span class="plot-caption" id="plotCaption"></span>
+          <span class="grow"></span>
+          <span id="plotInfo" class="muted small"></span>
+          <button id="resetZoom" class="icon-btn" type="button" title="Reset pan / zoom">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 4 3 10 9 10"/><path d="M3.5 10a9 9 0 1 1 1.5 6"/></svg>
+          </button>
+          <button id="savePlot" class="icon-btn" type="button" title="Save plot as PNG">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          </button>
+        </div>
+        <div class="md-canvaswrap">
+          <canvas id="plot"></canvas>
+          <div id="legend" class="plot-legend"></div>
+        </div>
+      </div>
     </div>
   </main>
 

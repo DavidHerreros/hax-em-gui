@@ -179,16 +179,62 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .mdt-img { object-fit: contain; image-rendering: auto; background: #04060f; border-radius: 3px; }
 .mdt-skel { color: transparent; background: linear-gradient(90deg, transparent, rgba(148,163,184,0.12), transparent); }
 
-/* plot */
-.md-plot { flex: 1; min-height: 0; position: relative; }
-.md-plot > canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
-.md-plot > canvas:active { cursor: grabbing; }
+/* plot: a control rail on the left + the canvas area on the right */
+.md-plot { flex: 1; min-height: 0; display: flex; }
+
+.md-rail { width: 244px; flex: none; border-right: 1px solid var(--border); background: var(--panel); overflow: auto; padding: 14px; display: flex; flex-direction: column; gap: 16px; }
+.rail-grp { display: flex; flex-direction: column; gap: 8px; }
+.rail-lbl { font-size: 10.5px; letter-spacing: 0.09em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+.rail-lbl-row { display: flex; align-items: baseline; justify-content: space-between; }
+.ycount { font-size: 11px; color: var(--accent); font-weight: 600; }
+.rail-select { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; font-size: 12px; }
+.rail-select:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+
+/* chart-type segmented control (glyphs) */
+.type-seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.type-btn { display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 8px 4px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--muted); cursor: pointer; font-size: 10.5px; }
+.type-btn svg { width: 19px; height: 19px; }
+.type-btn:hover { color: var(--text); border-color: var(--accent); }
+.type-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(45,212,191,0.12); }
+
+/* Y multi-select: filter + scrollable checklist with palette swatches */
+.ysearch { position: relative; }
+.ysearch svg { position: absolute; left: 8px; top: 50%; transform: translateY(-50%); width: 13px; height: 13px; color: var(--muted); pointer-events: none; }
+.ysearch input { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px 6px 26px; font-size: 12px; }
+.ysearch input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+.ylist { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); max-height: 200px; overflow: auto; }
+.yitem { display: flex; align-items: center; gap: 9px; padding: 6px 9px; cursor: pointer; border-bottom: 1px solid var(--border); }
+.yitem:last-child { border-bottom: none; }
+.yitem:hover { background: var(--panel); }
+.yitem-sw { width: 13px; height: 13px; border-radius: 4px; border: 1.5px solid var(--border); flex: none; }
+.yitem.on .yitem-sw { border-color: transparent; }
+.yitem-name { font-size: 12px; color: var(--muted); font-family: "JetBrains Mono", ui-monospace, monospace; }
+.yitem.on .yitem-name { color: var(--text); }
+.yclear { align-self: flex-end; background: none; border: none; color: var(--muted); font-size: 11px; cursor: pointer; padding: 0; }
+.yclear:hover { color: var(--text); }
+.ynote { padding: 10px; text-align: center; color: var(--muted); font-size: 12px; }
+
+.bins-row { display: flex; align-items: center; gap: 8px; }
+.bins-row input[type="range"] { flex: 1; accent-color: var(--accent); }
+.bins-val { font-size: 12px; color: var(--muted); min-width: 22px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* plot area (right of the rail) */
+.md-plotarea { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.md-plothead { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.plot-caption { font-size: 12px; color: var(--muted); }
+.plot-caption b { color: var(--text); font-weight: 600; }
+.md-plothead .grow { flex: 1; }
+.icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel); color: var(--muted); cursor: pointer; }
+.icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+.icon-btn svg { width: 15px; height: 15px; }
+.md-canvaswrap { flex: 1; min-height: 0; position: relative; }
+.md-canvaswrap > canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
+.md-canvaswrap > canvas:active { cursor: grabbing; }
 .plot-legend { position: absolute; top: 10px; right: 16px; display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; background: color-mix(in srgb, var(--panel) 82%, transparent); border: 1px solid var(--border); border-radius: 8px; font-size: 12px; pointer-events: none; }
 .leg-item { display: flex; align-items: center; gap: 6px; }
 .leg-swatch { width: 12px; height: 12px; border-radius: 3px; }
 
-/* Y-column chip multi-select */
-.chip-select { display: inline-flex; flex-wrap: wrap; gap: 4px; max-width: 46vw; }
-.chip { background: var(--panel); color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px; font-size: 11px; cursor: pointer; }
-.chip:hover { color: var(--text); border-color: var(--accent); }
-.chip.active { background: rgba(45,212,191,0.16); color: var(--accent); border-color: var(--accent); }
+@media (max-width: 640px) {
+  .md-plot { flex-direction: column; }
+  .md-rail { width: auto; border-right: none; border-bottom: 1px solid var(--border); }
+}

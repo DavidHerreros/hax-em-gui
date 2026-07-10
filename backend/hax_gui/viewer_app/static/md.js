@@ -55,34 +55,109 @@ $("imgSize").addEventListener("input", (e) => { state.imgSize = +e.target.value;
 $("download").addEventListener("click", () => { window.location.href = "./api/download"; });
 
 // ---- plot controls ----
+// The rail holds the type toggle, X select and a searchable Y checklist; every change
+// re-plots automatically (debounced). Y is multi-select, and each picked column shows
+// its series colour in the list, so the checklist doubles as the legend.
+const yItems = new Map();   // column name -> { row, sw }, for in-place refresh
+let plotTimer = null;
+let hasSeries = false;
+
 function buildPlotControls() {
   const nums = state.meta.numeric_columns;
+
   const xsel = $("xcol");
   xsel.innerHTML = "";
   xsel.appendChild(new Option("(row index)", "__index__"));
   for (const c of nums) xsel.appendChild(new Option(c, c));
 
-  const chips = $("ycols");
-  chips.innerHTML = "";
-  for (const c of nums) {
-    const b = document.createElement("button");
-    b.className = "chip"; b.textContent = c;
-    b.onclick = () => { b.classList.toggle("active"); if (state.ySel.has(c)) state.ySel.delete(c); else state.ySel.add(c); };
-    chips.appendChild(b);
+  const list = $("ycols");
+  list.innerHTML = "";
+  yItems.clear();
+  if (!nums.length) {
+    list.appendChild(Object.assign(document.createElement("div"), { className: "ynote", textContent: "no numeric columns" }));
+  } else {
+    for (const c of nums) {
+      const row = document.createElement("div"); row.className = "yitem";
+      const sw = document.createElement("span"); sw.className = "yitem-sw";
+      const nm = document.createElement("span"); nm.className = "yitem-name"; nm.textContent = c;
+      row.append(sw, nm);
+      row.addEventListener("click", () => {
+        if (state.ySel.has(c)) state.ySel.delete(c); else state.ySel.add(c);
+        refreshY(); schedulePlot();
+      });
+      list.appendChild(row);
+      yItems.set(c, { row, sw });
+    }
+    state.ySel.add(nums[0]);   // start on the first column so Plot mode isn't blank
   }
-  if (!nums.length) chips.appendChild(Object.assign(document.createElement("span"), { className: "muted small", textContent: "no numeric columns" }));
+
+  $("plotInfo").textContent = "wheel = zoom · drag = pan · double-click = reset";
+  refreshY();
   onTypeChange();
 }
 
-function onTypeChange() {
-  const t = $("plotType").value;
-  $("xwrap").style.display = t === "scatter" || t === "line" ? "" : "none";
-  $("binswrap").style.display = t === "histogram" ? "" : "none";
+// Reflect the selection into the checklist: on-state + each picked column's series
+// colour (colour == its position in the selection, matching doPlot's PALETTE index).
+function refreshY() {
+  const order = [...state.ySel];
+  for (const [c, { row, sw }] of yItems) {
+    const on = state.ySel.has(c);
+    row.classList.toggle("on", on);
+    sw.style.background = on ? PALETTE[order.indexOf(c) % PALETTE.length] : "";
+  }
+  $("ycount").textContent = state.ySel.size ? `${state.ySel.size} selected` : "";
+  applyYFilter();
+  updateCaption();
 }
-$("plotType").addEventListener("change", onTypeChange);
-$("replot").addEventListener("click", doPlot);
+
+function applyYFilter() {
+  const q = $("yfilter").value.trim().toLowerCase();
+  for (const [c, { row }] of yItems) row.style.display = (!q || c.toLowerCase().includes(q)) ? "" : "none";
+}
+
+function currentType() { return $("plotType").querySelector(".type-btn.active").dataset.type; }
+
+function onTypeChange() {
+  const t = currentType();
+  $("xgrp").style.display = t === "histogram" ? "none" : "";   // X is meaningless for a histogram
+  $("binsgrp").style.display = t === "histogram" ? "" : "none";
+  updateCaption();
+}
+
+function updateCaption() {
+  const t = currentType();
+  const yl = state.ySel.size ? [...state.ySel].join(", ") : "—";
+  const el = $("plotCaption"); el.innerHTML = "";
+  const strong = (txt) => { const b = document.createElement("b"); b.textContent = txt; return b; };
+  if (t === "histogram") {
+    el.append(strong(yl), document.createTextNode(" distribution"));
+  } else {
+    const xl = $("xcol").value === "__index__" ? "row index" : $("xcol").value;
+    el.append(strong(yl), document.createTextNode(" vs "), strong(xl));
+  }
+}
+
+// Re-plot after a short quiet period so rapid changes (toggling several Y columns,
+// sliding bins) collapse into one backend fetch.
+function schedulePlot() {
+  updateCaption();
+  if (state.mode !== "plot") return;
+  clearTimeout(plotTimer);
+  status("Updating…", "busy");
+  plotTimer = setTimeout(doPlot, 260);
+}
+
+$("plotType").addEventListener("click", (e) => {
+  const b = e.target.closest(".type-btn"); if (!b) return;
+  for (const el of $("plotType").children) el.classList.toggle("active", el === b);
+  onTypeChange(); schedulePlot();
+});
+$("xcol").addEventListener("change", () => { updateCaption(); schedulePlot(); });
+$("yfilter").addEventListener("input", applyYFilter);
+$("yclear").addEventListener("click", () => { state.ySel.clear(); refreshY(); schedulePlot(); });
+$("bins").addEventListener("input", () => { $("binsVal").textContent = $("bins").value; });
+$("bins").addEventListener("change", schedulePlot);
 $("resetZoom").addEventListener("click", () => plot.resetZoom());
-$("bins").addEventListener("change", () => { if (state.mode === "plot") doPlot(); });
 $("savePlot").addEventListener("click", async () => {
   const blob = await plot.snapshot({ scale: 2 }); if (!blob) return;
   const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
@@ -91,9 +166,9 @@ $("savePlot").addEventListener("click", async () => {
 });
 
 async function doPlot() {
-  const t = $("plotType").value;
+  const t = currentType();
   const ys = [...state.ySel];
-  if (!ys.length) { status("Pick one or more Y columns", "warn"); return; }
+  if (!ys.length) { plot.setSeries(t, [], { x: "", y: "" }); legend([]); hasSeries = false; status("Pick a Y column", "warn"); return; }
   status("Loading plot data…", "busy");
   try {
     if (t === "histogram") {
@@ -120,7 +195,7 @@ async function doPlot() {
       legend(series);
       status((r.decimated ? `Showing ${r.indices.length.toLocaleString()} of ${r.total.toLocaleString()} rows (decimated)` : `${r.total.toLocaleString()} rows`));
     }
-    $("plotInfo").textContent = "wheel = zoom · drag = pan · double-click = reset";
+    hasSeries = true;
   } catch (err) { status("Plot failed: " + err.message, "err"); }
 }
 
@@ -143,9 +218,13 @@ function setMode(mode) {
   state.mode = mode;
   for (const b of $("modeSeg").querySelectorAll(".seg-btn")) b.classList.toggle("active", b.dataset.mode === mode);
   const isTable = mode === "table";
+  // Table has its own toolbar; the plot controls live inside plotWrap (the rail), so
+  // only the table toolbar toggles here.
   $("tableTools").style.display = isTable ? "" : "none";
-  $("plotTools").style.display = isTable ? "none" : "";
   $("tableWrap").style.display = isTable ? "" : "none";
   $("plotWrap").style.display = isTable ? "none" : "flex";
-  if (!isTable) plot.redraw();
+  if (!isTable) {
+    plot.redraw();
+    if (!hasSeries && state.ySel.size) schedulePlot();   // first entry: draw the preselected column
+  }
 }
