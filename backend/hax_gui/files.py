@@ -60,6 +60,9 @@ def list_dir(path: str | None) -> dict[str, Any]:
                     "path": str(child),
                     "is_dir": is_dir,
                     "hidden": child.name.startswith("."),   # dotfile; hidden by default in the UI
+                    # A symlinked directory can point out of the sandbox. Flag it so the
+                    # UI greys it out, rather than letting the click fail with a 403.
+                    "denied": is_dir and not _within_roots(child.resolve()),
                     "size": None if is_dir else child.stat().st_size,
                 }
             )

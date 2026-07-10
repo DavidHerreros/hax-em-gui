@@ -9,26 +9,26 @@ const MAP_RX = /\.(mrc|map|vol)$/i;
 const MD_RX = /\.(xmd|star|cs)$/i;
 
 export function openFilePicker(kind, onSelect) {
-  let current;            // current directory listing
+  let current;            // last *successfully* listed directory
+  let ok = false;         // is `current` what the modal is showing right now?
   let showHidden = false; // hide dotfiles by default
 
   const list = h("div", { class: "filelist" });
   const pathLabel = h("span", { class: "cur" }, "…");
-  const upBtn = h("button", { class: "btn-icon", onclick: () => load(current && current.parent) }, icon("chevronUp", 16));
+  // After a failed listing, "up" returns to the last good directory (the one the
+  // failing entry was clicked in); otherwise it walks to the parent as usual.
+  const upBtn = h("button", { class: "btn-icon", onclick: () => load(current && (ok ? current.parent : current.path)) }, icon("chevronUp", 16));
   const hiddenCheck = h("input", { type: "checkbox", onchange: (e) => { showHidden = e.target.checked; renderList(); } });
   const hiddenToggle = h("label", { class: "fp-hidden", title: "Show hidden files (dotfiles)" }, hiddenCheck, "Hidden");
 
   // Creating folders only makes sense when picking one; a file picker stays read-only.
   const newDir = kind === "directory" ? newDirRow() : null;
 
-  const foot =
+  const useBtn =
     kind === "directory"
-      ? h(
-          "div",
-          { class: "modal-foot" },
-          h("button", { class: "btn", onclick: () => current && finish(current.path) }, icon("check", 16), "Use this folder")
-        )
+      ? h("button", { class: "btn", onclick: () => ok && current && finish(current.path) }, icon("check", 16), "Use this folder")
       : null;
+  const foot = useBtn ? h("div", { class: "modal-foot" }, useBtn) : null;
 
   const modal = h(
     "div",
@@ -54,8 +54,16 @@ export function openFilePicker(kind, onSelect) {
 
   function finish(path) { close(); onSelect(path); }
 
+  // Nothing may be selected or created unless the modal is showing a real listing.
+  function setUsable(on) {
+    ok = on;
+    if (useBtn) useBtn.disabled = !on;
+    if (newDir) newDir.toggle.disabled = !on;
+  }
+
   function load(path) {
     if (newDir) newDir.show(false);
+    setUsable(false);
     mount(list, h("p", { class: "muted", style: { padding: "12px" } }, "Loading…"));
     api
       .files(path || undefined)
@@ -63,11 +71,15 @@ export function openFilePicker(kind, onSelect) {
         current = data;
         pathLabel.textContent = data.path;
         upBtn.disabled = !data.parent;
-        if (newDir) newDir.toggle.disabled = false;
+        setUsable(true);
         renderList();
       })
       .catch((err) => {
-        if (newDir) newDir.toggle.disabled = true;   // nothing to create into
+        // `current` still holds the last good directory so "up" can go back — but the
+        // modal is no longer showing it, so it must not be selectable. Naming the
+        // attempted path here keeps the label honest about what actually failed.
+        if (path) pathLabel.textContent = path;
+        upBtn.disabled = !current;
         mount(list, errorBox(err));
       });
   }
@@ -136,6 +148,14 @@ export function openFilePicker(kind, onSelect) {
   }
 
   function entryRow(e) {
+    // A symlink out of the sandbox: listing it would 403, so don't offer the click.
+    if (e.denied) {
+      return h("button",
+        { class: "entry", disabled: true, title: "Outside the folders the browser may show (set HAX_GUI_FILE_ROOTS to allow it)" },
+        icon("ban", 16),
+        h("span", { class: "nm" }, e.name),
+        h("span", { class: "sz" }, "outside roots"));
+    }
     const row = h(
       "button",
       {
