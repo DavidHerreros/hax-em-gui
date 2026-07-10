@@ -13,6 +13,12 @@ import { identity, axisAngle, multiply, mulVec4 } from "./mat4.js";
 export function createOrbit(canvas, onChange, onClick, opts = {}) {
   const dist0 = opts.dist || 3.4;
   const FOV = ((opts.fov || 45) * Math.PI) / 180;   // must match the renderer's perspective FOV
+  // Models are normalized into a [-1,1] cube (half-diagonal √3 ≈ 1.73), and every
+  // renderer's frustum is near=0.01 far=100. So the camera can come right up to the
+  // surface — and inside it — and still pull far enough back to see the whole box.
+  const minDist = opts.minDist || 0.05;
+  const maxDist = opts.maxDist || 60;
+  const clampDist = (d) => Math.max(minDist, Math.min(maxDist, d));
   let R = identity();
   let dist = dist0;
   let offset = [0, 0, 0];   // world-space model translation (pan + carried orbit pivot)
@@ -65,7 +71,7 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
   canvas.addEventListener("auxclick", (e) => { if (e.button === 1) e.preventDefault(); });
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
-    dist = Math.max(1.2, Math.min(16, dist * Math.exp(e.deltaY * 0.001)));
+    dist = clampDist(dist * Math.exp(e.deltaY * 0.001));
     onChange();
   }, { passive: false });
 
@@ -76,7 +82,7 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
     get eye() { return [0, 0, dist]; },
     drag(dx, dy) { rotateBy(dx, dy); onChange(); },   // externally driven rotation (e.g. an overlay)
     pan(dx, dy) { panBy(dx, dy); onChange(); },       // externally driven pan (CSS px)
-    zoom(deltaY) { dist = Math.max(1.2, Math.min(16, dist * Math.exp(deltaY * 0.001))); onChange(); },
+    zoom(deltaY) { dist = clampDist(dist * Math.exp(deltaY * 0.001)); onChange(); },
     reset() { R = identity(); dist = dist0; offset = [0, 0, 0]; onChange(); },
   };
 }

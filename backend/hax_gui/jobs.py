@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import adapters, projects, registry, settings_store
+from . import adapters, mdpaths, projects, registry, settings_store
 from .command import ValidationError, build_command
 from .config import settings
 
@@ -327,9 +327,14 @@ class JobManager:
     def _launch_cwd(program: str, values: dict[str, Any], workdir: Path) -> str:
         wd_arg = registry.working_dir_arg(program)
         if wd_arg and values.get(wd_arg):
-            parent = Path(str(values[wd_arg])).expanduser().parent
-            if parent.is_dir():
-                return str(parent)
+            md = Path(str(values[wd_arg])).expanduser()
+            # Where the metadata's image refs actually resolve from — usually its
+            # own folder, but Scipion writes them relative to the project root.
+            base = mdpaths.image_base_dir(md)
+            if base is not None:
+                return str(base)
+            if md.parent.is_dir():
+                return str(md.parent)
         return str(workdir)
 
     async def _launch(self, job_id: str, command: list[str], log_path: str, cwd: str | None = None) -> None:

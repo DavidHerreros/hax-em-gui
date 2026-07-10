@@ -20,7 +20,6 @@ const state = { render: "surface", sigma: 2.5, smooth: 6 };
 let info = null;        // /api/info
 let gridVol = null;     // parsed /api/grid for the ray-marcher (coarse)
 let gridSlice = null;   // parsed /api/grid for slices (finer)
-let surfToken = 0;
 
 function status(msg, cls = "") {
   const el = $("status"); el.textContent = msg; el.title = msg;
@@ -78,17 +77,30 @@ async function fetchGrid(size) {
   return parseGrid(buf);
 }
 
-async function loadSurface() {
-  const token = ++surfToken;
+// Run `fn` at most once at a time, re-running it after it settles if it was asked
+// again meanwhile. Gives continuous (server-bounded) updates without piling up
+// requests — same helper the landscape app uses.
+function makeLive(fn) {
+  let busy = false, pending = false;
+  async function run() { busy = true; do { pending = false; try { await fn(); } catch { /* fn reports */ } } while (pending); busy = false; }
+  return () => { if (busy) pending = true; else run(); };
+}
+
+// One contour costs a full marching-cubes pass over the whole volume plus a
+// multi-MB mesh download, and the histogram fires this on every pointermove. Left
+// unthrottled a single drag queues one such request per pixel crossed; each reads
+// the *current* level, so coalescing converges on the level you released at.
+async function surfaceOnce() {
   status("Contouring…", "busy");
   try {
     const buf = await (await fetch(`./api/decode?sigma=${state.sigma.toFixed(3)}&smooth=${state.smooth}`)).arrayBuffer();
-    if (token !== surfToken) return;   // superseded by a newer contour
+    if (state.render !== "surface") return;   // mode switched while we were waiting
     const m = parseMesh(buf);
     renderer.setMesh(m.positions, m.normals, m.indices);
     status(m.indices.length ? `Surface · σ ${state.sigma.toFixed(2)}` : "Empty surface at this contour", m.indices.length ? "" : "warn");
-  } catch (err) { if (token === surfToken) status("Contour failed: " + err.message, "err"); }
+  } catch (err) { status("Contour failed: " + err.message, "err"); }
 }
+const loadSurface = makeLive(surfaceOnce);
 
 async function loadVolume() {
   status("Loading volume…", "busy");

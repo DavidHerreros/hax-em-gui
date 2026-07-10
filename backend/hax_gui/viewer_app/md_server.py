@@ -62,6 +62,7 @@ class Meta:
         self.path = path
         self.dir = Path(path).resolve().parent
         self._md = None
+        self._base: Path | None = None
         self._cols: list[str] | None = None
         self._numeric: list[str] | None = None
 
@@ -103,14 +104,22 @@ class Meta:
         except Exception:  # noqa: BLE001
             return False
 
+    @property
+    def base(self) -> Path:
+        """Directory the metadata's relative image refs resolve against."""
+        if self._base is None:
+            from hax_gui.mdpaths import image_base_dir
+            self._base = image_base_dir(self.path) or self.dir
+        return self._base
+
     def _resolve(self, path: str) -> str:
-        """Resolve an image path, trying it as-is then relative to the metadata
-        file's directory (and its parent) — the usual Xmipp/Relion conventions."""
+        """Resolve an image path, trying it as-is then relative to the directory
+        the metadata's refs are written against."""
         p = Path(path)
         if p.is_absolute():
             return str(p)
-        for base in (Path.cwd(), self.dir, self.dir.parent):
-            cand = base / path
+        for candidate_base in (Path.cwd(), self.base, self.dir, self.dir.parent):
+            cand = candidate_base / path
             if cand.exists():
                 return str(cand)
         return path

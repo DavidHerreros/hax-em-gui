@@ -18,6 +18,8 @@ from typing import Any
 
 import httpx
 
+from . import mdpaths
+
 _SERVER = Path(__file__).resolve().parent / "viewer_app" / "md_server.py"
 
 _SUFFIXES = (".xmd", ".star", ".cs")
@@ -64,9 +66,10 @@ class MdViewerManager:
             "--host", "127.0.0.1",
             "--port", str(port),
         ]
-        # Run in the file's directory so image refs stored relative to the
-        # metadata (the Xmipp/Relion convention) resolve.
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, cwd=str(path.parent))
+        # Run from wherever the file's relative image refs resolve — its own
+        # folder by the Xmipp/Relion convention, an ancestor under Scipion.
+        cwd = mdpaths.image_base_dir(path) or path.parent
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, cwd=str(cwd))
         instance = {"id": vid, "port": port, "md": str(path), "title": title, "proc": proc}
         await self._wait_ready(instance)
         self._by_path[key] = instance
