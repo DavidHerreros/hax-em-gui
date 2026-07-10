@@ -1,11 +1,18 @@
 """Sandboxed server-side file browser for path-typed arguments.
 
-Listings are confined to the configured ``file_roots`` so the SPA can never
-escape above them via ``..`` or symlinks.
+Listings are confined to the configured ``file_roots``: the SPA can never climb
+above them with ``..``, which is collapsed lexically before the check.
+
+Containment is judged on the path the user *navigated*, not on where it finally
+points, so a symlink placed inside a root (``~/scratch -> /mnt/fast/scratch``) is
+followed like any other folder — as a file manager would. Note this is a usability
+guardrail, not a security boundary: path-typed job arguments are never confined to
+the roots (see ``command.py``), so the browser is not the thing keeping anyone out.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -20,19 +27,36 @@ class InvalidName(ValueError):
     pass
 
 
+def _norm(path: str | Path) -> Path:
+    """Absolute and lexically normalized (``..``/``.`` collapsed), symlinks intact."""
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
 def _roots() -> list[Path]:
-    return [Path(r).expanduser().resolve() for r in settings.file_roots]
+    return [_norm(r) for r in settings.file_roots]
+
+
+def _contains(root: Path, target: Path) -> bool:
+    return target == root or root in target.parents
 
 
 def _within_roots(target: Path) -> bool:
-    return any(target == root or root in target.parents for root in _roots())
+    """True when ``target`` (already lexically normalized) sits under a root.
+
+    Compared as navigated, so symlinks under a root stay under it. The resolved
+    forms are compared too, which lets a root that is *itself* a symlink still
+    match requests naming its real location.
+    """
+    roots = _roots()
+    if any(_contains(root, target) for root in roots):
+        return True
+    resolved = target.resolve()
+    return any(_contains(root.resolve(), resolved) for root in roots)
 
 
 def resolve(path: str | None) -> Path:
-    """Resolve a request path, defaulting to (and confined within) the roots."""
-    roots = _roots()
-    target = roots[0] if not path else Path(path).expanduser()
-    target = target.resolve()
+    """Normalize a request path, defaulting to (and confined within) the roots."""
+    target = _roots()[0] if not path else _norm(path)
     if not _within_roots(target):
         raise AccessDenied(f"path outside allowed roots: {target}")
     return target
@@ -60,9 +84,6 @@ def list_dir(path: str | None) -> dict[str, Any]:
                     "path": str(child),
                     "is_dir": is_dir,
                     "hidden": child.name.startswith("."),   # dotfile; hidden by default in the UI
-                    # A symlinked directory can point out of the sandbox. Flag it so the
-                    # UI greys it out, rather than letting the click fail with a 403.
-                    "denied": is_dir and not _within_roots(child.resolve()),
                     "size": None if is_dir else child.stat().st_size,
                 }
             )
@@ -94,9 +115,7 @@ def make_dir(path: str | None, name: str) -> dict[str, Any]:
         raise NotADirectoryError(str(base))
 
     target = base / name
-    # Resolved, so an existing symlink pointing out of the roots is caught here
-    # rather than surfacing as a confusing "already exists".
-    if not _within_roots(target.resolve()):
+    if not _within_roots(target):
         raise AccessDenied(f"path outside allowed roots: {target}")
     try:
         target.mkdir()   # non-recursive, and errors if the name is already taken

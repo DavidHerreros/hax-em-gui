@@ -148,14 +148,6 @@ export function openFilePicker(kind, onSelect) {
   }
 
   function entryRow(e) {
-    // A symlink out of the sandbox: listing it would 403, so don't offer the click.
-    if (e.denied) {
-      return h("button",
-        { class: "entry", disabled: true, title: "Outside the folders the browser may show (set HAX_GUI_FILE_ROOTS to allow it)" },
-        icon("ban", 16),
-        h("span", { class: "nm" }, e.name),
-        h("span", { class: "sz" }, "outside roots"));
-    }
     const row = h(
       "button",
       {
