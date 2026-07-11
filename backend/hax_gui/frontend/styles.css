@@ -231,6 +231,8 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .btn-split > .btn { border-radius: 0; }
 .btn-split > .btn:first-child { border-top-left-radius: 10px; border-bottom-left-radius: 10px; }
 .btn-split > .split-caret { border-top-right-radius: 10px; border-bottom-right-radius: 10px; border-left: none; padding-left: 9px; padding-right: 9px; }
+/* On a .secondary split the shared border is the divider; a solid (brand) one needs its own. */
+.btn-split > .split-caret:not(.secondary):not(.ghost) { box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.28); }
 .btn-split .split-chevron { display: inline-flex; transform: rotate(180deg); }
 .ml-auto { margin-left: auto; }
 .back { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 14px; margin-bottom: 16px; }
@@ -588,6 +590,13 @@ body.vwin-dragging iframe { pointer-events: none; }
 .workflows-view { display: flex; flex-direction: column; height: 100%; min-height: 480px; }
 
 .wf-topbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; flex-wrap: wrap; }
+/* Zones: the workflow, the view, then (after the spacer) status + actions. The dividers
+   make the three groups read apart instead of as one long undifferentiated row. */
+.wf-zone { display: flex; align-items: center; gap: 8px; }
+.wf-zone + .wf-zone { padding-left: 10px; border-left: 1px solid var(--border); }
+.wf-spacer { flex: 1; }
+.wf-actions { display: flex; align-items: center; gap: 8px; }
+.wf-selcount { font-size: 12px; color: var(--accent); font-weight: 600; white-space: nowrap; }
 .wf-name { flex: 0 1 220px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); }
 .wf-select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); max-width: 200px; }
 .wf-status { font-size: 12px; }

@@ -1751,12 +1751,23 @@ def validate_workflow(wid: str) -> dict[str, Any]:
 
 @app.post("/api/workflows/{wid}/run", dependencies=[Depends(auth)])
 async def run_workflow(wid: str, body: WorkflowRun = WorkflowRun()) -> dict[str, Any]:
+    """Queue steps. When a run is already in flight the steps are appended to its
+    queue and the live scheduler picks them up in turn."""
     try:
         return await wf_manager.run(wid, body.nodes)
     except KeyError:
         raise HTTPException(status_code=404, detail="workflow not found")
     except WorkflowError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
+
+
+@app.post("/api/workflows/{wid}/stop", dependencies=[Depends(auth)])
+async def stop_workflow(wid: str) -> dict[str, Any]:
+    """Halt a run: cancel the step executing now and dequeue everything still waiting."""
+    try:
+        return await wf_manager.stop(wid)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="workflow not found")
 
 
 @app.post("/api/workflows/from-project/{project_id}", dependencies=[Depends(auth)])

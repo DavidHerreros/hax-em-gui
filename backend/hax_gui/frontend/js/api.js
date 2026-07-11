@@ -81,8 +81,10 @@ export const api = {
   updateWorkflow: (id, body) => req(`/api/workflows/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteWorkflow: (id) => req(`/api/workflows/${id}`, { method: "DELETE" }),
   // runWorkflow with no `nodes` runs the whole graph; pass an array of node ids
-  // to run just that subset (a single node or a selection).
+  // to run just that subset (a single node or a selection). If a run is already in
+  // flight the steps are appended to its queue rather than rejected.
   runWorkflow: (id, nodes) => req(`/api/workflows/${id}/run`, { method: "POST", body: JSON.stringify(nodes ? { nodes } : {}) }),
+  stopWorkflow: (id) => req(`/api/workflows/${id}/stop`, { method: "POST" }),
   workflowFromProject: (projectId, name) => req(`/api/workflows/from-project/${projectId}`, { method: "POST", body: JSON.stringify({ name: name || null }) }),
   workflowSaveAsProject: (id, name) => req(`/api/workflows/${id}/save-as-project`, { method: "POST", body: JSON.stringify({ name }) }),
 

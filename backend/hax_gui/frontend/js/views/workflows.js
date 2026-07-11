@@ -14,6 +14,7 @@ import { errorBox } from "./ui.js";
 import { visibleFields } from "./formFields.js";
 import { openFilePicker } from "./filePicker.js";
 import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js";
+import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
 import { loadProgramGroups, isModed } from "../programGroups.js";
 
@@ -86,31 +87,84 @@ export function WorkflowsView() {
   const root = h("div", { class: "view workflows-view" });
 
   // ── top bar ──
+  // Three zones instead of one flat row of ~20 buttons: the workflow (open / name /
+  // a ⋮ menu for file actions), the view (one View menu + the zoom readout), and the
+  // actions. The action cluster is rebuilt by syncActions() because it depends on run
+  // state and selection: while a run is live it offers Stop and "Queue selected"
+  // (steps appended to the live queue); otherwise a Run split button.
   const nameInput = h("input", { class: "wf-name", placeholder: "Workflow name", value: "" });
   nameInput.addEventListener("input", () => { dirty = true; });
   const wfSelect = h("select", { class: "wf-select", title: "Open a saved workflow" });
   wfSelect.addEventListener("change", () => openWorkflow(wfSelect.value || null));
   const statusEl = h("span", { class: "wf-status muted" }, "");
-  const orientBtn = h("button", { class: "btn small", title: "Toggle horizontal / vertical layout", onclick: toggleOrientation });
-  const layoutBtn = h("button", { class: "btn small", title: "Auto-arrange into dependency levels", onclick: () => { autoLayout(); dirty = true; } }, icon("sliders", 14), "Tidy");
-  const pinBtn = h("button", { class: "btn small", title: "Pin the current node layout so you can return to it", onclick: saveLayout }, icon("bookmark", 14), "Pin layout");
-  const restoreBtn = h("button", { class: "btn small", title: "Restore the pinned layout", onclick: restoreLayout }, icon("restore", 14), "Restore");
-  const centerBtn = h("button", { class: "btn small", title: "Center the workflow in view", onclick: centerView }, icon("orbit", 14), "Center");
-  const mmBtn = h("button", { class: "btn small", title: "Toggle the overview minimap", onclick: toggleMinimap }, icon("grid", 14), "Map");
   const zoomLabel = h("button", { class: "btn small wf-zoom", title: "Reset zoom to 100%", onclick: resetZoom }, "100%");
-  const importBtn = h("button", { class: "btn small", title: "Open the active project as a live workflow (edits & runs change the project)", onclick: openProject }, icon("box", 14), "Open project");
-  const asProjBtn = h("button", { class: "btn small", title: "Create a new project backed by this workflow", onclick: saveAsProject }, icon("plus", 14), "Save as project");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
-  const dupBtn = h("button", { class: "btn secondary", title: "Duplicate the selected step(s) as new, un-run steps (Ctrl/Cmd+D)", onclick: () => duplicateNodes([...selectedSet]) }, icon("copy", 15), "Duplicate");
-  const rmSelBtn = h("button", { class: "btn secondary", title: "Remove the selected step(s) from the canvas (Delete / Backspace). Save to persist.", onclick: () => removeNodes([...selectedSet]) }, icon("x", 15), "Remove selected");
-  const runSelBtn = h("button", { class: "btn secondary", title: "Run the selected step(s) only. Select several by Shift-dragging a box on empty canvas (Ctrl/Cmd-drag adds to the selection), or Shift/Ctrl-click nodes.", onclick: () => runNodes([...selectedSet]) }, icon("play", 15), "Run selected");
-  const runBtn = h("button", { class: "btn", title: "Run the whole workflow", onclick: () => runNodes(null) }, icon("play", 15), "Run all");
-  const delBtn = h("button", { class: "btn", title: "Delete this workflow", onclick: removeWorkflow }, icon("trash", 15));
+  const actionsEl = h("div", { class: "wf-actions" });
+  const wfMenuBtn = h("button", { class: "btn small", title: "Workflow actions",
+    onclick: (e) => openContextMenu(e.currentTarget, wfMenuItems()) }, icon("more", 15));
+  const viewMenuBtn = h("button", { class: "btn small", title: "View & layout",
+    onclick: (e) => openContextMenu(e.currentTarget, viewMenuItems()) }, icon("sliders", 14), "View");
+
   const topbar = h("div", { class: "wf-topbar" },
-    h("strong", null, "Workflow"), wfSelect,
-    h("button", { class: "btn small", onclick: () => openWorkflow(null) }, "+ New"),
-    importBtn, asProjBtn, nameInput, orientBtn, layoutBtn, pinBtn, restoreBtn, centerBtn, mmBtn, zoomLabel,
-    h("span", { style: { flex: "1" } }), statusEl, saveBtn, dupBtn, rmSelBtn, runSelBtn, runBtn, delBtn);
+    h("div", { class: "wf-zone" }, h("strong", null, "Workflow"), wfSelect, nameInput, wfMenuBtn),
+    h("div", { class: "wf-zone" }, viewMenuBtn, zoomLabel),
+    h("span", { class: "wf-spacer" }),
+    statusEl, actionsEl);
+
+  // Menus are built on open, so they always read the current workflow / layout state.
+  function wfMenuItems() {
+    const items = [
+      { label: "New workflow", icon: icon("plus", 15), onClick: () => openWorkflow(null) },
+      { label: "Open project as workflow", icon: icon("box", 15), onClick: openProject },
+    ];
+    if (!(wf && wf.project_id)) items.push({ label: "Save as project", icon: icon("save", 15), onClick: saveAsProject });
+    if (wf) items.push({ label: "Delete workflow", icon: icon("trash", 15), danger: true, onClick: removeWorkflow });
+    return items;
+  }
+  function viewMenuItems() {
+    const items = [
+      { label: "Tidy — arrange by dependency", icon: icon("sliders", 15), onClick: () => { autoLayout(); dirty = true; } },
+      { label: horiz() ? "Switch to vertical" : "Switch to horizontal", icon: icon(horiz() ? "chevronRight" : "arrowRight", 15), onClick: toggleOrientation },
+      { label: "Center in view", icon: icon("orbit", 15), onClick: centerView },
+      { label: minimapOn ? "Hide minimap" : "Show minimap", icon: icon("grid", 15), onClick: toggleMinimap },
+      { label: "Pin this layout", icon: icon("bookmark", 15), onClick: saveLayout },
+    ];
+    if (graph.savedLayout && graph.savedLayout.pos) {
+      items.push({ label: "Restore pinned layout", icon: icon("restore", 15), onClick: restoreLayout });
+    }
+    return items;
+  }
+
+  // A primary action joined to a caret holding its variant — same pattern as the job page.
+  function splitButton(main, items) {
+    return h("div", { class: "btn-split" },
+      h("button", { class: "btn split-main", title: main.title || "", onclick: main.onClick }, icon(main.icon, 15), main.label),
+      h("button", { class: "btn split-caret", title: "More…", onclick: (e) => { e.stopPropagation(); openContextMenu(e.currentTarget, items); } },
+        h("span", { class: "split-chevron" }, icon("chevronUp", 13))));
+  }
+
+  function syncActions() {
+    clear(actionsEl);
+    const running = !!(wf && wf.status === "running");
+    const n = selectedSet.size;
+    if (n) {   // selection tools only exist while there *is* a selection
+      actionsEl.append(
+        h("span", { class: "wf-selcount" }, `${n} selected`),
+        h("button", { class: "btn secondary small", title: "Duplicate the selected step(s) as new, un-run steps (Ctrl/Cmd+D)", onclick: () => duplicateNodes([...selectedSet]) }, icon("copy", 14)),
+        h("button", { class: "btn secondary small", title: "Remove the selected step(s) (Delete / Backspace). Save to persist.", onclick: () => removeNodes([...selectedSet]) }, icon("x", 14)));
+    }
+    actionsEl.appendChild(saveBtn);
+    if (running) {
+      if (n) actionsEl.appendChild(h("button", { class: "btn secondary", title: "Queue the selected step(s) onto the running workflow — each starts when its turn comes",
+        onclick: () => runNodes([...selectedSet]) }, icon("plus", 15), "Queue selected"));
+      actionsEl.appendChild(h("button", { class: "btn secondary", style: { color: "var(--warn)", borderColor: "var(--warn)" },
+        title: "Stop the run: cancel the step running now and dequeue the rest", onclick: stopRun }, icon("ban", 15), "Stop"));
+    } else {
+      actionsEl.appendChild(splitButton(
+        { icon: "play", label: "Run all", title: "Run the whole workflow", onClick: () => runNodes(null) },
+        [{ label: "Run selected steps", icon: icon("play", 15), onClick: () => runNodes([...selectedSet]) }]));
+    }
+  }
 
   // ── body: palette | canvas (+minimap) | inspector ──
   // Both side panels are resizable (drag the divider) and collapsible (chevron in
@@ -263,8 +317,7 @@ export function WorkflowsView() {
       catalog = await api.workflowCatalog();
       byName = Object.fromEntries(catalog.map((p) => [p.name, p]));
     } catch (err) { mount(palette, errorBox(err)); return; }
-    renderPalette(); syncOrientBtn();
-    mmBtn.classList.toggle("on", minimapOn);
+    renderPalette(); syncActions();
     loadLabels().catch(() => {});
     loadProgramGroups().catch(() => {});
     await refreshList();
@@ -481,6 +534,7 @@ export function WorkflowsView() {
     for (const n of graph.nodes) nodesLayer.appendChild(nodeEl(n));
     redrawWires();
     drawMinimap();
+    syncActions();   // the action cluster follows the selection and the run state
   }
 
   function portEl(cls, originX, originY, pos, data) {
@@ -502,7 +556,7 @@ export function WorkflowsView() {
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
       st ? h("span", { class: "wf-node-st", style: { color: statusColor(st) } }, st) : null,
-      h("button", { class: "wf-node-run", title: "Run this step", disabled: running, onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon("play", 12)),
+      h("button", { class: "wf-node-run", title: running ? "Queue this step onto the running workflow" : "Run this step", onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon(running ? "plus" : "play", 12)),
       h("button", { class: "wf-node-run", title: "Duplicate this step (un-run copy)", onclick: (e) => { e.stopPropagation(); duplicateNodes([n.id]); } }, icon("copy", 12)),
       h("button", { class: "wf-node-x", title: "Remove step (deletes its job + outputs)", onclick: (e) => { e.stopPropagation(); removeNodes([n.id]); } }, "×"));
     head.addEventListener("pointerdown", (e) => startNodeDrag(e, n));
@@ -776,11 +830,7 @@ export function WorkflowsView() {
   // ── layout ──
   function toggleOrientation() {
     graph.orientation = horiz() ? "vertical" : "horizontal";
-    syncOrientBtn(); autoLayout(); dirty = true;
-  }
-  function syncOrientBtn() {
-    clear(orientBtn);
-    orientBtn.append(icon(horiz() ? "arrowRight" : "chevronRight", 14), horiz() ? "Horizontal" : "Vertical");
+    autoLayout(); dirty = true;
   }
 
   // Arrange nodes into longest-path dependency tiers along the layout axis.
@@ -838,7 +888,7 @@ export function WorkflowsView() {
     canvas.scrollTop = Math.max(0, Math.min(CONTENT_H * zoom - canvas.clientHeight, b.cy * zoom - canvas.clientHeight / 2));
     drawMinimap();
   }
-  function toggleMinimap() { minimapOn = !minimapOn; minimap.classList.toggle("hidden", !minimapOn); mmBtn.classList.toggle("on", minimapOn); drawMinimap(); }
+  function toggleMinimap() { minimapOn = !minimapOn; minimap.classList.toggle("hidden", !minimapOn); drawMinimap(); }
 
   function drawMinimap() {
     if (!minimapOn) return;
@@ -906,13 +956,9 @@ export function WorkflowsView() {
       wf = await api.workflowSaveAsProject(wf.id, name);
       nameInput.value = wf.name || name;
       await refreshList();
-      syncProjectBtn();
       flash(`Saved as project "${name}" — this workflow now drives it.`, "muted");
     } catch (err) { flash("Couldn't create project: " + (err.detail || err.message), "err"); }
   }
-
-  // "Save as project" is only offered for a draft workflow not yet bound to one.
-  function syncProjectBtn() { asProjBtn.style.display = wf && wf.project_id ? "none" : ""; }
 
   // ── pinned layout (save / restore node positions) ──
   // Independent of "Tidy": pins the user's own arrangement so they can return to it.
@@ -922,14 +968,13 @@ export function WorkflowsView() {
       orientation: graph.orientation,
       pos: Object.fromEntries(graph.nodes.map((n) => [n.id, { x: n.x, y: n.y, job: n.job_id || null }])),
     };
-    syncLayoutBtns();
     if (wf) await save();      // persist the pin
     flash(`Pinned the current layout (${graph.nodes.length} positions).`, "muted");
   }
   function restoreLayout() {
     const sl = graph.savedLayout;
     if (!sl || !sl.pos) { flash("No pinned layout yet — pin one first.", "warn"); return; }
-    if (sl.orientation && sl.orientation !== graph.orientation) { graph.orientation = sl.orientation; syncOrientBtn(); }
+    if (sl.orientation && sl.orientation !== graph.orientation) { graph.orientation = sl.orientation; }
     const known = [], unknown = [];
     for (const n of graph.nodes) {
       // match by node id, falling back to job id (project re-syncs can renumber)
@@ -947,11 +992,6 @@ export function WorkflowsView() {
     dirty = true; renderNodes(); centerView();
     flash(unknown.length ? `Restored the pinned layout; placed ${unknown.length} new node(s) alongside it.` : "Restored the pinned layout.", "muted");
   }
-  function syncLayoutBtns() {
-    const has = !!(graph.savedLayout && graph.savedLayout.pos);
-    restoreBtn.disabled = !has;
-    restoreBtn.classList.toggle("disabled", !has);
-  }
 
   // ── persistence + run ──
   function graphSnapshot() { return { nodes: graph.nodes, edges: graph.edges, orientation: graph.orientation, savedLayout: graph.savedLayout || null }; }
@@ -963,7 +1003,7 @@ export function WorkflowsView() {
     try {
       if (wf) wf = await api.updateWorkflow(wf.id, { name, graph: graphSnapshot() });
       else wf = await api.createWorkflow({ project_id: pid, name, graph: graphSnapshot() });
-      dirty = false; rememberWorkflow(wf.id); flash("Saved.", "muted"); await refreshList(); wfSelect.value = wf.id; syncProjectBtn();
+      dirty = false; rememberWorkflow(wf.id); flash("Saved.", "muted"); await refreshList(); wfSelect.value = wf.id; syncActions();
     } catch (err) { flash("Save failed: " + (err.detail || err.message), "err"); }
     return wf;
   }
@@ -973,11 +1013,18 @@ export function WorkflowsView() {
     if (!(wf && wf.project_id) && !getState().activeProjectId) { flash("Open a project first (Projects), or use “Save as project” — steps run into a project.", "err"); return; }
     if (!graph.nodes.length) { flash("Add at least one step.", "warn"); return; }
     if (ids && !ids.length) { flash("Select one or more steps first.", "warn"); return; }
+    // Save first — the scheduler reads the graph from the server, so a step that only
+    // exists on the canvas has to be persisted before it can be queued.
+    const wasRunning = !!(wf && wf.status === "running");
     await save();
     if (!wf) return;
     try {
       wf = await api.runWorkflow(wf.id, ids || undefined);
-      flash(ids ? `Running ${ids.length} step(s)…` : "Running…", "busy");
+      runState = wf.run_state || null;
+      flash(wasRunning
+        ? `Queued ${ids ? ids.length : graph.nodes.length} step(s) onto the running workflow.`
+        : (ids ? `Running ${ids.length} step(s)…` : "Running…"), "busy");
+      renderNodes();
       startPolling();
     } catch (err) {
       const errs = err.detail && err.detail.errors ? err.detail.errors : [err.detail || err.message];
@@ -985,12 +1032,23 @@ export function WorkflowsView() {
     }
   }
 
+  // Halt the run: the backend cancels the step executing now and dequeues the rest.
+  async function stopRun() {
+    if (!wf) return;
+    try {
+      wf = await api.stopWorkflow(wf.id);
+      runState = wf.run_state || null;
+      stopPolling();
+      renderNodes();
+      flash("Stopped — the running step was cancelled and the queue cleared.", "warn");
+    } catch (err) { flash("Stop failed: " + (err.detail || err.message), "err"); }
+  }
+
   // Adopt a server graph into local state (keeping the id counters ahead).
   function adoptGraph(g) {
     graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || graph.orientation || "horizontal", savedLayout: g.savedLayout || null };
     nodeSeq = Math.max(1, ...graph.nodes.map((n) => +(n.id.replace(/\D/g, "")) || 0)) + 1;
     edgeSeq = Math.max(1, ...graph.edges.map((e) => +((e.id || "").replace(/\D/g, "")) || 0)) + 1;
-    syncLayoutBtns();
   }
 
   function startPolling() {
@@ -1024,14 +1082,13 @@ export function WorkflowsView() {
     if (!id) {
       wf = null; graph = { nodes: [], edges: [], orientation: "horizontal" }; runState = null; selected = null; nameInput.value = "";
       wfSelect.value = ""; rememberWorkflow(null);
-      syncOrientBtn(); syncProjectBtn(); syncLayoutBtns(); renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
+      renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
     }
     try {
       wf = await api.workflow(id);
       adoptGraph(wf.graph || {});
       runState = wf.run_state || null; selected = null; nameInput.value = wf.name || ""; wfSelect.value = wf.id;
       rememberWorkflow(wf.id);
-      syncOrientBtn(); syncProjectBtn();
       // freshly imported / never-laid-out graphs have all-zero coords — tidy once
       if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
       else { renderNodes(); centerView(); }
