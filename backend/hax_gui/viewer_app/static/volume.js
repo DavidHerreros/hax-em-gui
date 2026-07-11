@@ -3,7 +3,7 @@
 // the grid occupies (uBoxLo..uBoxHi), which the backend picks to coincide exactly with
 // the marching-cubes surface so the map does not shift when you switch render modes;
 // orbit camera shared in style with gl.js. Hand-written, no dependencies.
-import { perspective, lookAt, multiply, invert, mulVec4 } from "./mat4.js";
+import { projection, lookAt, multiply, invert, mulVec4 } from "./mat4.js";
 import { createOrbit } from "./orbit.js";
 
 const VERT = `#version 300 es
@@ -136,7 +136,9 @@ export function createVolume(canvas) {
     return null;                               // the ray passed through empty space
   }
 
-  const orbit = createOrbit(canvas, () => render(), null, { dist: 3.4, probeDepth: centreDepth });
+  // 1.41 = the height this view has always shown (old camera: 3.4·tan(22.5°)), so the map
+  // keeps its size and its registration with the surface view across a render-mode switch.
+  const orbit = createOrbit(canvas, () => render(), null, { fitRadius: 1.41, probeDepth: centreDepth });
 
   function resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -152,7 +154,7 @@ export function createVolume(canvas) {
     const eye = orbit.eye, M = orbit.model;
     // march in MODEL space: transform = proj·view·M, so invert(mvp) maps clip→model
     // and the eye in model space is M⁻¹·eye_world (M = translate(pan)·R; camera is fixed on +Z).
-    const mvp = multiply(multiply(perspective((45 * Math.PI) / 180, aspect, 0.01, 100), lookAt(eye, [0, 0, 0], [0, 1, 0])), M);
+    const mvp = multiply(multiply(projection(aspect, 0.01, 100), lookAt(eye, [0, 0, 0], [0, 1, 0])), M);
     const ivp = invert(mvp); if (!ivp) return;
     const Minv = invert(M); if (!Minv) return;
     const em = mulVec4(Minv, [eye[0], eye[1], eye[2], 1]);

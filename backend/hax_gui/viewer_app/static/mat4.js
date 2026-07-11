@@ -1,15 +1,46 @@
 // Minimal column-major 4x4 matrix + vec3 helpers (no gl-matrix dependency).
-// Only what the isosurface renderer needs: perspective, lookAt, multiply.
+// Only what the renderers need: the camera, lookAt, multiply.
 
-export function perspective(fovyRad, aspect, near, far) {
-  const f = 1 / Math.tan(fovyRad / 2);
+// ChimeraX's camera, so that a map looks here the way it looks there.
+// `MonoCamera.field_of_view = 30` and that is the *horizontal* field: its
+// perspective_projection_matrix() sizes the frustum from the width
+// (w = 2·near·tan(fov/2)) and derives the height from the aspect ratio
+// (h = w·height/width). See chimerax/graphics/camera.py.
+//
+// The number is the whole story. Fixing 45° *vertically* instead — as this
+// viewer used to — comes out at ~64° across a landscape canvas, more than twice
+// ChimeraX's angular field. A wide field means the camera must sit close to keep
+// the map framed, and a close camera foreshortens hard: the near side of the
+// map balloons relative to the far side. Hence the "zoomed / fish-eyed" look.
+export const FOV_X_DEG = 30;
+const FOV_X_2 = (FOV_X_DEG * Math.PI) / 360;   // half the horizontal field, in radians
+
+// Half the vertical field, for a canvas of the given aspect (width / height).
+// Renderers need this to turn pixels into world units; it is no longer a constant,
+// because with the field pinned horizontally the vertical one follows the window.
+export function halfFovY(aspect) {
+  return Math.atan(Math.tan(FOV_X_2) / Math.max(1e-6, aspect));
+}
+
+// The projection matrix for that camera. aspect = width / height.
+export function projection(aspect, near, far) {
+  const f = 1 / Math.tan(FOV_X_2);   // horizontal, not vertical: m[0] carries it, m[5] scales by aspect
   const nf = 1 / (near - far);
   return new Float32Array([
-    f / aspect, 0, 0, 0,
-    0, f, 0, 0,
+    f, 0, 0, 0,
+    0, f * aspect, 0, 0,
     0, 0, (far + near) * nf, -1,
     0, 0, 2 * far * near * nf, 0,
   ]);
+}
+
+// Eye distance at which a sphere of the given radius about the origin exactly fills
+// the narrower of the two fields — ChimeraX's `view_all`, fitted to a bounding sphere
+// rather than the box corners so the framing does not breathe as the trackball turns.
+// Narrowing the field without pulling the eye back would just shrink the map on screen;
+// this is what keeps it the same size while the perspective relaxes.
+export function fitDistance(radius, aspect) {
+  return radius / Math.sin(Math.min(FOV_X_2, halfFovY(aspect)));
 }
 
 export function lookAt(eye, center, up) {

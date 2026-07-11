@@ -1,7 +1,7 @@
 // Minimal WebGL2 3D point-cloud renderer for the latent landscape (3 PCs).
 // Orbit camera (shared style with gl.js), per-point color, selection/target
 // rings, CPU-side picking, and high-DPI / transparent snapshots. No deps.
-import { perspective, lookAt, multiply, mulVec4, invert } from "./mat4.js";
+import { projection, halfFovY, lookAt, multiply, mulVec4, invert } from "./mat4.js";
 import { createOrbit } from "./orbit.js";
 
 const VERT = `#version 300 es
@@ -164,7 +164,7 @@ export function createCloud(canvas, onSelect) {
   function centreDepth() {
     if (!norm || !count) return null;
     const { view } = matrices();   // view = lookAt · model, so this lands straight in view space
-    const tanF = Math.tan((45 * Math.PI) / 180 / 2);
+    const tanF = Math.tan(halfFovY(canvas.width / Math.max(1, canvas.height)));   // vertical field follows the window
     const halfH = Math.max(1, canvas.clientHeight) / 2;
     let best = null;
     for (let i = 0; i < count; i++) {
@@ -178,10 +178,12 @@ export function createCloud(canvas, onSelect) {
   }
 
   const orbit = createOrbit(canvas, () => render(), (e) => { const i = pick(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); },
-    { probeDepth: centreDepth, modelWidth: 1.8 });   // normalizePoints() scales the largest extent to 1.8
+    // normalizePoints() scales the largest extent to 1.8; fitRadius 1.41 is the height the
+    // old 45°-vertical camera showed at its default distance, so the cloud keeps its framing.
+    { probeDepth: centreDepth, modelWidth: 1.8, fitRadius: 1.41 });
   function matrices() {
     const aspect = canvas.width / Math.max(1, canvas.height);
-    const proj = perspective((45 * Math.PI) / 180, aspect, 0.01, 100);
+    const proj = projection(aspect, 0.01, 100);
     // camera fixed on +Z; the model transform (trackball rotation + pan) is baked into view.
     const view = multiply(lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]), orbit.model);
     return { proj, view };

@@ -11,7 +11,7 @@
 // multisampling, so silhouettes stay smooth (deferred shading would alias them).
 // Falls back to a single forward pass (derivative AO) when float targets are
 // unsupported. Hand-written, no dependencies.
-import { perspective, lookAt } from "./mat4.js";
+import { projection, lookAt } from "./mat4.js";
 import { createOrbit } from "./orbit.js";
 
 const KSIZE = 24;   // SSAO hemisphere samples
@@ -268,7 +268,10 @@ export function createRenderer(canvas) {
     return best;
   }
 
-  const orbit = createOrbit(canvas, () => render(), null, { dist: 3.2, probeDepth: centreDepth });
+  // fitRadius 1.33 keeps the map the on-screen size it has always been (the old
+  // 45°-vertical camera at dist 3.2 showed 3.2·tan(22.5°) ≈ 1.33 world units of height);
+  // the camera now reaches that framing from further back, through ChimeraX's field.
+  const orbit = createOrbit(canvas, () => render(), null, { fitRadius: 1.33, probeDepth: centreDepth });
 
   function resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -320,7 +323,7 @@ export function createRenderer(canvas) {
 
   function camera() {
     const aspect = canvas.width / Math.max(1, canvas.height);
-    const proj = perspective((45 * Math.PI) / 180, aspect, 0.01, 100);
+    const proj = projection(aspect, 0.01, 100);
     const view = lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]);   // camera fixed; model carries the trackball rotation + pan
     return { proj, view, model: orbit.model };
   }

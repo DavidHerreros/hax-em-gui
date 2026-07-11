@@ -69,13 +69,37 @@ export function MetricsView() {
     finally { openBtn.disabled = false; }
   }
 
+  // Closing a tab used to only drop it from client state, leaving the TB process alive
+  // until the whole GUI shut down — which is also why a logdir's stale projector could
+  // never be refreshed (`ensure()` hands back the same cached process).
+  async function closeTB(id) {
+    store.closeTB(id);
+    try { await api.stopTensorBoard(id); } catch { /* already gone */ }
+  }
+
+  // Respawn TB on the same logs and swap the tab over to the new instance.
+  async function restart(tb) {
+    try {
+      const fresh = await api.restartTensorBoard(tb.id);
+      const f = frames.get(tb.id);
+      if (f) { f.remove(); frames.delete(tb.id); }
+      store.closeTB(tb.id);
+      store.openTB(fresh);
+    } catch (err) { mount(launchErr, h("div", { style: { marginTop: "12px" } }, errorBox(err))); }
+  }
+
   function sync() {
     const { openTBs, activeTBId } = getState();
     clear(tabbar);
     for (const tb of openTBs) {
       tabbar.appendChild(h("div", { class: "tab" + (tb.id === activeTBId ? " active" : ""), onclick: () => store.setActiveTB(tb.id) },
         h("span", { class: "tab-label" }, folderName(tb.logdir)),
-        h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); store.closeTB(tb.id); } }, icon("x", 14))));
+        h("button", {
+          class: "tab-close",
+          title: "Reload TensorBoard on these logs — needed to pick up new projector (latent-space) epochs, which TensorBoard only reads when it starts",
+          onclick: (e) => { e.stopPropagation(); restart(tb); },
+        }, icon("refresh", 14)),
+        h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); closeTB(tb.id); } }, icon("x", 14))));
     }
     for (const tb of openTBs) {
       if (!frames.has(tb.id)) {

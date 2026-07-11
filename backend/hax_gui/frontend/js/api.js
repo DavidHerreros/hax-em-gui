@@ -70,6 +70,11 @@ export const api = {
 
   startTensorBoard: (logdir) =>
     req("/api/tensorboard", { method: "POST", body: JSON.stringify({ logdir }) }),
+  stopTensorBoard: (id) => req(`/api/tensorboard/${id}`, { method: "DELETE" }),
+  // Respawn TB on the same logs. The projector reads projector_config.pbtxt once per
+  // process and never re-reads it for a JAX logdir, so only a fresh process shows
+  // latent-space epochs logged since it started.
+  restartTensorBoard: (id) => req(`/api/tensorboard/${id}/restart`, { method: "POST" }),
   tensorboards: () => req("/api/tensorboard"),
   metricsJobs: () => req("/api/metrics/jobs"),
 

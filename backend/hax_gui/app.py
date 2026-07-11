@@ -1045,6 +1045,22 @@ def stop_tensorboard(tb_id: str) -> dict[str, bool]:
     return {"stopped": tb_manager.stop(tb_id)}
 
 
+@app.post("/api/tensorboard/{tb_id}/restart", dependencies=[Depends(auth)])
+async def restart_tensorboard(tb_id: str) -> dict[str, Any]:
+    """Respawn TB on the same logs — the only way to pick up new projector epochs."""
+    try:
+        inst = await tb_manager.restart(tb_id)
+    except filebrowser.AccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (RuntimeError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail=f"TensorBoard failed to start: {exc}")
+    if inst is None:
+        raise HTTPException(status_code=404, detail="tensorboard not found")
+    return inst
+
+
 # Reverse proxy to per-instance TensorBoard servers. The instance id is an
 # unguessable capability token, so these routes are intentionally not behind the
 # bearer auth (the browser can't send headers for iframe sub-resources).
