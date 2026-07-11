@@ -307,6 +307,9 @@ export function createCloud(canvas, onSelect) {
   }
 
   window.addEventListener("resize", render);
+  // Same reason as in plot.js: a canvas built while its tab is hidden has no size, so
+  // whatever we drew went nowhere. Redraw when the box we actually occupy changes.
+  if (window.ResizeObserver) new ResizeObserver(() => render()).observe(canvas);
 
   // Hover, to match the 2D scatter. pick() is O(count), so coalesce to one test per
   // animation frame rather than one per mousemove event; and stay out of the way while

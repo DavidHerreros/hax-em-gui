@@ -41,19 +41,26 @@ _EVENT_PREFIX = "events.out.tfevents"
 # keeps the tree walk cheap on a run folder full of checkpoints and .mrc volumes.
 _PRUNE = {"checkpoints", "extra_files"}
 
-# Reservoir sizes. Scalars: 0 == keep everything. Images/tensors are capped so a long
-# run can't pin hundreds of MB of PNGs in the server — TB's Reservoir always keeps the
-# newest item, so a live run's current epoch is never the one that gets dropped.
+# Reservoir sizes. Scalars: 0 == keep everything (they are cheap). Images are the
+# expensive ones — hax's "predicted images batch" runs to ~150 KB a frame, so an
+# uncapped run would pin hundreds of MB. 200 frames still plays as a smooth training
+# movie, and TB's Reservoir always keeps the newest item, so a live run's current epoch
+# is never the one that gets dropped.
 _GUIDANCE = {
     "scalars": 0,
-    "images": 400,
-    "tensors": 400,
+    "images": 200,
+    "tensors": 200,
     "audio": 1,
     "histograms": 1,
     "compressedHistograms": 1,
 }
 
-_MAX_LOGDIRS = 3        # accumulators are memory-hungry; keep only the tabs in play
+# Accumulators are memory-hungry (a run with hundreds of image frames pins tens of MB),
+# but this cap must stay above the number of metrics tabs anyone realistically opens:
+# below it, every poll of the (n+1)-th tab evicts another tab's accumulator and forces a
+# full re-parse of its event files on the next poll — which reads as "the plots take
+# forever to appear". Closing a tab drops its entry, so the cache tracks what is open.
+_MAX_LOGDIRS = 8
 _RELOAD_EVERY = 2.0     # s — a client polling faster than this reuses the last read
 
 _lock = threading.Lock()

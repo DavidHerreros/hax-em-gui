@@ -222,6 +222,9 @@ export function createScatter(canvas, onSelect) {
   canvas.addEventListener("wheel", (e) => { e.preventDefault(); zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * 0.0015)); }, { passive: false });
   canvas.addEventListener("dblclick", () => { view = { ...bounds }; draw(); });
   window.addEventListener("resize", draw);
+  // Same reason as in plot.js: a canvas built while its tab is hidden has no size, so
+  // whatever we drew went nowhere. Redraw when the box we actually occupy changes.
+  if (window.ResizeObserver) new ResizeObserver(() => draw()).observe(canvas);
 
   return {
     setPoints(p) { points = p; setBounds(); draw(); },

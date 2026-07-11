@@ -728,6 +728,10 @@ export function metricsPanel({ logdir, jobId }) {
 
   return {
     el: root,
+    // Called when this panel's tab becomes the visible one. Its canvases were laid out
+    // at zero width while hidden, so they need to be told to draw themselves again now
+    // that they actually have a box.
+    onShow() { showTab(); },
     // `closing` distinguishes the tab being closed from the view merely unmounting on
     // navigation: only the former releases the server's event cache. A TensorBoard the
     // user opened is deliberately left alone — it lives in a browser tab of its own.

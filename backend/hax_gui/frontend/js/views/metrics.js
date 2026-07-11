@@ -61,6 +61,7 @@ export function MetricsView() {
   root.appendChild(panelsWrap);
 
   const panels = new Map();   // logdir -> panel instance (kept mounted so state survives tab switches)
+  let shownId = null;         // which panel is currently on screen
 
   function open(dir, program, jobId) {
     if (!dir) { mount(launchErr, h("div", { style: { marginTop: "12px" } }, errorBox("Choose a log directory first."))); return; }
@@ -93,6 +94,13 @@ export function MetricsView() {
       if (!openMetrics.some((m) => m.id === id)) { p.destroy(true); p.el.remove(); panels.delete(id); }
     }
     for (const [id, p] of panels) p.el.style.display = id === activeMetricsId ? "" : "none";
+    // Nudge the newly revealed panel to redraw: until this point its canvases had no
+    // width to draw into. (The renderers also self-heal via ResizeObserver; this just
+    // makes the switch immediate rather than a frame late.)
+    if (activeMetricsId !== shownId) {
+      shownId = activeMetricsId;
+      panels.get(activeMetricsId)?.onShow?.();
+    }
 
     const empty = panelsWrap.querySelector(".mx-none");
     if (!openMetrics.length && !empty) {
