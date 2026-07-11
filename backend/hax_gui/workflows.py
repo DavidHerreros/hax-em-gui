@@ -12,6 +12,7 @@ binding pointing at its upstream node's job once that job has succeeded.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import sqlite3
@@ -91,6 +92,13 @@ class WorkflowManager:
         if name is not None:
             sets.append("name=?"); params.append(name.strip() or "Untitled workflow")
         if graph is not None:
+            # Carry over node->job links the client doesn't know about. Saving during a
+            # live run (which is how you queue a new step onto it) posts the graph as the
+            # canvas last saw it, so a link the run wrote since then would be erased.
+            prior = {n["id"]: n for n in (wf["graph"] or {}).get("nodes", [])}
+            for n in graph.get("nodes", []):
+                if not n.get("job_id") and prior.get(n["id"], {}).get("job_id"):
+                    n["job_id"] = prior[n["id"]]["job_id"]
             sets.append("graph=?"); params.append(json.dumps(graph))
         if not sets:
             return wf
@@ -361,15 +369,21 @@ class WorkflowManager:
         return errors
 
     # -- execution ---------------------------------------------------------
+    # The runner is a re-entrant scheduler, not a one-shot walk over a snapshot taken at
+    # launch. Each tick it re-reads the graph and run_state from the DB, so steps queued
+    # onto a live run — and edits saved while it runs — are picked up. Steps still
+    # execute strictly one at a time (two trainings at once would fight for the GPU).
+    WAITING = ("pending", "running")
+
     async def run(self, wid: str, only: list[str] | None = None) -> dict[str, Any]:
-        """Run the whole workflow, or just the nodes in `only` (a subset run). For
-        a subset run, nodes outside the set keep their existing run_state, so an
-        already-succeeded upstream node supplies its job to the nodes being run."""
+        """Queue nodes for execution: `only` selects a subset, omit it for the whole
+        graph. If a run is already in flight the nodes are *appended to its queue* and
+        the live scheduler picks them up when their turn comes; otherwise a run starts.
+        Nodes outside the set keep their existing state, so an already-succeeded
+        upstream node still supplies its job to the nodes being queued."""
         wf = self.get(wid)
         if wf is None:
             raise KeyError(wid)
-        if wf["status"] == "running" or (wid in self._running and not self._running[wid].done()):
-            raise WorkflowError(["workflow is already running"])
         errors = self.validate(wf["graph"])
         if errors:
             raise WorkflowError(errors)
@@ -378,97 +392,168 @@ class WorkflowManager:
         only_set = set(only) & ids if only is not None else None
         if only is not None and not only_set:
             raise WorkflowError(["none of the selected steps exist in this workflow"])
+
+        live = self._is_live(wid)
         prev = wf["run_state"] or {}
-        # nodes being run reset to pending; others keep their prior state (job + status)
-        state = {}
+        state: dict[str, Any] = {}
         for n in nodes:
-            if only_set is None or n["id"] in only_set:
-                state[n["id"]] = {"job_id": None, "status": "pending", "error": None}
+            nid = n["id"]
+            if only_set is None or nid in only_set:
+                if live and prev.get(nid, {}).get("status") in self.WAITING:
+                    state[nid] = prev[nid]        # already queued or running: leave it be
+                else:
+                    state[nid] = {"job_id": None, "status": "pending", "error": None}
             else:
-                state[n["id"]] = prev.get(n["id"], {"job_id": None, "status": "idle", "error": None})
+                s = prev.get(nid, {"job_id": None, "status": "idle", "error": None})
+                # A leftover pending/running from an interrupted run isn't real: leave it
+                # and the scheduler would wait on it forever, stalling its dependents.
+                if not live and s.get("status") in self.WAITING:
+                    s = {**s, "status": "idle"}
+                state[nid] = s
         self._set_run(wid, "running", state)
-        self._running[wid] = asyncio.create_task(self._execute(wid, only_set))
+        if not live:
+            self._running[wid] = asyncio.create_task(self._execute(wid))
         return self.get(wid)
 
-    async def _execute(self, wid: str, only: set[str] | None = None) -> None:
+    async def stop(self, wid: str) -> dict[str, Any]:
+        """Stop a live run: halt the scheduler, cancel the step currently executing, and
+        drop everything still queued back to idle. The scheduler only ever *polled* jobs,
+        so the running subprocess has to be cancelled explicitly here."""
+        wf = self.get(wid)
+        if wf is None:
+            raise KeyError(wid)
+        task = self._running.pop(wid, None)
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        state = self._fresh_state(wid)
+        for nid, s in list(state.items()):
+            st = s.get("status")
+            if st == "running" and s.get("job_id"):
+                await jobs.cancel(s["job_id"])
+                state[nid] = {**s, "status": "cancelled", "error": None}
+            elif st == "pending":
+                state[nid] = {"job_id": None, "status": "idle", "error": None}   # dequeued
+        self._set_run(wid, "cancelled", state)
+        return self.get(wid)
+
+    def _is_live(self, wid: str) -> bool:
+        task = self._running.get(wid)
+        return task is not None and not task.done()
+
+    async def _execute(self, wid: str) -> None:
+        executed: set[str] = set()
         try:
-            wf = self.get(wid)
-            graph = wf["graph"]
-            nodes = {n["id"]: n for n in graph["nodes"]}
-            edges = graph["edges"]
-            project_id = wf["project_id"]
-            is_project = wf.get("kind") == "project"   # live view: rerun jobs in place
-            graph_dirty = False
-            order = self.topo_order(graph["nodes"], edges)
-            state = wf["run_state"] or {i: {"job_id": None, "status": "pending", "error": None} for i in nodes}
+            while True:
+                wf = self.get(wid)
+                if wf is None:
+                    return
+                graph = wf["graph"]
+                nodes = {n["id"]: n for n in graph["nodes"]}
+                edges = graph["edges"]
+                state = self._sync_state(wid, nodes)
 
-            for nid in order:
-                if only is not None and nid not in only:
-                    continue  # subset run: leave untouched (its job feeds downstream deps)
-                deps = [e for e in edges if e["to"] == nid]
-                # block if any upstream did not succeed
-                if any(state.get(e["from"], {}).get("status") != "succeeded" for e in deps):
-                    state[nid] = {"job_id": None, "status": "blocked",
-                                  "error": "an upstream step did not succeed"}
-                    self._set_run(wid, "running", state)
-                    continue
-
-                node = nodes[nid]
-                args = dict(node.get("args", {}))
-                for auto in (registry.output_arg(node["program"]), registry.ssd_arg(node["program"])):
-                    if auto:
-                        args.pop(auto, None)
-                bindings: dict[str, Any] = {}
-                for e in deps:
-                    one = {"job_id": state[e["from"]]["job_id"], "kind": e["kind"]}
-                    if adapters.is_multi_bindable(node["program"], e["field"]):
-                        bindings.setdefault(e["field"], []).append(one)   # multi-valued input
+                # A queued node is ready once every upstream has succeeded; it stays
+                # queued while an upstream is still queued/running, and is blocked once
+                # an upstream can no longer succeed (failed, or never queued at all).
+                ready: list[str] = []
+                blocked: list[str] = []
+                for nid in self.topo_order(graph["nodes"], edges):
+                    if state.get(nid, {}).get("status") != "pending":
+                        continue
+                    dep_st = [state.get(e["from"], {}).get("status") for e in edges if e["to"] == nid]
+                    if any(s != "succeeded" and s not in self.WAITING for s in dep_st):
+                        blocked.append(nid)
+                    elif any(s in self.WAITING for s in dep_st):
+                        continue
                     else:
-                        bindings[e["field"]] = one
-                for field in bindings:           # drop any stale literal so the binding wins
-                    args.pop(field, None)
-                # In a live project workflow, a node linked to an existing job
-                # reruns *that* job in place (modifying the project), instead of
-                # creating a duplicate. New nodes create a job and get linked.
-                replace = node.get("job_id") if (is_project and node.get("job_id") and jobs.get(node["job_id"])) else None
-                try:
-                    job = await jobs.create(node["program"], args, node.get("gpu"), project_id,
-                                            name=node.get("name"), bindings=bindings, replace_job_id=replace)
-                except Exception as exc:  # noqa: BLE001 - surface build/validation failures per node
-                    state[nid] = {"job_id": None, "status": "failed", "error": str(exc)}
+                        ready.append(nid)
+
+                if blocked:
+                    state = self._fresh_state(wid)
+                    for nid in blocked:
+                        state[nid] = {"job_id": None, "status": "blocked",
+                                      "error": "an upstream step did not succeed"}
+                        executed.add(nid)
                     self._set_run(wid, "running", state)
-                    continue
+                    continue                       # blocking cascades: re-evaluate
 
-                jid = job["id"]
-                if is_project and node.get("job_id") != jid:
-                    node["job_id"] = jid; graph_dirty = True   # link the new job to its node
-                if node.get("labels"):           # carry the node's labels onto the job
-                    try:
-                        labels.set_job_labels(jid, node["labels"])
-                    except Exception:  # noqa: BLE001 - labels are non-critical
-                        pass
-                state[nid] = {"job_id": jid, "status": "running", "error": None}
-                self._set_run(wid, "running", state)
-                final = await self._wait_job(jid)
-                state[nid] = {"job_id": jid, "status": final,
-                              "error": None if final == "succeeded" else "step failed (see the job log)"}
-                self._set_run(wid, "running", state)
+                if not ready:
+                    # Steps are awaited inline, so nothing should be mid-flight here —
+                    # but never exit the loop out from under a running step.
+                    if any(s.get("status") == "running" for s in state.values()):
+                        await asyncio.sleep(1.0)
+                        continue
+                    break                          # queue drained
 
-            if graph_dirty:           # persist new node<->job links for the live view
-                self._db.execute("UPDATE workflows SET graph=? WHERE id=?", (json.dumps(graph), wid))
-                self._db.commit()
-            # judge overall status by the nodes actually run this pass
-            judged = [s for nid, s in state.items() if only is None or nid in only]
-            done = "succeeded" if all(s["status"] == "succeeded" for s in judged) else "failed"
-            self._set_run(wid, done, state)
+                nid = ready[0]                     # strictly sequential: one step at a time
+                executed.add(nid)
+                deps = [e for e in edges if e["to"] == nid]
+                await self._run_node(wid, nid, nodes[nid], deps, wf["project_id"],
+                                     wf.get("kind") == "project")
+                # loop round: re-reads the graph, so steps queued while that job ran run next
+
+            self._finish(wid, executed)
         except asyncio.CancelledError:
-            self._set_run(wid, "cancelled", self.get(wid)["run_state"])
+            wf = self.get(wid)
+            self._set_run(wid, "cancelled", (wf or {}).get("run_state") or {})
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             wf = self.get(wid)
             self._set_run(wid, "failed", (wf or {}).get("run_state") or {})
         finally:
             self._running.pop(wid, None)
+
+    async def _run_node(self, wid: str, nid: str, node: dict[str, Any], deps: list[dict[str, Any]],
+                        project_id: str | None, is_project: bool) -> None:
+        """Launch one step and wait for it out. run_state is re-read from the DB after
+        every await: a step may have been queued onto this live run while we waited, and
+        writing back a stale copy would silently drop it."""
+        state = self._fresh_state(wid)
+        args = dict(node.get("args", {}))
+        for auto in (registry.output_arg(node["program"]), registry.ssd_arg(node["program"])):
+            if auto:
+                args.pop(auto, None)
+        bindings: dict[str, Any] = {}
+        for e in deps:
+            one = {"job_id": state.get(e["from"], {}).get("job_id"), "kind": e["kind"]}
+            if adapters.is_multi_bindable(node["program"], e["field"]):
+                bindings.setdefault(e["field"], []).append(one)   # multi-valued input
+            else:
+                bindings[e["field"]] = one
+        for field in bindings:               # drop any stale literal so the binding wins
+            args.pop(field, None)
+        # In a live project workflow, a node linked to an existing job reruns *that* job
+        # in place (modifying the project) instead of creating a duplicate.
+        replace = node.get("job_id") if (is_project and node.get("job_id") and jobs.get(node["job_id"])) else None
+        try:
+            job = await jobs.create(node["program"], args, node.get("gpu"), project_id,
+                                    name=node.get("name"), bindings=bindings, replace_job_id=replace)
+        except Exception as exc:  # noqa: BLE001 - surface build/validation failures per node
+            state = self._fresh_state(wid)
+            state[nid] = {"job_id": None, "status": "failed", "error": str(exc)}
+            self._set_run(wid, "running", state)
+            return
+
+        jid = job["id"]
+        if is_project:
+            self._link_job(wid, nid, jid)
+        if node.get("labels"):                # carry the node's labels onto the job
+            try:
+                labels.set_job_labels(jid, node["labels"])
+            except Exception:  # noqa: BLE001 - labels are non-critical
+                pass
+
+        state = self._fresh_state(wid)
+        state[nid] = {"job_id": jid, "status": "running", "error": None}
+        self._set_run(wid, "running", state)
+
+        final = await self._wait_job(jid)
+        state = self._fresh_state(wid)
+        state[nid] = {"job_id": jid, "status": final,
+                      "error": None if final == "succeeded" else "step failed (see the job log)"}
+        self._set_run(wid, "running", state)
 
     async def _wait_job(self, job_id: str) -> str:
         """Poll until the job reaches a terminal status; return it. ``cancelling``
@@ -482,6 +567,51 @@ class WorkflowManager:
             if job["status"] not in ACTIVE and job["status"] != "cancelling":
                 return job["status"]
             await asyncio.sleep(2.0)
+
+    def _fresh_state(self, wid: str) -> dict[str, Any]:
+        """run_state straight from the DB — never a copy held across an await."""
+        wf = self.get(wid)
+        return dict((wf or {}).get("run_state") or {})
+
+    def _sync_state(self, wid: str, nodes: dict[str, Any]) -> dict[str, Any]:
+        """Reconcile run_state with the graph as it stands now: forget deleted nodes and
+        give nodes added mid-run an `idle` entry, so they show up on the canvas and can
+        be queued — they do not start on their own just for being saved."""
+        state = self._fresh_state(wid)
+        synced = {nid: s for nid, s in state.items() if nid in nodes}
+        for nid in nodes:
+            synced.setdefault(nid, {"job_id": None, "status": "idle", "error": None})
+        if synced != state:
+            self._set_run(wid, "running", synced)
+        return synced
+
+    def _link_job(self, wid: str, nid: str, jid: str) -> None:
+        """Point a project-workflow node at the job it just launched, merged into the
+        graph *as it stands now* — the old runner wrote its launch-time snapshot back
+        wholesale, silently destroying nodes and edges added while the run was going."""
+        wf = self.get(wid)
+        if wf is None:
+            return
+        graph = wf["graph"]
+        for n in graph.get("nodes", []):
+            if n["id"] == nid:
+                if n.get("job_id") == jid:
+                    return
+                n["job_id"] = jid
+                break
+        else:
+            return
+        self._db.execute("UPDATE workflows SET graph=? WHERE id=?", (json.dumps(graph), wid))
+        self._db.commit()
+
+    def _finish(self, wid: str, executed: set[str]) -> None:
+        state = self._fresh_state(wid)
+        judged = [state[nid]["status"] for nid in executed if nid in state]
+        if not judged:
+            done = "idle"
+        else:
+            done = "succeeded" if all(s == "succeeded" for s in judged) else "failed"
+        self._set_run(wid, done, state)
 
     # -- helpers -----------------------------------------------------------
     def _set_run(self, wid: str, status: str, state: dict) -> None:

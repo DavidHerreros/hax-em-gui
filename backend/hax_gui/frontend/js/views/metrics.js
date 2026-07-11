@@ -1,6 +1,7 @@
-// Metrics: pick a run that has TensorBoard events (auto-listed) or enter a log
-// directory manually, then view it. Multiple sessions open as tabs; iframes stay
-// mounted across tab switches so each keeps its state.
+// Metrics: pick a run that has event files (auto-listed) or enter a log directory
+// manually, then read it. Each run opens as a tab, rendered natively by metricsPanel —
+// the GUI parses the same tfevents/projector files TensorBoard would, so there is no
+// iframe. Real TensorBoard is still one click away inside each panel.
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
@@ -8,6 +9,7 @@ import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
 import { openFilePicker } from "./filePicker.js";
 import { jobLabelChips } from "./labels.js";
+import { metricsPanel } from "./metricsPanel.js";
 
 export function MetricsView() {
   const root = h("div", { class: "view metrics-view" });
@@ -15,13 +17,13 @@ export function MetricsView() {
   let logdir = "";
   const input = h("input", { class: "input", placeholder: "server log directory (manual)", oninput: (e) => (logdir = e.target.value) });
   const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; logdir = p; }, input.value) }, icon("folderOpen", 16));
-  const openBtn = h("button", { class: "btn", onclick: () => launch(logdir.trim()) }, icon("plus", 18), "Open");
+  const openBtn = h("button", { class: "btn", onclick: () => open(logdir.trim(), null, null) }, icon("plus", 18), "Open");
   const launchErr = h("div");
 
   root.appendChild(h("header", { class: "page-head" }, h("h1", null, "Metrics"),
-    h("p", { class: "subtitle" }, "Open TensorBoard for any run. Sessions appear as tabs below.")));
+    h("p", { class: "subtitle" }, "Training curves, image panels and the latent space, read straight from a run's logs.")));
 
-  // -- available runs (jobs with TensorBoard events) -------------------
+  // -- available runs (jobs with event files) ---------------------------
   const runsBox = h("div", { style: { marginBottom: "20px" } });
   root.appendChild(runsBox);
 
@@ -39,7 +41,7 @@ export function MetricsView() {
     if (!jobs.length) {
       return h("div", null, header, h("p", { class: "muted small" }, "No runs with metrics yet. Train a model, then refresh."));
     }
-    return h("div", null, header, ...jobs.map((j) => h("button", { class: "run-row", onclick: () => launch(j.workdir) },
+    return h("div", null, header, ...jobs.map((j) => h("button", { class: "run-row", onclick: () => open(j.workdir, j.program, j.id) },
       h("span", { class: "run-prog mono" }, j.program),
       j.project_name ? h("span", { class: "proj-chip" }, icon("box", 12), j.project_name) : null,
       h("span", { class: "run-folder mono" }, folderName(j.workdir)),
@@ -54,52 +56,64 @@ export function MetricsView() {
   root.appendChild(launchErr);
 
   const tabbar = h("div", { class: "tabbar", style: { marginTop: "20px" } });
-  const framesWrap = h("div", { class: "frames-wrap" });
+  const panelsWrap = h("div", { class: "mx-wrap" });
   root.appendChild(tabbar);
-  root.appendChild(framesWrap);
+  root.appendChild(panelsWrap);
 
-  const frames = new Map();
+  const panels = new Map();   // logdir -> panel instance (kept mounted so state survives tab switches)
 
-  async function launch(dir) {
+  function open(dir, program, jobId) {
     if (!dir) { mount(launchErr, h("div", { style: { marginTop: "12px" } }, errorBox("Choose a log directory first."))); return; }
     clear(launchErr);
-    openBtn.disabled = true;
-    try { store.openTB(await api.startTensorBoard(dir)); }
-    catch (err) { mount(launchErr, h("div", { style: { marginTop: "12px" } }, errorBox(err))); }
-    finally { openBtn.disabled = false; }
+    store.openMetrics({ logdir: dir, title: program ? `${program} · ${folderName(dir)}` : folderName(dir), jobId });
+  }
+
+  function close(id) {
+    const p = panels.get(id);
+    if (p) { p.destroy(true); p.el.remove(); panels.delete(id); }
+    store.closeMetrics(id);
   }
 
   function sync() {
-    const { openTBs, activeTBId } = getState();
+    const { openMetrics, activeMetricsId } = getState();
     clear(tabbar);
-    for (const tb of openTBs) {
-      tabbar.appendChild(h("div", { class: "tab" + (tb.id === activeTBId ? " active" : ""), onclick: () => store.setActiveTB(tb.id) },
-        h("span", { class: "tab-label" }, folderName(tb.logdir)),
-        h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); store.closeTB(tb.id); } }, icon("x", 14))));
+    for (const m of openMetrics) {
+      tabbar.appendChild(h("div", { class: "tab" + (m.id === activeMetricsId ? " active" : ""), onclick: () => store.setActiveMetrics(m.id), title: m.logdir },
+        h("span", { class: "tab-label" }, m.title),
+        h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); close(m.id); } }, icon("x", 14))));
     }
-    for (const tb of openTBs) {
-      if (!frames.has(tb.id)) {
-        const f = h("iframe", { class: "tb-frame", src: tb.url, title: "TensorBoard " + tb.id });
-        frames.set(tb.id, f);
-        framesWrap.appendChild(f);
+    for (const m of openMetrics) {
+      if (!panels.has(m.id)) {
+        const p = metricsPanel({ logdir: m.logdir, jobId: m.jobId });
+        panels.set(m.id, p);
+        panelsWrap.appendChild(p.el);
       }
     }
-    for (const id of [...frames.keys()]) {
-      if (!openTBs.some((t) => t.id === id)) { frames.get(id).remove(); frames.delete(id); }
+    for (const [id, p] of [...panels]) {
+      if (!openMetrics.some((m) => m.id === id)) { p.destroy(true); p.el.remove(); panels.delete(id); }
     }
-    for (const [id, f] of frames) f.style.display = id === activeTBId ? "block" : "none";
+    for (const [id, p] of panels) p.el.style.display = id === activeMetricsId ? "" : "none";
 
-    if (!openTBs.length) mount(framesWrap, h("p", { class: "muted", style: { padding: "24px 0" } }, "No TensorBoard sessions open. Open a run above."));
-    else if (framesWrap.querySelector("p")) framesWrap.querySelector("p").remove();
+    const empty = panelsWrap.querySelector(".mx-none");
+    if (!openMetrics.length && !empty) {
+      panelsWrap.appendChild(h("p", { class: "muted mx-none", style: { padding: "24px 0" } }, "No run open. Pick one above."));
+    } else if (openMetrics.length && empty) empty.remove();
   }
 
   const unsub = subscribe(sync);
   loadRuns();
   sync();
-  return { el: root, cleanup: unsub };
+  return {
+    el: root,
+    cleanup() {
+      unsub();
+      for (const p of panels.values()) p.destroy();   // stop pollers / free object URLs
+      panels.clear();
+    },
+  };
 }
 
 function folderName(p) {
   const parts = (p || "").replace(/\/+$/, "").split("/");
-  return parts[parts.length - 1] || "TensorBoard";
+  return parts[parts.length - 1] || "run";
 }

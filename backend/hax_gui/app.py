@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -24,6 +25,7 @@ from . import adapters
 from . import assistant as assistant_bridge
 from . import assistant_actions
 from . import chats as chat_store
+from . import metrics as metrics_reader
 from . import ollama as ollama_manager_mod
 from . import files as filebrowser
 from . import branches, gpus, projects, registry, settings_store, updates
@@ -747,6 +749,10 @@ def get_job(job_id: str) -> dict[str, Any]:
     # skip the disk check for active/saved jobs.
     job["resumable"] = False if job.get("active") or job["status"] == "saved" else \
         adapters.is_resumable(job["program"], job.get("workdir"))
+    # Did this run write any event files? Drives the "Metrics" button. A running job
+    # gets one too — the native metrics view follows a live run.
+    wd = job.get("workdir")
+    job["has_metrics"] = bool(wd) and job["status"] != "saved" and _has_tb_events(Path(wd))
     return _with_project_names([job])[0]
 
 
@@ -1043,6 +1049,74 @@ def metrics_jobs() -> list[dict[str, Any]]:
 @app.delete("/api/tensorboard/{tb_id}", dependencies=[Depends(auth)])
 def stop_tensorboard(tb_id: str) -> dict[str, bool]:
     return {"stopped": tb_manager.stop(tb_id)}
+
+
+# -- metrics (native reader over the same event files) ---------------------
+# The GUI draws the curves/images/latent space itself; TensorBoard stays available
+# via the endpoints above, opened in its own browser tab. Reading is blocking I/O
+# (protobuf decode), so every call hops to the threadpool.
+def _metrics_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except filebrowser.AccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except (FileNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except metrics_reader.TensorBoardMissing as exc:
+        raise HTTPException(status_code=501, detail=str(exc))
+
+
+@app.get("/api/metrics/manifest", dependencies=[Depends(auth)])
+async def metrics_manifest(logdir: str) -> dict[str, Any]:
+    """Which tags a run logged, of what kind, in which sub-runs, at which steps."""
+    return await run_in_threadpool(_metrics_call, metrics_reader.manifest, logdir)
+
+
+@app.get("/api/metrics/scalars", dependencies=[Depends(auth)])
+async def metrics_scalars(logdir: str, tags: str | None = None) -> dict[str, Any]:
+    want = [t for t in tags.split("\n") if t] if tags else None
+    return await run_in_threadpool(_metrics_call, metrics_reader.scalars, logdir, want)
+
+
+@app.get("/api/metrics/image", dependencies=[Depends(auth)])
+async def metrics_image(logdir: str, run: str, tag: str, frame: int | None = None) -> Response:
+    png = await run_in_threadpool(_metrics_call, metrics_reader.image, logdir, run, tag, frame)
+    return Response(content=png, media_type="image/png")
+
+
+@app.get("/api/metrics/embedding", dependencies=[Depends(auth)])
+async def metrics_embedding(logdir: str, step: int, tag: str | None = None) -> dict[str, Any]:
+    """One epoch of the projector's latent space. Re-read from disk every call, so
+    epochs written after the page loaded just show up."""
+    return await run_in_threadpool(_metrics_call, metrics_reader.embedding, logdir, step, tag)
+
+
+@app.get("/api/metrics/sprite", dependencies=[Depends(auth)])
+async def metrics_sprite(logdir: str, step: int, tag: str | None = None) -> Response:
+    png = await run_in_threadpool(_metrics_call, metrics_reader.sprite, logdir, step, tag)
+    return Response(content=png, media_type="image/png")
+
+
+@app.delete("/api/metrics/cache", dependencies=[Depends(auth)])
+async def metrics_drop(logdir: str) -> dict[str, bool]:
+    """Release a log dir's accumulators (its image reservoir can be sizeable)."""
+    return {"dropped": await run_in_threadpool(_metrics_call, metrics_reader.drop, logdir)}
+
+
+@app.post("/api/tensorboard/{tb_id}/restart", dependencies=[Depends(auth)])
+async def restart_tensorboard(tb_id: str) -> dict[str, Any]:
+    """Respawn TB on the same logs — the only way to pick up new projector epochs."""
+    try:
+        inst = await tb_manager.restart(tb_id)
+    except filebrowser.AccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (RuntimeError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail=f"TensorBoard failed to start: {exc}")
+    if inst is None:
+        raise HTTPException(status_code=404, detail="tensorboard not found")
+    return inst
 
 
 # Reverse proxy to per-instance TensorBoard servers. The instance id is an
@@ -1751,12 +1825,23 @@ def validate_workflow(wid: str) -> dict[str, Any]:
 
 @app.post("/api/workflows/{wid}/run", dependencies=[Depends(auth)])
 async def run_workflow(wid: str, body: WorkflowRun = WorkflowRun()) -> dict[str, Any]:
+    """Queue steps. When a run is already in flight the steps are appended to its
+    queue and the live scheduler picks them up in turn."""
     try:
         return await wf_manager.run(wid, body.nodes)
     except KeyError:
         raise HTTPException(status_code=404, detail="workflow not found")
     except WorkflowError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
+
+
+@app.post("/api/workflows/{wid}/stop", dependencies=[Depends(auth)])
+async def stop_workflow(wid: str) -> dict[str, Any]:
+    """Halt a run: cancel the step executing now and dequeue everything still waiting."""
+    try:
+        return await wf_manager.stop(wid)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="workflow not found")
 
 
 @app.post("/api/workflows/from-project/{project_id}", dependencies=[Depends(auth)])
@@ -1788,6 +1873,13 @@ def workflow_save_as_project(wid: str, body: WorkflowFromProject = WorkflowFromP
 # The frontend is plain ES modules + CSS (no build step), so we serve the
 # directory directly. Same-origin => no CORS/proxy needed for production use.
 def mount_spa() -> None:
+    # The canvas plotter and the latent scatter live in the viewer app's static dir.
+    # The SPA's metrics view imports the very same modules from /shared, rather than
+    # keeping a forked copy in sync by hand.
+    shared = Path(__file__).resolve().parent / "viewer_app" / "static"
+    if shared.is_dir():
+        app.mount("/shared", StaticFiles(directory=str(shared)), name="shared")
+
     frontend = settings.frontend_dir
     if (frontend / "index.html").exists():
         app.mount("/", StaticFiles(directory=str(frontend), html=True), name="spa")

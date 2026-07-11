@@ -1,14 +1,14 @@
 // Minimal WebGL2 3D point-cloud renderer for the latent landscape (3 PCs).
 // Orbit camera (shared style with gl.js), per-point color, selection/target
 // rings, CPU-side picking, and high-DPI / transparent snapshots. No deps.
-import { perspective, lookAt, multiply, mulVec4, invert } from "./mat4.js";
+import { projection, halfFovY, lookAt, multiply, mulVec4, invert } from "./mat4.js";
 import { createOrbit } from "./orbit.js";
 
 const VERT = `#version 300 es
 precision highp float;
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aColor;
-layout(location=2) in float aFlag;   // 0 normal, 1 current, 2 path, 3 selection
+layout(location=2) in float aFlag;   // 0 normal, 1 current, 2 path, 3 selection, 4 hover
 uniform mat4 uProj;
 uniform mat4 uView;
 uniform float uSize;
@@ -31,7 +31,8 @@ void main() {
   float r = length(d);
   if (r > 0.5) discard;                       // round dots
   if (vFlag > 0.5 && r > 0.34 && r < 0.5) {   // highlight ring (always visible)
-    vec3 ring = vFlag > 2.5 ? vec3(0.95,0.96,0.98)      // selection (white)
+    vec3 ring = vFlag > 3.5 ? vec3(0.886,0.910,0.941)   // hover (light slate, as in 2D)
+              : vFlag > 2.5 ? vec3(0.95,0.96,0.98)      // selection (white)
               : vFlag > 1.5 ? vec3(0.957,0.447,0.714)   // path (pink)
                             : vec3(0.176,0.831,0.749);  // current (teal)
     outColor = vec4(ring, 1.0); return;
@@ -154,7 +155,7 @@ export function createCloud(canvas, onSelect) {
   let count = 0;
   let colorData = null;   // persisted per-point RGB so points are never left black
   let showDens = false, hasDens = false, densIntensity = 0.22, pointAlpha = 1.0;
-  let selected = -1, pathArr = [], selArr = [];
+  let selected = -1, hover = -1, pathArr = [], selArr = [];
 
   // Distance from the eye to the nearest point under the centre of the window, which the
   // camera turns into a ChimeraX-style centre of rotation: zoom into a lobe of the
@@ -164,7 +165,7 @@ export function createCloud(canvas, onSelect) {
   function centreDepth() {
     if (!norm || !count) return null;
     const { view } = matrices();   // view = lookAt · model, so this lands straight in view space
-    const tanF = Math.tan((45 * Math.PI) / 180 / 2);
+    const tanF = Math.tan(halfFovY(canvas.width / Math.max(1, canvas.height)));   // vertical field follows the window
     const halfH = Math.max(1, canvas.clientHeight) / 2;
     let best = null;
     for (let i = 0; i < count; i++) {
@@ -178,10 +179,12 @@ export function createCloud(canvas, onSelect) {
   }
 
   const orbit = createOrbit(canvas, () => render(), (e) => { const i = pick(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); },
-    { probeDepth: centreDepth, modelWidth: 1.8 });   // normalizePoints() scales the largest extent to 1.8
+    // normalizePoints() scales the largest extent to 1.8; fitRadius 1.41 is the height the
+    // old 45°-vertical camera showed at its default distance, so the cloud keeps its framing.
+    { probeDepth: centreDepth, modelWidth: 1.8, fitRadius: 1.41 });
   function matrices() {
     const aspect = canvas.width / Math.max(1, canvas.height);
-    const proj = perspective((45 * Math.PI) / 180, aspect, 0.01, 100);
+    const proj = projection(aspect, 0.01, 100);
     // camera fixed on +Z; the model transform (trackball rotation + pan) is baked into view.
     const view = multiply(lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]), orbit.model);
     return { proj, view };
@@ -272,8 +275,11 @@ export function createCloud(canvas, onSelect) {
   const dataToNorm = (p) => [((p[0] || 0) - nCenter[0]) * nScale, ((p[1] || 0) - nCenter[1]) * nScale, ((p[2] || 0) - nCenter[2]) * nScale];
   const normToData = (q) => [q[0] / nScale + nCenter[0], q[1] / nScale + nCenter[1], q[2] / nScale + nCenter[2]];
 
+  // Written weakest-first, so a point that is several things at once shows the one that
+  // matters most: hover < selection < path < current.
   function uploadFlags() {
     const f = new Float32Array(count);
+    if (hover >= 0 && hover < count) f[hover] = 4;                    // hover = light
     for (const si of selArr) if (si >= 0 && si < count) f[si] = 3;    // selection = white
     for (const pi of pathArr) if (pi >= 0 && pi < count) f[pi] = 2;   // path = pink
     if (selected >= 0 && selected < count) f[selected] = 1;           // current = teal (wins)
@@ -302,9 +308,28 @@ export function createCloud(canvas, onSelect) {
 
   window.addEventListener("resize", render);
 
+  // Hover, to match the 2D scatter. pick() is O(count), so coalesce to one test per
+  // animation frame rather than one per mousemove event; and stay out of the way while
+  // the camera is being dragged (any button down).
+  let hoverPending = 0, hx = 0, hy = 0;
+  function setHover(i) {
+    if (i === hover) return;
+    hover = i;
+    uploadFlags();
+    render();
+  }
+  canvas.addEventListener("mousemove", (e) => {
+    if (e.buttons) { setHover(-1); return; }   // orbiting/panning, not pointing at anything
+    hx = e.clientX; hy = e.clientY;
+    if (hoverPending) return;
+    hoverPending = requestAnimationFrame(() => { hoverPending = 0; setHover(pick(hx, hy)); });
+  });
+  canvas.addEventListener("mouseleave", () => setHover(-1));
+
   return {
     setPoints(pts) {
       norm = normalizePoints(pts); count = pts.length;
+      hover = -1;                // the old hover index means nothing in a new cloud
       orbit.invalidatePivot();   // a new cloud is a new front surface
       gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, norm, gl.STATIC_DRAW);
       // (re)seed colors so a fresh point set is never drawn black before applyColor()
