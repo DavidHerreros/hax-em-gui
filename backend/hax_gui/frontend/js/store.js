@@ -1,5 +1,5 @@
 // Global app state with a tiny pub/sub. Holds the open project tabs, the active
-// project, open TensorBoard tabs, the right-menu program selection, and the
+// project, open metrics tabs, the right-menu program selection, and the
 // collapse state of the two side menus. Persisted bits survive reloads.
 
 const PERSIST_KEY = "hax_gui_state";
@@ -10,8 +10,8 @@ const state = {
   rightOpen: true,
   openProjects: [],     // [{id, name}]
   activeProjectId: null,
-  openTBs: [],          // [{id, logdir, url}] — server-side, not persisted
-  activeTBId: null,
+  openMetrics: [],      // [{id, logdir, title, jobId}] — native metrics tabs, not persisted
+  activeMetricsId: null,
   openViewers: [],      // [{id, title, url}] — WebGL viewer sessions, not persisted
   activeViewerId: null,
   selectedProgram: null, // program name shown in the right menu (null = catalog list)
@@ -73,17 +73,21 @@ export const store = {
   },
   activeProject() { return state.openProjects.find((x) => x.id === state.activeProjectId) ?? null; },
 
-  openTB(inst) {
-    if (!state.openTBs.some((x) => x.id === inst.id)) state.openTBs.push(inst);
-    state.activeTBId = inst.id;
+  // Metrics tabs are keyed by log directory, so opening the same run twice focuses
+  // the tab that is already there instead of stacking duplicates.
+  openMetrics({ logdir, title, jobId }) {
+    const existing = state.openMetrics.find((x) => x.id === logdir);
+    if (existing) { if (jobId) existing.jobId = jobId; }
+    else state.openMetrics.push({ id: logdir, logdir, title: title || logdir, jobId: jobId || null });
+    state.activeMetricsId = logdir;
     emit();
   },
-  closeTB(id) {
-    state.openTBs = state.openTBs.filter((x) => x.id !== id);
-    if (state.activeTBId === id) state.activeTBId = state.openTBs.at(-1)?.id ?? null;
+  closeMetrics(id) {
+    state.openMetrics = state.openMetrics.filter((x) => x.id !== id);
+    if (state.activeMetricsId === id) state.activeMetricsId = state.openMetrics.at(-1)?.id ?? null;
     emit();
   },
-  setActiveTB(id) { state.activeTBId = id; emit(); },
+  setActiveMetrics(id) { state.activeMetricsId = id; emit(); },
 
   openViewer(inst) {
     if (!state.openViewers.some((x) => x.id === inst.id)) state.openViewers.push(inst);

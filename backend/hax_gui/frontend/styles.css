@@ -280,12 +280,6 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .tab-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--err); opacity: 0; transition: opacity .15s; }
 .tab.has-err .tab-dot { opacity: 1; }
 
-/* ---- metrics (tensorboard) ---- */
-/* TensorBoard renders inside this iframe, so its own tooltips/cards are beyond our CSS.
-   Below ~900px its responsive grid collapses and the data-point tooltip mispositions and
-   sticks — so give it a floor to lay out against and let the wrapper scroll instead of
-   starving it of width. */
-.tb-frame { width: 100%; min-width: 900px; height: calc(100vh - 220px); min-height: 480px; border: 1px solid var(--border); border-radius: 12px; background: var(--console-bg); }
 
 /* ── floating viewer window (mrc / metadata / 3D landscape, as movable tabs) ── */
 .vwin { position: fixed; z-index: 45; display: none; flex-direction: column; overflow: hidden;
@@ -454,9 +448,83 @@ body.vwin-dragging iframe { pointer-events: none; }
 /* project chip on job rows */
 .proj-chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; background: var(--active-bg); color: var(--brand-300); font-size: 12px; }
 
-/* metrics frames */
-.frames-wrap { position: relative; overflow-x: auto; }
-.metrics-view .tb-frame { height: calc(100vh - 260px); }
+/* ===== metrics (native reader over the run's TensorBoard logs) ===== */
+.mx-wrap { position: relative; }
+.mx { display: flex; flex-direction: column; gap: 12px; }
+
+.mx-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mx-spacer { flex: 1; }
+.mx-subtabs { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.mx-subtab { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border: none; border-radius: 7px; background: none; color: var(--muted); font-size: 13px; }
+.mx-subtab:hover:not(:disabled) { color: var(--text); background: var(--hover); }
+.mx-subtab.active { color: var(--text); background: var(--active-bg); box-shadow: inset 0 0 0 1px var(--active-ring); }
+.mx-subtab:disabled { opacity: .4; cursor: default; }
+.mx-count { min-width: 18px; height: 17px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; border-radius: 999px; background: var(--hover); color: var(--faint); }
+.mx-live { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+
+/* -- shared rail (tag picker / controls) -- */
+.mx-rail, .mx-latent-side { width: 232px; flex: 0 0 232px; display: flex; flex-direction: column; gap: 14px; }
+.mx-railgrp { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 10px; }
+.mx-raillabel { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--faint); margin-bottom: 8px; }
+.mx-railrow { display: flex; gap: 6px; margin-top: 8px; }
+.mx-taglist { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; max-height: 260px; overflow-y: auto; }
+.mx-tagitem { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 7px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+.mx-tagitem:hover { background: var(--hover); color: var(--text); }
+.mx-tagitem span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mx-ctl { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+.mx-range { width: 100%; accent-color: var(--brand); }
+.mx-range.grow { flex: 1; }
+.mx-info .mono { font-size: 13px; color: var(--text); }
+.mx-select { padding: 5px 8px; font-size: 12.5px; max-width: 120px; }
+.btn.small { padding: 5px 10px; font-size: 12.5px; border-radius: 8px; }
+
+/* -- scalars -- */
+.mx-scalars { display: flex; gap: 16px; align-items: flex-start; }
+.mx-cards { flex: 1; min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
+.mx-card { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 10px 12px 4px; }
+.mx-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.mx-card-title { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mx-card-head .btn-icon { margin-left: auto; }
+.mx-card-head .btn-icon + .btn-icon { margin-left: 0; }
+.mx-legend { display: flex; gap: 10px; flex-wrap: wrap; }
+.mx-legitem { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
+.mx-swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.mx-canvas { width: 100%; height: 210px; display: block; }
+.mx-empty { padding: 40px 0; text-align: center; }
+
+/* -- images -- */
+.mx-images { display: flex; flex-direction: column; gap: 12px; }
+.mx-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.mx-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-size: 12.5px; }
+.mx-chip:hover { color: var(--text); border-color: var(--border-2); }
+.mx-chip.active { color: var(--text); background: var(--active-bg); border-color: var(--active-ring); }
+.mx-imgwrap { display: flex; align-items: center; justify-content: center; min-height: 320px; border: 1px solid var(--border); border-radius: 12px; background: var(--console-bg); padding: 12px; overflow: auto; }
+.mx-img { max-width: 100%; image-rendering: pixelated; }
+.mx-transport { display: flex; align-items: center; gap: 12px; }
+
+/* -- latent space -- */
+.mx-latent { display: flex; gap: 16px; align-items: flex-start; }
+.mx-latent-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.mx-scatterwrap { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 6px; }
+.mx-scatter { width: 100%; height: min(60vh, 560px); display: block; }
+.mx-dimseg { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: 8px; background: var(--input-bg); }
+.mx-dimbtn { padding: 3px 10px; border: none; border-radius: 6px; background: none; color: var(--muted); font-size: 12px; }
+.mx-dimbtn:hover { color: var(--text); background: var(--hover); }
+.mx-dimbtn.active { color: var(--text); background: var(--active-bg); box-shadow: inset 0 0 0 1px var(--active-ring); }
+.mx-spritebox { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 10px; }
+.mx-sprite { width: 96px; height: 96px; border-radius: 8px; background: var(--console-bg); display: block; margin: 0 auto; }
+
+.mx-legends { margin-top: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 10px 12px; }
+.mx-legends summary { font-size: 12.5px; color: var(--muted); cursor: pointer; }
+.mx-legendtext { font-size: 12.5px; color: var(--muted); }
+.mx-legendtext h3 { font-size: 13px; color: var(--text); margin: 10px 0 4px; }
+.mx-legendtext ul { margin: 0; padding-left: 18px; }
+
+@media (max-width: 1100px) {
+  .mx-scalars, .mx-latent { flex-direction: column; }
+  .mx-rail, .mx-latent-side { width: 100%; flex: 1 1 auto; }
+  .mx-cards { width: 100%; }
+}
 
 /* ===== themed scrollbars everywhere ===== */
 * { scrollbar-width: thin; scrollbar-color: var(--border-2) transparent; }
@@ -586,7 +654,6 @@ body.vwin-dragging iframe { pointer-events: none; }
 .jobs-group-count { margin-left: 2px; min-width: 20px; height: 18px; padding: 0 6px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; border-radius: 999px; background: var(--active-bg); color: var(--brand-300); }
 
 /* ===== 3D viewer tab ===== */
-.viewer-view .tb-frame { height: calc(100vh - 240px); min-height: 520px; }
 .viewer-view .section-head { margin-bottom: 10px; }
 
 /* ── Workflow builder (node-graph canvas) ───────────────────────────── */

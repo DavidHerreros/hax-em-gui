@@ -16,7 +16,7 @@ const STEPS = [
   { icon: "box", title: "Create a project", desc: "Set a projects folder in Settings, then create or open a project. Each project keeps all of its runs together." },
   { icon: "sliders", title: "Pick a program", desc: "Browse programs in the right-hand menu and fill the auto-generated form. Output folders are created for you." },
   { icon: "terminal", title: "Run & follow logs", desc: "Launch on a chosen GPU into the active project and watch the live log stream with an animated progress line." },
-  { icon: "chart", title: "Inspect metrics", desc: "Open one or more TensorBoard tabs in Metrics to explore training and validation curves." },
+  { icon: "chart", title: "Inspect metrics", desc: "Open a run in Metrics for its training curves, image panels and latent space — live, while it trains." },
 ];
 
 export function HomeView() {

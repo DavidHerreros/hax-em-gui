@@ -83,6 +83,7 @@ export function JobDetailView(params) {
         h("button", { class: "btn ghost", style: { color: "var(--err)" }, onclick: del }, icon("trash", 15), "Delete")));
     } else if (running && job) {
       head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
+        job.has_metrics ? metricsBtn() : null,
         viewable(job) ? viewerBtn() : null,
         h("button", { class: "btn ghost", style: { color: "var(--warn)" }, onclick: (e) => {
           // immediate feedback; the terminal status still arrives over the WS once
@@ -97,6 +98,7 @@ export function JobDetailView(params) {
       const canResume = job.resumable &&
         (status === "failed" || status === "cancelled" || status === "interrupted");
       head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
+        job.has_metrics ? metricsBtn() : null,
         viewable(job) ? viewerBtn() : null,
         canResume ? splitButton(
           { icon: "restore", label: "Continue", title: "Resume from the last saved checkpoint with the same inputs", onClick: continueRun },
@@ -207,6 +209,15 @@ export function JobDetailView(params) {
     finally { if (btn) { btn.disabled = false; btn.lastChild.textContent = orig; } }
   }
   const viewerBtn = () => h("button", { class: "btn secondary", onclick: openViewer, title: "Explore this run's conformational landscape in the embedded WebGL viewer" }, icon("box", 15), "3D viewer");
+
+  // Reads the run's event files natively — so it works on a job that is still training.
+  const metricsBtn = () => h("button", {
+    class: "btn secondary", title: "Training curves, image panels and the latent space for this run",
+    onclick: () => {
+      store.openMetrics({ logdir: job.workdir, title: `${job.program} · ${jobDisplayName(job)}`, jobId: id });
+      navigate("/metrics");
+    },
+  }, icon("chart", 15), "Metrics");
 
   // A primary action + a caret that opens its variant(s) as a menu, so paired actions
   // (e.g. Continue / Edit & continue) read as one control. `items` are context-menu

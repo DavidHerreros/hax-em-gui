@@ -31,6 +31,18 @@ async function req(path, init = {}) {
   return res.json();
 }
 
+// Same as `req`, for endpoints that answer with binary (image/png).
+async function blob(path) {
+  const token = getToken();
+  const res = await fetch(path, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  if (!res.ok) {
+    let detail;
+    try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
+    throw new ApiError(res.status, detail);
+  }
+  return res.blob();
+}
+
 export const api = {
   health: () => req("/api/health"),
   programs: () => req("/api/programs"),
@@ -68,15 +80,35 @@ export const api = {
   deleteLabel: (id) => req(`/api/labels/${id}`, { method: "DELETE" }),
   setJobLabels: (jobId, labels) => req(`/api/jobs/${jobId}/labels`, { method: "PUT", body: JSON.stringify({ labels }) }),
 
+  // TensorBoard is no longer the metrics UI — the GUI reads the same event files
+  // itself (see below). These stay so a run can still be opened in real TB, in its
+  // own browser tab, for anything the native view doesn't cover.
   startTensorBoard: (logdir) =>
     req("/api/tensorboard", { method: "POST", body: JSON.stringify({ logdir }) }),
   stopTensorBoard: (id) => req(`/api/tensorboard/${id}`, { method: "DELETE" }),
-  // Respawn TB on the same logs. The projector reads projector_config.pbtxt once per
-  // process and never re-reads it for a JAX logdir, so only a fresh process shows
-  // latent-space epochs logged since it started.
   restartTensorBoard: (id) => req(`/api/tensorboard/${id}/restart`, { method: "POST" }),
   tensorboards: () => req("/api/tensorboard"),
+
+  // native metrics: the GUI's own reader over the run's tfevents + projector TSVs
   metricsJobs: () => req("/api/metrics/jobs"),
+  metricsManifest: (logdir) => req(`/api/metrics/manifest?logdir=${encodeURIComponent(logdir)}`),
+  metricsScalars: (logdir, tags) =>
+    req(`/api/metrics/scalars?logdir=${encodeURIComponent(logdir)}` +
+      (tags && tags.length ? `&tags=${encodeURIComponent(tags.join("\n"))}` : "")),
+  metricsEmbedding: (logdir, step, tag) =>
+    req(`/api/metrics/embedding?logdir=${encodeURIComponent(logdir)}&step=${step}` +
+      (tag ? `&tag=${encodeURIComponent(tag)}` : "")),
+  dropMetrics: (logdir) => req(`/api/metrics/cache?logdir=${encodeURIComponent(logdir)}`, { method: "DELETE" }),
+  // PNGs come back as blobs, not JSON: an <img src> can't carry the bearer header,
+  // so they are fetched here and handed to the DOM as object URLs.
+  // `frame` indexes the wall-clock-ordered images, not the step: hax logs every epoch
+  // without a global_step, so they all carry step 0.
+  metricsImage: (logdir, run, tag, frame) =>
+    blob(`/api/metrics/image?logdir=${encodeURIComponent(logdir)}&run=${encodeURIComponent(run)}` +
+      `&tag=${encodeURIComponent(tag)}${frame != null ? `&frame=${frame}` : ""}`),
+  metricsSprite: (logdir, step, tag) =>
+    blob(`/api/metrics/sprite?logdir=${encodeURIComponent(logdir)}&step=${step}` +
+      (tag ? `&tag=${encodeURIComponent(tag)}` : "")),
 
   // workflows (visual pipeline builder)
   workflowCatalog: () => req("/api/workflows/catalog"),
