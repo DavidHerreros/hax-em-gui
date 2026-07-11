@@ -61,6 +61,10 @@ class TensorBoardManager:
                 "--host", "127.0.0.1",
                 "--port", str(port),
                 "--path_prefix", prefix,
+                # Poll the event files often: a live training run should show up on the
+                # curves promptly, not on TB's 5s-ish default cadence behind a writer
+                # that only flushes periodically.
+                "--reload_interval", "5",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
@@ -97,6 +101,21 @@ class TensorBoardManager:
         except OSError:
             pass
         return True
+
+    async def restart(self, tb_id: str) -> dict[str, Any] | None:
+        """Respawn the server for this logdir (new process, same logs).
+
+        The projector plugin reads ``projector_config.pbtxt`` once per process and then
+        never re-reads it for a JAX logdir — its invalidation check only fires when a
+        *TensorFlow* checkpoint changes, and there is none here. So latent-space epochs
+        logged after TB started are invisible until TB is restarted. This is that
+        restart; hax's own in-UI warning tells users to do it."""
+        inst = self._by_id.get(tb_id)
+        if inst is None:
+            return None
+        logdir = inst["logdir"]
+        self.stop(tb_id)
+        return await self.ensure(logdir)
 
     def shutdown(self) -> None:
         for inst in list(self._by_id.values()):

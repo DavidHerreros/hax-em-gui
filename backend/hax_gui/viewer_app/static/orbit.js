@@ -12,11 +12,16 @@
 // window, so the feature you are looking at stays under the crosshair instead of
 // swinging away. The depth of that surface is supplied by the renderer, which is the
 // only thing that knows the geometry — see `opts.probeDepth`.
-import { identity, axisAngle, multiply, mulVec4 } from "./mat4.js";
+import { identity, axisAngle, multiply, mulVec4, halfFovY, fitDistance, FOV_X_DEG } from "./mat4.js";
 
 export function createOrbit(canvas, onChange, onClick, opts = {}) {
-  const dist0 = opts.dist || 3.4;
-  const FOV = ((opts.fov || 45) * Math.PI) / 180;   // must match the renderer's perspective FOV
+  // Radius of the sphere the camera frames on open (and on reset) — see fitDistance().
+  // The eye distance is no longer a constant: the field is pinned horizontally
+  // (ChimeraX-style), so how far back the camera must sit to frame the map depends on
+  // the shape of the window. Resolved lazily, because the canvas is often still
+  // unlaid-out (clientWidth 0) when the renderer is constructed.
+  const fitRadius = opts.fitRadius || 1.4;
+  const FOV_X_2 = (FOV_X_DEG * Math.PI) / 360;
   // Models are normalized into a [-1,1] cube (half-diagonal √3 ≈ 1.73), and every
   // renderer's frustum is near=0.01 far=100. So the camera can come right up to the
   // surface — and inside it — and still pull far enough back to see the whole box.
@@ -28,11 +33,21 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
   const probeDepth = opts.probeDepth || null;
   const clampDist = (d) => Math.max(minDist, Math.min(maxDist, d));
   let R = identity();
-  let dist = dist0;
+  let dist = null;          // null = "not fitted yet"; resolved on first use, once the canvas has a size
   let offset = [0, 0, 0];   // world-space model translation (pan + carried orbit pivot)
   let pivotZ = 0;           // world Z of the centre of rotation; it always lies on the view axis
   let pivotStale = true;
   let dragging = false, moved = false, mode = "rotate", lx = 0, ly = 0, downX = 0, downY = 0;
+
+  const aspect = () => (canvas.clientWidth || canvas.width || 1) / Math.max(1, canvas.clientHeight || canvas.height || 1);
+  // The narrower of the two half-fields: what actually decides whether the model fits.
+  const halfFov = () => Math.min(FOV_X_2, halfFovY(aspect()));
+  // Every read of the eye distance goes through here, so the initial fit happens as
+  // late as possible — by which time the canvas has been laid out and we know its shape.
+  function eyeDist() {
+    if (dist === null) dist = clampDist(fitDistance(fitRadius, aspect()));
+    return dist;
+  }
 
   // Full model matrix = translate(offset) · R. R is a pure rotation (last column
   // [0,0,0,1]), so this is just R with its translation column set to `offset`.
@@ -52,7 +67,7 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
       R[4] * v[0] + R[5] * v[1] + R[6] * v[2],
       R[8] * v[0] + R[9] * v[1] + R[10] * v[2],
     ];
-    return { origin: rt([-offset[0], -offset[1], dist - offset[2]]), dir: rt([0, 0, -1]) };
+    return { origin: rt([-offset[0], -offset[1], eyeDist() - offset[2]]), dir: rt([0, 0, -1]) };
   }
 
   // ChimeraX recomputes the centre of rotation after translations only, never during
@@ -60,12 +75,13 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
   // the model would wander. So this runs at most once per rotate gesture.
   function updatePivot() {
     pivotStale = false;
+    const d = eyeDist();
     const centre = offset[2];                          // the model's centre sits at `offset`
-    const depth = Math.max(minDist, dist - centre);    // eye -> model centre
-    if (2 * depth * Math.tan(FOV / 2) >= modelWidth) { pivotZ = centre; return; }   // zoomed out: it all fits
+    const depth = Math.max(minDist, d - centre);       // eye -> model centre
+    if (2 * depth * Math.tan(halfFov()) >= modelWidth) { pivotZ = centre; return; }   // zoomed out: it all fits
     const t = probeDepth && probeDepth();
     if (t == null || !isFinite(t)) return;             // nothing at the centre: keep the depth we had
-    pivotZ = Math.min(dist - t, dist - minDist);       // never let the pivot fall behind the eye
+    pivotZ = Math.min(d - t, d - minDist);             // never let the pivot fall behind the eye
   }
 
   function rotateBy(dx, dy) {
@@ -85,14 +101,15 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
   }
   function panBy(dxCss, dyCss) {
     // CSS px -> world units on the plane through the centre of rotation, so whatever
-    // you grabbed there tracks the cursor.
-    const depth = Math.max(minDist, dist - pivotZ);
-    const wpp = (2 * depth * Math.tan(FOV / 2)) / Math.max(1, canvas.clientHeight);
+    // you grabbed there tracks the cursor. Pixels are square, so measure across the
+    // width, where the field is the fixed one.
+    const depth = Math.max(minDist, eyeDist() - pivotZ);
+    const wpp = (2 * depth * Math.tan(FOV_X_2)) / Math.max(1, canvas.clientWidth);
     offset = [offset[0] + dxCss * wpp, offset[1] - dyCss * wpp, offset[2]];   // screen y-down -> world y-up
     pivotStale = true;   // a translation changed what sits at the centre of the window
   }
   function zoomBy(deltaY) {
-    dist = clampDist(dist * Math.exp(deltaY * 0.001));
+    dist = clampDist(eyeDist() * Math.exp(deltaY * 0.001));
     pivotStale = true;
   }
 
@@ -124,14 +141,14 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
   return {
     get rotation() { return R; },
     get model() { return modelMatrix(); },   // translate(offset) · R — use for the model transform
-    get dist() { return dist; },
-    get eye() { return [0, 0, dist]; },
+    get dist() { return eyeDist(); },
+    get eye() { return [0, 0, eyeDist()]; },
     get pivot() { return [0, 0, pivotZ]; },  // world-space centre of rotation
     axisRay,                                          // model-space ray through the window centre
     // Each renderer owns a camera, but the map is one object. Switching render mode
     // hands the outgoing camera to the incoming one, so the view survives the switch.
     // Safe across renderers: they all frame the same [-1,1] cube through the same FOV.
-    getState() { return { R: R.slice(), dist, offset: offset.slice(), pivotZ }; },
+    getState() { return { R: R.slice(), dist: eyeDist(), offset: offset.slice(), pivotZ }; },
     setState(s) {
       if (!s) return;
       R = s.R.slice(); dist = clampDist(s.dist); offset = s.offset.slice(); pivotZ = s.pivotZ;
@@ -142,6 +159,8 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
     pan(dx, dy) { panBy(dx, dy); onChange(); },       // externally driven pan (CSS px)
     zoom(deltaY) { zoomBy(deltaY); onChange(); },
     invalidatePivot() { pivotStale = true; },         // the geometry changed under the camera
-    reset() { R = identity(); dist = dist0; offset = [0, 0, 0]; pivotZ = 0; pivotStale = true; onChange(); },
+    // null, not a stored constant: re-fit to whatever shape the window is now — this is
+    // ChimeraX's `view`, which reframes the model rather than restoring an old distance.
+    reset() { R = identity(); dist = null; offset = [0, 0, 0]; pivotZ = 0; pivotStale = true; onChange(); },
   };
 }
