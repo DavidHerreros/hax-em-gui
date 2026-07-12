@@ -525,13 +525,22 @@ def _taubin_smooth(verts: np.ndarray, faces: np.ndarray, iterations: int,
     return v.astype(np.float32)
 
 
-def mesh_at(vol: np.ndarray, level: float, smooth: int = 0) -> bytes:
+def mesh_at(vol: np.ndarray, level: float, smooth: int = 0,
+            step: int = 1, full_size: int | None = None) -> bytes:
     """Marching-cubes mesh of `vol` at an absolute `level`, packed as binary:
 
     int32 nverts, int32 nfaces, float32 level, float32 mass, float32 vmax,
     then float32[nverts*3] positions, float32[nverts*3] normals,
     then uint32[nfaces*3] indices. Positions are normalized to a [-1,1] cube.
     `smooth` runs that many Taubin smoothing iterations on the surface.
+
+    `step`/`full_size` describe a *draft* mesh taken from a strided view of a bigger
+    volume (see `/api/decode?size=`): sample `j` of the strided grid is voxel `j*step` of
+    the full one, so scaling the vertices by `step` and normalizing by the full size puts
+    the draft in exactly the same [-1,1] cube as the full-resolution surface — it refines
+    in place rather than jumping when the final mesh replaces it. Enclosed mass is scaled
+    back up by `step**3` for the same reason: so a draft's reported mass is comparable to
+    a full one (the client keys constant-mass morphs off it).
     """
     from skimage import measure
 
@@ -548,12 +557,12 @@ def mesh_at(vol: np.ndarray, level: float, smooth: int = 0) -> bytes:
         verts = _taubin_smooth(verts, faces, smooth)
         normals = _vertex_normals(verts, faces)   # recompute from the relaxed surface
 
-    size = float(max(vol.shape))
-    verts = (verts.astype(np.float32) - size / 2.0) / (size / 2.0)
+    size = float(full_size if full_size else max(vol.shape))
+    verts = (verts.astype(np.float32) * float(step) - size / 2.0) / (size / 2.0)
 
     header = (
         np.array([verts.shape[0], faces.shape[0]], dtype="<i4").tobytes()
-        + np.array([level, enclosed_mass(vol, level), vmax], dtype="<f4").tobytes()
+        + np.array([level, enclosed_mass(vol, level) * float(step) ** 3, vmax], dtype="<f4").tobytes()
     )
     body = (
         np.ascontiguousarray(verts, dtype="<f4").tobytes()
@@ -742,18 +751,32 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         return _i32_vector(labels)
 
     def _resolve_volume(index: int, index2: int | None, t: float) -> np.ndarray:
+        """The decoded volume. Cheap on a repeat: `Decoder.volume` caches, so moving the
+        contour slider never re-runs the network — only the mesh below is recomputed.
+
+        The caller must hold `_DECODE_SLOTS`."""
         if index < 0 or index >= decoder.total:
             raise HTTPException(status_code=404, detail="latent index out of range")
-        # Serialise the decodes. These routes are sync `def`, so Starlette runs them in a
-        # threadpool with ~40 slots, and a threadpool task cannot be cancelled — not even
-        # when the client has gone away. Dragging the threshold slider could therefore pile
-        # up dozens of concurrent 320³ decodes that nobody would ever look at, each holding
-        # a volume plus its temporaries. The cap makes them queue instead of competing for
-        # the same GPU and the same RAM.
-        with _DECODE_SLOTS:
-            if index2 is not None and 0 <= index2 < decoder.total and index2 != index:
-                return decoder.volume_interp(index, index2, max(0.0, min(1.0, t)))
-            return decoder.volume(index)
+        if index2 is not None and 0 <= index2 < decoder.total and index2 != index:
+            return decoder.volume_interp(index, index2, max(0.0, min(1.0, t)))
+        return decoder.volume(index)
+
+    # Strided copies of a volume, cached per (state, size). A contour drag re-meshes the
+    # same volume over and over; without this, every frame would pay the stride-copy — a
+    # 131 MB strided read at a 320³ box, which is the same order as the draft mesh itself.
+    _drafts: dict[tuple, tuple[np.ndarray, int]] = {}
+    _draft_order: list[tuple] = []
+
+    def _draft_grid(vol: np.ndarray, key: tuple, size: int) -> tuple[np.ndarray, int]:
+        hit = _drafts.get(key)
+        if hit is not None:
+            return hit
+        ds, step = _downsample(vol, size)
+        _drafts[key] = (ds, step)
+        _draft_order.append(key)
+        while len(_draft_order) > 4:               # ~16 MB each at 160³ — bound it
+            _drafts.pop(_draft_order.pop(0), None)
+        return ds, step
 
     @app.get("/api/decode")
     def decode(
@@ -763,15 +786,38 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         index2: int = Query(-1),         # >=0 -> interpolate index..index2 at t
         t: float = Query(0.0),
         smooth: int = Query(0),          # Taubin smoothing iterations on the surface
+        size: int = Query(0),            # >0 -> draft mesh from a strided grid this big
     ) -> Response:
-        try:
-            vol = _resolve_volume(index, index2 if index2 >= 0 else None, t)
-        except HTTPException:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
-        level = level_for_mass(vol, mass) if mass >= 0 else level_for_sigma(vol, sigma)
-        return Response(content=mesh_at(vol, level, smooth=max(0, min(50, smooth))), media_type="application/octet-stream")
+        # The *whole* route runs under the slot, not just the decode. Marching cubes plus
+        # Taubin smoothing is the expensive half (~700 ms of the ~750 at a 320³ box), and
+        # a client cannot cancel it: this is a sync `def`, so Starlette runs it in a
+        # threadpool task, and aborting the fetch frees only the browser. Leaving the mesh
+        # outside the slot let an aborting client stack up abandoned meshes — and they do
+        # not parallelise, they contend (8 at once measured 5x slower *each*), so a
+        # threshold drag got slower the further it went.
+        with _DECODE_SLOTS:
+            try:
+                vol = _resolve_volume(index, index2 if index2 >= 0 else None, t)
+            except HTTPException:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
+
+            full = max(vol.shape)
+            if 0 < size < full:
+                # Draft: mesh a strided grid instead of the full one. ~15x cheaper at 320³
+                # (49 ms / 3.8 MB vs 773 ms / 21 MB), which is what makes a drag live. The
+                # level is taken from the strided grid too — millions of samples, so its
+                # mean/std match the full volume's — keeping the drag off the big array
+                # entirely. The final full-res pass on pointer-up fixes it exactly.
+                grid, step = _draft_grid(vol, (index, index2, round(float(t), 3), int(size)), int(size))
+            else:
+                grid, step = vol, 1
+            level = (level_for_mass(grid, mass / float(step) ** 3) if mass >= 0
+                     else level_for_sigma(grid, sigma))
+            body = mesh_at(grid, level, smooth=max(0, min(50, smooth)),
+                           step=step, full_size=full)
+        return Response(content=body, media_type="application/octet-stream")
 
     @app.get("/api/grid")
     def grid(
@@ -786,12 +832,13 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         float32 vmin, vmax, mean, std, then float32 boxLo[3], boxHi[3] (the model-space
         cube the grid occupies, matching the surface mesh), then nx*ny*nz uint8 voxels
         (C order)."""
-        try:
-            vol = _resolve_volume(index, index2 if index2 >= 0 else None, t)
-        except HTTPException:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
+        with _DECODE_SLOTS:      # _resolve_volume no longer takes it; the caller must
+            try:
+                vol = _resolve_volume(index, index2 if index2 >= 0 else None, t)
+            except HTTPException:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
         ds, step = _downsample(vol, int(max(16, min(160, size))))
         vmin, vmax = float(ds.min()), float(ds.max())
         u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)

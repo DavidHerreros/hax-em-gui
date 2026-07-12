@@ -834,52 +834,66 @@ async function onSelect(i, opts) {
   decode();
 }
 
-function onLevel(level) {
+function onLevel(level, dragging) {
   state.sigma = hist.sigma;
   if (state.render !== "surface" && volRenderer && curVolMeta) { volRenderer.setThreshold(normThreshold()); return; }
-  liveDecode();
+  liveDecode(!!dragging);
 }
 
-// Coalescing single-flight runner: fires immediately, and if more updates arrive
-// while a request is in flight, re-runs once with the latest values when it returns.
-// Gives continuous (server-bounded) updates without piling up requests.
+// Coalescing single-flight runner: fires immediately, and if more updates arrive while a
+// request is in flight, re-runs once with the latest values when it returns. Gives
+// continuous (server-bounded) updates without piling up requests.
 //
-// `onSupersede` fires when a newer call arrives while one is still running, which is the
-// cue to abandon the running one. Without it a drag of the threshold slider would let
-// every superseded decode finish and ship its mesh — tens of MB each at a 320³ box — only
-// for the result to be thrown away on arrival.
-function makeLive(fn, onSupersede) {
+// It must *wait* for the in-flight request, not abandon it. This used to abort the fetch
+// on supersede, to avoid downloading a mesh that was already stale — but `/api/decode` is
+// a sync route, so it runs in a threadpool task that cannot be cancelled: aborting freed
+// the browser to fire the next request while the server kept grinding on the abandoned
+// one. A drag therefore stacked up marching-cubes jobs that don't parallelise (8 at once
+// measured ~5x slower *each*), so the further you dragged the slower it got. Waiting keeps
+// the server at exactly one mesh at a time; the draft below is what makes that cheap.
+function makeLive(fn) {
   let busy = false, pending = false, args = [];
   async function run() { busy = true; do { pending = false; try { await fn(...args); } catch { /* ignore */ } } while (pending); busy = false; }
-  return (...a) => { args = a; if (busy) { pending = true; if (onSupersede) onSupersede(); } else run(); };
+  return (...a) => { args = a; if (busy) pending = true; else run(); };
 }
-let decodeAbort = null;
-const liveDecode = makeLive(() => decode(), () => decodeAbort && decodeAbort.abort());
+const liveDecode = makeLive((draft) => decode(draft));
 const liveFrame = makeLive((i) => renderFrame(i));
 
-async function decode() {
+// While the contour is being dragged, mesh a strided grid instead of the full one: at a
+// 320³ box that is ~50 ms and 3.8 MB against ~750 ms and 21 MB, which is the difference
+// between a live slider and a frozen one. The server scales the draft by its stride, so it
+// occupies the same [-1,1] cube and refines in place when the full mesh lands on release.
+const DRAFT_GRID = 160;
+
+let decodedIndex = -1;    // the state whose volume the server has already decoded
+
+async function decode(draft = false) {
   if (state.current < 0) return;
   const token = ++decodeToken;
-  const ac = new AbortController();
-  decodeAbort = ac;
-  status("Decoding map…", "busy");
+  // Only a change of *state* runs the network. A contour change re-meshes a volume the
+  // server already holds (Decoder.volume caches it), so say what is really happening.
+  const fresh = state.current !== decodedIndex;
+  status(fresh ? "Decoding map…" : "Contouring…", "busy");
   try {
-    const res = await fetch(`./api/decode?index=${state.current}&sigma=${state.sigma.toFixed(3)}&smooth=${state.smooth}`,
-                            { signal: ac.signal });
+    const q = `index=${state.current}&sigma=${state.sigma.toFixed(3)}`
+            + (draft ? `&smooth=0&size=${DRAFT_GRID}` : `&smooth=${state.smooth}`);
+    const res = await fetch(`./api/decode?${q}`);
     if (!res.ok) throw new Error(await res.text());
     const m = parseMesh(await res.arrayBuffer());
     if (token !== decodeToken) return;
-    state.refMass = m.mass;
+    decodedIndex = state.current;
+    // A draft's mass is only an estimate (it is measured on the strided grid), and refMass
+    // is what constant-mass morphs are keyed off — so only ever take it from a full mesh.
+    if (!draft) state.refMass = m.mass;
     renderer.setMesh(m.positions, m.normals, m.indices);
     renderer.setColor(colorForIndex(state.current));   // centroids carry their cluster color
     if (state.render !== "surface") { loadVolume(state.current); return; }
     if (!m.indices.length) { renderer.clear(); status("No surface at this contour — lower the threshold.", "warn"); return; }
-    status(`${(m.indices.length / 3).toLocaleString()} triangles · σ ${state.sigma.toFixed(1)} · level ${m.level.toFixed(3)}`);
+    const tris = (m.indices.length / 3).toLocaleString();
+    status(draft ? `Contouring · σ ${state.sigma.toFixed(1)} · draft`
+                 : `${tris} triangles · σ ${state.sigma.toFixed(1)} · level ${m.level.toFixed(3)}`);
   } catch (err) {
-    if (err && err.name === "AbortError") return;   // superseded by a newer request, not a failure
     if (token === decodeToken) status("Decode failed: " + err.message, "err");
-  } finally {
-    if (decodeAbort === ac) decodeAbort = null;
   }
 }
 
