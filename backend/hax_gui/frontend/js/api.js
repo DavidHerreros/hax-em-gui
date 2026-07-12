@@ -127,7 +127,14 @@ export const api = {
 
   // WebGL viewer sessions
   viewers: () => req("/api/viewer"),
-  viewerFromJob: (jobId, space) => req(`/api/viewer/from-job/${jobId}${space != null ? `?space=${space}` : ""}`, { method: "POST" }),
+  // gpu: "0" / "cpu" pins the viewer's device; omit to fall back to the saved default.
+  viewerFromJob: (jobId, space, gpu) => {
+    const q = new URLSearchParams();
+    if (space != null) q.set("space", space);
+    if (gpu) q.set("gpu", gpu);
+    const qs = q.toString();
+    return req(`/api/viewer/from-job/${jobId}${qs ? `?${qs}` : ""}`, { method: "POST" });
+  },
   flexconsensusSpaces: (jobId) => req(`/api/viewer/flexconsensus/${jobId}`),
   stopViewer: (id) => req(`/api/viewer/${id}`, { method: "DELETE" }),
 

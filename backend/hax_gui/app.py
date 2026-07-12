@@ -577,6 +577,9 @@ def make_directory(body: DirCreate) -> dict[str, Any]:
 class SettingsUpdate(BaseModel):
     projects_root: str | None = None
     ssd_scratch_root: str | None = None
+    # Device the landscape viewer loads the network and decodes maps on: a GPU index
+    # ("0"), "cpu", or "" to be asked at launch time (see _viewer_gpu).
+    viewer_gpu: str | None = None
 
 
 @app.get("/api/settings", dependencies=[Depends(auth)])
@@ -1159,12 +1162,13 @@ class ViewerStart(BaseModel):
     reload: str
     title: str | None = None
     reduced: str | None = None
+    gpu: str | None = None
 
 
 @app.post("/api/viewer", dependencies=[Depends(auth)])
 async def start_viewer(body: ViewerStart) -> dict[str, Any]:
     return await _ensure_viewer(body.latents, body.reload, body.title or "Conformational landscape",
-                                reduced=body.reduced)
+                                reduced=body.reduced, gpu=body.gpu)
 
 
 @app.get("/api/viewer/flexconsensus/{job_id}", dependencies=[Depends(auth)])
@@ -1181,7 +1185,8 @@ def flexconsensus_spaces(job_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/viewer/from-job/{job_id}", dependencies=[Depends(auth)])
-async def start_viewer_from_job(job_id: str, space: int | None = None) -> dict[str, Any]:
+async def start_viewer_from_job(job_id: str, space: int | None = None,
+                                gpu: str | None = None) -> dict[str, Any]:
     job = manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
@@ -1204,7 +1209,7 @@ async def start_viewer_from_job(job_id: str, space: int | None = None) -> dict[s
         project_dir = projects.dir_for(job.get("project_id"))
         metadata = _find_latent_metadata(project_dir, sp["input_space"])
         return await _ensure_viewer(sp["input_space"], sp["reload"], title, metadata,
-                                    str(project_dir) if project_dir else None, sp["consensus"])
+                                    str(project_dir) if project_dir else None, sp["consensus"], gpu)
     reload_raw = args.get("pickled_nn") or args.get("reload")
     # Full latents: a direct input (annotate_space), or derived from this run's
     # own output (a predict run's predicted latents).
@@ -1227,7 +1232,7 @@ async def start_viewer_from_job(job_id: str, space: int | None = None) -> dict[s
     project_dir = projects.dir_for(job.get("project_id"))
     metadata = _find_latent_metadata(project_dir, latents)
     return await _ensure_viewer(latents, reload, title, metadata,
-                                str(project_dir) if project_dir else None, reduced)
+                                str(project_dir) if project_dir else None, reduced, gpu)
 
 
 def _find_latent_metadata(project_dir: "Path | None", latents: str) -> str | None:
@@ -1352,11 +1357,22 @@ def _flexconsensus_spaces(job: dict[str, Any]) -> list[dict[str, Any]]:
     return spaces
 
 
+def _viewer_gpu(explicit: str | None) -> str | None:
+    """The device to pin a viewer to: the caller's choice, else the saved default.
+
+    None (nothing chosen, no default saved) means "don't pin": the viewer inherits
+    our environment and JAX picks its own device, which is what it always did.
+    """
+    gpu = explicit if explicit is not None else settings_store.load().get("viewer_gpu")
+    return (gpu or "").strip() or None
+
+
 async def _ensure_viewer(latents: str, reload: str, title: str,
                          metadata: str | None = None, project_dir: str | None = None,
-                         reduced: str | None = None) -> dict[str, Any]:
+                         reduced: str | None = None, gpu: str | None = None) -> dict[str, Any]:
     try:
-        return await viewer_manager.ensure(latents, reload, title, metadata, project_dir, reduced)
+        return await viewer_manager.ensure(latents, reload, title, metadata, project_dir,
+                                           reduced, _viewer_gpu(gpu))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except (RuntimeError, TimeoutError) as exc:

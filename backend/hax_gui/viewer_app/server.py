@@ -641,6 +641,26 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
     return app
 
 
+def select_gpu(gpu: str | None) -> None:
+    """Pin this process to one device, before JAX ever loads.
+
+    Same contract as ``hax_project_manager --gpu``: an index picks that device;
+    ``cpu`` (or an empty string) hides every device and falls back to the CPU.
+    Passing None leaves the inherited environment alone, so JAX chooses for itself
+    — what the viewer did before the device was selectable.
+
+    Ordering is the whole point, and it is not fragile here: JAX only reads
+    CUDA_VISIBLE_DEVICES when it first initialises its backend, and this module
+    defers ``import jax`` all the way to the first decode request (see
+    ``Decoder._ensure_model``). Anything set before uvicorn starts serving — this
+    included — lands well ahead of it.
+    """
+    if gpu is None:
+        return
+    choice = gpu.strip()
+    os.environ["CUDA_VISIBLE_DEVICES"] = "" if choice.lower() in ("", "cpu") else choice
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="WebGL conformational-landscape viewer backend")
     parser.add_argument("--latents", required=True, help="latents .npy/.txt of shape (N, latent_dim)")
@@ -651,9 +671,14 @@ def main() -> None:
     parser.add_argument("--title", default="Conformational landscape")
     parser.add_argument("--metadata", default=None, help="row-aligned particle metadata (.xmd/.star) for layer export")
     parser.add_argument("--project-dir", dest="project_dir", default=None, help="project folder where exported layers are written")
+    parser.add_argument("--gpu", default=None,
+                        help="device to load the network and decode maps on: a GPU index (e.g. 0), or 'cpu' for none. "
+                             "Omit to inherit CUDA_VISIBLE_DEVICES and let JAX choose.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8051)
     args = parser.parse_args()
+
+    select_gpu(args.gpu)   # must precede the first JAX import; see select_gpu()
 
     decoder = Decoder(args.latents, args.reload, reduced_path=args.reduced)
     app = build_app(decoder, title=args.title, metadata=args.metadata, project_dir=args.project_dir)

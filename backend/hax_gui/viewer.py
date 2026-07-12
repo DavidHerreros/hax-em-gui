@@ -32,7 +32,7 @@ def _free_port() -> int:
 
 class ViewerManager:
     def __init__(self) -> None:
-        self._by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        self._by_key: dict[tuple[str, ...], dict[str, Any]] = {}
         self._by_id: dict[str, dict[str, Any]] = {}
 
     def get(self, vid: str) -> dict[str, Any] | None:
@@ -43,8 +43,16 @@ class ViewerManager:
 
     async def ensure(self, latents: str, reload: str, title: str = "Conformational landscape",
                      metadata: str | None = None, project_dir: str | None = None,
-                     reduced: str | None = None) -> dict[str, Any]:
-        """Start (or reuse) a viewer for (latents, reload) and wait until it's up."""
+                     reduced: str | None = None, gpu: str | None = None) -> dict[str, Any]:
+        """Start (or reuse) a viewer for (latents, reload, gpu) and wait until it's up.
+
+        ``gpu`` pins the subprocess to one device (an index, or "cpu"); None lets
+        JAX choose. It is part of the reuse key because the device is fixed at
+        spawn — CUDA_VISIBLE_DEVICES is read once, when JAX initialises inside the
+        subprocess — so a live viewer cannot be moved. Keying on it means asking
+        for a different device starts a second viewer instead of silently handing
+        back the one still bound to the old one.
+        """
         if not _SERVER.exists():
             raise RuntimeError(f"viewer backend not found at {_SERVER}")
         lat = Path(latents).expanduser()
@@ -57,7 +65,7 @@ class ViewerManager:
         if red is not None and not red.exists():
             red = None   # ignore a missing reduced-space file rather than failing the launch
 
-        key = (str(lat), str(ckpt), str(red) if red else "")
+        key = (str(lat), str(ckpt), str(red) if red else "", gpu or "")
         existing = self._by_key.get(key)
         if existing and existing["proc"].poll() is None:
             existing["title"] = title
@@ -79,8 +87,11 @@ class ViewerManager:
             cmd += ["--project-dir", str(project_dir)]
         if metadata:
             cmd += ["--metadata", str(metadata)]
+        if gpu:
+            cmd += ["--gpu", str(gpu)]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        instance = {"id": vid, "port": port, "latents": str(lat), "reload": str(ckpt), "title": title, "proc": proc}
+        instance = {"id": vid, "port": port, "latents": str(lat), "reload": str(ckpt),
+                    "title": title, "gpu": gpu or "", "key": key, "proc": proc}
         await self._wait_ready(instance)
         self._by_key[key] = instance
         self._by_id[vid] = instance
@@ -106,7 +117,7 @@ class ViewerManager:
         inst = self._by_id.pop(vid, None)
         if not inst:
             return False
-        self._by_key.pop((inst["latents"], inst["reload"]), None)
+        self._by_key.pop(inst["key"], None)   # the key we actually filed it under
         try:
             inst["proc"].terminate()
         except OSError:
@@ -127,6 +138,7 @@ class ViewerManager:
             "title": instance["title"],
             "latents": instance["latents"],
             "reload": instance["reload"],
+            "gpu": instance["gpu"],   # "" = unpinned (JAX chose); "cpu" = no device
             "url": f"/viewer/{instance['id']}/",
             "running": instance["proc"].poll() is None,
         }
