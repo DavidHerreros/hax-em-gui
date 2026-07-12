@@ -59,6 +59,7 @@ let lassoArmed = false, lassoing = false, lassoPts = [], lctx = null, lassoMode 
 // points, or grab an existing waypoint to drag it onto another state. Works on the
 // active 2D or 3D landscape via projectedPoints().
 let pathDrawArmed = false, drawing = false, drawPts = [], draggingWp = -1, draggingCtrl = -1;
+let dragProj = null;   // screen projection of every state, held for the duration of a waypoint drag
 const DRAG_R = 12;   // px: grab radius for a waypoint / control handle
 // A free-spline path layer keeps editable control points in data coords (not snapped
 // to states); it is only snapped to the nearest states silently at morph time.
@@ -117,9 +118,12 @@ async function boot() {
   applyTheme(new URLSearchParams(location.search).get("theme"));
   window.addEventListener("message", (e) => { if (e.data && e.data.type === "hax-theme") applyTheme(e.data.theme); });
 
-  try { L = await (await fetch("./api/landscape?k=5")).json(); }
-  catch (err) { status("Could not load landscape: " + err, "err"); return; }
-  clusterCache[5] = L.cluster.labels;
+  try {
+    L = await (await fetch("./api/landscape")).json();   // metadata only; arrays follow as binary
+    L.pca = await fetchMatrix("./api/pca.bin");
+    L.latents = null;   // fetched on demand — only the "latent" embedding view needs them
+    clusterCache[5] = await fetchLabels("./api/cluster.bin?k=5");
+  } catch (err) { status("Could not load landscape: " + err, "err"); return; }
   $("title").textContent = L.title || "Conformational landscape";
   $("meta").textContent = `${L.n} states · latent dim ${L.dims}`;
   populateAxes();
@@ -159,7 +163,10 @@ function wireControls() {
   $("zaxis").addEventListener("change", (e) => { state.z = +e.target.value; updatePoints(); });
   $("embed").addEventListener("change", async (e) => {
     state.embedding = e.target.value;
-    if (state.embedding === "umap" && !umapData) { status("Computing UMAP…", "busy"); try { umapData = (await (await fetch("./api/embedding?kind=umap")).json()).points; } catch (err) { status("UMAP failed: " + err, "err"); $("embed").value = "pca"; state.embedding = "pca"; return; } status(""); }
+    if (state.embedding === "umap" && !umapData) { status("Computing UMAP…", "busy"); try { umapData = await fetchMatrix("./api/umap.bin"); } catch (err) { status("UMAP failed: " + err, "err"); $("embed").value = "pca"; state.embedding = "pca"; return; } status(""); }
+    // The raw latent coords are big and only this view uses them, so they are not part of
+    // the initial load — fetch them the first time someone actually asks for them.
+    if (state.embedding === "latent" && !L.latents) { status("Loading latent coordinates…", "busy"); try { L.latents = await fetchMatrix("./api/latents.bin"); } catch (err) { status("Could not load latents: " + err, "err"); $("embed").value = "pca"; state.embedding = "pca"; return; } status(""); }
     populateAxes();        // each embedding has its own axis set (PCs / UMAP dims / latent dims)
     refreshAxisEnabled();
     updatePoints();
@@ -266,15 +273,145 @@ const axesOf = (vec) => viewAxes().map((a) => vec[a]);   // full embedding vecto
 // A curve lives in its embedding; control points carry full embedding vectors, so it
 // renders in any axis/2D/3D view of that embedding (we just read the displayed axes).
 function curveMatchesView(ly) { return ly.embed === state.embedding; }
+// ── nearest state, indexed ───────────────────────────────────────────────────
+// Both curve tools need "which state lies closest to this point in embedding space", and
+// both used to answer it by scanning every row: screenToVec on every mousemove while a
+// handle is being dragged, curveToIndices ~550 times the moment a curve is played. At a
+// million states those scans are what froze the tab.
+//
+// A uniform grid over the first few dimensions turns each query into a local search, and
+// it stays EXACT rather than approximate: distance measured in a subset of the dimensions
+// is a lower bound on the full distance, so once we hold a candidate closer than the
+// nearest unscanned ring could possibly be, nothing further out can beat it.
+//
+// Convention: `dims` lists which coordinate indices to compare, and a query vector `q` is
+// parallel to `dims` (q[j] pairs with dims[j]). That suits both callers — one searches on
+// the two or three displayed axes, the other on every dimension.
+const nnCache = new WeakMap();
+
+function nnIndex(coords, dims) {
+  let per = nnCache.get(coords);
+  if (!per) { per = new Map(); nnCache.set(coords, per); }
+  const key = dims.join(",");
+  const hit = per.get(key);
+  if (hit) return hit;
+
+  const n = coords.length;
+  const m = dims.length;
+  // Flatten the compared columns into one typed array. The rows are arrays-of-arrays, and
+  // chasing those pointers dominates any distance loop over them; this alone makes even a
+  // straight scan several times faster, and it is what the fallback below relies on.
+  const flat = new Float32Array(n * m);
+  for (let i = 0; i < n; i++) {
+    const row = coords[i];
+    for (let j = 0; j < m; j++) flat[i * m + j] = row[dims[j]] || 0;
+  }
+  const gd = dims.slice(0, 3);            // grid on at most three axes
+  const k = gd.length;
+  const mn = new Array(k).fill(Infinity), mx = new Array(k).fill(-Infinity);
+  for (let i = 0; i < n; i++) {
+    for (let g = 0; g < k; g++) { const v = flat[i * m + g]; if (v < mn[g]) mn[g] = v; if (v > mx[g]) mx[g] = v; }
+  }
+  const G = Math.max(1, Math.min(128, Math.round(Math.cbrt(Math.max(1, n / 4)))));   // ~4 points per cell
+  const span = Math.max(...mn.map((_, g) => (mx[g] - mn[g]) || 1));
+  const h = Math.max(1e-9, span / G);
+  const dim = new Array(k);
+  for (let g = 0; g < k; g++) dim[g] = Math.max(1, Math.min(G, Math.ceil(((mx[g] - mn[g]) || 1) / h)));
+  const strides = new Array(k);
+  for (let g = k - 1, s = 1; g >= 0; g--) { strides[g] = s; s *= dim[g]; }
+  const cells = dim.reduce((a, b) => a * b, 1);
+
+  const cellOf = new Int32Array(n), start = new Int32Array(cells + 1);
+  const cellIx = (g, v) => Math.min(dim[g] - 1, Math.max(0, ((v - mn[g]) / h) | 0));
+  for (let i = 0; i < n; i++) {
+    let c = 0;
+    for (let g = 0; g < k; g++) c += cellIx(g, flat[i * m + g]) * strides[g];
+    cellOf[i] = c; start[c + 1]++;
+  }
+  for (let c = 0; c < cells; c++) start[c + 1] += start[c];
+  const items = new Int32Array(n), cur = start.slice(0, cells);
+  for (let i = 0; i < n; i++) items[cur[cellOf[i]]++] = i;
+
+  const maxR = Math.max(...dim);
+  // The ring search is only worth doing when the grid spans *every* compared dimension.
+  // Then the projected distance IS the full distance, the bound is tight, and a query is
+  // a local lookup. With more dimensions than the grid covers (curveToIndices searches all
+  // 8–10 at once) the bound is weak, the rings keep growing, and the search ends up
+  // costing more than the scan it was meant to replace — measurably so. In that case skip
+  // the grid and scan the flat array, which is itself several times faster than the
+  // arrays-of-arrays scan this all replaced.
+  const gridSpansAll = k === m;
+  const qv = new Float32Array(m);   // scratch query vector, reused across queries
+
+  const idx = {
+    // `hint` is an index believed to be near the answer. It only seeds the distance bound,
+    // never the result, so it cannot change what is returned — but a good hint lets the
+    // ring search stop almost at once. curveToIndices walks a spline, so each sample's
+    // answer is an excellent hint for the next.
+    query(q, hint) {
+      if (!n) return -1;
+      for (let j = 0; j < m; j++) qv[j] = q[j] || 0;   // typed, so the scan below stays monomorphic
+      let best = -1, bestD = Infinity;
+      const consider = (i) => {
+        let dd = 0;
+        const o = i * m;
+        for (let j = 0; j < m; j++) { const e = flat[o + j] - qv[j]; dd += e * e; }
+        if (dd < bestD) { bestD = dd; best = i; }
+      };
+      if (hint >= 0 && hint < n) consider(hint);
+
+      if (gridSpansAll) {
+        const qc = new Array(k);
+        for (let g = 0; g < k; g++) qc[g] = cellIx(g, qv[g]);
+        const scan = (c) => { for (let t = start[c]; t < start[c + 1]; t++) consider(items[t]); };
+        for (let r = 0; r <= maxR; r++) {
+          ringCells(qc, r, dim, k, strides, scan);
+          // every unscanned cell is at least r cells away on some axis, so nothing out
+          // there can be nearer than r*h — once we beat that, we are done
+          if (best >= 0 && (r * h) ** 2 >= bestD) return best;
+        }
+        return best;
+      }
+      // Flat scan, hoisted out of `consider` so the whole thing is one tight typed loop.
+      for (let i = 0, o = 0; i < n; i++, o += m) {
+        let dd = 0;
+        for (let j = 0; j < m; j++) { const e = flat[o + j] - qv[j]; dd += e * e; }
+        if (dd < bestD) { bestD = dd; best = i; }
+      }
+      return best;
+    },
+  };
+  per.set(key, idx);
+  return idx;
+}
+
+// Visit every cell whose Chebyshev distance from `qc` is exactly r (clipped to the grid).
+function ringCells(qc, r, dim, k, strides, visit) {
+  const at = new Array(k);
+  const rec = (g) => {
+    if (g === k) {
+      let onRing = r === 0;
+      for (let t = 0; t < k && !onRing; t++) if (Math.abs(at[t] - qc[t]) === r) onRing = true;
+      if (!onRing) return;
+      let c = 0;
+      for (let t = 0; t < k; t++) c += at[t] * strides[t];
+      visit(c);
+      return;
+    }
+    const lo = Math.max(0, qc[g] - r), hi = Math.min(dim[g] - 1, qc[g] + r);
+    for (let v = lo; v <= hi; v++) { at[g] = v; rec(g + 1); }
+  };
+  rec(0);
+}
+
 // Map a screen point to a full embedding vector: the displayed axes are free (where
 // you drew), the remaining axes are borrowed from the nearest state (depth/structure).
 function screenToVec(sx, sy) {
   const disp = activeLand().unproject(sx, sy);
   const coords = embedCoords(state.embedding);
-  if (!disp || !coords) return null;
+  if (!disp || !coords || !coords.length) return null;
   const ax = viewAxes();
-  let best = -1, bestD = Infinity;
-  for (let i = 0; i < coords.length; i++) { let dd = 0; for (let d = 0; d < ax.length; d++) { const e = coords[i][ax[d]] - disp[d]; dd += e * e; } if (dd < bestD) { bestD = dd; best = i; } }
+  const best = nnIndex(coords, ax).query(disp);   // `disp` is parallel to `ax`
   const vec = best >= 0 ? coords[best].slice() : new Array((coords[0] || disp).length).fill(0);
   ax.forEach((a, d) => { vec[a] = disp[d]; });
   return vec;
@@ -317,16 +454,42 @@ function strokeToCtrl(strokePts) {
   return ctrl.length > 24 ? ctrl.filter((_, i) => i % Math.ceil(ctrl.length / 24) === 0) : ctrl;
 }
 // Snap a curve to an ordered, deduped state-index sequence (silent, at morph time).
-function curveToIndices(ly) {
+//
+// Answered by the server, which holds the very same coordinates and can put a k-d tree
+// over them: the whole curve comes back in tens of milliseconds. Doing it here means
+// finding the nearest of a million states for each of ~550 spline samples — billions of
+// distance evaluations on the UI thread, which froze the tab for seconds on a click of ▶.
+// A k-d tree in JS would fix the complexity but not the fact that the work sits on the
+// one thread that has to stay responsive.
+//
+// The local scan is kept as a fallback (below): it is exact, just slow, so a viewer whose
+// backend is unreachable degrades in speed rather than in behaviour.
+async function curveToIndices(ly) {
   const coords = embedCoords(ly.embed);
   if (!coords || !coords.length) return [];
-  const dim = coords[0].length, dense = splineSamples(ly.ctrl, 24), seq = [];
+  const dense = splineSamples(ly.ctrl, 24);
+  if (!dense.length) return [];
+  try {
+    const res = await fetch("./api/snap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // Array.from: a spline sample can be a Float32Array row view, and JSON.stringify
+      // turns one of those into {"0":…,"1":…} rather than a list.
+      body: JSON.stringify({ embed: ly.embed, points: dense.map((p) => Array.from(p)) }),
+    });
+    if (res.ok) return (await res.json()).indices || [];
+  } catch { /* fall through to the local scan */ }
+  return curveToIndicesLocal(coords, dense);
+}
+
+function curveToIndicesLocal(coords, dense) {
+  const dim = coords[0].length, seq = [];
+  const dims = Array.from({ length: dim }, (_, d) => d);
+  const nn = nnIndex(coords, dims);
+  let hint = -1;
   for (const p of dense) {
-    let best = -1, bestD = Infinity;
-    for (let i = 0; i < coords.length; i++) {
-      let dd = 0; for (let d = 0; d < dim; d++) { const e = coords[i][d] - (p[d] || 0); dd += e * e; }
-      if (dd < bestD) { bestD = dd; best = i; }
-    }
+    const best = nn.query(p, hint);   // the previous sample's state is next door on the spline
+    hint = best;
     if (best >= 0 && (!seq.length || seq[seq.length - 1] !== best)) seq.push(best);
   }
   return seq;
@@ -447,9 +610,32 @@ function updatePoints() {
   refreshFreeCurves();
 }
 
+// ── binary transfers ─────────────────────────────────────────────────────────
+// The landscape arrays arrive as raw buffers (see the server's _f32_matrix). At a million
+// states the JSON they replace was a few hundred MB of text that the server spent minutes
+// building — with the GIL held, so it stopped answering anything else — and that the
+// browser then had to parse. There is nothing to parse here.
+//
+// Rows are *views* into the one buffer, not copies: `coords[i][d]`, `.length` and
+// `.slice()` all behave as before, but a row costs a small view object rather than a
+// fresh array of boxed doubles.
+async function fetchMatrix(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const [rows, cols] = new Int32Array(buf, 0, 2);
+  const data = new Float32Array(buf, 8, rows * cols);
+  const out = new Array(rows);
+  for (let i = 0; i < rows; i++) out[i] = data.subarray(i * cols, (i + 1) * cols);
+  return out;
+}
+async function fetchLabels(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const n = new Int32Array(buf, 0, 1)[0];
+  return new Int32Array(buf, 4, n);
+}
+
 async function clusterLabels() {
   let labels = clusterCache[state.k];
-  if (!labels) { try { labels = clusterCache[state.k] = (await (await fetch(`./api/cluster?k=${state.k}`)).json()).labels; } catch { labels = null; } }
+  if (!labels) { try { labels = clusterCache[state.k] = await fetchLabels(`./api/cluster.bin?k=${state.k}`); } catch { labels = null; } }
   return labels;
 }
 
@@ -523,21 +709,80 @@ function layerColorsCSS() {
   return out;
 }
 
-// O(N^2) neighbour count within `frac` of the bbox diagonal -> [0,1].
+// Local density in [0,1], within `frac` of the bbox diagonal.
+//
+// Binned: drop the points into a uniform grid, blur it, then read each point back out
+// of its cell. O(N + G) rather than the O(N²) all-pairs neighbour count this replaces
+// — that scan was ~1e12 distance tests at a million points and simply hung the tab.
+//
+// The result is a kernel-density estimate instead of an exact neighbour count. That is
+// no loss: the value only ever tints points and drives the glow overlay, and it is
+// exactly how the 2D view has always computed its density, so the two now agree.
+const DENS_GRID = 64;   // cells along the longest axis -> <=64³ = 262k cells, ~1 MB
+
 function density3(pts, frac = 0.12) {
   const n = pts.length, d = new Float32Array(n);
+  if (!n) return d;
+
   const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
   for (const p of pts) for (let k = 0; k < 3; k++) { const v = p[k] || 0; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
-  let diag = 0; for (let k = 0; k < 3; k++) diag += (mx[k] - mn[k]) ** 2; diag = Math.sqrt(diag) || 1;
-  const r2 = (diag * frac) ** 2;
-  let max = 0;
+  const ext = [0, 1, 2].map((k) => (mx[k] - mn[k]) || 1);
+  const diag = Math.hypot(ext[0], ext[1], ext[2]) || 1;
+
+  // Cubic cells, so a radius in world units is the same number of cells on every axis.
+  const h = Math.max(ext[0], ext[1], ext[2]) / DENS_GRID;
+  const dim = ext.map((e) => Math.max(1, Math.min(DENS_GRID, Math.ceil(e / h))));
+  const [nx, ny, nz] = dim;
+  const grid = new Float32Array(nx * ny * nz);
+
+  // bin (O(N)), remembering each point's cell so the read-back is a lookup, not a search
+  const cellOf = new Int32Array(n);
   for (let i = 0; i < n; i++) {
-    let c = 0;
-    for (let j = 0; j < n; j++) { let dd = 0; for (let k = 0; k < 3; k++) { const a = (pts[i][k] || 0) - (pts[j][k] || 0); dd += a * a; } if (dd <= r2) c++; }
-    d[i] = c; if (c > max) max = c;
+    const p = pts[i];
+    const ix = Math.min(nx - 1, Math.max(0, ((p[0] || 0) - mn[0]) / h | 0));
+    const iy = Math.min(ny - 1, Math.max(0, ((p[1] || 0) - mn[1]) / h | 0));
+    const iz = Math.min(nz - 1, Math.max(0, ((p[2] || 0) - mn[2]) / h | 0));
+    const c = (ix * ny + iy) * nz + iz;
+    cellOf[i] = c;
+    grid[c] += 1;
   }
+
+  // Three separable box passes ≈ a gaussian of the requested radius. Each pass is a
+  // running prefix sum, so the cost does not grow with the radius.
+  const rad = Math.max(1, Math.round((frac * diag) / h / 2));
+  let src = grid, dst = new Float32Array(grid.length);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let axis = 0; axis < 3; axis++) {
+      boxBlurAxis(src, dst, dim, axis, rad);
+      const t = src; src = dst; dst = t;   // ping-pong
+    }
+  }
+
+  let max = 0;
+  for (let i = 0; i < n; i++) { const v = src[cellOf[i]]; d[i] = v; if (v > max) max = v; }
   if (max > 0) for (let i = 0; i < n; i++) d[i] /= max;
   return d;
+}
+
+// One separable box-blur pass along `axis` of a 3D grid, as a sliding window sum, so a
+// cell costs O(1) however wide the kernel is. Edges clamp (the border cell repeats).
+function boxBlurAxis(src, dst, dim, axis, rad) {
+  const strides = [dim[1] * dim[2], dim[2], 1];   // grid index = (ix*ny + iy)*nz + iz
+  const step = strides[axis], len = dim[axis];
+  const [oa, ob] = [0, 1, 2].filter((k) => k !== axis);
+  const cl = (i) => (i < 0 ? 0 : i >= len ? len - 1 : i);
+  const win = 2 * rad + 1;
+  for (let a = 0; a < dim[oa]; a++) {
+    for (let b = 0; b < dim[ob]; b++) {
+      const base = a * strides[oa] + b * strides[ob];
+      let sum = 0;
+      for (let k = -rad; k <= rad; k++) sum += src[base + cl(k) * step];
+      for (let i = 0; i < len; i++) {
+        dst[base + i * step] = sum / win;
+        sum += src[base + cl(i + rad + 1) * step] - src[base + cl(i - rad) * step];
+      }
+    }
+  }
 }
 
 
@@ -598,20 +843,29 @@ function onLevel(level) {
 // Coalescing single-flight runner: fires immediately, and if more updates arrive
 // while a request is in flight, re-runs once with the latest values when it returns.
 // Gives continuous (server-bounded) updates without piling up requests.
-function makeLive(fn) {
+//
+// `onSupersede` fires when a newer call arrives while one is still running, which is the
+// cue to abandon the running one. Without it a drag of the threshold slider would let
+// every superseded decode finish and ship its mesh — tens of MB each at a 320³ box — only
+// for the result to be thrown away on arrival.
+function makeLive(fn, onSupersede) {
   let busy = false, pending = false, args = [];
   async function run() { busy = true; do { pending = false; try { await fn(...args); } catch { /* ignore */ } } while (pending); busy = false; }
-  return (...a) => { args = a; if (busy) pending = true; else run(); };
+  return (...a) => { args = a; if (busy) { pending = true; if (onSupersede) onSupersede(); } else run(); };
 }
-const liveDecode = makeLive(() => decode());
+let decodeAbort = null;
+const liveDecode = makeLive(() => decode(), () => decodeAbort && decodeAbort.abort());
 const liveFrame = makeLive((i) => renderFrame(i));
 
 async function decode() {
   if (state.current < 0) return;
   const token = ++decodeToken;
+  const ac = new AbortController();
+  decodeAbort = ac;
   status("Decoding map…", "busy");
   try {
-    const res = await fetch(`./api/decode?index=${state.current}&sigma=${state.sigma.toFixed(3)}&smooth=${state.smooth}`);
+    const res = await fetch(`./api/decode?index=${state.current}&sigma=${state.sigma.toFixed(3)}&smooth=${state.smooth}`,
+                            { signal: ac.signal });
     if (!res.ok) throw new Error(await res.text());
     const m = parseMesh(await res.arrayBuffer());
     if (token !== decodeToken) return;
@@ -621,7 +875,12 @@ async function decode() {
     if (state.render !== "surface") { loadVolume(state.current); return; }
     if (!m.indices.length) { renderer.clear(); status("No surface at this contour — lower the threshold.", "warn"); return; }
     status(`${(m.indices.length / 3).toLocaleString()} triangles · σ ${state.sigma.toFixed(1)} · level ${m.level.toFixed(3)}`);
-  } catch (err) { if (token === decodeToken) status("Decode failed: " + err.message, "err"); }
+  } catch (err) {
+    if (err && err.name === "AbortError") return;   // superseded by a newer request, not a failure
+    if (token === decodeToken) status("Decode failed: " + err.message, "err");
+  } finally {
+    if (decodeAbort === ac) decodeAbort = null;
+  }
 }
 
 // ---- volume ray-marching mode ----
@@ -954,7 +1213,10 @@ function setupLasso() {
     if (editingPathLayer) {                                // index-path waypoint editing
       const proj = activeLand().projectedPoints();
       const wp = hitWaypoint(e.offsetX, e.offsetY, currentTrajectory(), proj);
-      if (wp >= 0) { draggingWp = wp; drawDragPreview(currentTrajectory(), wp, [e.offsetX, e.offsetY], proj); return; }
+      // Hold the projection for the whole drag: dragging a waypoint cannot move the
+      // camera, so it never changes — and recomputing it per mousemove re-projects and
+      // re-allocates every state (a million [x,y] arrays, which froze the drag outright).
+      if (wp >= 0) { draggingWp = wp; dragProj = proj; drawDragPreview(currentTrajectory(), wp, [e.offsetX, e.offsetY], proj); return; }
     }
     drawing = true; drawPts = [[e.offsetX, e.offsetY]];     // stroke or tap (resolved on pointerup)
   });
@@ -965,7 +1227,7 @@ function setupLasso() {
       orbX = e.clientX; orbY = e.clientY; return;
     }
     if (draggingCtrl >= 0) { const v = screenToVec(e.offsetX, e.offsetY); if (v) { editCurve.ctrl[draggingCtrl] = v; refreshFreeCurves(); } return; }
-    if (draggingWp >= 0) { drawDragPreview(currentTrajectory(), draggingWp, [e.offsetX, e.offsetY], activeLand().projectedPoints()); return; }
+    if (draggingWp >= 0) { drawDragPreview(currentTrajectory(), draggingWp, [e.offsetX, e.offsetY], dragProj || activeLand().projectedPoints()); return; }
     if (drawing) { drawPts.push([e.offsetX, e.offsetY]); drawStroke(); }
   });
   lc.addEventListener("pointerup", (e) => {
@@ -983,8 +1245,8 @@ function setupLasso() {
     }
     lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
     if (draggingWp >= 0) {                                  // drop the dragged waypoint on the nearest state
-      const proj = activeLand().projectedPoints();
-      const i = nearestPointTo(e.offsetX, e.offsetY, proj), pos = draggingWp; draggingWp = -1;
+      const proj = dragProj || activeLand().projectedPoints();
+      const i = nearestPointTo(e.offsetX, e.offsetY, proj), pos = draggingWp; draggingWp = -1; dragProj = null;
       if (i >= 0) { const traj = currentTrajectory(); traj[pos] = i; applyTrajectory(traj, pos === 0); status(`Moved waypoint ${pos + 1} → state #${i}.`); }
       return;
     }
@@ -1085,7 +1347,7 @@ function setPathDrawArmed(on) {
   pathDrawArmed = on;
   if (on && lassoArmed) setLassoArmed(false);
   if (!on) {
-    drawing = false; draggingWp = -1; draggingCtrl = -1; drawPts = []; orbiting = false;
+    drawing = false; draggingWp = -1; draggingCtrl = -1; drawPts = []; orbiting = false; dragProj = null;
     const finished = editCurve || editingPathLayer;
     editCurve = null;                                  // curve layers stay visible via refreshFreeCurves
     if (lctx) lctx.clearRect(0, 0, $("lassoCanvas").clientWidth, $("lassoCanvas").clientHeight);
@@ -1214,15 +1476,19 @@ async function computeClusters(seeds) {
   const spaceLbl = space === "network" ? "full network space" : "viewed space";
   const label = (seeded ? `seeded KMeans (${seeds.length} picks)` : `KMeans (k=${k})`) + ` on ${spaceLbl}`;
   status(`Computing ${label}…`, "busy");
-  let d;
-  try { d = await (await fetch(url)).json(); }
-  catch (err) { status("Clustering failed: " + err, "err"); return; }
+  let d, kLabels;
+  // Metadata and the per-state labels come over separately — the labels as binary. The
+  // server memoises the clustering, so the second request is a lookup, not a second run.
+  try {
+    d = await (await fetch(url)).json();
+    kLabels = await fetchLabels(`./api/kmeans.bin?${q}`);
+  } catch (err) { status("Clustering failed: " + err, "err"); return; }
   if (seeded) $("clusterK").value = d.k;   // reflect the seed-derived cluster count
   // drop previous auto-generated cluster/centroid layers (keep manual ones)
   for (let i = layers.length - 1; i >= 0; i--) if (layers[i].kind === "cluster" || layers[i].kind === "centroid") layers.splice(i, 1);
   indexColor = {}; centroidPCA = {};
   const groups = Array.from({ length: d.k }, () => []);
-  d.labels.forEach((lab, i) => groups[lab] && groups[lab].push(i));
+  for (let i = 0; i < kLabels.length; i++) { const g = groups[kLabels[i]]; if (g) g.push(i); }
   // Tag each cluster with its centroid's virtual index so deleting the cluster
   // can drop the matching point from the Centroids layer.
   groups.forEach((idxs, j) => layers.push({ name: `Cluster ${j + 1}`, color: clusterColor(j), indices: idxs, visible: true, kind: "cluster", centroid: d.base + j }));
@@ -1264,7 +1530,8 @@ async function saveAllLayers() {
 
 async function playLayerSeries(ly) {
   // curve = snap the spline to states (silently); path = stored waypoint order; else order along the axis
-  const ordered = ly.kind === "curve" ? curveToIndices(ly)
+  if (ly.kind === "curve") status("Snapping the curve to states…", "busy");
+  const ordered = ly.kind === "curve" ? await curveToIndices(ly)
     : ly.kind === "path" ? ly.indices.filter((v) => v >= 0)
       : orderAlongAxis(ly.indices);
   if (ordered.length < 2) { status(ly.kind === "curve" ? "Draw the curve across at least two states." : "A series needs ≥2 states.", "warn"); return; }

@@ -15,10 +15,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 from pathlib import Path
 
 # Be a good GPU citizen: don't preallocate the whole device.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+# How many volume decodes may run at once (see _resolve_volume).
+_DECODE_SLOTS = threading.BoundedSemaphore(
+    max(1, int(os.environ.get("HAX_VIEWER_DECODE_CONCURRENCY", "2")))
+)
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -33,6 +39,11 @@ class SaveLayer(BaseModel):
     name: str
     indices: list[int]
     format: str = "xmd"
+
+
+class SnapCurve(BaseModel):
+    embed: str = "pca"                 # which coordinate table the curve was drawn in
+    points: list[list[float]] = []     # the dense spline samples, in that space
 
 
 # --------------------------------------------------------------------------
@@ -53,6 +64,8 @@ class Landscape:
         self._pca_mean = None
         self._umap = None
         self._clusters: dict[int, list[int]] = {}
+        self._kmeans: dict[tuple, tuple] = {}   # (k, seeds, space) -> (labels, centroids, cpca)
+        self._trees: dict[str, object] = {}     # embed -> cKDTree, for snapping drawn curves
 
     @property
     def pca(self):
@@ -76,6 +89,30 @@ class Landscape:
                 self._pca_var = (ev / ev.sum()).astype(float).tolist()
         return self._pca
 
+    # Above this many states, Lloyd's algorithm with ten restarts is minutes of work, and
+    # it was being run *before the first frame was drawn* (see the /api/landscape route).
+    # MiniBatchKMeans converges on the same structure from samples, in seconds.
+    MINIBATCH_N = 50_000
+
+    def _fit_labels(self, data: np.ndarray, k: int, init=None) -> np.ndarray:
+        """Cluster `data` into k groups. One place, so every caller gets the same policy."""
+        n = data.shape[0]
+        if n > self.MINIBATCH_N:
+            from sklearn.cluster import MiniBatchKMeans
+            km = MiniBatchKMeans(
+                n_clusters=k,
+                init=init if init is not None else "k-means++",
+                n_init=1 if init is not None else 3,
+                batch_size=4096,
+                max_iter=200,
+                random_state=0,
+            )
+            return km.fit_predict(data)
+        from sklearn.cluster import KMeans
+        km = KMeans(n_clusters=k, init=init if init is not None else "k-means++",
+                    n_init=1 if init is not None else 10, random_state=0)
+        return km.fit_predict(data)
+
     def kmeans_full(self, k: int, seeds: list[int] | None = None, space: str = "view"):
         """KMeans -> (labels, decodable centroid latents, centroid PCA coords).
 
@@ -94,14 +131,16 @@ class Landscape:
         data = self.decode if space == "network" else self.latents
         seeds = [int(s) for s in (seeds or []) if 0 <= int(s) < self.n]
         seeds = list(dict.fromkeys(seeds))  # de-dup, keep order
+        # Memoised: this used to be the one clustering path with no cache at all, so every
+        # click of "Cluster" re-ran a full KMeans over every state.
+        ckey = (int(k), tuple(seeds), str(space))
+        hit = self._kmeans.get(ckey)
+        if hit is not None:
+            return hit
         try:
-            from sklearn.cluster import KMeans
-            if len(seeds) >= 2:
-                labels = KMeans(n_clusters=len(seeds), init=data[seeds],
-                                n_init=1, random_state=0).fit_predict(data).astype(int)
-            else:
-                k = int(max(2, min(20, k)))
-                labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(data).astype(int)
+            init = data[seeds] if len(seeds) >= 2 else None
+            labels = self._fit_labels(data, len(seeds) if init is not None else int(max(2, min(20, k))),
+                                      init=init).astype(int)
         except Exception:  # noqa: BLE001 - degenerate fallback: one cluster
             labels = np.zeros(self.n, dtype=int)
         uniq = np.unique(labels)
@@ -110,7 +149,9 @@ class Landscape:
         # display positions: mean of the display latents per cluster, projected to PCA
         disp_centers = np.stack([self.latents[labels == c].mean(0) for c in uniq]).astype(np.float32)
         cpca = ((disp_centers - self._pca_mean) @ self._pca_comp.T).astype(np.float32)
-        return labels, centroids, cpca
+        out = (labels, centroids, cpca)
+        self._kmeans[ckey] = out
+        return out
 
     @property
     def pca_var(self):
@@ -131,15 +172,72 @@ class Landscape:
                 self._umap = self.pca[:, :k].copy()
         return self._umap
 
-    def clusters(self, k: int) -> list[int]:
+    def _coords(self, embed: str) -> np.ndarray:
+        """The coordinate table a given embedding view is drawn from."""
+        if embed == "umap":
+            return self.umap()
+        if embed == "latent":
+            return self.latents
+        return self.pca
+
+    def snap(self, embed: str, pts: np.ndarray) -> list[int]:
+        """Nearest state to each point of a drawn curve → an ordered, deduped sequence.
+
+        This is the query the browser used to answer itself, by scanning every state for
+        each of the ~550 samples along the spline: ~4e9 distance evaluations, seconds of a
+        frozen tab, on a plain click of ▶. A k-d tree answers the same thing exactly, in
+        tens of milliseconds, and the tree is built once per embedding and kept.
+
+        (A KMeans/IVF index over the same points is also exact, via the triangle
+        inequality, but measurably slower to both build and query at these dimensions —
+        eight dims is still comfortably inside what a k-d tree handles well.)
+        """
+        coords = np.ascontiguousarray(self._coords(embed), dtype=np.float32)
+        pts = np.atleast_2d(np.asarray(pts, dtype=np.float32))
+        if pts.ndim != 2 or pts.shape[1] != coords.shape[1]:
+            raise ValueError(f"curve points have {pts.shape[1]} dims, but the "
+                             f"'{embed}' space has {coords.shape[1]}")
+        tree = self._trees.get(embed)
+        if tree is None:
+            try:
+                from scipy.spatial import cKDTree
+                tree = self._trees[embed] = cKDTree(coords)
+            except ImportError:
+                tree = None
+        if tree is not None:
+            _dist, idx = tree.query(pts, k=1, workers=-1)
+        else:
+            # No scipy: an exact blocked brute force. Still far better than the browser
+            # doing it, because BLAS is doing the work and it is off the UI thread.
+            best_d = np.full(len(pts), np.inf, np.float64)
+            idx = np.zeros(len(pts), np.int64)
+            qsq = (pts ** 2).sum(1)[:, None]
+            for s in range(0, coords.shape[0], 100_000):
+                blk = coords[s:s + 100_000]
+                d = qsq - 2.0 * (pts @ blk.T) + (blk ** 2).sum(1)[None, :]
+                j = d.argmin(1)
+                v = d[np.arange(len(pts)), j]
+                m = v < best_d
+                best_d[m] = v[m]
+                idx[m] = j[m] + s
+
+        seq: list[int] = []
+        for i in np.atleast_1d(idx):
+            i = int(i)
+            if not seq or seq[-1] != i:   # consecutive samples land on the same state a lot
+                seq.append(i)
+        return seq
+
+    def clusters(self, k: int) -> np.ndarray:
         k = int(max(1, min(20, k)))
         if k not in self._clusters:
             try:
-                from sklearn.cluster import KMeans
-                labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(self.latents)
+                labels = self._fit_labels(self.latents, k)
             except Exception:  # noqa: BLE001
                 labels = np.zeros(self.n, dtype=int)
-            self._clusters[k] = [int(v) for v in labels]
+            # int32, not a list of Python ints: this is shipped as binary now, and at a
+            # million states the list alone was tens of MB of boxed objects.
+            self._clusters[k] = np.asarray(labels, dtype=np.int32)
         return self._clusters[k]
 
 
@@ -170,6 +268,9 @@ class Decoder:
         self._icache: dict[tuple, np.ndarray] = {}
         self._icache_order: list[tuple] = []
         self._icache_cap = 16
+        # Total RAM the two caches above may hold. The count caps are the first limit; this
+        # is the one that actually bounds memory once the box gets large (see _trim_caches).
+        self._budget = int(os.environ.get("HAX_VIEWER_VOL_CACHE_MB", "1024")) * 1024 * 1024
         self.extra: list[np.ndarray] = []   # centroid latents, addressed as indices n..n+m-1
 
     @property
@@ -232,14 +333,32 @@ class Decoder:
             raise RuntimeError(f"decode_volume returned shape {vol.shape}, expected a 3D grid")
         return vol
 
+    def _cached_bytes(self) -> int:
+        return (sum(v.nbytes for v in self._cache.values())
+                + sum(v.nbytes for v in self._icache.values()))
+
+    def _trim_caches(self) -> None:
+        """Hold both volume caches inside a *byte* budget.
+
+        The counts alone (8 states + 16 morph frames) are a memory cap only if you know
+        how big a volume is. At a 320³ box each one is 131 MB, so the caps quietly
+        authorised ~3.1 GB of resident volumes. Evict morph frames first: a morph re-fills
+        its timeline cheaply, whereas the cached states are what the user is looking at.
+        """
+        while self._cached_bytes() > self._budget and len(self._icache_order) > 2:
+            self._icache.pop(self._icache_order.pop(0), None)
+        while self._cached_bytes() > self._budget and len(self._cache_order) > 1:
+            self._cache.pop(self._cache_order.pop(0), None)
+
     def volume(self, index: int) -> np.ndarray:
         if index in self._cache:
             return self._cache[index]
         vol = self._decode_latent(self._latent(index))
         self._cache[index] = vol
         self._cache_order.append(index)
-        while len(self._cache_order) > 8:  # cap memory: keep the 8 most recent volumes
+        while len(self._cache_order) > 8:  # keep at most the 8 most recent volumes...
             self._cache.pop(self._cache_order.pop(0), None)
+        self._trim_caches()                # ...and fewer still if they are large
         return vol
 
     def volume_interp(self, a: int, b: int, t: float) -> np.ndarray:
@@ -257,6 +376,7 @@ class Decoder:
         self._icache_order.append(key)
         while len(self._icache_order) > self._icache_cap:
             self._icache.pop(self._icache_order.pop(0), None)
+        self._trim_caches()
         return vol
 
 
@@ -279,19 +399,38 @@ def enclosed_mass(vol: np.ndarray, level: float) -> float:
     return float(vol[vol >= level].sum())
 
 
-def level_for_mass(vol: np.ndarray, target_mass: float) -> float:
-    """Bisection for the level whose enclosed mass equals `target_mass`.
+def level_for_mass(vol: np.ndarray, target_mass: float, bins: int = 1 << 16) -> float:
+    """The level whose enclosed mass equals `target_mass`. Used to morph at constant mass
+    (a fair shape comparison), so it runs on *every* morph frame.
 
-    Mass is monotonically non-increasing in level, so a simple binary search
-    converges. Used to morph at constant mass (a fair shape comparison)."""
-    lo, hi = float(vol.min()), float(vol.max())
-    for _ in range(40):
-        mid = 0.5 * (lo + hi)
-        if enclosed_mass(vol, mid) > target_mass:
-            lo = mid  # too much mass -> raise the level
-        else:
-            hi = mid
-    return 0.5 * (lo + hi)
+    Solved from one weighted histogram rather than by bisection. Mass above a level is a
+    reverse cumulative sum over the histogram, which is monotone, so the answer is a
+    lookup plus a linear interpolation inside the bracketing bin.
+
+    The bisection this replaces evaluated `enclosed_mass` 40 times, and each of those
+    built a full boolean mask and a fancy-indexed copy of the volume — at a 320³ box that
+    is ~40 × 160 MB of pure memory traffic per frame, none of it releasing the GIL. This
+    is a single pass instead.
+    """
+    flat = vol.ravel()
+    lo, hi = float(flat.min()), float(flat.max())
+    if not (hi > lo):
+        return lo
+    # mass (sum of voxel values), binned by voxel value
+    per_bin, edges = np.histogram(flat, bins=bins, range=(lo, hi), weights=flat)
+    # above[i] = mass of every voxel whose value is >= edges[i]; non-increasing in i
+    above = np.empty(len(edges), dtype=np.float64)
+    above[:-1] = np.cumsum(per_bin[::-1])[::-1]
+    above[-1] = 0.0
+    # first edge whose enclosed mass has dropped to or below the target
+    i = int(np.searchsorted(-above, -float(target_mass), side="left"))
+    if i <= 0:
+        return lo
+    if i >= len(edges):
+        return hi
+    m0, m1 = above[i - 1], above[i]          # m0 >= target >= m1
+    f = 0.0 if m0 == m1 else (m0 - float(target_mass)) / (m0 - m1)
+    return float(edges[i - 1] + f * (edges[i] - edges[i - 1]))
 
 
 def _downsample(vol: np.ndarray, size: int) -> tuple[np.ndarray, int]:
@@ -322,13 +461,29 @@ def grid_box(full_shape, ds_shape, step: int):
     return lo, hi
 
 
+def _scatter_add(idx: np.ndarray, vals: np.ndarray, n: int) -> np.ndarray:
+    """Sum `vals` (m, c) into `n` rows selected by `idx` (m,) — i.e. `np.add.at`, but fast.
+
+    `np.add.at` is the obvious way to write this and the wrong one: it is unbuffered,
+    single-threaded, and holds the GIL for its whole run. On a 320³ mesh (millions of
+    faces) that alone was tens of seconds per decode, during which the viewer's own HTTP
+    server could not answer anything. `np.bincount` computes the same sums in a tight C
+    loop, per column.
+    """
+    out = np.empty((n, vals.shape[1]), dtype=np.float64)
+    for c in range(vals.shape[1]):
+        out[:, c] = np.bincount(idx, weights=vals[:, c], minlength=n)
+    return out
+
+
 def _vertex_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
     """Smooth (area-weighted) per-vertex normals from face geometry."""
-    n = np.zeros(verts.shape, np.float64)
+    nv = verts.shape[0]
     tris = verts[faces]
     fn = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    n = np.zeros((nv, 3), np.float64)
     for k in range(3):
-        np.add.at(n, faces[:, k], fn)
+        n += _scatter_add(faces[:, k], fn, nv)
     ln = np.linalg.norm(n, axis=1, keepdims=True)
     ln[ln == 0] = 1.0
     return (n / ln).astype(np.float32)
@@ -338,7 +493,14 @@ def _taubin_smooth(verts: np.ndarray, faces: np.ndarray, iterations: int,
                    lam: float = 0.5, mu: float = -0.53) -> np.ndarray:
     """Taubin λ|μ low-pass smoothing of the surface. Alternating positive/negative
     Laplacian steps relax the mesh (removing marching-cubes faceting) without the
-    volume shrinkage that plain Laplacian smoothing causes."""
+    volume shrinkage that plain Laplacian smoothing causes.
+
+    The neighbour-averaging is a sparse matrix product, built once and reused across the
+    iterations: with `smooth=6` the Laplacian is evaluated twelve times, and doing that
+    with `np.add.at` (see `_scatter_add`) was the single most GIL-toxic thing in the
+    backend. `A` sums duplicate (src, dst) pairs exactly as the scatter-add did, so the
+    result is unchanged.
+    """
     if iterations <= 0 or len(verts) == 0 or len(faces) == 0:
         return verts
     v = verts.astype(np.float64)
@@ -349,10 +511,13 @@ def _taubin_smooth(verts: np.ndarray, faces: np.ndarray, iterations: int,
     deg = np.bincount(src, minlength=nv).astype(np.float64)
     deg[deg == 0] = 1.0
 
-    def laplacian(p):
-        acc = np.zeros_like(p)
-        np.add.at(acc, src, p[dst])
-        return acc / deg[:, None] - p
+    try:
+        from scipy.sparse import csr_matrix
+        # row-normalised adjacency: (A @ p)[i] = mean of p over i's neighbours
+        A = csr_matrix((1.0 / deg[src], (src, dst)), shape=(nv, nv))
+        laplacian = lambda p: A @ p - p                                    # noqa: E731
+    except ImportError:   # scipy ships with scikit-image, but don't hard-fail on it
+        laplacian = lambda p: _scatter_add(src, p[dst], nv) / deg[:, None] - p   # noqa: E731
 
     for _ in range(int(iterations)):
         v += lam * laplacian(v)
@@ -478,28 +643,57 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
     def health() -> dict:
         return {"ok": True, "n": int(ls.n), "dims": int(ls.dim)}
 
+    # The landscape arrays go out as raw little-endian buffers, not JSON.
+    #
+    # This was by far the worst thing the backend did. `pca.tolist()` plus
+    # `latents.tolist()` at a million states is ~19 million boxed Python floats, which
+    # FastAPI then walks twice (response-model coercion, then the JSON encoder) and
+    # serialises into a few hundred MB of text — minutes of work with the GIL held, so the
+    # viewer's own HTTP server went deaf while it happened, and then the browser had to
+    # JSON.parse the result. The same numbers as float32 are ~8x smaller and parse in no
+    # time, because there is nothing to parse.
+    #
+    # Layout: int32 rows, int32 cols, then rows*cols float32 (C order).
+    def _f32_matrix(a: np.ndarray) -> Response:
+        a = np.ascontiguousarray(a, dtype=np.float32)
+        head = np.array(a.shape[:2], dtype="<i4").tobytes()
+        return Response(content=head + a.tobytes(), media_type="application/octet-stream")
+
+    # Layout: int32 n, then n int32.
+    def _i32_vector(a: np.ndarray) -> Response:
+        a = np.ascontiguousarray(a, dtype="<i4")
+        head = np.array([a.shape[0]], dtype="<i4").tobytes()
+        return Response(content=head + a.tobytes(), media_type="application/octet-stream")
+
     @app.get("/api/landscape")
-    def landscape(k: int = Query(5)) -> dict:
+    def landscape() -> dict:
+        """Just the metadata. The arrays are fetched separately, as binary."""
         return {
             "title": title,
             "n": int(ls.n),
             "dims": int(ls.dim),
-            "pca": ls.pca.tolist(),
             "pca_var": ls.pca_var,
             "pca_k": int(ls.pca.shape[1]),
-            "latents": ls.latents.tolist(),   # raw latent coords, for the "latent" view
-            "cluster": {"k": int(k), "labels": ls.clusters(k)},
         }
 
-    @app.get("/api/embedding")
-    def embedding(kind: str = Query("umap")) -> dict:
-        if kind == "umap":
-            return {"kind": "umap", "points": ls.umap().tolist()}
-        return {"kind": "pca", "points": ls.pca[:, :2].tolist()}
+    @app.get("/api/pca.bin")
+    def pca_bin() -> Response:
+        return _f32_matrix(ls.pca)
 
-    @app.get("/api/cluster")
-    def cluster(k: int = Query(5)) -> dict:
-        return {"k": int(k), "labels": ls.clusters(k)}
+    @app.get("/api/latents.bin")
+    def latents_bin() -> Response:
+        # Only the "latent" embedding view needs these, so they are no longer part of the
+        # first page load — which used to ship the entire latent space to the browser
+        # before it had drawn a single point.
+        return _f32_matrix(ls.latents)
+
+    @app.get("/api/umap.bin")
+    def umap_bin() -> Response:
+        return _f32_matrix(ls.umap())
+
+    @app.get("/api/cluster.bin")
+    def cluster_bin(k: int = Query(5)) -> Response:
+        return _i32_vector(ls.clusters(k))
 
     @app.get("/api/kmeans")
     def kmeans(k: int = Query(5), seeds: str = Query(""), space: str = Query("view")) -> dict:
@@ -514,21 +708,52 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             except ValueError:
                 seed_list = None
         space = "network" if space == "network" else "view"
-        labels, centroids, cpca = ls.kmeans_full(k, seed_list, space=space)
+        _labels, centroids, cpca = ls.kmeans_full(k, seed_list, space=space)
         base = decoder.set_centroids(centroids)
+        # The per-state labels come back through /api/kmeans.bin instead of riding along
+        # here as a million boxed Python ints. kmeans_full is memoised, so that second
+        # call is a dict lookup, not a second clustering.
         return {
             "k": int(centroids.shape[0]),
-            "labels": [int(v) for v in labels],
             "base": int(base),
             "centroid_pca": cpca.tolist(),
         }
 
+    @app.post("/api/snap")
+    def snap(body: SnapCurve) -> dict:
+        """Snap a drawn curve onto the states it passes through (see Landscape.snap)."""
+        if not body.points:
+            return {"indices": []}
+        try:
+            return {"indices": ls.snap(body.embed, body.points)}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    @app.get("/api/kmeans.bin")
+    def kmeans_bin(k: int = Query(5), seeds: str = Query(""), space: str = Query("view")) -> Response:
+        seed_list = None
+        if seeds.strip():
+            try:
+                seed_list = [int(x) for x in seeds.split(",") if x.strip() != ""]
+            except ValueError:
+                seed_list = None
+        space = "network" if space == "network" else "view"
+        labels, _c, _p = ls.kmeans_full(k, seed_list, space=space)
+        return _i32_vector(labels)
+
     def _resolve_volume(index: int, index2: int | None, t: float) -> np.ndarray:
         if index < 0 or index >= decoder.total:
             raise HTTPException(status_code=404, detail="latent index out of range")
-        if index2 is not None and 0 <= index2 < decoder.total and index2 != index:
-            return decoder.volume_interp(index, index2, max(0.0, min(1.0, t)))
-        return decoder.volume(index)
+        # Serialise the decodes. These routes are sync `def`, so Starlette runs them in a
+        # threadpool with ~40 slots, and a threadpool task cannot be cancelled — not even
+        # when the client has gone away. Dragging the threshold slider could therefore pile
+        # up dozens of concurrent 320³ decodes that nobody would ever look at, each holding
+        # a volume plus its temporaries. The cap makes them queue instead of competing for
+        # the same GPU and the same RAM.
+        with _DECODE_SLOTS:
+            if index2 is not None and 0 <= index2 < decoder.total and index2 != index:
+                return decoder.volume_interp(index, index2, max(0.0, min(1.0, t)))
+            return decoder.volume(index)
 
     @app.get("/api/decode")
     def decode(

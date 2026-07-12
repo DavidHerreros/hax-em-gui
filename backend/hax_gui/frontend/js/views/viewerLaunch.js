@@ -53,7 +53,7 @@ function chooseGpu(gpus) {
     const row = (value, label, detail) => h("button", {
       class: "btn", style: { justifyContent: "space-between", width: "100%" },
       onclick: () => done(value),
-    }, h("span", { class: "mono" }, label), h("span", { class: "muted small" }, detail));
+    }, h("span", { class: "mono" }, label), h("span", { class: "btn-sub" }, detail));
 
     const gb = (mb) => (mb == null ? null : `${(mb / 1024).toFixed(1)}`);
     const rows = gpus.map((g) => {
@@ -92,7 +92,7 @@ function chooseSpace(spaces) {
       onclick: () => done(s.index),
     },
       h("span", { class: "mono" }, s.name),
-      h("span", { class: "muted small" }, s.viewable ? `decoder: ${s.decoder_program}` : (s.reason || ""))));
+      h("span", { class: "btn-sub" }, s.viewable ? `decoder: ${s.decoder_program}` : (s.reason || ""))));
 
     const modal = h("div", { class: "modal", onclick: (e) => e.stopPropagation() },
       h("div", { class: "modal-head" }, h("span", null, "Choose a consensus space"),

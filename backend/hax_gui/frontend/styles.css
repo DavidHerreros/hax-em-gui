@@ -225,6 +225,15 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .btn.secondary:hover { background: var(--surface-hover); }
 .btn.ghost { background: transparent; color: var(--muted); }
 .btn.ghost:hover { color: var(--text); background: var(--hover); }
+/* Secondary text inside a filled .btn — the right-hand detail on the chooser modals'
+   option rows. It cannot use --muted: that is tuned for page surfaces, and against the
+   brand fill it all but vanishes (light mode puts a dark slate on indigo, 1.2:1). Derive
+   it from the button's own white foreground instead, which is identical in both themes:
+   5.4:1 at rest. On hover the fill lightens to --brand, where even solid white only
+   reaches 4.5:1, so go fully opaque there and track the button's own label rather than
+   sitting below it. */
+.btn .btn-sub { color: rgba(255, 255, 255, 0.9); font-size: 12px; font-weight: 400; }
+.btn:hover .btn-sub { color: #fff; }
 /* split button: a primary action joined to a caret that reveals its "Edit &" variant,
    so paired actions read as one control instead of crowding the row. */
 .btn-split { display: inline-flex; }
@@ -486,6 +495,16 @@ body.vwin-dragging iframe { pointer-events: none; }
 .mx-card-title { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mx-card-head .btn-icon { margin-left: auto; }
 .mx-card-head .btn-icon + .btn-icon { margin-left: 0; }
+/* per-curve appearance editor, expanded inside the card it belongs to */
+.mx-stylebox { display: flex; flex-direction: column; gap: 6px; padding: 8px; margin-bottom: 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--input-bg); }
+.mx-styrow { display: flex; align-items: center; gap: 8px; }
+.mx-color { width: 26px; height: 24px; padding: 0; border: 1px solid var(--border-2); border-radius: 6px; background: none; cursor: pointer; }
+.mx-color::-webkit-color-swatch-wrapper { padding: 2px; }
+.mx-color::-webkit-color-swatch { border: none; border-radius: 4px; }
+.mx-styname { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mx-alpha { width: 68px; flex: 0 0 auto; }
+.btn-icon.active { border-color: var(--brand); color: var(--text); background: var(--active-bg); }
+
 .mx-legend { display: flex; gap: 10px; flex-wrap: wrap; }
 .mx-legitem { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
 .mx-swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
@@ -833,6 +852,14 @@ body.vwin-dragging iframe { pointer-events: none; }
 .setup-list strong { color: var(--text); font-weight: 500; }
 .setup-list code { font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--warn); }
 .setup-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+
+/* interrupted workflow runs: one row per run, each decided on its own (several can be
+   waiting at once — e.g. one per GPU), so the buttons live in the row, not the banner. */
+.resume-row { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  flex-wrap: wrap; margin: 8px 0; }
+.resume-what { min-width: 0; }
+.resume-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.resume-actions .btn { padding: 5px 10px; font-size: 12px; }
 
 /* the Settings cards pulse when the notice's "Set" button sends you to them */
 .card.highlight { animation: setup-pulse 1.2s ease-out 2; }

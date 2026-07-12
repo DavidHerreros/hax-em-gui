@@ -85,6 +85,13 @@ def _startup() -> None:
     app.state.keep_ollama = False  # set true across an in-place restart (see restart_server)
     app.state.updates = {"checked_at": None, "checking": False, "packages": []}
     app.state.update_poller = asyncio.create_task(_poll_updates())
+    # Jobs outlive this process now, so a restart does not end them — pick up the ones
+    # left running by the previous server and resume streaming their logs. Workflow
+    # schedulers, being asyncio tasks rather than processes, cannot outlive it: restart
+    # the ones whose run is still genuinely in flight (workflows._plan_resume decides;
+    # the rest are parked for the user to confirm, since resuming them would launch work).
+    app.state.job_reattach = asyncio.create_task(manager.reattach())
+    app.state.wf_resume = asyncio.create_task(wf_manager.resume_all())
 
     # Optionally bring up a local Ollama for the assistant (only if not already
     # running); shutdown stops only an instance we started. See ollama.py.
@@ -1805,6 +1812,36 @@ def list_workflows(project_id: str | None = None) -> list[dict[str, Any]]:
 @app.post("/api/workflows", dependencies=[Depends(auth)])
 def create_workflow(body: WorkflowBody) -> dict[str, Any]:
     return wf_manager.save(body.project_id, body.name, body.graph)
+
+
+@app.get("/api/workflows/resumable", dependencies=[Depends(auth)])
+def resumable_workflows() -> list[dict[str, Any]]:
+    """Runs the server was restarted out from under, whose next step never started.
+
+    Declared before /api/workflows/{wid} so it isn't swallowed by it. Only workflows
+    where resuming would actually *launch* something land here: one whose step is still
+    running was resumed silently at startup, and one with nothing left to do was settled.
+    """
+    return wf_manager.list_resumable()
+
+
+@app.post("/api/workflows/{wid}/resume", dependencies=[Depends(auth)])
+async def resume_workflow(wid: str) -> dict[str, Any]:
+    """Carry on from where the run stopped. Completed steps keep their jobs and are not
+    recomputed; the steps still queued are launched in order."""
+    try:
+        return await wf_manager.resume(wid)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="workflow not found")
+
+
+@app.post("/api/workflows/{wid}/dismiss-resume", dependencies=[Depends(auth)])
+def dismiss_workflow_resume(wid: str) -> dict[str, Any]:
+    """Stop offering to resume this run (its queue is kept, so the canvas can still run it)."""
+    wf = wf_manager.dismiss_resume(wid)
+    if wf is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return wf
 
 
 @app.get("/api/workflows/{wid}", dependencies=[Depends(auth)])

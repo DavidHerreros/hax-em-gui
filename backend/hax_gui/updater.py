@@ -91,8 +91,19 @@ class Updater:
             raise UpdateBlocked(f"unknown update mode '{mode}'")
         if not updates.is_watched(package):
             raise UpdateBlocked(f"'{package}' is not a managed package")
-        if job_manager.count_active() > 0:
-            raise UpdateBlocked("a job is still running — wait for it to finish before updating")
+        # Updating the GUI no longer disturbs a running job: jobs own their log files and
+        # their own process group, so the restart at the end of the update leaves them
+        # alone and the next server process reattaches to them (see jobs.py).
+        #
+        # Updating hax-em itself is a different matter, and still blocked. A running job
+        # *is* hax: pip would be replacing the very modules it is executing, and it
+        # imports lazily as it goes, so the files could change underneath it mid-run.
+        if package != updates.GUI_DIST and job_manager.count_active() > 0:
+            raise UpdateBlocked(
+                f"a job is still running — '{package}' is the package those jobs execute, "
+                "so updating it now could change the code underneath them. Wait for the job "
+                "to finish, or cancel it."
+            )
 
         status = await asyncio.to_thread(updates.status_for, package)
         if status is None:

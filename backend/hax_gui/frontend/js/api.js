@@ -122,6 +122,10 @@ export const api = {
   // flight the steps are appended to its queue rather than rejected.
   runWorkflow: (id, nodes) => req(`/api/workflows/${id}/run`, { method: "POST", body: JSON.stringify(nodes ? { nodes } : {}) }),
   stopWorkflow: (id) => req(`/api/workflows/${id}/stop`, { method: "POST" }),
+  // Runs the server was restarted out from under, whose next step never started.
+  resumableWorkflows: () => req("/api/workflows/resumable"),
+  resumeWorkflow: (id) => req(`/api/workflows/${id}/resume`, { method: "POST" }),
+  dismissWorkflowResume: (id) => req(`/api/workflows/${id}/dismiss-resume`, { method: "POST" }),
   workflowFromProject: (projectId, name) => req(`/api/workflows/from-project/${projectId}`, { method: "POST", body: JSON.stringify({ name: name || null }) }),
   workflowSaveAsProject: (id, name) => req(`/api/workflows/${id}/save-as-project`, { method: "POST", body: JSON.stringify({ name }) }),
 
