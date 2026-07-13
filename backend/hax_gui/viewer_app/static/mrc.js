@@ -94,16 +94,20 @@ function makeLive(fn) {
 // coalescing converges on the level you released at.
 //
 // Even coalesced, a full pass is ~750 ms and ~21 MB at a 320³ box — steady, but not live.
-// So while the pointer is down we ask for a draft: a strided grid, no smoothing (~50 ms,
+// So while the pointer is down we ask for a draft: a strided grid, lightly smoothed (~80 ms,
 // ~3.8 MB), and take the full mesh once on release. The server scales the draft by its
 // stride, so it sits in the same [-1,1] cube and refines in place rather than jumping.
 const DRAFT_GRID = 160;
+// Drafts carry light smoothing too: a coarse grid facets more, and Taubin's cost is
+// almost all fixed setup (one tick costs what six do), so leaving it off bought nothing
+// and made the surface change character when you let go of the slider. See app.js.
+const DRAFT_SMOOTH = 2;
 
 async function surfaceOnce(draft) {
   status("Contouring…", "busy");
   try {
     const q = `sigma=${state.sigma.toFixed(3)}`
-            + (draft ? `&smooth=0&size=${DRAFT_GRID}` : `&smooth=${state.smooth}`);
+            + (draft ? `&smooth=${Math.min(state.smooth, DRAFT_SMOOTH)}&size=${DRAFT_GRID}` : `&smooth=${state.smooth}`);
     const buf = await (await fetch(`./api/decode?${q}`)).arrayBuffer();
     if (state.render !== "surface") return;   // mode switched while we were waiting
     const m = parseMesh(buf);

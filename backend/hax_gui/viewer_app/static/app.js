@@ -197,7 +197,8 @@ function wireControls() {
   $("densint").addEventListener("input", (e) => { state.densIntensity = +e.target.value; if (cloud) cloud.setDensityIntensity(state.densIntensity); });
   $("densmap").addEventListener("change", (e) => { state.densMap = e.target.value; applyColormap(); if (state.colorBy === "density") applyColor(); });
   $("light").addEventListener("change", (e) => renderer.setLighting(e.target.value));
-  $("smooth").addEventListener("input", (e) => { state.smooth = +e.target.value; if (state.timeline.length && state.frame > 0) liveFrame(state.frame); else liveDecode(); });
+  // Smoothing is baked into the cached draft meshes, so changing it invalidates them.
+  $("smooth").addEventListener("input", (e) => { state.smooth = +e.target.value; clearFrameCache(); if (state.timeline.length && state.frame > 0) liveFrame(state.frame, false); else liveDecode(); });
   $("color").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setColor(c); if (volRenderer) volRenderer.setColor(c); });
   $("bg").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setBackground(c); if (volRenderer) volRenderer.setBackground(c); });
   $("reset").addEventListener("click", () => { renderer.resetView(); if (volRenderer) volRenderer.resetView(); });
@@ -207,9 +208,11 @@ function wireControls() {
   $("play").addEventListener("click", togglePlay);
   $("record").addEventListener("click", recordSeries);
   $("stop").addEventListener("click", stopPlayback);
-  $("scrub").addEventListener("input", (e) => { setPlaying(false); if (!state.timeline.length) buildTimeline(); liveFrame(+e.target.value); });
+  // Scrubbing is a drag: draft while it moves, full resolution once it settles.
+  $("scrub").addEventListener("input", (e) => { setPlaying(false); if (!state.timeline.length) buildTimeline(); liveFrame(+e.target.value, true); });
+  $("scrub").addEventListener("change", (e) => { if (!playing) liveFrame(+e.target.value, false); });
   $("frames").addEventListener("change", () => { buildTimeline(); });
-  $("speed").addEventListener("input", (e) => { state.fps = +e.target.value; if (playing) backgroundFill(); });
+  $("speed").addEventListener("input", (e) => { state.fps = +e.target.value; if (playing) prefetch(true); });
   $("clearpath").addEventListener("click", clearPath);
   $("rendermode").addEventListener("change", (e) => setRenderMode(e.target.value));
   $("vgamma").addEventListener("input", (e) => { state.vGamma = +e.target.value; if (volRenderer) volRenderer.setGamma(state.vGamma); });
@@ -857,13 +860,36 @@ function makeLive(fn) {
   return (...a) => { args = a; if (busy) pending = true; else run(); };
 }
 const liveDecode = makeLive((draft) => decode(draft));
-const liveFrame = makeLive((i) => renderFrame(i));
+const liveFrame = makeLive((i, draft) => renderFrame(i, draft));
 
-// While the contour is being dragged, mesh a strided grid instead of the full one: at a
-// 320³ box that is ~50 ms and 3.8 MB against ~750 ms and 21 MB, which is the difference
-// between a live slider and a frozen one. The server scales the draft by its stride, so it
-// occupies the same [-1,1] cube and refines in place when the full mesh lands on release.
-const DRAFT_GRID = 160;
+// Draft resolutions. Rather than mesh the full grid, ask the server for a strided one; it
+// scales the result by the stride, so a draft occupies the same [-1,1] cube as the full
+// surface and refines in place instead of jumping. Boxes at or below these sizes are not
+// strided at all, so a small map is unaffected.
+//
+// Two sizes, because the two jobs want different things. A contour drag ends on a still
+// you will look at, so it stays fairly fine. Playback needs a *new* frame every 33 ms —
+// and a morph frame is a fresh latent, so unlike a contour it can never be served from a
+// cache — so it trades detail for rate, which motion hides anyway. Measured on a 320³ box:
+//   full 470 ms (2 fps) · 160³ 99 ms (10 fps) · 107³ 60 ms (17 fps) · 80³ 46 ms (22 fps)
+const DRAFT_GRID = 160;   // contour drag / scrub
+const PLAY_GRID = 128;    // morph playback (-> a 107³ grid at a 320³ box)
+
+// Drafts are smoothed too, lightly. They used to be sent raw, which was backwards: a
+// coarse grid facets *more*, so the draft is exactly where relaxing the surface earns its
+// keep — and leaving it off meant the map visibly changed character when you released the
+// slider or paused.
+//
+// The cap is not a speed compromise. Almost none of the cost of Taubin is the iterating:
+// building the mesh's adjacency and recomputing the normals afterwards are O(edges) and
+// paid once for any k > 0, while each iteration is two sparse matvecs (~1 ms on a draft).
+// Measured on a 320³ box: smooth=0 -> 66 ms, smooth=1 -> 81 ms, smooth=6 -> 85 ms. So one
+// tick costs essentially what six do; the choice is on-or-off. The cap is about *looks*:
+// Taubin relaxes vertices by a fixed amount in mesh units, and a draft's triangles are
+// bigger, so the same k smooths a draft harder than the full surface. Two keeps the draft
+// looking like what you get when you let go.
+const DRAFT_SMOOTH = 2;
+const draftSmooth = () => Math.min(state.smooth, DRAFT_SMOOTH);
 
 let decodedIndex = -1;    // the state whose volume the server has already decoded
 
@@ -876,7 +902,7 @@ async function decode(draft = false) {
   status(fresh ? "Decoding map…" : "Contouring…", "busy");
   try {
     const q = `index=${state.current}&sigma=${state.sigma.toFixed(3)}`
-            + (draft ? `&smooth=0&size=${DRAFT_GRID}` : `&smooth=${state.smooth}`);
+            + (draft ? `&smooth=${draftSmooth()}&size=${DRAFT_GRID}` : `&smooth=${state.smooth}`);
     const res = await fetch(`./api/decode?${q}`);
     if (!res.ok) throw new Error(await res.text());
     const m = parseMesh(await res.arrayBuffer());
@@ -918,7 +944,7 @@ function setRenderMode(mode) {
   if (volRenderer) volRenderer.setMode(mode === "emission" ? "emission" : "mip");
   const to = surf ? renderer : volRenderer;
   if (to && to !== from && camera) to.setCamera(camera);
-  if (state.timeline.length && state.frame > 0) renderFrame(state.frame);
+  if (state.timeline.length && state.frame > 0) renderFrame(state.frame, false);
   else if (state.current >= 0) decode();
 }
 
@@ -986,36 +1012,74 @@ function buildTimeline() {
 // no mid-loop stalls. The budget is what bounds memory — sized by bytes (not a
 // frame count) because a 96³ grid and a marching-cubes mesh differ ~10×.
 const CACHE_BUDGET = 768 * 1024 * 1024;   // ~768 MB of decoded frames (tune freely)
-const frameCache = new Map();      // key -> { surface, payload, bytes }
+const frameCache = new Map();      // key -> { surface, payload, bytes, idx }
 const frameInflight = new Map();   // key -> Promise (single-flight per key)
-const frameCacheKeys = [];         // insertion order, for LRU eviction
 let cacheBytes = 0;
-let fillToken = 0;                  // bumped to cancel an in-flight background fill
+let fillToken = 0;                  // bumped to cancel an in-flight prefetch
+
+// Prefetch shape. The server serialises decodes at 2 slots, so 2 in flight saturates it;
+// more would only make each one slower (they contend for CPU and memory bandwidth).
+const PREROLL_FRAMES = 24;    // buffered before playback starts at all
+const LOOKAHEAD = 64;         // frames kept ready ahead of the playhead
+const LOW_WATER = 8;          // below this the buffer is draining -> pace to the server
+const FETCH_CONCURRENCY = 2;
+
+// Rolling measure of what the server actually sustains, in ms per delivered frame. Used to
+// pace the *first* pass: better to play smoothly at 12 fps than to stutter at a nominal 30.
+const doneAt = [];
+function decodeRateMs() {
+  if (doneAt.length < 3) return 0;
+  return (doneAt[doneAt.length - 1] - doneAt[0]) / (doneAt.length - 1);
+}
 
 function clearFrameCache() {
-  fillToken++;                     // cancel any running fill (its frames are stale)
-  frameCache.clear(); frameInflight.clear(); frameCacheKeys.length = 0; cacheBytes = 0;
+  fillToken++;                     // cancel any running prefetch (its frames are stale)
+  frameCache.clear(); frameInflight.clear(); cacheBytes = 0; doneAt.length = 0;
+}
+
+// Evict down to the budget, dropping the frame furthest AHEAD of the playhead first.
+//
+// This replaces an LRU, which is the worst possible policy for a loop: the least-recently
+// used frame is precisely the one the playhead is about to come round to again, so a
+// timeline that overflowed the budget evicted exactly what it was about to need and hit
+// approximately never — a long morph (a cluster layer) stayed slow on every cycle, for
+// ever. Evicting what we'll want *last* is near-optimal for a cyclic scan.
+function evictTo(budget) {
+  if (cacheBytes <= budget) return;
+  const n = state.timeline.length || 1;
+  const here = state.frame;
+  const ranked = [...frameCache.entries()]
+    .map(([k, e]) => [k, e, (e.idx - here + n) % n])
+    .sort((x, y) => y[2] - x[2]);              // furthest ahead in playback order first
+  for (const [k, e] of ranked) {
+    if (cacheBytes <= budget) return;
+    if (e.idx === here) continue;              // never evict the frame on screen
+    frameCache.delete(k); cacheBytes -= e.bytes;
+  }
 }
 
 // The decode request (query + cache key) for timeline frame i, or null.
-function frameRequest(i) {
+// `draft` asks the server for a strided, lightly-smoothed mesh — see DRAFT_GRID.
+function frameRequest(i, draft) {
   if (!state.timeline.length) return null;
   i = Math.max(0, Math.min(state.timeline.length - 1, i | 0));
   const [a, b, t] = state.timeline[i];
   const mass = state.refMass >= 0 ? state.refMass : null;
+  const at = `index=${a}&index2=${b}&t=${t.toFixed(4)}`;
+  const level = mass != null ? `&mass=${mass}` : `&sigma=${state.sigma.toFixed(3)}`;
   if (state.render === "surface") {
-    const q = `index=${a}&index2=${b}&t=${t.toFixed(4)}&smooth=${state.smooth}` + (mass != null ? `&mass=${mass}` : `&sigma=${state.sigma.toFixed(3)}`);
+    const q = at + (draft ? `&smooth=${draftSmooth()}&size=${PLAY_GRID}` : `&smooth=${state.smooth}`) + level;
     return { surface: true, url: `./api/decode?${q}`, key: `s|${q}` };
   }
-  const q = `index=${a}&index2=${b}&t=${t.toFixed(4)}&size=96`;
+  const q = `${at}&size=96`;
   return { surface: false, url: `./api/grid?${q}`, key: `v|${q}` };
 }
 
-// Decode (or reuse) frame i -> { surface, payload }. Caches the parsed result
-// and coalesces concurrent requests for the same key, so the prefetcher and the
-// render loop never fetch the same frame twice.
-function decodeFrame(i) {
-  const req = frameRequest(i);
+// Decode (or reuse) frame i -> { surface, payload }. Caches the parsed result and
+// coalesces concurrent requests for the same key, so the prefetcher and the render loop
+// never fetch the same frame twice.
+function decodeFrame(i, draft) {
+  const req = frameRequest(i, draft);
   if (!req) return Promise.resolve(null);
   const hit = frameCache.get(req.key);
   if (hit) return Promise.resolve(hit);
@@ -1027,14 +1091,11 @@ function decodeFrame(i) {
     const bytes = req.surface
       ? payload.positions.byteLength + payload.normals.byteLength + payload.indices.byteLength
       : payload.data.byteLength;
-    const entry = { surface: req.surface, payload, bytes };
-    frameCache.set(req.key, entry); frameCacheKeys.push(req.key); cacheBytes += bytes;
-    // evict oldest until under budget (never the entry we just added: it's at the tail)
-    while (cacheBytes > CACHE_BUDGET && frameCacheKeys.length > 1) {
-      const old = frameCacheKeys.shift();
-      const e = frameCache.get(old);
-      if (e) { cacheBytes -= e.bytes; frameCache.delete(old); }
-    }
+    const entry = { surface: req.surface, payload, bytes, idx: i };
+    frameCache.set(req.key, entry); cacheBytes += bytes;
+    evictTo(CACHE_BUDGET);
+    doneAt.push(performance.now());
+    if (doneAt.length > 12) doneAt.shift();
     return entry;
   })();
   p.finally(() => { if (frameInflight.get(req.key) === p) frameInflight.delete(req.key); });
@@ -1042,25 +1103,61 @@ function decodeFrame(i) {
   return p;
 }
 
-// Decode the whole timeline ahead of the playhead, as fast as the server allows
-// (one outstanding request; the fps sleeps leave plenty of idle time). Stops if
-// the cache fills the budget — past that point the look-ahead window is all we
-// can keep, so further filling would just thrash. Re-launched on each play.
-async function backgroundFill() {
+// How many frames the playhead can advance through, right now, without waiting.
+function bufferedAhead(step, draft) {
+  const n = state.timeline.length;
+  if (!n) return 0;
+  for (let d = 1; d <= LOOKAHEAD; d++) {
+    const req = frameRequest((state.frame + d * step) % n, draft);
+    if (!req || !frameCache.has(req.key)) return d - 1;
+  }
+  return LOOKAHEAD;
+}
+
+// Keep a window of frames ready *ahead* of the playhead, nearest first, with a couple of
+// requests in flight.
+//
+// The old filler walked the timeline one request deep, in lockstep with the playhead —
+// and its premise ("use the idle time during the fps sleeps") was false: when a frame
+// costs a second and the frame period is 33 ms, `sleep(delay - elapsed)` is zero. There is
+// no idle time. All it achieved was a second concurrent request on a server that does not
+// parallelise, making every frame slower for no look-ahead at all.
+async function prefetch(draft) {
   const my = ++fillToken;
+  while (my === fillToken && playing) {
+    const n = state.timeline.length;
+    if (!n) return;
+    const { step } = playCadence();
+    const jobs = [];
+    for (let d = 1; d <= LOOKAHEAD; d++) {
+      if (frameInflight.size + jobs.length >= FETCH_CONCURRENCY) break;
+      const i = (state.frame + d * step) % n;
+      const req = frameRequest(i, draft);
+      if (!req || frameCache.has(req.key) || frameInflight.has(req.key)) continue;
+      jobs.push(decodeFrame(i, draft).catch(() => {}));
+    }
+    // Window full (or the server is busy): wait for something to change rather than spin.
+    if (!jobs.length) { await sleep(30); continue; }
+    await Promise.race(jobs);          // as soon as one lands, re-evaluate the window
+  }
+}
+
+// Fill a starting buffer before the first frame is shown, so playback does not begin by
+// stalling. Instant on a second play (everything is already cached).
+async function preroll(draft) {
   const n = state.timeline.length;
   const { step } = playCadence();
-  const start = state.frame;                            // cover the frames the playhead will show
-  const count = Math.ceil(n / step) + 1;               // one stride past the wrap, in playhead order
-  for (let d = 0; d < count; d++) {
-    if (my !== fillToken || !playing) return;          // superseded / stopped / timeline rebuilt
-    if (cacheBytes > CACHE_BUDGET * 0.92) return;       // budget reached -> stop pre-filling
-    await decodeFrame((start + d * step) % n).catch(() => {});
+  const want = Math.max(1, Math.min(PREROLL_FRAMES, Math.ceil(n / step) - 1));
+  while (playing) {
+    const have = bufferedAhead(step, draft);
+    if (have >= want) return;
+    status(`Preparing morph… ${have}/${want} frames`, "busy");
+    await sleep(60);
   }
 }
 
 // Render one timeline frame in the current render mode (mass-constant for surfaces).
-async function renderFrame(i) {
+async function renderFrame(i, draft = false) {
   if (!state.timeline.length) return;
   i = Math.max(0, Math.min(state.timeline.length - 1, i | 0));
   state.frame = i; $("scrub").value = String(i); $("framelbl").textContent = `${i + 1}/${state.timeline.length}`;
@@ -1069,7 +1166,7 @@ async function renderFrame(i) {
   const col = lerpColor(colorForIndex(a), colorForIndex(b), t);   // smooth cluster-color transition
   const tok = ++decodeToken;
   try {
-    const entry = await decodeFrame(i);
+    const entry = await decodeFrame(i, draft);
     if (tok !== decodeToken || !entry) return;   // a newer frame superseded this one
     if (entry.surface) {
       const m = entry.payload;
@@ -1094,24 +1191,42 @@ async function togglePlay() {
   if (playing) { setPlaying(false); return; }
   if (!state.timeline.length && !buildTimeline()) { status("Build a path first (shift-click states).", "warn"); return; }
   setPlaying(true);
-  backgroundFill();                            // race ahead of the playhead, filling the cache
+  // Playback runs on draft meshes: a morph frame is a *new* latent every time, so nothing
+  // is ever cached server-side and the full-resolution mesh cannot be made cheap. The
+  // draft is ~15x cheaper, and the frame you settle on is re-rendered at full resolution
+  // when you pause (below).
+  prefetch(true);                              // keep a window ready ahead of the playhead
+  await preroll(true);                         // don't start by stalling
   while (playing) {
     const { delay, step } = playCadence();
     let next = state.frame + step;
     if (next >= state.timeline.length) next = 0;     // loop (wrap to start)
     const t0 = performance.now();
-    await renderFrame(next);
+    await renderFrame(next, true);
     if (!playing) break;
-    status(`Playing… frame ${state.frame + 1}/${state.timeline.length}`, "busy");
-    // hold the display rate without double-counting the decode we just paid for
-    await sleep(Math.max(0, delay - (performance.now() - t0)));
+    // Pace to the buffer. With a healthy look-ahead we hold the display rate; while the
+    // prefetcher is still catching up we drop to the rate the server actually sustains,
+    // so the first pass is smooth-but-slower rather than jerky. Once the timeline is
+    // cached the buffer never drains and it runs at full speed.
+    const rate = decodeRateMs();
+    const draining = bufferedAhead(step, true) < LOW_WATER && rate > 0;
+    const pace = draining ? Math.max(delay, rate) : delay;
+    status(draining
+      ? `Playing… frame ${state.frame + 1}/${state.timeline.length} (buffering)`
+      : `Playing… frame ${state.frame + 1}/${state.timeline.length}`, "busy");
+    await sleep(Math.max(0, pace - (performance.now() - t0)));
   }
-  if (!recording) status(`Paused at frame ${state.frame + 1}/${state.timeline.length}.`);
+  fillToken++;                                 // stop the prefetcher
+  if (!recording) {
+    status(`Paused at frame ${state.frame + 1}/${state.timeline.length}.`);
+    renderFrame(state.frame, false);           // settle on the full-resolution surface
+  }
 }
 
 function stopPlayback() {
   setPlaying(false); recording = false;
-  if (state.timeline.length) renderFrame(0);
+  fillToken++;
+  if (state.timeline.length) renderFrame(0, false);
   status("Stopped.");
 }
 
@@ -1127,10 +1242,14 @@ async function recordSeries() {
     rec.start();
   } catch (err) { status("Recording unavailable: " + err.message, "err"); return; }
   recording = true; setPlaying(true);
-  backgroundFill();
-  await renderFrame(0);
+  // Recording stays on full-resolution frames — an exported movie is the one place the
+  // draft would be a real loss — but it now prefetches ahead of itself instead of decoding
+  // strictly in lockstep, so the capture stalls less between frames.
+  prefetch(false);
+  await renderFrame(0, false);
   const { delay: recDelay, step: recStep } = playCadence();   // record what playback shows
-  for (let i = recStep; i < state.timeline.length && playing; i += recStep) { await renderFrame(i); status(`Recording… ${i + 1}/${state.timeline.length}`, "busy"); await sleep(recDelay); }
+  for (let i = recStep; i < state.timeline.length && playing; i += recStep) { await renderFrame(i, false); status(`Recording… ${i + 1}/${state.timeline.length}`, "busy"); await sleep(recDelay); }
+  fillToken++;
   setPlaying(false); recording = false;
   rec.stop(); rec.onstop = () => downloadBlob(new Blob(chunks, { type: "video/webm" }), "morph.webm");
   status("Recording saved (morph.webm).");

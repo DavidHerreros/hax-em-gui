@@ -271,6 +271,7 @@ class Decoder:
         # Total RAM the two caches above may hold. The count caps are the first limit; this
         # is the one that actually bounds memory once the box gets large (see _trim_caches).
         self._budget = int(os.environ.get("HAX_VIEWER_VOL_CACHE_MB", "1024")) * 1024 * 1024
+        self._box: int | None = None        # the model's grid size, learned on first decode
         self.extra: list[np.ndarray] = []   # centroid latents, addressed as indices n..n+m-1
 
     @property
@@ -320,18 +321,67 @@ class Decoder:
         self._jnp = jnp
         self._decode = _decode
 
-    def _decode_latent(self, latent: np.ndarray) -> np.ndarray:
+    def _decode_latent(self, latent: np.ndarray, stride: int = 1) -> np.ndarray:
+        """Decode one latent to a density grid. With ``stride > 1`` the grid is subsampled
+        **on the device, before the copy home**.
+
+        That ordering is the whole point. The network is cheap and barely cares about the
+        box (it evaluates a fixed set of Gaussians and splats them), but the volume it
+        splats into is not: at a 320³ box the result is 131 MB, and getting it across PCIe
+        costs ~85 ms — measured *more* than meshing a draft of it. Striding on the host
+        would pay that 85 ms and then throw 7/8 of the data away. Striding here copies
+        only what we are going to mesh (~16 MB, ~10 ms), which is what makes a morph — a
+        fresh latent every frame, so nothing is ever cached — playable at all.
+        """
         self._ensure_model()
-        x = self._jnp.asarray(latent)
-        # np.array (not asarray) forces a writable copy -- JAX arrays are
-        # read-only and skimage.marching_cubes needs a writable buffer.
-        vol = np.array(self._decode(x), dtype=np.float32)
-        vol = np.squeeze(vol)
+        jnp = self._jnp
+        vol = self._decode(jnp.asarray(latent))
+        vol = jnp.squeeze(vol)
         if vol.ndim == 4:
             vol = vol[0]
         if vol.ndim != 3:
             raise RuntimeError(f"decode_volume returned shape {vol.shape}, expected a 3D grid")
-        return vol
+        self._box = int(max(vol.shape))     # learned once; the box is a property of the model
+        if stride > 1:
+            vol = vol[::stride, ::stride, ::stride]      # still a device op
+        # np.array (not asarray) forces a writable copy -- JAX arrays are
+        # read-only and skimage.marching_cubes needs a writable buffer.
+        return np.ascontiguousarray(np.array(vol, dtype=np.float32))
+
+    @property
+    def box(self) -> int | None:
+        """The model's grid size, or None until something has been decoded."""
+        return self._box
+
+    def has(self, index: int) -> bool:
+        return index in self._cache
+
+    def draft(self, index: int, index2: int | None, t: float, size: int) -> tuple[np.ndarray, int]:
+        """A reduced-resolution grid to mesh, and the stride it was taken at.
+
+        Two paths, and the split is what matters:
+
+        * **a plain state** — its full volume is very likely already cached (it was decoded
+          to show the map), so stride the cached array. No GPU work at all.
+        * **a morph frame** — every ``t`` is a new latent, so nothing is or ever will be
+          cached and a decode is unavoidable. Take the stride on the device (see
+          ``_decode_latent``) so the full volume never crosses PCIe.
+        """
+        if self._box is None:
+            self.volume(index)                     # one full decode: learns the box, caches it
+        step = max(1, int(np.ceil(self._box / float(max(1, size)))))
+        if step <= 1:                              # asked for a draft no coarser than the box
+            vol = (self.volume_interp(index, index2, t) if index2 is not None
+                   else self.volume(index))
+            return vol, 1
+        if index2 is None:
+            if index in self._cache:
+                cached = self._cache[index]
+                return np.ascontiguousarray(cached[::step, ::step, ::step], dtype=np.float32), step
+            return self._decode_latent(self._latent(index), stride=step), step
+        tt = max(0.0, min(1.0, float(t)))
+        latent = (1.0 - tt) * self._latent(index) + tt * self._latent(index2)
+        return self._decode_latent(latent, stride=step), step
 
     def _cached_bytes(self) -> int:
         return (sum(v.nbytes for v in self._cache.values())
@@ -761,17 +811,22 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             return decoder.volume_interp(index, index2, max(0.0, min(1.0, t)))
         return decoder.volume(index)
 
-    # Strided copies of a volume, cached per (state, size). A contour drag re-meshes the
-    # same volume over and over; without this, every frame would pay the stride-copy — a
-    # 131 MB strided read at a 320³ box, which is the same order as the draft mesh itself.
+    # Strided copies of a *state's* volume, cached per (state, size). A contour drag
+    # re-meshes the same volume over and over; without this, every frame would pay the
+    # stride-copy — a 131 MB strided read at a 320³ box, the same order as the draft mesh
+    # itself. Morph frames are deliberately NOT cached here: every `t` is a distinct
+    # latent, so nothing would ever be reused, and the client caches the finished meshes.
     _drafts: dict[tuple, tuple[np.ndarray, int]] = {}
     _draft_order: list[tuple] = []
 
-    def _draft_grid(vol: np.ndarray, key: tuple, size: int) -> tuple[np.ndarray, int]:
+    def _draft_grid(index: int, index2: int | None, t: float, size: int) -> tuple[np.ndarray, int]:
+        if index2 is not None:
+            return decoder.draft(index, index2, t, size)      # morph frame: decode strided
+        key = (index, int(size))
         hit = _drafts.get(key)
         if hit is not None:
             return hit
-        ds, step = _downsample(vol, size)
+        ds, step = decoder.draft(index, None, 0.0, size)
         _drafts[key] = (ds, step)
         _draft_order.append(key)
         while len(_draft_order) > 4:               # ~16 MB each at 160³ — bound it
@@ -795,24 +850,26 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         # outside the slot let an aborting client stack up abandoned meshes — and they do
         # not parallelise, they contend (8 at once measured 5x slower *each*), so a
         # threshold drag got slower the further it went.
+        if index < 0 or index >= decoder.total:
+            raise HTTPException(status_code=404, detail="latent index out of range")
+        other = index2 if (0 <= index2 < decoder.total and index2 != index) else None
         with _DECODE_SLOTS:
             try:
-                vol = _resolve_volume(index, index2 if index2 >= 0 else None, t)
+                if size > 0:
+                    # Draft: mesh a strided grid instead of the full one. ~15x cheaper at
+                    # 320³ (a ~65 ms frame against ~1240 ms), which is what makes both a
+                    # contour drag and a morph live. The level is taken from the strided
+                    # grid too — millions of samples, so its mean/std match the full
+                    # volume's to 4 decimals — keeping the whole request off the big array.
+                    grid, step = _draft_grid(index, other, t, int(size))
+                else:
+                    grid, step = _resolve_volume(index, other, t), 1
             except HTTPException:
                 raise
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
 
-            full = max(vol.shape)
-            if 0 < size < full:
-                # Draft: mesh a strided grid instead of the full one. ~15x cheaper at 320³
-                # (49 ms / 3.8 MB vs 773 ms / 21 MB), which is what makes a drag live. The
-                # level is taken from the strided grid too — millions of samples, so its
-                # mean/std match the full volume's — keeping the drag off the big array
-                # entirely. The final full-res pass on pointer-up fixes it exactly.
-                grid, step = _draft_grid(vol, (index, index2, round(float(t), 3), int(size)), int(size))
-            else:
-                grid, step = vol, 1
+            full = decoder.box or max(grid.shape)
             level = (level_for_mass(grid, mass / float(step) ** 3) if mass >= 0
                      else level_for_sigma(grid, sigma))
             body = mesh_at(grid, level, smooth=max(0, min(50, smooth)),
@@ -832,22 +889,30 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         float32 vmin, vmax, mean, std, then float32 boxLo[3], boxHi[3] (the model-space
         cube the grid occupies, matching the surface mesh), then nx*ny*nz uint8 voxels
         (C order)."""
-        with _DECODE_SLOTS:      # _resolve_volume no longer takes it; the caller must
+        if index < 0 or index >= decoder.total:
+            raise HTTPException(status_code=404, detail="latent index out of range")
+        other = index2 if (0 <= index2 < decoder.total and index2 != index) else None
+        # The texture is a subsample, so decode straight to it — striding on the device
+        # rather than hauling the full volume home and throwing most of it away. This is
+        # what a morph frame costs in the ray-marched render modes.
+        with _DECODE_SLOTS:
             try:
-                vol = _resolve_volume(index, index2 if index2 >= 0 else None, t)
+                ds, step = _draft_grid(index, other, t, int(max(16, min(160, size))))
             except HTTPException:
                 raise
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
-        ds, step = _downsample(vol, int(max(16, min(160, size))))
         vmin, vmax = float(ds.min()), float(ds.max())
         u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)
         # numpy C order has the last axis varying fastest -> that is the texture x.
         nx, ny, nz = ds.shape[2], ds.shape[1], ds.shape[0]
-        lo, hi = grid_box(vol.shape, ds.shape, step)
+        full = decoder.box or max(ds.shape) * step
+        # The stats come from the strided grid: millions of samples, so its mean/std match
+        # the full volume's — and taking them here keeps the full array out of the request.
+        lo, hi = grid_box((full, full, full), ds.shape, step)
         header = (
             np.array([nx, ny, nz], dtype="<i4").tobytes()
-            + np.array([vmin, vmax, float(vol.mean()), float(vol.std())], dtype="<f4").tobytes()
+            + np.array([vmin, vmax, float(ds.mean()), float(ds.std())], dtype="<f4").tobytes()
             + np.array(lo + hi, dtype="<f4").tobytes()
         )
         return Response(content=header + np.ascontiguousarray(u8).tobytes(), media_type="application/octet-stream")
