@@ -218,7 +218,12 @@ function wireControls() {
   $("record").addEventListener("click", recordSeries);
   $("stop").addEventListener("click", stopPlayback);
   // Scrubbing is a drag: draft while it moves, full resolution once it settles.
-  $("scrub").addEventListener("input", (e) => { setPlaying(false); if (!state.timeline.length) buildTimeline(); liveFrame(+e.target.value, true); });
+  $("scrub").addEventListener("input", async (e) => {
+    const v = +e.target.value;
+    setPlaying(false);
+    if (!state.timeline.length) await buildTimeline();   // async now: it prices the hops
+    liveFrame(v, true);
+  });
   $("scrub").addEventListener("change", (e) => { if (!playing) liveFrame(+e.target.value, false); });
   $("frames").addEventListener("change", () => { buildTimeline(); });
   $("speed").addEventListener("input", (e) => { state.fps = +e.target.value; if (playing) prefetch(true); });
@@ -571,7 +576,7 @@ function updatePathLabel() {
   if (!traj.length) $("morphto").textContent = "—";
   else if (!long || state.pathExpanded) $("morphto").textContent = traj.map((i) => `#${i}`).join(" → ");
   else $("morphto").textContent = `${traj.length} states · #${traj[0]} → … → #${traj[traj.length - 1]}`;
-  buildTimeline();        // cheap: just (re)computes the [a,b,t] frame list
+  buildTimeline();        // async (it prices the hops in latent space); nothing here awaits it
   updateMorphButtons();
 }
 function updateMorphButtons() {
@@ -1027,18 +1032,131 @@ function parseGrid(buf) {
 // Build the ordered list of [a,b,t] frames for the current path (forward then back,
 // so playback loops cleanly and the scrubber covers a full there-and-back). Cheap —
 // no network — so it's safe to call on every path edit.
-function buildTimeline() {
+// A morph's cost is (path nodes − 1) × frames-per-segment — the size of the landscape has
+// nothing to do with it. Two limits keep that from running away, because a series taken
+// from a cluster layer can hand us hundreds or thousands of states:
+//
+// MAX_TIMELINE bounds the unique frames so the whole morph *fits the frame cache*. That is
+// the difference between a morph that is slow for ever (it never caches, so every cycle
+// re-decodes: see the eviction note above) and one that is slow once and then plays at the
+// full display rate for ever. At ~1.5 MB per draft mesh, 360 frames is ~540 MB — inside the
+// 768 MB budget, with room for the full-resolution frame you land on when you pause.
+//
+// MAX_NODES bounds the *waypoints*: every hop needs at least its endpoint, so a path with
+// more nodes than this could not be drawn in MAX_TIMELINE frames at all. Over the limit we
+// resample the node list at even arc length (keeping the ends) — a "tour of the tour".
+const MAX_TIMELINE = 360;
+const MAX_NODES = 120;
+
+// Latent-space hop lengths, memoised on the path itself (rebuilt on every path edit).
+let segCache = { key: "", lengths: null };
+async function segmentLengths(path) {
+  const key = path.join(",");
+  if (segCache.key === key && segCache.lengths) return segCache.lengths;
+  try {
+    const res = await fetch("./api/segments", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ indices: path }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const { lengths } = await res.json();
+    segCache = { key, lengths };
+    return lengths;
+  } catch {
+    // Equal hops: exactly the old behaviour, so a failure here degrades rather than breaks.
+    const lengths = path.slice(1).map(() => 1);
+    segCache = { key, lengths };
+    return lengths;
+  }
+}
+
+// Split `total` frames across the hops in proportion to how far each travels, giving every
+// hop at least `MIN_SEG` (its two endpoints) so no waypoint is skipped. Largest-remainder
+// rounding, so the parts sum to `total` exactly.
+const MIN_SEG = 2;
+function allocate(lengths, total) {
+  const n = lengths.length;
+  const sum = lengths.reduce((a, b) => a + b, 0);
+  const spare = Math.max(0, total - MIN_SEG * n);
+  if (!(sum > 0)) return lengths.map(() => MIN_SEG + Math.floor(spare / n));
+  const raw = lengths.map((L) => MIN_SEG + (spare * L) / sum);
+  const out = raw.map(Math.floor);
+  let left = total - out.reduce((a, b) => a + b, 0);
+  const order = raw.map((v, i) => [i, v - Math.floor(v)]).sort((a, b) => b[1] - a[1]);
+  for (let k = 0; left > 0; k++, left--) out[order[k % n][0]]++;
+  return out;
+}
+
+// Resample a too-long node list at even arc length, always keeping the first and last.
+function thinPath(path, lengths, keep) {
+  const cum = [0];
+  for (const L of lengths) cum.push(cum[cum.length - 1] + L);
+  const total = cum[cum.length - 1];
+  if (!(total > 0)) {                       // degenerate: fall back to even index spacing
+    return Array.from({ length: keep }, (_, i) =>
+      path[Math.round((i * (path.length - 1)) / (keep - 1))]);
+  }
+  const out = [];
+  for (let i = 0; i < keep; i++) {
+    const s = (total * i) / (keep - 1);
+    let j = 0;
+    while (j < cum.length - 1 && cum[j + 1] < s) j++;
+    // Take the *nearer* of the hop's two endpoints. Taking its start (the obvious thing)
+    // silently drops the final state: at the last sample s sits at the end of the last hop,
+    // whose start is the second-to-last node — so the morph would never arrive.
+    const near = (j + 1 < cum.length && Math.abs(cum[j + 1] - s) < Math.abs(cum[j] - s)) ? j + 1 : j;
+    out.push(path[Math.min(near, path.length - 1)]);
+  }
+  return out.filter((v, i) => i === 0 || v !== out[i - 1]);   // collapse any duplicates
+}
+
+async function buildTimeline() {
   clearFrameCache();   // the frame list changed -> any cached frames are stale
-  const path = trajectory();
+  let path = trajectory();
   if (path.length < 2) { state.timeline = []; state.frame = 0; $("scrub").max = "0"; $("scrub").value = "0"; $("framelbl").textContent = "—"; return false; }
-  const frames = Math.max(2, Math.min(120, +$("frames").value || 36));
+
+  let lengths = await segmentLengths(path);
+  let note = "";
+  if (path.length > MAX_NODES) {
+    const before = path.length;
+    path = thinPath(path, lengths, MAX_NODES);
+    lengths = await segmentLengths(path);
+    note = `${before} states thinned to ${path.length}`;
+  }
+
+  const perSeg = Math.max(2, Math.min(120, +$("frames").value || 36));
+  const nominal = perSeg * (path.length - 1);
+  const total = Math.min(nominal, MAX_TIMELINE);
+  const counts = allocate(lengths, total);
+
+  // Frames are placed by arc length, so the map advances at a constant speed through latent
+  // space. Giving every hop the same count (what this used to do) made the morph lurch —
+  // crawling through closely-spaced states and racing through distant ones — which is a
+  // smoothness problem entirely separate from the frame rate, and it bites hardest on a
+  // cluster series, whose representatives are unevenly spaced almost by construction.
+  //
+  // Each hop after the first starts at i=1: its i=0 is the previous hop's endpoint, the very
+  // same latent, and emitting it again would decode the waypoint twice under two cache keys.
   const steps = [];
-  for (let s = 0; s < path.length - 1; s++) { const a = path[s], b = path[s + 1]; for (let i = 0; i < frames; i++) steps.push([a, b, i / (frames - 1)]); }
-  state.timeline = steps.concat(steps.slice(0, -1).reverse());
+  for (let s = 0; s < path.length - 1; s++) {
+    const a = path[s], b = path[s + 1], k = Math.max(2, counts[s]);
+    for (let i = (s === 0 ? 0 : 1); i < k; i++) steps.push([a, b, i / (k - 1)]);
+  }
+  state.timeline = steps.concat(steps.slice(0, -1).reverse());   // there-and-back reuses the keys
   state.frame = Math.min(state.frame, state.timeline.length - 1);
   $("scrub").max = String(state.timeline.length - 1);
   $("scrub").value = String(state.frame);
   $("framelbl").textContent = `${state.frame + 1}/${state.timeline.length}`;
+  // The status line gets overwritten the moment playback starts, so the explanation also
+  // lives on the frame counter, where it stays.
+  const capped = nominal > MAX_TIMELINE || note;
+  $("framelbl").title = capped
+    ? `${steps.length} unique frames over ${path.length} states`
+      + (note ? ` · ${note}` : "")
+      + (nominal > MAX_TIMELINE ? ` · capped from ${nominal}` : "")
+      + " — bounded so the whole morph fits the frame cache and plays back smoothly."
+    : `${steps.length} unique frames over ${path.length} states, spaced by latent-space distance.`;
+  if (capped) status($("framelbl").title, "warn");
   return true;
 }
 
@@ -1231,7 +1349,7 @@ function setPlaying(on) {
 
 async function togglePlay() {
   if (playing) { setPlaying(false); return; }
-  if (!state.timeline.length && !buildTimeline()) { status("Build a path first (shift-click states).", "warn"); return; }
+  if (!state.timeline.length && !(await buildTimeline())) { status("Build a path first (shift-click states).", "warn"); return; }
   setPlaying(true);
   // Playback runs on draft meshes: a morph frame is a *new* latent every time, so nothing
   // is ever cached server-side and the full-resolution mesh cannot be made cheap. The
@@ -1273,7 +1391,7 @@ function stopPlayback() {
 }
 
 async function recordSeries() {
-  if (!state.timeline.length && !buildTimeline()) { status("Build a path first (shift-click states).", "warn"); return; }
+  if (!state.timeline.length && !(await buildTimeline())) { status("Build a path first (shift-click states).", "warn"); return; }
   const active = state.render === "surface" ? renderer : volRenderer;
   if (!active || !active.captureStream) { status("Recording unavailable for this view.", "err"); return; }
   let rec = null; const chunks = [];
@@ -1715,6 +1833,10 @@ async function playLayerSeries(ly) {
   state.current = ordered[0]; state.path = ordered.slice(1); state.frame = 0;
   syncSelection(); updatePathLabel(); $("sel").textContent = `state #${ordered[0]}`;
   try { const h = await (await fetch(`./api/histogram?index=${ordered[0]}`)).json(); hist.setData(h, h.mean + state.sigma * h.std); } catch { /* keep */ }
+  // Explicitly, before playing: a cluster series can arrive with hundreds of states, and
+  // buildTimeline is what thins it and prices the hops. (updatePathLabel fires it too, but
+  // does not await it — and togglePlay must not race a half-built timeline.)
+  await buildTimeline();
   await decode();                              // sets refMass for the constant-mass series
   togglePlay();
 }

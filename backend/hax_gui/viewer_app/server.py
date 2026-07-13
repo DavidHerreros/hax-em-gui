@@ -46,6 +46,10 @@ class SnapCurve(BaseModel):
     points: list[list[float]] = []     # the dense spline samples, in that space
 
 
+class PathSpec(BaseModel):
+    indices: list[int] = []            # the states a morph walks through, in order
+
+
 # --------------------------------------------------------------------------
 # Landscape: embeddings (PCA/UMAP) + clustering of the latent space.
 # --------------------------------------------------------------------------
@@ -300,6 +304,10 @@ class Decoder:
         if n <= index < n + len(self.extra):
             return self.extra[index - n]
         raise IndexError(f"latent index {index} out of range")
+
+    def latent(self, index: int) -> np.ndarray:
+        """The decodable latent for a state index (centroids included)."""
+        return self._latent(index)
 
     def _ensure_model(self) -> None:
         if self._decode is not None:
@@ -916,6 +924,27 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             + np.array(lo + hi, dtype="<f4").tobytes()
         )
         return Response(content=header + np.ascontiguousarray(u8).tobytes(), media_type="application/octet-stream")
+
+    @app.post("/api/segments")
+    def segments(body: PathSpec) -> dict:
+        """The latent-space length of each consecutive hop in a path.
+
+        A morph allocates its frames in proportion to these, so it advances at a constant
+        speed through latent space instead of giving every hop the same frame count
+        regardless of how far it travels.
+
+        The distances have to be taken in the **full** latent space — the space the decoder
+        actually interpolates in — not in the 2-D/3-D projection the landscape is drawn in.
+        A projection foreshortens: two states that look adjacent on screen can be far apart
+        in the space the morph traverses, and allocating frames from the picture would give
+        that hop too few and make the map jump through it.
+        """
+        idx = [int(i) for i in body.indices if 0 <= int(i) < decoder.total]
+        if len(idx) < 2:
+            return {"lengths": []}
+        lat = np.stack([decoder.latent(i) for i in idx]).astype(np.float64)
+        d = np.linalg.norm(np.diff(lat, axis=0), axis=1)
+        return {"lengths": [float(x) for x in d]}
 
     @app.get("/api/mass")
     def mass_at(index: int = Query(...), sigma: float = Query(2.5), size: int = Query(0)) -> dict:
