@@ -917,6 +917,33 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         )
         return Response(content=header + np.ascontiguousarray(u8).tobytes(), media_type="application/octet-stream")
 
+    @app.get("/api/mass")
+    def mass_at(index: int = Query(...), sigma: float = Query(2.5), size: int = Query(0)) -> dict:
+        """The density a state encloses at a given sigma — the reference a constant-mass
+        morph contours every frame to.
+
+        Its own route because the client wants the *number*, not a picture. A morph is
+        contoured at constant mass (a fixed sigma would make the map breathe as the latent
+        moves), so dragging the contour during one has to re-derive this reference on every
+        pointermove. Asking `/api/decode` for it would mesh the state each time — ~30x the
+        cost, for a mesh thrown away on arrival. On a cached draft grid this is a mean, a
+        std and one masked sum: a few ms.
+        """
+        if index < 0 or index >= decoder.total:
+            raise HTTPException(status_code=404, detail="latent index out of range")
+        with _DECODE_SLOTS:
+            try:
+                grid, step = (_draft_grid(index, None, 0.0, int(size)) if size > 0
+                              else (_resolve_volume(index, None, 0.0), 1))
+            except HTTPException:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
+            level = level_for_sigma(grid, sigma)
+            # Scale back up by the stride so a draft's mass is comparable to a full one —
+            # the same convention `mesh_at` uses for the mass it reports in its header.
+            return {"level": level, "mass": enclosed_mass(grid, level) * float(step) ** 3}
+
     @app.get("/api/histogram")
     def histogram(index: int = Query(...), bins: int = Query(96)) -> dict:
         if index < 0 or index >= decoder.total:

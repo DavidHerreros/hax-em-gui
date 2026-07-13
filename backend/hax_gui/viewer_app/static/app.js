@@ -197,8 +197,17 @@ function wireControls() {
   $("densint").addEventListener("input", (e) => { state.densIntensity = +e.target.value; if (cloud) cloud.setDensityIntensity(state.densIntensity); });
   $("densmap").addEventListener("change", (e) => { state.densMap = e.target.value; applyColormap(); if (state.colorBy === "density") applyColor(); });
   $("light").addEventListener("change", (e) => renderer.setLighting(e.target.value));
-  // Smoothing is baked into the cached draft meshes, so changing it invalidates them.
-  $("smooth").addEventListener("input", (e) => { state.smooth = +e.target.value; clearFrameCache(); if (state.timeline.length && state.frame > 0) liveFrame(state.frame, false); else liveDecode(); });
+  // Smoothing is baked into the cached meshes, so changing it invalidates every frame. That
+  // flush also stops the prefetcher (clearFrameCache bumps fillToken), so restart it — and
+  // while playing let the play loop redraw, rather than forcing a full-resolution mesh of
+  // the current frame into the middle of the animation.
+  $("smooth").addEventListener("input", (e) => {
+    state.smooth = +e.target.value;
+    clearFrameCache();
+    if (playing) { prefetch(true); return; }
+    if (state.timeline.length && state.frame > 0) liveFrame(state.frame, false);
+    else liveDecode();
+  });
   $("color").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setColor(c); if (volRenderer) volRenderer.setColor(c); });
   $("bg").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setBackground(c); if (volRenderer) volRenderer.setBackground(c); });
   $("reset").addEventListener("click", () => { renderer.resetView(); if (volRenderer) volRenderer.resetView(); });
@@ -840,8 +849,41 @@ async function onSelect(i, opts) {
 function onLevel(level, dragging) {
   state.sigma = hist.sigma;
   if (state.render !== "surface" && volRenderer && curVolMeta) { volRenderer.setThreshold(normThreshold()); return; }
+  // With a morph on screen the contour has to move the *reference* the frames are contoured
+  // to, not the frames — see recontourSeries. Re-decoding the selected state here (what this
+  // used to do, unconditionally) painted a static map over the running animation, and the
+  // frames themselves never read sigma at all, so the slider appeared to do nothing.
+  if (state.timeline.length && (playing || state.frame > 0)) { liveSeriesContour(!!dragging); return; }
   liveDecode(!!dragging);
 }
+
+// Re-aim a morph's contour.
+//
+// A morph is contoured at *constant enclosed mass*, not at sigma: as the latent moves, the
+// decoded density's mean and std drift, so holding sigma fixed would make the map appear to
+// breathe and would ruin the shape comparison. `state.refMass` is that reference — the mass
+// the selected state encloses at the chosen sigma — and every frame is then contoured to
+// enclose it. Which is precisely why dragging the contour did nothing during a morph: the
+// frames are contoured to a mass, and the mass never moved.
+//
+// So the slider moves the reference. Every cached frame's contour changes with it, hence the
+// cache flush; and clearFrameCache() cancels the running prefetcher (it bumps fillToken), so
+// it has to be restarted or playback would fall back to decoding on demand.
+async function recontourSeries(draft) {
+  if (state.current < 0) return;
+  try {
+    const res = await fetch(`./api/mass?index=${state.current}`
+                          + `&sigma=${state.sigma.toFixed(3)}&size=${PLAY_GRID}`);
+    if (!res.ok) return;
+    const { mass } = await res.json();
+    if (!(mass > 0)) return;
+    state.refMass = mass;
+    clearFrameCache();                  // every frame's contour — and so its cache key — moved
+    if (playing) prefetch(true);        // ...and the flush stopped the prefetcher
+    await renderFrame(state.frame, playing ? true : draft);
+  } catch { /* a superseded drag frame: the next pointermove supersedes it anyway */ }
+}
+const liveSeriesContour = makeLive((draft) => recontourSeries(draft));
 
 // Coalescing single-flight runner: fires immediately, and if more updates arrive while a
 // request is in flight, re-runs once with the latest values when it returns. Gives
