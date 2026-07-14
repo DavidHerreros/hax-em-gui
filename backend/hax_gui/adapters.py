@@ -44,6 +44,9 @@ BINDABLE_FIELDS: dict[str, dict[str, str]] = {
     "volume_gray_scale_adjustment": {"reload": "volume_adjust_model", "md": "particles", "vol": "volume"},
     "estimate_latent_covariances": {"md": "particles"},
     "modart": {"md": "particles", "vol": "volume"},
+    # reconstruct_volume needs nothing but the posed particles: it reconstructs the
+    # consensus map from their alignments, so it takes no reference volume to wire in.
+    "reconstruct_volume": {"md": "particles"},
     "preprocess_particles": {"md": "particles"},
     "preprocess_volumes": {"vol": "volume"},
 }
@@ -121,6 +124,16 @@ _ARTIFACT_PRODUCERS: dict[str, list[dict[str, Any]]] = {
             "programs": {"preprocess_volumes"},
             "globs": ["*_preprocessed.mrc"],
         },
+        {
+            # The consensus map a reconstruct_volume run produced -- the reference the
+            # heterogeneity programs and MoDART take in `--vol`. The glob names the map
+            # explicitly rather than matching `*.mrc`: a `--write_mask` run also writes
+            # `consensus_mask.mrc`, and under "unique_glob" a second hit would silently
+            # cost the run its volume port.
+            "style": "unique_glob",
+            "programs": {"reconstruct_volume"},
+            "globs": ["consensus_reconstruction.mrc"],
+        },
     ],
 }
 
@@ -159,7 +172,7 @@ def _pretty_kind(kind: str) -> str:
     if kind == "particles":
         return "a preprocessed particle set"
     if kind == "volume":
-        return "a preprocessed volume"
+        return "a volume"
     if kind.endswith("_model"):
         return "a saved network"
     return kind

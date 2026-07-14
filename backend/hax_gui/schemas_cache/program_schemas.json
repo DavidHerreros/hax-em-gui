@@ -432,7 +432,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 0.0001,
           "type": "number"
         },
@@ -950,7 +950,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 0.0001,
           "type": "number"
         },
@@ -1098,7 +1098,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 1e-05,
           "type": "number"
         },
@@ -1460,7 +1460,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 1e-05,
           "type": "number"
         },
@@ -1684,7 +1684,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 1e-05,
           "type": "number"
         },
@@ -2319,7 +2319,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 0.0001,
           "type": "number"
         },
@@ -2576,7 +2576,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 0.0001,
           "type": "number"
         },
@@ -2799,6 +2799,167 @@
           "flag": "--ssd_scratch_folder",
           "required": false,
           "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
+        }
+      ]
+    },
+    "reconstruct_volume": {
+      "name": "reconstruct_volume",
+      "module": "hax.programs.reconstruct_volume",
+      "description": "Consensus volume reconstruction from posed particles (single pass, with FSC denoising and gray scale calibration)",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Whether the images carry a CTF. The reconstruction only needs to know if they do: apply, wiener and precorrect all mean they do (the slices are CTF weighted and the quotient deconvolves them), while None means they do not. NOTE: this must match your data -- weighting CTF-free images by a CTF is not a harmless no-op, it reweights the slices and degrades the map.",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "tau",
+          "flags": [
+            "--tau"
+          ],
+          "flag": "--tau",
+          "required": false,
+          "help": "Wiener floor of the reconstruction quotient (set by default to 0.05). This is only a numerical regularizer to keep the shells with little CTF power from blowing up -- the resolution of the map is set by the data, not by this. Raise it if the map looks noisy at high frequency, lower it if it looks over-smoothed.",
+          "default": 0.05,
+          "type": "number"
+        },
+        {
+          "name": "no_denoise",
+          "flags": [
+            "--no_denoise"
+          ],
+          "flag": "--no_denoise",
+          "required": false,
+          "help": "Skip the FSC based denoising. By default the particles are split into two independent halves, the FSC between the resulting half maps measures the spectral signal-to-noise, and the combined map is filtered with it, so the shells carrying signal pass untouched and the shells that are only noise are removed (the measured resolution is printed). Pass this flag to get the raw, unfiltered map instead.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "no_gray_scale_calibration",
+          "flags": [
+            "--no_gray_scale_calibration"
+          ],
+          "flag": "--no_gray_scale_calibration",
+          "required": false,
+          "help": "Skip the global gray-scale calibration. By default the finished map is forward-projected at a subset of the real poses and least-squares scaled against the input images, so that re-projecting it reproduces their contrast and value range. Pass this flag to keep the raw amplitudes.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "write_mask",
+          "flags": [
+            "--write_mask"
+          ],
+          "flag": "--write_mask",
+          "required": false,
+          "help": "Also write a binary mask of the protein region derived from the reconstructed map (consensus_mask.mrc). This is the mask HetSIREN/MoDART expect in their --mask parameter.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mask_threshold",
+          "flags": [
+            "--mask_threshold"
+          ],
+          "flag": "--mask_threshold",
+          "required": false,
+          "help": "Only used with --write_mask: fraction of the map's maximum above which a voxel is considered protein (set by default to 0.02). Raise it for a tighter mask, lower it for a looser one.",
+          "default": 0.02,
+          "type": "number"
+        },
+        {
+          "name": "mask_dilate",
+          "flags": [
+            "--mask_dilate"
+          ],
+          "flag": "--mask_dilate",
+          "required": false,
+          "help": "Only used with --write_mask: how many voxels to grow the mask by (set by default to 2), so that a deformation estimated later has somewhere to move the mass into.",
+          "default": 2,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "How many images are read and inserted at once (set by default to 1024). The images are read on a thread pool while the GPU accumulates, so peak RAM tracks this value rather than the number of particles - lower it if you run out of memory, raise it to read fewer, larger chunks.",
+          "default": 1024,
+          "type": "integer"
+        },
+        {
+          "name": "threads",
+          "flags": [
+            "--threads"
+          ],
+          "flag": "--threads",
+          "required": false,
+          "help": "Number of reader threads feeding the GPU with image chunks (set by default to 8)",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, new metadata...)",
           "default": null,
           "type": "string",
           "widget": "path",
