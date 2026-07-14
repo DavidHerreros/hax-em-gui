@@ -350,13 +350,27 @@ class JobManager:
         if out_arg:
             values[out_arg] = str(workdir)
 
-        # Auto-fill the SSD scratch dir (shared per project+program) when a
-        # scratch root is configured, so users never pass an SSD path.
+        # Auto-fill the SSD scratch dir (shared per project) when a scratch root is
+        # configured, so users never pass an SSD path.
+        #
+        # Shared by every program in the project, deliberately. hax caches the particle
+        # images inside this folder as an array-record copy, and that copy is expensive:
+        # building it means reading the whole stack once (410 GB for 1M particles at box
+        # 320 -- an hour off a spinning disk). It is also program-agnostic -- HetSIREN,
+        # MoDART and reconstruct_volume all build and read exactly the same shards -- so a
+        # per-program folder made each of them pay that price separately. One folder per
+        # project means whoever runs first pays, and everyone after reads from the SSD.
+        #
+        # This is safe because hax names each cache directory after the *dataset* it holds
+        # (MetaDataGenerator._cache_dir: a digest of the metadata path, particle count, box
+        # and precision). Two datasets in one project therefore get two directories rather
+        # than silently sharing one -- which is what previously made a shared folder
+        # dangerous, and why this used to be split per program.
         ssd_dir = None
         ssd_arg = registry.ssd_arg(program)
         ssd_root = settings_store.ssd_scratch_root()
         if ssd_arg and ssd_root is not None:
-            ssd_dir = ssd_root / project_id / program
+            ssd_dir = ssd_root / project_id
             values[ssd_arg] = str(ssd_dir)
 
         # The run folder is created up-front so bound inputs (derived from a
@@ -370,12 +384,16 @@ class JobManager:
             shutil.rmtree(workdir, ignore_errors=True)
             raise
         if ssd_dir is not None:
-            # The SSD scratch is shared per project+program and reused across runs
-            # (the generator skips rebuilding when cached shards exist). Optionally
-            # discard it so it's rebuilt from the current inputs — only on an actual
-            # launch, so a merely-saved job can't clobber a concurrent run's scratch.
+            # The SSD scratch is shared per project and reused across runs (the generator
+            # skips rebuilding when cached shards exist). Optionally discard it so it's
+            # rebuilt from the current inputs — only on an actual launch, so a merely-saved
+            # job can't clobber a concurrent run's scratch.
+            #
+            # Only THIS job's dataset is discarded, never the whole folder: it now holds the
+            # caches of every dataset in the project, and wiping it would throw away hours of
+            # rebuilding for datasets this run has nothing to do with.
             if recreate_ssd and launch and ssd_dir.exists():
-                shutil.rmtree(ssd_dir, ignore_errors=True)
+                self._purge_dataset_cache(ssd_dir, values.get(registry.working_dir_arg(program)))
             ssd_dir.mkdir(parents=True, exist_ok=True)
 
         # Launch from the metadata file's folder so relative image references in
@@ -530,6 +548,34 @@ class JobManager:
             raise JobNotFound(job_id)
         self._exec("UPDATE jobs SET name=? WHERE id=?", ((name or "").strip() or None, job_id))
         return self.get(job_id)
+
+    @staticmethod
+    def _purge_dataset_cache(ssd_dir: Path, md_path: str | None) -> None:
+        """Delete the cached images of one dataset from the project's shared scratch folder.
+
+        hax writes each cache as ``<scratch>/images_mmap*_<digest>/`` with a ``manifest.json``
+        naming the dataset it holds, so we match on that rather than recomputing the digest
+        here — the GUI must not have to know how hax hashes a dataset. A cache with no
+        manifest predates that scheme (or isn't ours) and is left alone.
+
+        With no metadata path to match (a program whose scratch isn't keyed to an ``--md``),
+        nothing is deleted: silently wiping every dataset in the project would be far worse
+        than ignoring the checkbox.
+
+        Deleting shards from under a job that is *currently* streaming them is safe on POSIX:
+        the reader holds the files open, so the data survives until it closes. The next run
+        rebuilds them.
+        """
+        if not md_path:
+            return
+        target = os.path.abspath(str(md_path))
+        for manifest in ssd_dir.glob("images_mmap*/manifest.json"):
+            try:
+                held = json.loads(manifest.read_text()).get("md")
+            except (OSError, json.JSONDecodeError):
+                continue
+            if held and os.path.abspath(str(held)) == target:
+                shutil.rmtree(manifest.parent, ignore_errors=True)
 
     @staticmethod
     def _launch_cwd(program: str, values: dict[str, Any], workdir: Path) -> str:

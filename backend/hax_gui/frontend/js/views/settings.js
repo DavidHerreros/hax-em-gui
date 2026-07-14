@@ -101,7 +101,7 @@ export function SettingsView() {
         "New projects are created as subfolders here. Each program run gets its own folder inside its project, holding all outputs and logs.",
         values.projects_root, (v) => (values.projects_root = v)),
       pathField("ssd_scratch_root", "SSD scratch folder",
-        "Optional fast-disk scratch space. Each run that uses it gets a folder at <ssd>/<project>/<program>. Leave empty to disable — then SSD scratch paths are simply not passed to programs.",
+        "Optional fast-disk scratch space. Each project gets a folder at <ssd>/<project>, shared by all its programs: the particle images are cached there once (per dataset) and reused by every run, instead of each program re-reading the original stack. Leave empty to disable — then SSD scratch paths are simply not passed to programs.",
         values.ssd_scratch_root, (v) => (values.ssd_scratch_root = v)),
       gpuField(gpus, values.viewer_gpu, (v) => (values.viewer_gpu = v)),
       h("div", { style: { marginTop: "4px" } }, saveBtn),
