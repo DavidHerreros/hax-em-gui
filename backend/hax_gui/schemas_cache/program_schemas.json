@@ -432,7 +432,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 0.0001,
           "type": "number"
         },
@@ -950,7 +950,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 0.0001,
           "type": "number"
         },
@@ -1098,7 +1098,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 1e-05,
           "type": "number"
         },
@@ -1460,7 +1460,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 1e-05,
           "type": "number"
         },
@@ -1684,7 +1684,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 1e-05,
           "type": "number"
         },
@@ -2319,7 +2319,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 0.0001,
           "type": "number"
         },
@@ -2576,7 +2576,7 @@
           ],
           "flag": "--learning_rate",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps — it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
+          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
           "default": 0.0001,
           "type": "number"
         },
@@ -2948,7 +2948,7 @@
           ],
           "flag": "--threads",
           "required": false,
-          "help": "Number of reader threads feeding the GPU with image chunks (set by default to 8)",
+          "help": "Number of reader threads feeding the GPU with image chunks (set by default to 8). NOTE: on a spinning disk (HDD) several threads read different regions of the stack at once and the head seeks between them, so a lower value (1 or 2) can be faster there than the default.",
           "default": 8,
           "type": "integer"
         },
@@ -2960,6 +2960,19 @@
           "flag": "--output_path",
           "required": true,
           "help": "Path to save the results (trained neural network, new metadata...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "Path to a folder on a fast (SSD/NVMe) disk. The reconstruction has to read every particle once, so on a slow disk the read is the run: 1M particles at box 320 is 410 GB, which an HDD needs roughly an hour to deliver, and the GPU spends that hour idle. Given this parameter, the images are cached as a local float16 copy (half the bytes) and streamed from there. NOTE: building the cache still costs one full read of the original stack, so it does not make a single cold run faster - it pays off because the copy is reused, both by later runs and by the other hax programs (HetSIREN, Zernike3Deep, MoDART...) pointed at the same scratch folder, which build and read exactly the same cache.",
           "default": null,
           "type": "string",
           "widget": "path",
