@@ -27,6 +27,7 @@ export function createScatter(canvas, onSelect) {
   const ctx = canvas.getContext("2d");
   let points = [], labels = null, showDensity = false, pointColors = null;
   let selected = -1, hover = -1, pathSet = new Set(), selSet = new Set();
+  let pickFilter = null;   // when set, click/hover only consider points where pickFilter(i) is true
   let pathOrder = [], pathColor = "#f472b6";   // ordered morph path drawn as a polyline
   let freeCurves = [];   // [{ pts:[[x,y]...] data coords, color }] free-spline overlays
   let densBandwidth = 6, pointAlpha = 1.0, bgColor = null;   // bgColor set => opaque fill (dark density backdrop)
@@ -422,6 +423,7 @@ export function createScatter(canvas, onSelect) {
         const c = gy * G + gx;
         for (let k = start[c]; k < start[c + 1]; k++) {
           const i = items[k];
+          if (pickFilter && !pickFilter(i)) continue;
           const [sx, sy] = toScreen(points[i][0], points[i][1]);
           const dd = (sx - px) ** 2 + (sy - py) ** 2;
           if (dd < bestD) { bestD = dd; best = i; }
@@ -440,6 +442,7 @@ export function createScatter(canvas, onSelect) {
     const px = (cx - rect.left) * r, py = (cy - rect.top) * r;
     let best = -1, bestD = Infinity;
     for (let i2 = 0; i2 < points.length; i2++) {
+      if (pickFilter && !pickFilter(i2)) continue;
       const [sx, sy] = toScreen(points[i2][0], points[i2][1]);
       const dd = (sx - px) ** 2 + (sy - py) ** 2; if (dd < bestD) { bestD = dd; best = i2; }
     }
@@ -461,7 +464,9 @@ export function createScatter(canvas, onSelect) {
     plx = e.clientX; ply = e.clientY;
   });
   canvas.addEventListener("pointerup", (e) => { panning = false; try { canvas.releasePointerCapture(e.pointerId); } catch {} });
-  canvas.addEventListener("click", (e) => { if (panned) return; const i = nearestAnywhere(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); });
+  // Always report the click (with coords) even when no base point is hit, so the app can
+  // still resolve it to a centroid marker (which this renderer can't pick).
+  canvas.addEventListener("click", (e) => { if (panned) return; const i = nearestAnywhere(e.clientX, e.clientY); onSelect(i, { shift: e.shiftKey, cx: e.clientX, cy: e.clientY }); });
   // Hover is coalesced onto an animation frame: mousemove fires far faster than we can
   // usefully repaint, and every repaint at 1e6 points is real work.
   canvas.addEventListener("mousemove", (e) => {
@@ -484,6 +489,7 @@ export function createScatter(canvas, onSelect) {
 
   return {
     setPoints(p) { points = p; setBounds(); draw(); },
+    setPickFilter(fn) { pickFilter = typeof fn === "function" ? fn : null; },   // restrict click/hover to points where fn(i) is true
     setLabels(l) { labels = l; baseVer++; scheduleDraw(); },
     setPointColors(arr) { pointColors = arr; baseVer++; scheduleDraw(); },   // per-point CSS color (layers mode); null clears
     setBackground(css) { bgColor = css || null; scheduleDraw(); },   // opaque dark fill in density mode; null = transparent (theme)

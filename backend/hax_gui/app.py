@@ -198,6 +198,16 @@ def assistant_status() -> dict[str, Any]:
     return st
 
 
+@app.post("/api/assistant/reindex-docs", dependencies=[Depends(auth)])
+def assistant_reindex_docs(force: bool = True) -> dict[str, Any]:
+    """Rebuild the assistant's docs vector index from the current hax-em-docs
+    checkout, so edits to the docs are picked up without restarting the GUI.
+    With ``force=false`` it only rebuilds when the docs content hash changed."""
+    if not assistant_bridge.available():
+        raise HTTPException(status_code=400, detail="assistant not installed")
+    return assistant_bridge.reindex_docs(force=force)
+
+
 class JobProposal(BaseModel):
     program: str
     path: str | None = None
@@ -216,6 +226,85 @@ def assistant_preview_job(body: JobProposal) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail=spec["error"])
     inspect = assistant_actions.inspect_path(body.path) if body.path else None
     return {"spec": spec, "inspect": inspect}
+
+
+@app.get("/api/assistant/actions/prepare-motion/{job_id}", dependencies=[Depends(auth)])
+def assistant_prepare_motion_plan(job_id: str) -> dict[str, Any]:
+    """Read-only plan for preparing a run's deformation field (per-domain motion),
+    plus the visible GPUs — shown in the confirmation before any GPU run."""
+    if not assistant_bridge.available():
+        raise HTTPException(status_code=400, detail="assistant not installed")
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    art = _resolve_run_artifacts(job)
+    if not art["run_dir"]:
+        raise HTTPException(status_code=422, detail="run has no folder to analyse")
+    return {"plan": assistant_bridge.plan_prepare_motion(art["run_dir"]),
+            "gpus": assistant_bridge.list_gpus()}
+
+
+@app.websocket("/ws/assistant/prepare-motion")
+async def assistant_prepare_motion_ws(websocket: WebSocket) -> None:
+    """Run the (confirmed) prepare-motion pipeline for a job, streaming progress
+    lines. Client sends ``{job_id, gpu}``; server streams ``{status}`` then a final
+    ``{done, deformation_dir}`` or ``{error}``."""
+    if settings.auth_token and websocket.query_params.get("token") != settings.auth_token:
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    if not assistant_bridge.available():
+        await websocket.send_json({"error": "assistant not installed"})
+        await websocket.close()
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        req = await websocket.receive_json()
+        job = manager.get(req.get("job_id"))
+        if job is None:
+            await websocket.send_json({"error": "job not found"})
+            return
+        art = _resolve_run_artifacts(job)
+        if not art["run_dir"]:
+            await websocket.send_json({"error": "run has no folder to analyse"})
+            return
+        gpu = req.get("gpu", 0)
+
+        out: asyncio.Queue = asyncio.Queue()
+
+        def _progress(line: str) -> None:
+            loop.call_soon_threadsafe(out.put_nowait, ("status", line))
+
+        def _worker() -> None:
+            try:
+                d = assistant_bridge.run_prepare_motion(art["run_dir"], gpu, on_progress=_progress)
+                loop.call_soon_threadsafe(out.put_nowait, ("done", d))
+            except Exception as exc:  # noqa: BLE001
+                loop.call_soon_threadsafe(out.put_nowait, ("error", str(exc)))
+
+        loop.run_in_executor(None, _worker)
+        while True:
+            kind, val = await out.get()
+            if kind == "status":
+                await websocket.send_json({"status": val})
+            elif kind == "done":
+                await websocket.send_json({"done": True, "deformation_dir": val})
+                break
+            else:
+                await websocket.send_json({"error": val})
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await websocket.send_json({"error": str(exc)})
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.get("/api/assistant/run-preview/{job_id}", dependencies=[Depends(auth)])
@@ -326,6 +415,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                 job = manager.get(run_job_id)
                 if job is not None:
                     run = _resolve_run_artifacts(job)
+                    run["job_id"] = run_job_id   # so a proposed action can target it
             allow_actions = assistant_actions.actions_enabled()
 
             # Run the blocking LLM stream off the event loop, funnel events back.
@@ -781,6 +871,17 @@ class JobRename(BaseModel):
 def rename_job(job_id: str, body: JobRename) -> dict[str, Any]:
     try:
         return _with_project_names([manager.rename(job_id, body.name or "")])[0]
+    except JobNotFound:
+        raise HTTPException(status_code=404, detail="job not found")
+
+
+@app.get("/api/jobs/{job_id}/copy-prefill", dependencies=[Depends(auth)])
+def job_copy_prefill(job_id: str) -> dict[str, Any]:
+    """Recipe for copying this job into another project: program + parameters with the
+    per-project bits (output/SSD dirs) and data inputs cleared. Seeds the New Run form;
+    creates nothing."""
+    try:
+        return manager.copy_prefill(job_id)
     except JobNotFound:
         raise HTTPException(status_code=404, detail="job not found")
 
@@ -1516,9 +1617,14 @@ def _resolve_run_artifacts(job: dict[str, Any]) -> dict[str, Any]:
             counts[p.parent] = counts.get(p.parent, 0) + 1
         series = [(d, n) for d, n in counts.items() if n >= 2]
         if series:
-            def _score(item: tuple[Path, int]) -> tuple[bool, int]:
-                nm = item[0].name.lower()
-                return ("volume" in nm or "intermediate" in nm, item[1])
+            def _score(item: tuple[Path, int]) -> tuple[bool, bool, int]:
+                d, n = item
+                nm = d.name.lower()
+                # A decoded-state series with an exported deformation field wins:
+                # it is a real conformational trajectory with exact correspondences,
+                # unlike Intermediate_volumes (training-epoch snapshots).
+                has_deform = (d / "deformation" / "deformed_points.npy").is_file()
+                return (has_deform, "volume" in nm or "intermediate" in nm, n)
             volumes = str(max(series, key=_score)[0])
     if latents is None:
         latents, latents_from = _find_sibling_latents(job)
@@ -1804,6 +1910,11 @@ class WorkflowFromProject(BaseModel):
     name: str | None = None
 
 
+class WorkflowCopy(BaseModel):
+    project_id: str
+    name: str | None = None
+
+
 @app.get("/api/workflows", dependencies=[Depends(auth)])
 def list_workflows(project_id: str | None = None) -> list[dict[str, Any]]:
     return wf_manager.list(project_id)
@@ -1904,6 +2015,20 @@ def workflow_from_project(project_id: str, body: WorkflowFromProject = WorkflowF
     / running / labeling this workflow modifies the actual project."""
     proj = _project_or_404(project_id)
     return wf_manager.open_project(project_id, body.name or proj["name"])
+
+
+@app.post("/api/workflows/{wid}/copy", dependencies=[Depends(auth)])
+def workflow_copy(wid: str, body: WorkflowCopy) -> dict[str, Any]:
+    """Clone a workflow's graph into a new standalone workflow owned by another
+    project. Self-contained: node/job links dropped, external data inputs cleared,
+    internal dependencies preserved so it re-runs cleanly in the target project."""
+    if wf_manager.get(wid) is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    _project_or_404(body.project_id)
+    try:
+        return wf_manager.copy_to_project(wid, body.project_id, body.name)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="target project not found")
 
 
 @app.post("/api/workflows/{wid}/save-as-project", dependencies=[Depends(auth)])

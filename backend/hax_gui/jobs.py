@@ -549,6 +549,27 @@ class JobManager:
         self._exec("UPDATE jobs SET name=? WHERE id=?", ((name or "").strip() or None, job_id))
         return self.get(job_id)
 
+    def copy_prefill(self, job_id: str) -> dict[str, Any]:
+        """The recipe for re-creating a job in *another* project, as a launcher prefill.
+
+        We copy the program and its parameters, but not anything tied to the source
+        project or its run folder: the auto-managed output/SSD dirs are dropped (the new
+        project regenerates them), and every job-derived input field is cleared -- both
+        real bindings (which point at the source project's jobs) and literal data paths
+        (raw metadata etc.) -- so they are chosen fresh in the target project. The result
+        seeds the New Run form; nothing is created until the user saves or launches."""
+        job = self.get(job_id)
+        if job is None:
+            raise JobNotFound(job_id)
+        program = job["program"]
+        values = dict(job.get("args") or {})
+        for auto in (registry.output_arg(program), registry.ssd_arg(program)):
+            if auto:
+                values.pop(auto, None)
+        for field in adapters.bindable_fields(program):
+            values.pop(field, None)
+        return {"program": program, "gpu": job.get("gpu") or "", "values": values, "name": job.get("name") or ""}
+
     @staticmethod
     def _purge_dataset_cache(ssd_dir: Path, md_path: str | None) -> None:
         """Delete the cached images of one dataset from the project's shared scratch folder.

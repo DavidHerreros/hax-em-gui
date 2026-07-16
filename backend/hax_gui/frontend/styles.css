@@ -661,6 +661,13 @@ body.vwin-dragging iframe { pointer-events: none; }
 .prompt-modal { width: 420px; }
 .prompt-body { padding: 16px; display: flex; flex-direction: column; gap: 8px; }
 
+/* project-picker modal (Copy to project / Duplicate to project) */
+.pick-list { display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow: auto; }
+.pick-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; background: none; border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 13px; text-align: left; cursor: pointer; }
+.pick-item:hover { background: var(--hover); border-color: var(--accent); }
+.pick-item .icon { color: var(--faint); flex-shrink: 0; }
+.pick-item .pick-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ===== Jobs tab: filters + project grouping ===== */
 .jobs-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 20px; }
 .jobs-filters .filter-group { display: flex; align-items: center; gap: 6px; color: var(--muted); }
@@ -971,7 +978,9 @@ body.vwin-dragging iframe { pointer-events: none; }
 
 .chat-header { display: flex; align-items: center; justify-content: space-between; }
 .chat-title { display: flex; align-items: center; gap: 8px; font-size: 18px; font-weight: 600; }
-.chat-status { color: var(--muted); font-size: 12px; font-family: "JetBrains Mono", monospace; }
+.chat-status { color: var(--muted); font-size: 12px; font-family: "JetBrains Mono", monospace; display: flex; align-items: center; gap: 6px; }
+.chat-reindex { width: 22px; height: 22px; padding: 0; flex: 0 0 auto; color: var(--muted); }
+.chat-reindex:hover { color: var(--text); }
 .chip { padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border-2);
   background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; }
 .chip.active { color: var(--text); border-color: var(--accent); background: var(--active-bg); }
@@ -1069,7 +1078,13 @@ body.vwin-dragging iframe { pointer-events: none; }
 .chat-action-row .muted { min-width: 72px; }
 .chat-action-facts { color: var(--muted); font-size: 11px; font-family: "JetBrains Mono", monospace; }
 .chat-action-missing { color: #d97706; font-family: "JetBrains Mono", monospace; font-size: 12px; }
-.chat-action-warn { color: #dc2626; }
+.chat-action-warn { color: #dc2626; display: flex; align-items: center; gap: 5px; }
+.chat-action-steps { margin: 6px 0 8px; padding-left: 20px; color: var(--text); font-size: 13px; line-height: 1.5; }
+.chat-action-steps li { margin: 2px 0; }
+.chat-action-gpu { padding: 3px 6px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; }
+.chat-action-progress { max-height: 220px; overflow-y: auto; margin-top: 8px; background: var(--console-bg); color: var(--console-text); border-radius: 8px; padding: 10px 12px; font-family: "JetBrains Mono", monospace; font-size: 11.5px; line-height: 1.5; }
+.chat-action-progress .tline { white-space: pre-wrap; word-break: break-all; min-height: 1.4em; }
+.chat-action-done { color: #16a34a; display: flex; align-items: center; gap: 5px; margin-top: 6px; }
 .chat-action-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
 .chat-action-open { display: inline-flex; align-items: center; gap: 6px; }
 .chat-action-note { font-size: 11px; }

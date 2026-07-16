@@ -16,6 +16,7 @@ import { openFilePicker } from "./filePicker.js";
 import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
+import { pickProject } from "./pickProject.js";
 import { loadProgramGroups, isModed } from "../programGroups.js";
 
 const LAST_WF_KEY = "hax_gui_last_workflow";   // reopen this workflow on next visit
@@ -118,8 +119,29 @@ export function WorkflowsView() {
       { label: "Open project as workflow", icon: icon("box", 15), onClick: openProject },
     ];
     if (!(wf && wf.project_id)) items.push({ label: "Save as project", icon: icon("save", 15), onClick: saveAsProject });
+    if (wf) items.push({ label: "Duplicate to project…", icon: icon("copy", 15), onClick: duplicateToProject });
     if (wf) items.push({ label: "Delete workflow", icon: icon("trash", 15), danger: true, onClick: removeWorkflow });
     return items;
+  }
+
+  // Clone this whole pipeline into another project (a fresh, standalone copy). Internal
+  // step dependencies travel with it; external data inputs are cleared to set there.
+  async function duplicateToProject() {
+    if (!wf) return;
+    const target = await pickProject({
+      title: "Duplicate workflow to project", okText: "copy here", excludeId: wf.project_id,
+      hint: "Creates a self-contained copy of this pipeline in the chosen project. Step dependencies are kept; external data inputs are cleared for you to set before running.",
+    });
+    if (!target) return;
+    try {
+      const copy = await api.copyWorkflow(wf.id, target.id, null);
+      store.openProject({ id: target.id, name: target.name });   // switch context so the copy lists
+      await refreshList();
+      await openWorkflow(copy.id);
+      flash(`Copied to “${target.name}”.`, "muted");
+    } catch (err) {
+      flash(err && err.detail ? (typeof err.detail === "string" ? err.detail : "Could not copy workflow.") : "Could not copy workflow.", "err");
+    }
   }
   function viewMenuItems() {
     const items = [

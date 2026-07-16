@@ -441,6 +441,40 @@ class WorkflowManager:
         self._db.commit()
         return self.get(wid)
 
+    def copy_to_project(self, wid: str, target_project_id: str, name: str | None = None) -> dict[str, Any]:
+        """Clone a workflow's graph into a new standalone workflow owned by another
+        project, so an entire pipeline can be reused elsewhere.
+
+        The clone is self-contained and unlinked from the source: every node's `job_id`
+        is dropped (so nothing points at the source project's jobs) and the run-state
+        starts fresh. Dependencies *within* the copied graph travel as edges and rebind
+        automatically at run time; data inputs coming from *outside* the graph (a node's
+        bindable field with no incoming edge -- raw metadata, an un-copied job's output)
+        are cleared, to be set in the target project before the copy runs. Auto-managed
+        output/SSD dirs are dropped too, as they are per run."""
+        src = self.get(wid)
+        if src is None:
+            raise KeyError(wid)
+        if projects.dir_for(target_project_id) is None:
+            raise KeyError(target_project_id)
+        graph = json.loads(json.dumps(src.get("graph") or {"nodes": [], "edges": [], "orientation": "horizontal"}))
+        for node in graph.get("nodes", []) or []:
+            node.pop("job_id", None)               # unlink from the source project's jobs
+            program = node.get("program")
+            args = dict(node.get("args") or {})
+            for auto in (registry.output_arg(program), registry.ssd_arg(program)):
+                if auto:
+                    args.pop(auto, None)
+            # Data inputs are never carried as literals in a portable copy: an input fed
+            # by another step travels as an edge (rebinds at run time), and one from
+            # outside the graph is cleared to be set in the target project. Either way
+            # the field is dropped here — so no source-project path can leak through.
+            for field in adapters.bindable_fields(program):
+                args.pop(field, None)
+            node["args"] = args
+        new_name = (name or "").strip() or f"{src.get('name') or 'Workflow'} (copy)"
+        return self.save(target_project_id, new_name, graph, kind="standalone")
+
     # -- validation --------------------------------------------------------
     @staticmethod
     def topo_order(nodes: list[dict], edges: list[dict]) -> list[str]:

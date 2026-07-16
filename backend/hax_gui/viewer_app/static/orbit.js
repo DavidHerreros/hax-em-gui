@@ -4,7 +4,8 @@
 // from any point feels consistent. Zoom by wheel. Click-vs-drag is reported via
 // onClick so renderers can still pick.
 //
-// Panning (shift-drag or middle-mouse drag) translates the model in the view plane.
+// Panning (middle-mouse drag) translates the model in the view plane. Shift is left
+// free for the app's shift-click multi-select (building a morph path).
 //
 // Centre of rotation follows ChimeraX's `cofr frontCenter` (its default): while the
 // whole model still fits in the window, rotate about the model's centre; once you
@@ -116,7 +117,7 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
   canvas.addEventListener("pointerdown", (e) => {
     dragging = true; moved = false; lx = downX = e.clientX; ly = downY = e.clientY;
     if (pivotStale) updatePivot();   // once per gesture: a pan slides the plane through the pivot too
-    mode = (e.button === 1 || e.shiftKey) ? "pan" : "rotate";   // middle-mouse or shift = pan
+    mode = (e.button === 1) ? "pan" : "rotate";                 // middle-mouse = pan; shift stays free for select
     if (e.button === 1) e.preventDefault();                     // suppress middle-click autoscroll
     canvas.setPointerCapture(e.pointerId);
   });

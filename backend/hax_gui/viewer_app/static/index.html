@@ -66,6 +66,7 @@
           </span>
           <button id="drawBtn" class="btn" title="Draw a smooth editable curve across the landscape; it snaps to states only when you morph it (2D & 3D)">✎ Draw path</button>
           <button id="lassoBtn" class="btn" title="Lasso-select points (drag a loop)">▱ Lasso</button>
+          <button id="landSlicesBtn" class="btn" title="View the landscape as an orthogonal-slice density map (of the current X/Y/Z axes)">◫ Slices</button>
           <button id="layersBtn" class="btn" title="Show / hide the layers panel">Layers</button>
           <button id="saveLand" class="btn" title="Save landscape as PNG">Save PNG</button>
         </div>
@@ -74,8 +75,15 @@
         <aside class="layers" id="layersRail">
           <div class="layers-head">
             <span>Layers</span>
+            <button id="toggleAllLayers" class="iconbtn" title="Show / hide all layers">◉</button>
             <button id="addPath" class="btn small" title="Save the current morph path as an editable path layer">+ path</button>
             <button id="addLayer" class="btn small" disabled title="Make a layer from the current lasso selection">+ selection</button>
+          </div>
+          <div class="cluster-row layer-sel-row" id="layerSelRow" style="display:none">
+            <label title="Check / uncheck every layer"><input type="checkbox" id="selAllLayers" /> select</label>
+            <button id="showSelLayers" class="btn small" title="Show the checked layers (all, if none are checked)">Show</button>
+            <button id="hideSelLayers" class="btn small" title="Hide the checked layers (all, if none are checked)">Hide</button>
+            <label title="Restrict clicking &amp; lasso to points in the checked layers"><input type="checkbox" id="pickRestrict" /> pick only</label>
           </div>
           <div class="cluster-row">
             <label>k <input id="clusterK" type="number" min="2" max="20" value="5" /></label>
@@ -99,7 +107,9 @@
         <div class="canvas-wrap">
           <canvas id="scatter"></canvas>
           <canvas id="scatter3d" style="display:none"></canvas>
+          <canvas id="centroidOverlay" class="overlay"></canvas>
           <canvas id="lassoCanvas" class="overlay"></canvas>
+          <div id="landSlices" class="slices" style="display:none"></div>
         </div>
       </div>
     </section>
@@ -116,6 +126,7 @@
               <option value="surface" selected>Surface</option>
               <option value="mip">Volume · MIP</option>
               <option value="emission">Volume · glow</option>
+              <option value="slices">Orthogonal slices</option>
             </select>
           </label>
           <label id="lightlbl">light <select id="light"><option value="standard" selected>standard</option><option value="smooth">smooth</option><option value="raytraced">ray traced</option></select></label>
@@ -124,18 +135,33 @@
             <label>γ <input id="vgamma" type="range" min="0.3" max="3" step="0.1" value="1.4" title="Transfer-function gamma" /></label>
             <label>bright <input id="vbright" type="range" min="0.2" max="3" step="0.1" value="1.2" title="Brightness / opacity" /></label>
           </span>
-          <label>surface <input id="color" type="color" value="#dcdcdc" title="Surface / volume color" /></label>
+          <span id="slicectrls" style="display:none">
+            <label>map
+              <select id="slicemap" title="Slice colormap">
+                <option value="gray" selected>gray</option>
+                <option value="viridis">viridis</option>
+                <option value="magma">magma</option>
+                <option value="inferno">inferno</option>
+                <option value="hot">hot</option>
+              </select>
+            </label>
+            <label>low <input id="slicelo" type="range" min="0" max="1" step="0.01" value="0" title="Contrast — black point" /></label>
+            <label>high <input id="slicehi" type="range" min="0" max="1" step="0.01" value="1" title="Contrast — white point" /></label>
+            <label><input id="slicecross" type="checkbox" checked /> crosshair</label>
+            <button id="sliceReset" class="btn" title="Reset slice zoom / pan (mouse wheel zooms)">Reset zoom</button>
+          </span>
+          <label id="colorlbl">surface <input id="color" type="color" value="#dcdcdc" title="Surface / volume color" /></label>
           <label>bg <input id="bg" type="color" value="#040610" title="Background color" /></label>
           <button id="reset" class="btn">Reset view</button>
           <button id="saveMap" class="btn" title="Save map as PNG">Save PNG</button>
           <button id="mrc" class="btn" title="Download decoded map as .mrc">.mrc</button>
         </div>
       </div>
-      <div class="hist-strip">
+      <div class="hist-strip" id="histStrip">
         <span class="hist-label muted">contour</span>
         <canvas id="hist"></canvas>
       </div>
-      <div class="canvas-wrap"><canvas id="gl"></canvas><canvas id="glvol" style="display:none"></canvas></div>
+      <div class="canvas-wrap"><canvas id="gl"></canvas><canvas id="glvol" style="display:none"></canvas><div id="slices" class="slices" style="display:none"></div></div>
       <div class="morph-bar">
         <span class="muted">Path <button id="pathToggle" class="iconbtn" title="Show / hide the full path" style="display:none">▸</button> <span id="morphto" class="mono">—</span></span>
         <button id="clearpath" class="btn" title="Clear the morph path">Clear</button>

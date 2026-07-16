@@ -134,6 +134,7 @@ void main() {
 export function createCloud(canvas, onSelect) {
   const gl = canvas.getContext("webgl2", { antialias: true, depth: true, preserveDrawingBuffer: true, premultipliedAlpha: false });
   if (!gl) throw new Error("WebGL2 is not available in this browser.");
+  let pickFilter = null;   // when set, selection picks (not camera/path picks) only accept ids where pickFilter(i) is true
 
   const prog = link(gl, VERT, FRAG);
   const u = (n) => gl.getUniformLocation(prog, n);
@@ -253,7 +254,7 @@ export function createCloud(canvas, onSelect) {
   // Nearest drawn point to (px, py), both in device px with a GL bottom-up y, within
   // `tolPx`. Depth-tested, so an occluded point can no longer win over the one in front
   // of it — which the old screen-space scan happily let happen.
-  function pickAt(px, py, tolPx) {
+  function pickAt(px, py, tolPx, useFilter) {
     if (!ensurePickBuffer()) return -1;
     const r = Math.max(1, Math.round(tolPx));
     const x0 = Math.max(0, Math.round(px) - r), x1 = Math.min(pickW - 1, Math.round(px) + r);
@@ -270,6 +271,7 @@ export function createCloud(canvas, onSelect) {
         const o = (j * w + i) * 4;
         const id = buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16);
         if (!id) continue;
+        if (useFilter && pickFilter && !pickFilter(id - 1)) continue;   // out of the pick scope
         const dx = (x0 + i) - px, dy = (y0 + j) - py;
         const dd = dx * dx + dy * dy;
         if (dd < bestD) { bestD = dd; best = id - 1; }
@@ -297,7 +299,7 @@ export function createCloud(canvas, onSelect) {
 
   // invalidatePick on every camera change: the id buffer is rendered from this camera, so
   // it goes stale the moment the camera moves — but *not* when only the hover changes.
-  const orbit = createOrbit(canvas, () => { invalidatePick(); render(); }, (e) => { const i = pick(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); },
+  const orbit = createOrbit(canvas, () => { invalidatePick(); render(); }, (e) => { const i = pick(e.clientX, e.clientY); onSelect(i, { shift: e.shiftKey, cx: e.clientX, cy: e.clientY }); },
     // normalizePoints() scales the largest extent to 1.8; fitRadius 1.41 is the height the
     // old 45°-vertical camera showed at its default distance, so the cloud keeps its framing.
     { probeDepth: centreDepth, modelWidth: 1.8, fitRadius: 1.41 });
@@ -431,7 +433,7 @@ export function createCloud(canvas, onSelect) {
     if (!norm || !count) return -1;
     const rect = canvas.getBoundingClientRect();
     const r = Math.min(window.devicePixelRatio || 1, 2);
-    return pickAt((cx - rect.left) * r, glY(cy - rect.top), 16 * r);   // same tolerance as before
+    return pickAt((cx - rect.left) * r, glY(cy - rect.top), 16 * r, true);   // selection pick: honor the pick filter
   }
 
   window.addEventListener("resize", render);
@@ -471,6 +473,8 @@ export function createCloud(canvas, onSelect) {
       uploadFlags(); render();
     },
     setColors(colors) { colorData = colors; gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW); render(); },
+    setPickFilter(fn) { pickFilter = typeof fn === "function" ? fn : null; },   // restrict selection picks to ids where fn(i) is true
+
     setDensityField(values) { hasDens = !!(values && values.length === count); gl.bindBuffer(gl.ARRAY_BUFFER, densBuf); gl.bufferData(gl.ARRAY_BUFFER, values || new Float32Array(count), gl.STATIC_DRAW); render(); },
     showDensity(on) { showDens = on; render(); },
     setDensityIntensity(v) { densIntensity = Math.max(0, v); render(); },

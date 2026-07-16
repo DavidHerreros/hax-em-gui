@@ -12,6 +12,7 @@ import { icon } from "../icons.js";
 import { assistantChat, api } from "../api.js";
 import { renderMarkdown } from "../markdown.js";
 import { store } from "../store.js";
+import { createTerminal } from "./terminal.js";
 
 const GREETING =
   "Hi! I can help you pick programs and parameters, explain options from the docs, "
@@ -143,12 +144,39 @@ export function AssistantView() {
   }, "docs grounding");
   groundBtn.classList.toggle("active", ctrl.grounded);
 
-  const statusLine = h("div", { class: "chat-status" }, "");
-  api.assistantStatus().then((s) => {
-    statusLine.textContent = s.available
+  const statusText = h("span", null, "");
+  // Rebuild the docs index in place so edits to hax-em-docs are picked up
+  // without restarting the GUI. The index also auto-rebuilds on process start
+  // whenever the docs content hash changes; this is the live path.
+  const reindexBtn = h("button", {
+    class: "chat-reindex btn-icon", title: "Reindex docs (pick up hax-em-docs edits without a restart)",
+    onclick: async () => {
+      reindexBtn.disabled = true;
+      const prev = statusText.textContent;
+      statusText.textContent = "reindexing docs…";
+      try {
+        const r = await api.assistantReindexDocs();
+        if (r.ok) {
+          statusText.textContent = `docs reindexed · ${r.chunks} doc chunks`;
+          api.assistantStatus().then(showStatus).catch(() => {});
+        } else {
+          statusText.textContent = `reindex failed: ${r.reason || "unknown"}`;
+        }
+      } catch (e) {
+        statusText.textContent = prev;
+      } finally {
+        reindexBtn.disabled = false;
+      }
+    },
+  }, icon("refresh", 13));
+  const statusLine = h("div", { class: "chat-status" }, statusText, reindexBtn);
+  function showStatus(s) {
+    statusText.textContent = s.available
       ? `model: ${s.model}  ·  docs: ${s.docs_grounding ? "on" : "off"}  ·  ${s.programs} programs, ${s.doc_chunks} doc chunks`
       : "assistant unavailable";
-  }).catch(() => { statusLine.textContent = ""; });
+    reindexBtn.style.display = s.available ? "" : "none";
+  }
+  api.assistantStatus().then(showStatus).catch(() => { statusText.textContent = ""; });
 
   // ── attach a run (explicit): scope to the chat's project when it has one ──
   const attachRow = h("div", { class: "chat-attach" });
@@ -304,7 +332,9 @@ export function AssistantView() {
 
   // ── proposed-action card (create a draft job from a data path) ────────
   function renderActionCard(action) {
-    if (!action || action.kind !== "create_job") return;
+    if (!action) return;
+    if (action.kind === "prepare_motion") { renderPrepareMotionCard(action); return; }
+    if (action.kind !== "create_job") return;
     const card = h("div", { class: "chat-action" });
     const body = h("div", { class: "chat-action-body" }, h("span", { class: "muted" }, "Preparing proposal…"));
     card.appendChild(h("div", { class: "chat-action-head" },
@@ -364,6 +394,80 @@ export function AssistantView() {
     });
     body.appendChild(h("div", { class: "chat-action-actions" }, open,
       h("span", { class: "muted chat-action-note" }, "Draft only — nothing runs until you launch it.")));
+  }
+
+  // Confirm card for preparing a run's deformation field (per-domain motion). This
+  // runs GPU compute (predict + decode), so it always warns and asks for a GPU
+  // before anything runs.
+  function renderPrepareMotionCard(action) {
+    const card = h("div", { class: "chat-action" });
+    const body = h("div", { class: "chat-action-body" }, h("span", { class: "muted" }, "Loading plan…"));
+    card.appendChild(h("div", { class: "chat-action-head" }, icon("box", 15),
+      h("span", null, "Proposed action: prepare ", h("strong", null, "per-domain motion analysis"))));
+    card.appendChild(body);
+    log.appendChild(h("div", { class: "chat-msg assistant" },
+      h("div", { class: "chat-role" }, "Action"), card));
+    log.scrollTop = log.scrollHeight;
+
+    api.assistantPrepareMotionPlan(action.job_id).then(({ plan, gpus }) => {
+      body.replaceChildren();
+      if (plan.error) { body.appendChild(h("span", { class: "chat-action-warn" }, plan.error)); return; }
+      body.appendChild(h("div", { class: "chat-action-warn" }, icon("cpu", 14),
+        " Runs on the GPU (" + (plan.predict_needed ? "predict + decode" : "decode") +
+        ") — this may take a few minutes."));
+      body.appendChild(h("ol", { class: "chat-action-steps" },
+        ...(plan.steps || []).map((s) => h("li", null, s))));
+      body.appendChild(h("div", { class: "chat-action-row" },
+        h("span", { class: "muted" }, "Writes to"),
+        h("code", { class: "md-code" }, "decoded_states/deformation/")));
+
+      // GPU picker — only *ask* when several are available (else show the one).
+      let gpuValue = (gpus && gpus.length) ? String(gpus[0].index) : "";
+      let gpuControl;
+      if (gpus && gpus.length > 1) {
+        const sel = h("select", { class: "chat-action-gpu" },
+          ...gpus.map((g) => h("option", { value: String(g.index) },
+            `GPU ${g.index} — ${g.name} (${Math.round(g.mem_free_mb / 1024)} GB free)`)));
+        sel.value = gpuValue;
+        sel.addEventListener("change", () => { gpuValue = sel.value; });
+        gpuControl = sel;
+      } else if (gpus && gpus.length === 1) {
+        gpuControl = h("span", null, `GPU ${gpus[0].index} — ${gpus[0].name} ` +
+          `(${Math.round(gpus[0].mem_free_mb / 1024)} GB free)`);
+      } else {
+        gpuControl = h("span", { class: "muted" }, "no GPU detected — will use the default device");
+      }
+      body.appendChild(h("div", { class: "chat-action-row" }, h("span", { class: "muted" }, "GPU"), gpuControl));
+
+      // Live output rendered through the same terminal as job stdout (ANSI colours
+      // + carriage-return progress bars update in place).
+      const progress = h("div", { class: "chat-action-progress console", style: { display: "none" } });
+      const done = h("div");
+      const run = h("button", { class: "btn chat-action-open" }, icon("play", 15), "Run");
+      const note = h("span", { class: "muted chat-action-note" }, "Nothing runs until you click Run.");
+      run.addEventListener("click", () => {
+        run.disabled = true; note.textContent = "";
+        progress.style.display = "";
+        const term = createTerminal(progress);
+        term.write("\x1b[2mStarting…\x1b[0m\n");
+        api.assistantPrepareMotion({
+          jobId: action.job_id, gpu: gpuValue,
+          onStatus: (s) => { term.write(s); log.scrollTop = log.scrollHeight; },
+          onDone: () => {
+            term.write("\n\x1b[1;32m✓ Deformation field ready.\x1b[0m\n");
+            done.appendChild(h("div", { class: "chat-action-done" }, icon("check", 14),
+              " Ask about the motion again — or regenerate the report — for the per-domain "
+              + "hinge/rotation analysis."));
+            log.scrollTop = log.scrollHeight;
+          },
+          onError: (e) => { run.disabled = false; term.write("\n\x1b[1;31mFailed: " + e + "\x1b[0m\n"); },
+        });
+      });
+      body.appendChild(h("div", { class: "chat-action-actions" }, run, note));
+      body.appendChild(progress);
+      body.appendChild(done);
+    }).catch((e) => { body.replaceChildren(h("span", { class: "chat-action-warn" },
+      "Could not load the plan: " + (e && (e.detail || e.message) || "error"))); });
   }
 
   // ── send / hooks ──────────────────────────────────────────────────────

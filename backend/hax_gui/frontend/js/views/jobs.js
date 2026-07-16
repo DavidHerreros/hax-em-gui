@@ -5,6 +5,7 @@ import { api } from "../api.js";
 import { errorBox, skeleton } from "./ui.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
+import { pickProject } from "./pickProject.js";
 import { jobLabelChips, loadLabels } from "./labels.js";
 import { store } from "../store.js";
 
@@ -180,9 +181,27 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
     items.push(
       { label: "Open", icon: icon("arrowRight", 15), onClick: () => { location.hash = "#/jobs/" + job.id; } },
       { label: "Rename", icon: icon("pencil", 15), onClick: rename },
+      { label: "Copy to project…", icon: icon("copy", 15), onClick: copyToProject },
     );
     if (!job.active) items.push({ label: "Delete", icon: icon("trash", 15), danger: true, onClick: del });
     openContextMenu(anchor, items);
+  }
+  // Copy this run's recipe into another project: pick a destination, then open the New
+  // Run form there preloaded with the program + parameters (data inputs cleared, to be
+  // set in the target project). Nothing runs until the user saves/launches it there.
+  async function copyToProject() {
+    const target = await pickProject({
+      title: "Copy run to project", okText: "copy here", excludeId: job.project_id,
+      hint: "Opens the New Run form in the chosen project, preloaded with this run's program and settings. Data inputs are cleared for you to set there.",
+    });
+    if (!target) return;
+    try {
+      const pf = await api.jobCopyPrefill(job.id);
+      store.prefillProgram({ program: pf.program, values: pf.values, gpu: pf.gpu,
+                             projectId: target.id, projectName: target.name });
+    } catch (err) {
+      alert(err && err.detail ? (typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail)) : "Could not copy this run.");
+    }
   }
   async function run() {
     try { await api.startJob(job.id); location.hash = "#/jobs/" + job.id; }

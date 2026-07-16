@@ -136,8 +136,8 @@ export const store = {
   // Open the launcher for `program` preloaded with `values` (an assistant
   // proposal). No jobId → a NEW job: the user completes any required fields and
   // launches it themselves. Nothing runs from this call.
-  prefillProgram({ program, values, projectId, projectName }) {
-    state.prefill = { program, values: { ...(values || {}) }, gpu: "" };
+  prefillProgram({ program, values, gpu, projectId, projectName }) {
+    state.prefill = { program, values: { ...(values || {}) }, gpu: gpu || "" };
     state.selectedProgram = program;
     state.rightOpen = true;
     state.formNonce++;

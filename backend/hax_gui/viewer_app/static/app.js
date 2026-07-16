@@ -5,6 +5,7 @@ import { createVolume } from "./volume.js";
 import { createScatter, clusterColor } from "./scatter.js";
 import { createCloud } from "./cloud.js";
 import { createHistogram } from "./histogram.js";
+import { createSlices } from "./slices.js";
 
 // Density colormaps (RGB 0–255 control stops, low→high). Default inferno, to
 // match the desktop annotate_space landscape (napari "inferno" over a dark
@@ -27,7 +28,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let renderer, scatter, cloud = null, hist;
 let L = null, umapData = null, points3 = [];
 const clusterCache = {};
-const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 60, pointAlpha: 1, pathExpanded: false, smooth: 6 };
+const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 60, pointAlpha: 1, pathExpanded: false, smooth: 6, pickRestrict: false };
 // `state.fps` is the *motion* rate: timeline frames advanced per second. We render
 // at most DISPLAY_FPS_CAP frames/sec; once the motion rate exceeds that we keep the
 // render rate at the cap and advance several frames per tick instead. That lets a
@@ -52,6 +53,14 @@ let hidePathPicks = false;
 
 // volume ray-marcher (created lazily on first switch to a Volume render mode)
 let volRenderer = null, curVolMeta = null;
+// orthogonal-slice viewer (created lazily on first switch to the Slices render mode)
+let slices = null;
+// landscape orthogonal-slice viewer (left pane; created lazily) + which view the
+// landscape pane shows: the scatter/cloud points, or the density slices.
+let landSlices = null, landView = "points";
+// 2D context of the overlay canvas that draws KMeans centroid markers (virtual points
+// that live off the base cloud), kept in sync with the active projection via onRender.
+let centroidCtx = null;
 
 // lasso + layers
 let lassoArmed = false, lassoing = false, lassoPts = [], lctx = null, lassoMode = "replace";
@@ -93,6 +102,8 @@ function applyTheme(theme) {
   const c = hexToRgb(bg);
   renderer.setBackground(c);
   if (volRenderer) volRenderer.setBackground(c);
+  if (slices) slices.setBackground(bg);
+  if (landSlices) landSlices.setBackground(bg);
   applyLandscapeBg();   // keeps the dark density backdrop across theme toggles
   // Selection rings / path use a theme-aware contrast color computed at draw time,
   // so the landscape must repaint when the theme toggles.
@@ -113,6 +124,8 @@ async function boot() {
   try { renderer = createRenderer($("gl")); }
   catch (err) { status("WebGL2 unavailable: " + err.message, "err"); return; }
   scatter = createScatter($("scatter"), onSelect);
+  scatter.onRender(syncCentroidOverlay);   // keep centroid markers on the 2D projection
+  scatter.setPickFilter(pickAllowed);      // pick-restrict blocks direct clicks too
   hist = createHistogram($("hist"), onLevel);
   applyColormap();
   applyTheme(new URLSearchParams(location.search).get("theme"));
@@ -156,11 +169,12 @@ function wireControls() {
     state.dims = +e.target.value; const is3 = is3d();
     $("scatter").style.display = is3 ? "none" : ""; $("scatter3d").style.display = is3 ? "" : "none";
     $("zwrap").style.display = is3 ? "" : "none";
-    if (is3 && !cloud) { try { cloud = createCloud($("scatter3d"), onSelect); cloud.setBackground(hexToRgb($("bg").value)); cloud.setColormap(COLORMAPS[state.densMap] || COLORMAPS.viridis); } catch (err) { status("WebGL2 unavailable for 3D: " + err.message, "err"); state.dims = 2; $("dims").value = "2"; $("scatter").style.display = ""; $("scatter3d").style.display = "none"; return; } }
+    if (is3 && !cloud) { try { cloud = createCloud($("scatter3d"), onSelect); cloud.setBackground(hexToRgb($("bg").value)); cloud.setColormap(COLORMAPS[state.densMap] || COLORMAPS.viridis); cloud.onRender(syncCentroidOverlay); cloud.setPickFilter(pickAllowed); } catch (err) { status("WebGL2 unavailable for 3D: " + err.message, "err"); state.dims = 2; $("dims").value = "2"; $("scatter").style.display = ""; $("scatter3d").style.display = "none"; return; } }
+    if (landView === "slices") setLandView("points");   // slices are the flat XY/XZ/YZ cuts; leaving them while toggling dims is confusing
     refreshAxisEnabled();
     updatePoints(); applyColor(); syncSelection();   // re-apply color so 2D↔3D keeps density/cluster/layers
   });
-  $("zaxis").addEventListener("change", (e) => { state.z = +e.target.value; updatePoints(); });
+  $("zaxis").addEventListener("change", (e) => { state.z = +e.target.value; updatePoints(); if (landView === "slices") loadLandSlices(); });
   $("embed").addEventListener("change", async (e) => {
     state.embedding = e.target.value;
     if (state.embedding === "umap" && !umapData) { status("Computing UMAP…", "busy"); try { umapData = await fetchMatrix("./api/umap.bin"); } catch (err) { status("UMAP failed: " + err, "err"); $("embed").value = "pca"; state.embedding = "pca"; return; } status(""); }
@@ -170,11 +184,13 @@ function wireControls() {
     populateAxes();        // each embedding has its own axis set (PCs / UMAP dims / latent dims)
     refreshAxisEnabled();
     updatePoints();
+    if (landView === "slices") loadLandSlices();
   });
-  $("xaxis").addEventListener("change", (e) => { state.x = +e.target.value; updatePoints(); });
-  $("yaxis").addEventListener("change", (e) => { state.y = +e.target.value; updatePoints(); });
+  $("xaxis").addEventListener("change", (e) => { state.x = +e.target.value; updatePoints(); if (landView === "slices") loadLandSlices(); });
+  $("yaxis").addEventListener("change", (e) => { state.y = +e.target.value; updatePoints(); if (landView === "slices") loadLandSlices(); });
   $("colorby").addEventListener("change", (e) => { state.colorBy = e.target.value; toggleColorWraps(); applyColor(); });
   $("lassoBtn").addEventListener("click", () => setLassoArmed(!lassoArmed));
+  $("landSlicesBtn").addEventListener("click", () => setLandView(landView === "slices" ? "points" : "slices"));
   $("drawBtn").addEventListener("click", () => setPathDrawArmed(!pathDrawArmed));
   $("layersBtn").addEventListener("click", () => {
     const collapsed = $("layersRail").classList.toggle("collapsed");
@@ -182,6 +198,16 @@ function wireControls() {
   });
   $("addLayer").addEventListener("click", addLayerFromSelection);
   $("addPath").addEventListener("click", makePathLayer);
+  // ---- layer visibility: show/hide all + bulk on the checked subset ----
+  $("toggleAllLayers").addEventListener("click", toggleAllLayers);
+  $("selAllLayers").addEventListener("change", (e) => { layers.forEach((l) => (l.selected = e.target.checked)); renderLayers(); });
+  $("showSelLayers").addEventListener("click", () => setCheckedVisible(true));
+  $("hideSelLayers").addEventListener("click", () => setCheckedVisible(false));
+  $("pickRestrict").addEventListener("change", (e) => {
+    state.pickRestrict = e.target.checked;
+    renderLayers();
+    status(state.pickRestrict ? pickScopeMsg() : "Picking any point again.");
+  });
   $("clusterBtn").addEventListener("click", () => computeClusters());
   $("clusterSeedBtn").addEventListener("click", clusterFromPicks);
   $("saveAll").addEventListener("click", saveAllLayers);
@@ -191,11 +217,12 @@ function wireControls() {
   $("pathToggle").addEventListener("click", () => { state.pathExpanded = !state.pathExpanded; updatePathLabel(); });
   $("denssigma").addEventListener("input", (e) => {
     state.densBandwidth = +e.target.value;
+    if (landView === "slices") loadLandSlices();   // the slice field uses the same bandwidth
     if (state.colorBy !== "density") return;
     if (is3d() && cloud) applyColor(); else scatter.setDensityBandwidth(state.densBandwidth);
   });
   $("densint").addEventListener("input", (e) => { state.densIntensity = +e.target.value; if (cloud) cloud.setDensityIntensity(state.densIntensity); });
-  $("densmap").addEventListener("change", (e) => { state.densMap = e.target.value; applyColormap(); if (state.colorBy === "density") applyColor(); });
+  $("densmap").addEventListener("change", (e) => { state.densMap = e.target.value; applyColormap(); if (state.colorBy === "density") applyColor(); if (landSlices) landSlices.setColormap(sliceColormap()); });
   $("light").addEventListener("change", (e) => renderer.setLighting(e.target.value));
   // Smoothing is baked into the cached meshes, so changing it invalidates every frame. That
   // flush also stops the prefetcher (clearFrameCache bumps fillToken), so restart it — and
@@ -209,11 +236,11 @@ function wireControls() {
     else liveDecode();
   });
   $("color").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setColor(c); if (volRenderer) volRenderer.setColor(c); });
-  $("bg").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setBackground(c); if (volRenderer) volRenderer.setBackground(c); });
-  $("reset").addEventListener("click", () => { renderer.resetView(); if (volRenderer) volRenderer.resetView(); });
+  $("bg").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setBackground(c); if (volRenderer) volRenderer.setBackground(c); if (slices) slices.setBackground(e.target.value); if (landSlices) landSlices.setBackground(e.target.value); });
+  $("reset").addEventListener("click", () => { renderer.resetView(); if (volRenderer) volRenderer.resetView(); if (slices) slices.resetZoom(); });
   $("mrc").addEventListener("click", saveMrc);
-  $("saveMap").addEventListener("click", () => savePng(state.render === "surface" ? renderer : volRenderer, "map"));
-  $("saveLand").addEventListener("click", () => savePng(activeLand(), "landscape"));
+  $("saveMap").addEventListener("click", () => savePng(state.render === "surface" ? renderer : state.render === "slices" ? slices : volRenderer, "map"));
+  $("saveLand").addEventListener("click", () => savePng(landView === "slices" ? landSlices : activeLand(), "landscape"));
   $("play").addEventListener("click", togglePlay);
   $("record").addEventListener("click", recordSeries);
   $("stop").addEventListener("click", stopPlayback);
@@ -231,6 +258,12 @@ function wireControls() {
   $("rendermode").addEventListener("change", (e) => setRenderMode(e.target.value));
   $("vgamma").addEventListener("input", (e) => { state.vGamma = +e.target.value; if (volRenderer) volRenderer.setGamma(state.vGamma); });
   $("vbright").addEventListener("input", (e) => { state.vBright = +e.target.value; if (volRenderer) volRenderer.setBrightness(state.vBright); });
+  // ---- orthogonal slices (decoded map, right pane) ----
+  $("slicemap").addEventListener("change", (e) => { if (slices) slices.setColormap(e.target.value); });
+  $("slicelo").addEventListener("input", () => { if (slices) slices.setContrast(+$("slicelo").value, +$("slicehi").value); });
+  $("slicehi").addEventListener("input", () => { if (slices) slices.setContrast(+$("slicelo").value, +$("slicehi").value); });
+  $("slicecross").addEventListener("change", (e) => { if (slices) slices.setCrosshair(e.target.checked); });
+  $("sliceReset").addEventListener("click", () => { if (slices) slices.resetZoom(); });
 }
 
 // Save the current morph path ([current, ...path]) as an editable path layer.
@@ -726,6 +759,55 @@ function layerColorsCSS() {
   return out;
 }
 
+// Draw the visible Centroids layer's points as ringed markers. Centroids are virtual
+// states (index >= L.n) that live off the base cloud, so they are never part of the
+// scatter/cloud point set — we project their stored coords onto the active view and
+// stamp them on a dedicated overlay, re-synced after every render (onRender) so the
+// markers track panning and 3D orbit.
+function syncCentroidOverlay() {
+  if (!centroidCtx) return;
+  const co = $("centroidOverlay");
+  centroidCtx.clearRect(0, 0, co.clientWidth, co.clientHeight);
+  if (landView === "slices") return;   // the scatter is hidden behind the slice grid
+  const cen = layers.find((l) => l.kind === "centroid" && l.visible);
+  if (!cen || !cen.indices) return;
+  const land = activeLand();
+  if (!land || !land.projectData) return;
+  const dataOf = (i) => axesOf(i < L.n ? (activeCoords() || L.pca)[i] : (centroidPCA[i] || []));
+
+  // Morph path that runs through centroids: the base renderers can't draw segments to a
+  // virtual point, so we draw the whole trajectory here, colored to match the centroid.
+  const traj = hidePathPicks ? [] : [state.current, ...state.path].filter((v) => v >= 0);
+  if (traj.length > 1 && traj.some((i) => i >= L.n)) {
+    const tp = land.projectData(traj.map(dataOf));
+    const pcol = editingPathLayer ? editingPathLayer.color : (indexColor[state.current] || "#f472b6");
+    centroidCtx.lineJoin = "round"; centroidCtx.lineCap = "round";
+    const stroke = (color, w) => {
+      centroidCtx.strokeStyle = color; centroidCtx.lineWidth = w;
+      centroidCtx.beginPath(); let started = false;
+      for (const p of tp) { if (!p) { started = false; continue; } if (!started) { centroidCtx.moveTo(p[0], p[1]); started = true; } else centroidCtx.lineTo(p[0], p[1]); }
+      centroidCtx.stroke();
+    };
+    stroke("rgba(15,23,42,0.5)", 4.5);   // dark halo so the line reads on light backgrounds
+    stroke(pcol, 2.5);
+  }
+
+  // Centroid markers, the current one highlighted (its ring, since the base cloud can't).
+  const idxs = cen.indices.filter((i) => centroidPCA[i]);
+  const proj = land.projectData(idxs.map((i) => axesOf(centroidPCA[i])));
+  for (let k = 0; k < proj.length; k++) {
+    const p = proj[k];
+    if (p) drawCentroidMarker(centroidCtx, p[0], p[1], indexColor[idxs[k]] || cen.color || "#ffffff", idxs[k] === state.current);
+  }
+}
+function drawCentroidMarker(ctx, x, y, hex, current) {
+  const rad = current ? 8 : 6;
+  ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.fillStyle = hex; ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(15,23,42,0.85)"; ctx.stroke();     // dark halo reads on light bg
+  ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.lineWidth = 1.5; ctx.strokeStyle = "rgba(255,255,255,0.95)"; ctx.stroke();
+  if (current) { ctx.beginPath(); ctx.arc(x, y, rad + 4, 0, Math.PI * 2); ctx.lineWidth = 2; ctx.strokeStyle = "#2dd4bf"; ctx.stroke(); }   // selection halo
+}
+
 // Local density in [0,1], within `frac` of the bbox diagonal.
 //
 // Binned: drop the points into a uniform grid, blur it, then read each point back out
@@ -817,16 +899,30 @@ function syncSelection() {
   // overlay still conveys the path. state.path is untouched, so decoding is fine.
   const pathPts = hidePathPicks ? [] : state.path;
   const traj = hidePathPicks ? [] : [state.current, ...state.path].filter((v) => v >= 0);
-  const col = editingPathLayer ? editingPathLayer.color : "#f472b6";
+  // The path takes the current centroid's cluster color (so a morph built from centroids
+  // reads in their color, matching the decoded map). A trajectory that touches a centroid
+  // is drawn by the centroid overlay instead — the base renderers can't reach virtual
+  // points — so hand them an empty path to avoid a broken half-line.
+  const col = editingPathLayer ? editingPathLayer.color : (indexColor[state.current] || "#f472b6");
+  const baseTraj = traj.some((i) => i >= L.n) ? [] : traj;
   scatter.select(state.current); scatter.setPath(pathPts); scatter.setSelection(state.selection);
-  scatter.setPathOrder(traj, col);
-  if (cloud) { cloud.select(state.current); cloud.setPath(pathPts); cloud.setSelection(state.selection); cloud.setPathOrder(traj, hexToRgb(col)); }
+  scatter.setPathOrder(baseTraj, col);
+  if (cloud) { cloud.select(state.current); cloud.setPath(pathPts); cloud.setSelection(state.selection); cloud.setPathOrder(baseTraj, hexToRgb(col)); }
+  syncCentroidOverlay();   // path through / marker on centroids follows the selection
 }
 
 async function onSelect(i, opts) {
+  opts = opts || {};
+  // A real click/tap carries coords: resolve it into a base point or a centroid marker,
+  // honoring pick-restrict. Programmatic calls (layer loading, path edits) pass no coords
+  // and select `i` directly.
+  if (opts.cx != null) {
+    i = resolvePick(i, opts.cx, opts.cy);
+    if (i < 0) return;
+  }
   if (playing) setPlaying(false);              // editing the path stops playback
   hidePathPicks = false;                       // manual interaction -> show path picks again
-  if (opts && opts.shift) {
+  if (opts.shift) {
     // shift-click toggles a waypoint: remove it if already on the path, else append
     const at = state.path.indexOf(i);
     if (at >= 0) state.path.splice(at, 1);
@@ -853,6 +949,7 @@ async function onSelect(i, opts) {
 
 function onLevel(level, dragging) {
   state.sigma = hist.sigma;
+  if (state.render === "slices") return;   // slices show raw density, not a contour
   if (state.render !== "surface" && volRenderer && curVolMeta) { volRenderer.setThreshold(normThreshold()); return; }
   // With a morph on screen the contour has to move the *reference* the frames are contoured
   // to, not the frames — see recontourSeries. Re-decoding the selected state here (what this
@@ -941,6 +1038,7 @@ const draftSmooth = () => Math.min(state.smooth, DRAFT_SMOOTH);
 let decodedIndex = -1;    // the state whose volume the server has already decoded
 
 async function decode(draft = false) {
+  if (state.render === "slices") { loadSlices(); return; }   // slices ignore contour/mesh
   if (state.current < 0) return;
   const token = ++decodeToken;
   // Only a change of *state* runs the network. A contour change re-meshes a volume the
@@ -970,29 +1068,144 @@ async function decode(draft = false) {
   }
 }
 
-// ---- volume ray-marching mode ----
+// ---- volume ray-marching / orthogonal-slice mode ----
 function setRenderMode(mode) {
   if (mode !== state.render) clearFrameCache();   // surface<->volume payloads differ
-  // The surface and the ray-marcher live on different canvases, each with its own
-  // camera. Hand the outgoing one over so the map does not jump back to a default view.
-  const from = state.render === "surface" ? renderer : volRenderer;
+  const surf = mode === "surface";
+  const isSlices = mode === "slices";
+  const isVol = mode === "mip" || mode === "emission";
+  // Surface and the ray-marcher live on different canvases, each with its own camera;
+  // the slice view has none. Hand the outgoing 3D camera over so the map does not jump
+  // back to a default view when returning from slices to a 3D mode.
+  const from = state.render === "surface" ? renderer : state.render === "slices" ? null : volRenderer;
   const camera = from ? from.getCamera() : null;
   state.render = mode; $("rendermode").value = mode;
-  const surf = mode === "surface";
   $("gl").style.display = surf ? "" : "none";
-  $("glvol").style.display = surf ? "none" : "";
+  $("glvol").style.display = isVol ? "" : "none";
+  $("slices").style.display = isSlices ? "grid" : "none";
   $("lightlbl").style.display = surf ? "" : "none";
   $("smoothlbl").style.display = surf ? "" : "none";
-  $("volctrls").style.display = surf ? "none" : "";
-  if (!surf && !volRenderer) {
+  $("volctrls").style.display = isVol ? "" : "none";
+  $("slicectrls").style.display = isSlices ? "" : "none";
+  $("colorlbl").style.display = isSlices ? "none" : "";
+  $("histStrip").style.display = isSlices ? "none" : "";   // contour is meaningless for raw slices
+  if (isVol && !volRenderer) {
     try { volRenderer = createVolume($("glvol")); volRenderer.setColor(hexToRgb($("color").value)); volRenderer.setBackground(hexToRgb($("bg").value)); volRenderer.setGamma(state.vGamma); volRenderer.setBrightness(state.vBright); }
     catch (err) { status("Volume rendering unavailable: " + err.message, "err"); setRenderMode("surface"); return; }
   }
-  if (volRenderer) volRenderer.setMode(mode === "emission" ? "emission" : "mip");
-  const to = surf ? renderer : volRenderer;
+  if (isSlices && !slices) {
+    try {
+      slices = createSlices($("slices"));
+      slices.setBackground($("bg").value); slices.setColormap($("slicemap").value);
+      slices.setContrast(+$("slicelo").value, +$("slicehi").value); slices.setCrosshair($("slicecross").checked);
+    } catch (err) { status("Slices unavailable: " + err.message, "err"); setRenderMode("surface"); return; }
+  }
+  if (isVol) volRenderer.setMode(mode === "emission" ? "emission" : "mip");
+  const to = surf ? renderer : isVol ? volRenderer : null;
   if (to && to !== from && camera) to.setCamera(camera);
+  if (isSlices) { refreshSlices(); return; }
   if (state.timeline.length && state.frame > 0) renderFrame(state.frame, false);
   else if (state.current >= 0) decode();
+}
+
+// ---- orthogonal slices of the decoded map (right pane) ----
+// Land on the active morph frame when one is loaded (so a paused/looping morph keeps
+// its plane), otherwise slice the currently selected state.
+function refreshSlices() {
+  if (state.timeline.length && state.frame > 0) renderFrame(state.frame, false);
+  else loadSlices();
+}
+async function loadSlices() {
+  if (!slices) return;
+  if (state.current < 0) { status("Pick a state to slice its decoded map.", "warn"); return; }
+  const token = ++decodeToken;
+  status("Loading slices…", "busy");
+  try {
+    const res = await fetch(`./api/grid?index=${state.current}&size=160`);
+    if (!res.ok) throw new Error(await res.text());
+    const g = parseGrid(await res.arrayBuffer());
+    if (token !== decodeToken) return;
+    slices.setVolume(g);
+    status(`Slices ${g.nx}×${g.ny}×${g.nz} · state #${state.current}`);
+  } catch (err) { if (token === decodeToken) status("Slice load failed: " + err.message, "err"); }
+}
+
+// ---- landscape orthogonal-slice view (left pane) ----
+// Slices with a gray-ish default; the slice viewer only knows a handful of maps, so map
+// the density colormap onto the nearest one it supports (else viridis).
+const SLICE_MAPS = new Set(["gray", "viridis", "magma", "inferno", "hot"]);
+const sliceColormap = () => (SLICE_MAPS.has(state.densMap) ? state.densMap : "viridis");
+
+// Swap the landscape pane between the point cloud and an orthogonal-slice density map.
+function setLandView(mode) {
+  landView = mode === "slices" ? "slices" : "points";
+  const on = landView === "slices";
+  $("landSlicesBtn").classList.toggle("active", on);
+  const is3 = is3d();
+  $("scatter").style.display = on ? "none" : (is3 ? "none" : "");
+  $("scatter3d").style.display = on ? "none" : (is3 ? "" : "none");
+  $("centroidOverlay").style.display = on ? "none" : "";
+  $("lassoCanvas").style.display = on ? "none" : "";
+  $("landSlices").style.display = on ? "grid" : "none";
+  if (on) {
+    if (lassoArmed) setLassoArmed(false);        // the point tools have no meaning over slices
+    if (pathDrawArmed) setPathDrawArmed(false);
+    if (!landSlices) {
+      try {
+        landSlices = createSlices($("landSlices"));
+        landSlices.setBackground($("bg").value); landSlices.setColormap(sliceColormap()); landSlices.setCrosshair(true);
+      } catch (err) { status("Slices unavailable: " + err.message, "err"); setLandView("points"); return; }
+    }
+    loadLandSlices();
+  } else {
+    syncCentroidOverlay();
+  }
+}
+
+// Bin the landscape density onto the current X/Y/Z axes and show it as orthogonal cuts.
+function loadLandSlices() {
+  if (!landSlices) return;
+  const g = landscapeDensityGrid();
+  if (!g) { status("No points to build a density field.", "warn"); return; }
+  landSlices.setColormap(sliceColormap());
+  landSlices.setVolume(g);
+  status(`Landscape density slices ${g.nx}×${g.ny}×${g.nz} · ${axisLabel(state.x)} · ${axisLabel(state.y)} · ${axisLabel(state.z)}`);
+}
+
+// Bin the latent cloud (current x/y/z axes) into a 3D grid, blur it to a KDE, and
+// hand it to the slice viewer as a uint8 volume. Reuses the same box-blur passes as
+// the 3D density glow, so the two agree. `boxBlurAxis` works on the (ix*ny+iy)*nz+iz
+// layout; the slice viewer wants (iz*ny+iy)*nx+ix, so we remap on the way out.
+const DENS_SLICE_GRID = 96;
+function landscapeDensityGrid() {
+  const c = activeCoords();
+  if (!c || !c.length) return null;
+  const n = c.length, ax = [state.x, state.y, state.z];
+  const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+  const P = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) { const v = c[i][ax[k]] ?? 0; P[i * 3 + k] = v; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
+  const ext = [0, 1, 2].map((k) => (mx[k] - mn[k]) || 1);
+  const diag = Math.hypot(ext[0], ext[1], ext[2]) || 1;
+  const h = Math.max(ext[0], ext[1], ext[2]) / DENS_SLICE_GRID;
+  const dim = ext.map((e) => Math.max(1, Math.min(DENS_SLICE_GRID, Math.ceil(e / h))));
+  const [nx, ny, nz] = dim;
+  const grid = new Float32Array(nx * ny * nz);   // (ix*ny+iy)*nz+iz
+  for (let i = 0; i < n; i++) {
+    const ix = Math.min(nx - 1, Math.max(0, (P[i * 3] - mn[0]) / h | 0));
+    const iy = Math.min(ny - 1, Math.max(0, (P[i * 3 + 1] - mn[1]) / h | 0));
+    const iz = Math.min(nz - 1, Math.max(0, (P[i * 3 + 2] - mn[2]) / h | 0));
+    grid[(ix * ny + iy) * nz + iz] += 1;
+  }
+  const rad = Math.max(1, Math.round(((0.04 + state.densBandwidth * 0.02) * diag) / h / 2));
+  let src = grid, dst = new Float32Array(grid.length);
+  for (let pass = 0; pass < 3; pass++) for (let axis = 0; axis < 3; axis++) { boxBlurAxis(src, dst, dim, axis, rad); const t = src; src = dst; dst = t; }
+  let max = 0;
+  for (let i = 0; i < src.length; i++) if (src[i] > max) max = src[i];
+  const inv = max > 0 ? 255 / max : 0;
+  const data = new Uint8Array(nx * ny * nz);     // (iz*ny+iy)*nx+ix, x fastest
+  for (let ix = 0; ix < nx; ix++) for (let iy = 0; iy < ny; iy++) for (let iz = 0; iz < nz; iz++)
+    data[(iz * ny + iy) * nx + ix] = src[(ix * ny + iy) * nz + iz] * inv;
+  return { nx, ny, nz, data };
 }
 
 function normThreshold() {
@@ -1332,6 +1545,8 @@ async function renderFrame(i, draft = false) {
       const m = entry.payload;
       if (m.indices.length) renderer.setMesh(m.positions, m.normals, m.indices);
       renderer.setColor(col);
+    } else if (state.render === "slices") {
+      if (slices) slices.setVolume(entry.payload);   // same dims across frames → view is preserved
     } else if (volRenderer) {
       const g = entry.payload;
       curVolMeta = g; volRenderer.setVolume(g.nx, g.ny, g.nz, g.data, g.boxLo, g.boxHi); volRenderer.setThreshold(normThreshold());
@@ -1438,12 +1653,18 @@ function dragHandle(el, onMove) {
 
 // ---- lasso selection (app-owned overlay; works for the active 2D or 3D view) ----
 function sizeLasso() {
-  const lc = $("lassoCanvas"); const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  lc.width = Math.max(1, lc.clientWidth * dpr); lc.height = Math.max(1, lc.clientHeight * dpr);
-  if (lctx) lctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  for (const [id, ctx] of [["lassoCanvas", lctx], ["centroidOverlay", centroidCtx]]) {
+    const c = $(id); if (!c) continue;
+    c.width = Math.max(1, c.clientWidth * dpr); c.height = Math.max(1, c.clientHeight * dpr);
+    if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  syncCentroidOverlay();
 }
 function setupLasso() {
-  const lc = $("lassoCanvas"); lctx = lc.getContext("2d"); sizeLasso();
+  const lc = $("lassoCanvas"); lctx = lc.getContext("2d");
+  centroidCtx = $("centroidOverlay").getContext("2d");
+  sizeLasso();
   window.addEventListener("resize", sizeLasso);
   // Middle-mouse drag pans the active landscape even while a tool is armed (the
   // overlay otherwise swallows drags for lasso / draw). Capture phase + stop-
@@ -1565,8 +1786,9 @@ function setupLasso() {
 function commitCurve() { renderLayers(); refreshFreeCurves(); }
 const pathHexColor = () => (editCurve ? editCurve.color : editingPathLayer ? editingPathLayer.color : "#f472b6");
 function nearestPointTo(sx, sy, proj) {
+  const scope = pickScopeSet();   // Feature 3: only consider points in the checked layers
   let best = -1, bestD = Infinity;
-  for (let i = 0; i < proj.length; i++) { const p = proj[i]; if (!p) continue; const dd = (p[0] - sx) ** 2 + (p[1] - sy) ** 2; if (dd < bestD) { bestD = dd; best = i; } }
+  for (let i = 0; i < proj.length; i++) { const p = proj[i]; if (!p) continue; if (scope && !scope.has(i)) continue; const dd = (p[0] - sx) ** 2 + (p[1] - sy) ** 2; if (dd < bestD) { bestD = dd; best = i; } }
   return best;
 }
 function hitWaypoint(sx, sy, traj, proj) {
@@ -1669,8 +1891,9 @@ function finishLasso() {
   const lc = $("lassoCanvas"); lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
   if (poly.length < 3) return;
   const proj = activeLand().projectedPoints();
+  const scope = pickScopeSet();   // Feature 3: lasso only grabs points in the checked layers
   const enclosed = [];
-  for (let i = 0; i < proj.length; i++) if (proj[i] && pointInPoly(proj[i], poly)) enclosed.push(i);
+  for (let i = 0; i < proj.length; i++) if (proj[i] && (!scope || scope.has(i)) && pointInPoly(proj[i], poly)) enclosed.push(i);
   let next;
   if (lassoMode === "add") { const s = new Set(state.selection); enclosed.forEach((i) => s.add(i)); next = [...s].sort((a, b) => a - b); }
   else if (lassoMode === "remove") { const s = new Set(state.selection); enclosed.forEach((i) => s.delete(i)); next = [...s]; }
@@ -1710,17 +1933,21 @@ function iconBtn(txt, title, fn) {
 function renderLayers() {
   const ul = $("layerList"); ul.innerHTML = "";
   $("noLayers").style.display = layers.length ? "none" : "";
+  $("layerSelRow").style.display = layers.length ? "" : "none";
   layers.forEach((ly) => {
     const isCurve = ly.kind === "curve";
     const editing = editingPathLayer === ly || editCurve === ly;
-    const li = document.createElement("li"); li.className = "layer-item" + (ly.visible ? "" : " hidden") + (editing ? " editing" : "") + (ly.kind === "path" || isCurve ? " path" : "");
+    const inScope = state.pickRestrict && ly.selected && ly.indices && ly.indices.length > 0;
+    const li = document.createElement("li"); li.className = "layer-item" + (ly.visible ? "" : " hidden") + (editing ? " editing" : "") + (ly.kind === "path" || isCurve ? " path" : "") + (inScope ? " in-scope" : "");
+    const chk = document.createElement("input"); chk.type = "checkbox"; chk.className = "lsel"; chk.checked = !!ly.selected; chk.title = "Select layer (bulk show / hide · pick-restrict scope)";
+    chk.addEventListener("change", () => { ly.selected = chk.checked; syncSelAll(); if (state.pickRestrict) { renderLayers(); status(pickScopeMsg()); } });
     const eye = iconBtn(ly.visible ? "◉" : "○", "Show / hide", () => { ly.visible = !ly.visible; renderLayers(); if (state.colorBy === "layers") applyColor(); });
     const sw = document.createElement("input"); sw.type = "color"; sw.className = "swatch"; sw.value = ly.color; sw.title = "Layer color";
     sw.addEventListener("input", (e) => { ly.color = e.target.value; if (state.colorBy === "layers") applyColor(); if (isCurve) refreshFreeCurves(); if (editingPathLayer === ly) syncSelection(); });
     const name = document.createElement("span"); name.className = "lname"; name.textContent = (ly.kind === "path" ? "↳ " : isCurve ? "∿ " : "") + ly.name; name.title = "Click to rename";
     name.addEventListener("click", () => { const v = prompt("Layer name", ly.name); if (v) { ly.name = v.trim() || ly.name; renderLayers(); } });
     const cnt = document.createElement("span"); cnt.className = "lcount"; cnt.textContent = `${isCurve ? ly.ctrl.length : ly.indices.length}`;
-    li.append(eye, sw, name, cnt);
+    li.append(chk, eye, sw, name, cnt);
     if (ly.kind === "path") li.append(iconBtn(editing ? "✓" : "✎", editing ? "Finish editing this path" : "Edit waypoints (shift-click to add/remove)", () => editPathLayer(ly)));
     if (isCurve) li.append(iconBtn(editing ? "✓" : "✎", editing ? "Finish editing this curve" : "Edit the curve (drag handles · alt-click delete · tap to insert)", () => editCurveLayer(ly)));
     li.append(iconBtn("▶", isCurve ? "Morph along this curve (snaps to nearest states)" : ly.kind === "path" ? "Morph along this path" : "Morph through this layer as a volume series", () => playLayerSeries(ly)));
@@ -1728,7 +1955,92 @@ function renderLayers() {
     li.append(iconBtn("✕", "Delete layer", () => removeLayer(ly)));
     ul.appendChild(li);
   });
+  syncSelAll();
   refreshFreeCurves();
+  syncCentroidOverlay();   // reflect centroid-layer visibility toggles immediately
+}
+
+// ---- bulk layer visibility + pick-scope (Features 1–3) ----
+const checkedLayers = () => layers.filter((l) => l.selected);
+
+// Feature 1: one button flips every layer on / off. If any are visible, hide all;
+// otherwise show all — so a single press always changes something visible.
+function toggleAllLayers() {
+  const anyVisible = layers.some((l) => l.visible);
+  layers.forEach((l) => (l.visible = !anyVisible));
+  renderLayers();
+  if (state.colorBy === "layers") applyColor();
+}
+
+// Feature 2: show / hide the checked layers. With none checked it falls back to
+// acting on every layer, so the buttons are never dead.
+function setCheckedVisible(v) {
+  const target = checkedLayers();
+  (target.length ? target : layers).forEach((l) => (l.visible = v));
+  renderLayers();
+  if (state.colorBy === "layers") applyColor();
+}
+
+// Keep the master "select" checkbox in sync (checked / indeterminate / clear).
+function syncSelAll() {
+  const box = $("selAllLayers");
+  if (!box) return;
+  const on = layers.filter((l) => l.selected).length;
+  box.checked = layers.length > 0 && on === layers.length;
+  box.indeterminate = on > 0 && on < layers.length;
+}
+
+// Feature 3: the union of indices in the checked layers (base states *and* centroids —
+// both are selectable), or null when the restriction is off / nothing is checked
+// (→ no restriction). Centroids (index >= L.n) aren't in the base cloud, so the renderer
+// can't pick them; resolvePick() hit-tests their markers app-side instead.
+function pickScopeSet() {
+  if (!state.pickRestrict || !L) return null;
+  const s = new Set();
+  for (const l of checkedLayers()) if (l.indices) for (const i of l.indices) s.add(i);
+  return s.size ? s : null;
+}
+function pickScopeMsg() {
+  const s = pickScopeSet();
+  if (!s) return "Pick-restrict on — check one or more layers to limit picking to their points.";
+  return `Picking limited to ${s.size} point(s) in the checked layers.`;
+}
+// Pick filter handed to the scatter/cloud renderers: their base-point click/hover picking
+// consults this on every pick, so pick-restrict limits which *base* points are selectable.
+// Centroids are handled separately in resolvePick(). Reads the live scope each time.
+const pickAllowed = (i) => { const s = pickScopeSet(); return !s || s.has(i); };
+
+// Resolve a click at client (cx,cy) into a selectable index. The renderer hands us the
+// nearest in-scope BASE point (or -1). We additionally hit-test the visible, in-scope
+// Centroids — which the renderers can't pick at all — and let a click on a centroid
+// marker win. This is what makes centroid picking (and "pick only Centroids") work.
+const activeCanvas = () => (is3d() && cloud ? $("scatter3d") : $("scatter"));
+function screenPosOf(idx) {
+  const vec = idx < L.n ? (activeCoords() || L.pca)[idx] : centroidPCA[idx];
+  if (!vec) return null;
+  return (activeLand().projectData([axesOf(vec)]) || [null])[0];
+}
+const CENTROID_HIT2 = 12 * 12;   // CSS px²; a click this close to a marker selects it
+function resolvePick(baseIdx, cx, cy) {
+  const canvas = activeCanvas();
+  if (!canvas) return baseIdx;
+  const r = canvas.getBoundingClientRect();
+  const px = cx - r.left, py = cy - r.top;
+  const scope = pickScopeSet();
+  const cen = layers.find((l) => l.kind === "centroid" && l.visible);
+  let nc = null;   // nearest in-scope centroid
+  if (cen) for (const idx of cen.indices) {
+    if (!centroidPCA[idx] || (scope && !scope.has(idx))) continue;
+    const p = screenPosOf(idx); if (!p) continue;
+    const d = (p[0] - px) ** 2 + (p[1] - py) ** 2;
+    if (!nc || d < nc.d) nc = { idx, d };
+  }
+  if (nc && nc.d <= CENTROID_HIT2) return nc.idx;   // clicked on a centroid marker
+  if (baseIdx < 0) return nc ? nc.idx : -1;         // no in-scope base point (e.g. centroids-only)
+  if (!nc) return baseIdx;
+  const bp = screenPosOf(baseIdx);
+  const bd = bp ? (bp[0] - px) ** 2 + (bp[1] - py) ** 2 : Infinity;
+  return nc.d < bd ? nc.idx : baseIdx;             // whichever is nearer the click
 }
 
 // Delete a layer. Removing a cluster layer also drops its matching point from the
