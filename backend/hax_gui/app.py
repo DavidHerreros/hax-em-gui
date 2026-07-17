@@ -1153,7 +1153,7 @@ def metrics_jobs() -> list[dict[str, Any]]:
     for job in manager.list(limit=500):
         wd = job.get("workdir")
         if wd and _has_tb_events(Path(wd)):
-            out.append({k: job[k] for k in ("id", "program", "workdir", "created_at", "status", "project_id")})
+            out.append({k: job[k] for k in ("id", "program", "name", "workdir", "created_at", "status", "project_id")})
     return _with_project_names(out)
 
 

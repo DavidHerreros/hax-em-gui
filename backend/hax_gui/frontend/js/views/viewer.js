@@ -9,6 +9,7 @@ import { errorBox } from "./ui.js";
 import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
 import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
+import { runBrowser, folderName } from "./runBrowser.js";
 
 // A job is viewable if it has a network checkpoint plus latents — either a
 // latents input, or a finished predict run whose output provides them (which
@@ -32,31 +33,32 @@ export function ViewerView() {
   const runsBox = h("div");
   root.appendChild(runsBox);
 
-  function loadRuns() {
-    mount(runsBox, h("p", { class: "muted small", style: { margin: "8px 0" } }, "Loading runs…"));
-    Promise.all([loadProgramGroups().catch(() => {}), api.jobs()])
-      .then(([, jobs]) => mount(runsBox, renderRuns(jobs.filter((j) => viewable(j)))))
-      .catch((err) => mount(runsBox, errorBox(err)));
-  }
-
-  function renderRuns(jobs) {
-    const header = h("div", { class: "row section-head" },
-      h("h2", { class: "section", style: { margin: 0 } }, "Viewable runs"),
-      h("button", { class: "btn-icon", title: "Refresh", style: { marginLeft: "auto" }, onclick: loadRuns }, icon("refresh", 15)));
-    if (!jobs.length) {
-      return h("div", null, header,
-        h("p", { class: "muted small" }, "None yet. Open the viewer from an ", h("span", { class: "mono" }, "annotate_space"), " run, or from a finished network ", h("span", { class: "mono" }, "predict"), " run (its latents + network), then refresh."));
-    }
-    return h("div", null, header, ...jobs.map((j) => {
-      const btn = h("button", { class: "run-row", onclick: () => launch(j, btn) },
+  const browser = runBrowser({
+    renderRow: (j) => {
+      const btn = h("button", { class: "run-row" },
         h("span", { class: "run-prog mono" }, j.name || j.program),
-        j.project_name ? h("span", { class: "proj-chip" }, icon("box", 12), j.project_name) : null,
-        h("span", { class: "run-folder mono" }, j.program),
+        j.name ? h("span", { class: "run-sub mono" }, j.program) : null,
+        h("span", { class: "run-folder mono" }, folderName(j.workdir)),
         (j.labels && j.labels.length) ? jobLabelChips(j) : null,
         h("span", { class: "run-time" }, new Date(j.created_at).toLocaleString()),
         h("span", { class: "run-open" }, icon("box", 14), "Open viewer"));
+      btn.onclick = () => launch(j, btn);
       return btn;
-    }));
+    },
+    emptyText: h("span", null, "None yet. Open the viewer from an ", h("span", { class: "mono" }, "annotate_space"),
+      " run, or from a finished network ", h("span", { class: "mono" }, "predict"), " run (its latents + network), then refresh."),
+  });
+  mount(runsBox, h("div", null,
+    h("div", { class: "row section-head" },
+      h("h2", { class: "section", style: { margin: 0 } }, "Viewable runs"),
+      h("button", { class: "btn-icon", title: "Refresh", style: { marginLeft: "auto" }, onclick: loadRuns }, icon("refresh", 15))),
+    browser.el));
+
+  function loadRuns() {
+    browser.setStatus(h("p", { class: "muted small", style: { margin: "8px 0" } }, "Loading runs…"));
+    Promise.all([loadProgramGroups().catch(() => {}), api.jobs()])
+      .then(([, jobs]) => browser.setJobs(jobs.filter((j) => viewable(j))))
+      .catch((err) => browser.setStatus(errorBox(err)));
   }
 
   async function launch(job, btn) {

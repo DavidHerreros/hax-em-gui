@@ -568,6 +568,7 @@ body.vwin-dragging iframe { pointer-events: none; }
 .run-row { width: 100%; display: flex; align-items: center; gap: 14px; text-align: left; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 10px 14px; margin-bottom: 8px; color: var(--text); transition: border-color .15s, background .15s; }
 .run-row:hover { border-color: var(--active-ring); background: var(--surface-hover); }
 .run-prog { color: var(--accent); width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-sub { color: var(--faint); font-size: 12px; flex-shrink: 0; }
 .run-folder { color: var(--muted); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-time { color: var(--faint); font-size: 12px; }
 .run-open { display: inline-flex; align-items: center; gap: 5px; color: var(--accent); font-size: 13px; }
