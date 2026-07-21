@@ -71,6 +71,8 @@ export const api = {
   startJob: (id) => req(`/api/jobs/${id}/start`, { method: "POST" }),
   cancelJob: (id) => req(`/api/jobs/${id}/cancel`, { method: "POST" }),
   rerunJob: (id) => req(`/api/jobs/${id}/rerun`, { method: "POST" }),
+  // Recipe for copying a job into another project (program + params, inputs cleared).
+  jobCopyPrefill: (id) => req(`/api/jobs/${id}/copy-prefill`),
   continueJob: (id) => req(`/api/jobs/${id}/continue`, { method: "POST" }),
   deleteJob: (id) => req(`/api/jobs/${id}`, { method: "DELETE" }),
   // labels (colored tags on jobs)
@@ -122,8 +124,14 @@ export const api = {
   // flight the steps are appended to its queue rather than rejected.
   runWorkflow: (id, nodes) => req(`/api/workflows/${id}/run`, { method: "POST", body: JSON.stringify(nodes ? { nodes } : {}) }),
   stopWorkflow: (id) => req(`/api/workflows/${id}/stop`, { method: "POST" }),
+  // Runs the server was restarted out from under, whose next step never started.
+  resumableWorkflows: () => req("/api/workflows/resumable"),
+  resumeWorkflow: (id) => req(`/api/workflows/${id}/resume`, { method: "POST" }),
+  dismissWorkflowResume: (id) => req(`/api/workflows/${id}/dismiss-resume`, { method: "POST" }),
   workflowFromProject: (projectId, name) => req(`/api/workflows/from-project/${projectId}`, { method: "POST", body: JSON.stringify({ name: name || null }) }),
   workflowSaveAsProject: (id, name) => req(`/api/workflows/${id}/save-as-project`, { method: "POST", body: JSON.stringify({ name }) }),
+  // Clone a workflow's graph into a new standalone workflow under another project.
+  copyWorkflow: (id, projectId, name) => req(`/api/workflows/${id}/copy`, { method: "POST", body: JSON.stringify({ project_id: projectId, name: name || null }) }),
 
   // WebGL viewer sessions
   viewers: () => req("/api/viewer"),
@@ -175,8 +183,31 @@ export const api = {
 // Optional AI assistant. status() is always safe to call (reports
 // {available:false} when the hax-em-assistant package isn't installed).
 api.assistantStatus = () => req("/api/assistant/status");
+// Rebuild the docs vector index from the current hax-em-docs checkout (live,
+// no GUI restart). Returns {ok, rebuilt, chunks, ...}.
+api.assistantReindexDocs = (force = true) =>
+  req(`/api/assistant/reindex-docs?force=${force ? "true" : "false"}`, { method: "POST" });
 // Which artifacts a job exposes to the assistant (metrics/latents/volumes).
 api.assistantRunPreview = (jobId) => req(`/api/assistant/run-preview/${jobId}`);
+// Read-only plan + visible GPUs for preparing a run's deformation field.
+api.assistantPrepareMotionPlan = (jobId) =>
+  req(`/api/assistant/actions/prepare-motion/${jobId}`);
+// Run the (confirmed) prepare-motion pipeline, streaming progress lines.
+api.assistantPrepareMotion = ({ jobId, gpu, onStatus, onDone, onError }) => {
+  const token = getToken();
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const q = token ? `?token=${encodeURIComponent(token)}` : "";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/assistant/prepare-motion${q}`);
+  ws.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.status != null) { if (onStatus) onStatus(m.status); }
+    else if (m.done) { if (onDone) onDone(m.deformation_dir); ws.close(); }
+    else if (m.error != null) { if (onError) onError(m.error); ws.close(); }
+  };
+  ws.onopen = () => ws.send(JSON.stringify({ job_id: jobId, gpu }));
+  ws.onerror = () => { if (onError) onError("connection error"); };
+  return { close: () => ws.close() };
+};
 // Expand an assistant job proposal (program + path) into a draft spec + path facts.
 api.assistantPreviewJob = (program, path) =>
   req("/api/assistant/actions/preview-job", { method: "POST", body: JSON.stringify({ program, path: path || null }) });

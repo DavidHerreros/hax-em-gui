@@ -1,9 +1,17 @@
 // Minimal 2D plotter (line / scatter / histogram) on a canvas, with wheel-zoom,
 // drag-pan, reset and a hover readout. No dependencies. Series carry either
 // `points` ([[x,y],…]) for line/scatter or `bars` ([[x0,x1,h],…]) for histograms,
-// plus a name+color.
+// plus a name+color, and optionally `dash` ([on,off] px), `alpha` (0..1) and
+// `width` (line px).
 
-const MARGIN = { l: 64, r: 16, t: 14, b: 34 };
+// `l` is only the floor: the real left margin is measured from the widest y tick label,
+// since a label like "0.998740" is far wider than one like "0.5" and would otherwise run
+// straight over the rotated axis title.
+const MARGIN = { l: 44, r: 16, t: 14, b: 34 };
+const TITLE_W = 18;   // css px reserved for the rotated y-axis title
+const TICK_GAP = 8;   // css px between a y tick label and the plot frame
+
+const DASHES = { solid: [], dashed: [6, 4], dotted: [1.5, 3] };
 
 // The hover box reports an actual datum, so it needs real precision — the tick
 // formatters deliberately round to the grid spacing and would flatten a whole curve
@@ -23,16 +31,27 @@ export function createPlot(canvas) {
   let view = null;             // current (zoomed/panned) extent
   let labels = { x: "", y: "" };
   let cursor = null;           // {px, py} device px — drives the hover readout
+  let marginL = MARGIN.l;      // css px, widened to fit the y tick labels actually drawn
+  let snapBg = null;           // set only while exporting an opaque PNG
+  let snapping = false;        // exporting: the canvas is deliberately off its screen size
 
-  function dpr() { return Math.min(window.devicePixelRatio || 1, 2); }
+  // Every dimension in here (fonts, margins, line widths) is expressed in css px and
+  // multiplied by this. On screen it is the device pixel ratio; mid-export it is the
+  // chosen DPI multiplier, so a 4x PNG scales up as a whole instead of rendering
+  // screen-sized text on a huge canvas.
+  function dpr() {
+    if (snapping) return canvas.width / Math.max(1, canvas.clientWidth);
+    return Math.min(window.devicePixelRatio || 1, 2);
+  }
   function resize() {
+    if (snapping) return;   // don't snap the export canvas back to its on-screen size
     const r = dpr();
     const w = Math.max(1, Math.floor(canvas.clientWidth * r)), h = Math.max(1, Math.floor(canvas.clientHeight * r));
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   }
   function area() {
     const r = dpr();
-    return { l: MARGIN.l * r, t: MARGIN.t * r, w: canvas.width - (MARGIN.l + MARGIN.r) * r, h: canvas.height - (MARGIN.t + MARGIN.b) * r };
+    return { l: marginL * r, t: MARGIN.t * r, w: canvas.width - (marginL + MARGIN.r) * r, h: canvas.height - (MARGIN.t + MARGIN.b) * r };
   }
 
   function computeBounds() {
@@ -90,24 +109,36 @@ export function createPlot(canvas) {
 
   function draw() {
     resize();
-    const r = dpr(), a = area();
+    const r = dpr();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (snapBg) { ctx.fillStyle = snapBg; ctx.fillRect(0, 0, canvas.width, canvas.height); }
     if (!view) return;
     const css = getComputedStyle(document.documentElement);
     const fg = css.getPropertyValue("--text").trim() || "#e5e7eb";
     const grid = css.getPropertyValue("--border").trim() || "#334155";
     const muted = css.getPropertyValue("--muted").trim() || "#94a3b8";
 
+    ctx.font = `${11 * r}px system-ui, sans-serif`;
+
     // grid + ticks. Tick counts follow the plot's actual size, so a narrow card asks for
     // fewer labels instead of crowding them into each other.
-    const nx = Math.max(2, Math.min(8, Math.round(a.w / (92 * r))));
+    let a = area();
     const ny = Math.max(2, Math.min(8, Math.round(a.h / (44 * r))));
     const yT = niceTicks(view.y0, view.y1, ny);
-    const xT = niceTicks(view.x0, view.x1, nx);
     const fmtY = makeFmt(yT.step, view.y0, view.y1);
+
+    // Reserve exactly as much left margin as the labels we are about to draw need. A
+    // fixed margin is what let "0.998740" overlap the rotated "value" title.
+    let widest = 0;
+    for (const ty of yT.ticks) widest = Math.max(widest, ctx.measureText(fmtY(ty)).width / r);
+    const want = Math.max(MARGIN.l, (labels.y ? TITLE_W : 0) + widest + TICK_GAP + 4);
+    if (Math.abs(want - marginL) > 0.5) { marginL = want; a = area(); }
+
+    const nx = Math.max(2, Math.min(8, Math.round(a.w / (92 * r))));
+    const xT = niceTicks(view.x0, view.x1, nx);
     const fmtX = makeFmt(xT.step, view.x0, view.x1);
 
-    ctx.lineWidth = r; ctx.font = `${11 * r}px system-ui, sans-serif`; ctx.textBaseline = "middle";
+    ctx.lineWidth = r; ctx.textBaseline = "middle";
     ctx.strokeStyle = grid; ctx.fillStyle = muted;
     ctx.textAlign = "right";
     for (const ty of yT.ticks) {
@@ -130,15 +161,21 @@ export function createPlot(canvas) {
     ctx.beginPath(); ctx.rect(a.l, a.t, a.w, a.h); ctx.clip();
     for (const s of series) {
       ctx.fillStyle = s.color; ctx.strokeStyle = s.color;
+      const alpha = s.alpha == null ? 1 : s.alpha;
+      const dash = (typeof s.dash === "string" ? DASHES[s.dash] : s.dash) || [];
       if (kind === "histogram" && s.bars) {
-        ctx.globalAlpha = series.length > 1 ? 0.55 : 0.85;
+        ctx.globalAlpha = alpha * (series.length > 1 ? 0.55 : 0.85);
         for (const [x0, x1, hgt] of s.bars) {
           const px = sx(x0), pw = Math.max(1, sx(x1) - sx(x0)), py = sy(hgt), pb = sy(0);
           ctx.fillRect(px, py, pw, pb - py);
         }
         ctx.globalAlpha = 1;
       } else if (kind === "line" && s.points) {
-        ctx.lineWidth = 1.5 * r; ctx.beginPath();
+        ctx.globalAlpha = alpha;
+        ctx.lineWidth = (s.width || 1.5) * r;
+        ctx.lineJoin = "round"; ctx.lineCap = "round";
+        ctx.setLineDash(dash.map((d) => d * r));
+        ctx.beginPath();
         let started = false;
         for (const [x, y] of s.points) {
           if (y == null || !isFinite(y)) { started = false; continue; }
@@ -146,12 +183,15 @@ export function createPlot(canvas) {
           if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
         }
         ctx.stroke();
+        ctx.setLineDash([]); ctx.globalAlpha = 1;
       } else if (s.points) { // scatter
-        const rad = 2.2 * r;
+        ctx.globalAlpha = alpha;
+        const rad = (s.width ? s.width * 1.5 : 2.2) * r;
         for (const [x, y] of s.points) {
           if (y == null || !isFinite(y)) continue;
           ctx.beginPath(); ctx.arc(sx(x), sy(y), rad, 0, 6.2832); ctx.fill();
         }
+        ctx.globalAlpha = 1;
       }
     }
     ctx.restore();
@@ -312,13 +352,24 @@ export function createPlot(canvas) {
     },
     resetZoom,
     redraw: draw,
-    async snapshot({ scale = 2 } = {}) {
-      const ow = canvas.width, oh = canvas.height, oc = cursor;
+    // `scale` is the DPI multiplier (2 == twice the on-screen pixel size). Transparent
+    // exports drop the background so the chart drops onto a slide or a paper figure;
+    // opaque ones get the panel colour, which is what you want for a screenshot.
+    async snapshot({ scale = 2, transparent = false } = {}) {
+      const ow = canvas.width, oh = canvas.height, oc = cursor, om = marginL;
       cursor = null;   // an exported chart must not carry whatever the mouse was hovering
-      canvas.width = Math.floor(canvas.clientWidth * scale); canvas.height = Math.floor(canvas.clientHeight * scale);
+      if (!transparent) {
+        const bg = getComputedStyle(document.documentElement).getPropertyValue("--panel").trim();
+        snapBg = bg || "#0f172a";
+      }
+      snapping = true;
+      canvas.width = Math.max(1, Math.floor(canvas.clientWidth * scale));
+      canvas.height = Math.max(1, Math.floor(canvas.clientHeight * scale));
       draw();
       const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
-      canvas.width = ow; canvas.height = oh; cursor = oc; draw();
+      snapping = false; snapBg = null; cursor = oc; marginL = om;
+      canvas.width = ow; canvas.height = oh;
+      draw();
       return blob;
     },
   };

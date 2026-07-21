@@ -16,6 +16,7 @@ import { openFilePicker } from "./filePicker.js";
 import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
+import { pickProject } from "./pickProject.js";
 import { loadProgramGroups, isModed } from "../programGroups.js";
 
 const LAST_WF_KEY = "hax_gui_last_workflow";   // reopen this workflow on next visit
@@ -118,8 +119,29 @@ export function WorkflowsView() {
       { label: "Open project as workflow", icon: icon("box", 15), onClick: openProject },
     ];
     if (!(wf && wf.project_id)) items.push({ label: "Save as project", icon: icon("save", 15), onClick: saveAsProject });
+    if (wf) items.push({ label: "Duplicate to project…", icon: icon("copy", 15), onClick: duplicateToProject });
     if (wf) items.push({ label: "Delete workflow", icon: icon("trash", 15), danger: true, onClick: removeWorkflow });
     return items;
+  }
+
+  // Clone this whole pipeline into another project (a fresh, standalone copy). Internal
+  // step dependencies travel with it; external data inputs are cleared to set there.
+  async function duplicateToProject() {
+    if (!wf) return;
+    const target = await pickProject({
+      title: "Duplicate workflow to project", okText: "copy here", excludeId: wf.project_id,
+      hint: "Creates a self-contained copy of this pipeline in the chosen project. Step dependencies are kept; external data inputs are cleared for you to set before running.",
+    });
+    if (!target) return;
+    try {
+      const copy = await api.copyWorkflow(wf.id, target.id, null);
+      store.openProject({ id: target.id, name: target.name });   // switch context so the copy lists
+      await refreshList();
+      await openWorkflow(copy.id);
+      flash(`Copied to “${target.name}”.`, "muted");
+    } catch (err) {
+      flash(err && err.detail ? (typeof err.detail === "string" ? err.detail : "Could not copy workflow.") : "Could not copy workflow.", "err");
+    }
   }
   function viewMenuItems() {
     const items = [
@@ -474,12 +496,28 @@ export function WorkflowsView() {
     if (!("mode" in src.args)) src.args.mode = "train";
   }
 
+  // A node's output kinds, narrowed by its mode: a moded network yields its trained
+  // *_model checkpoint only in `train`, and its predict metadata (latents/particles)
+  // only in `predict`. Mirrors adapters.job_produces on the backend, so a train node
+  // can't be wired as a latents/particles source, nor a predict node as a model.
+  function nodeProduces(node) {
+    let all = (node && byName[node.program]?.produces) || [];
+    const args = (node && node.args) || {};
+    // A displacement field exists only under --transport_mass, so a plain HetSIREN node
+    // must not offer the port reconstruct_motion_corrected needs. Mirrors job_produces.
+    if (!args.transport_mass) all = all.filter((k) => k !== "transport_motion_model");
+    const mode = args.mode;
+    if (mode === "predict") return all.filter((k) => !k.endsWith("_model"));
+    if (mode === "train") return all.filter((k) => k.endsWith("_model"));
+    return all;
+  }
+
   // Auto-wire a freshly dropped node `b` to the node `a` it landed on: prefer
   // a -> b (a's output into b's input), else b -> a, on the first matching kind.
   function autoConnect(aId, bId) {
     const a = nodeById(aId), b = nodeById(bId);
     if (!a || !b) return;
-    const aOut = byName[a.program]?.produces || [], bOut = byName[b.program]?.produces || [];
+    const aOut = nodeProduces(a), bOut = nodeProduces(b);
     const aIn = inputsOf(a.program), bIn = inputsOf(b.program);
     let hit = bIn.find(([, kind]) => aOut.includes(kind));
     if (hit) return addEdge(aId, bId, hit[0], hit[1]);
@@ -579,7 +617,7 @@ export function WorkflowsView() {
       el.appendChild(h("div", { class: "wf-node-labels-strip" }, ...labels.map((l) => labelChip(l))));
     }
     // single output port
-    if ((byName[n.program]?.produces || []).length) {
+    if (nodeProduces(n).length) {
       const op = portEl("out", n.x, n.y, outPort(n), { node: n.id, out: "1" });
       op.addEventListener("pointerdown", (e) => startWire(e, n));
       el.appendChild(op);
@@ -721,7 +759,7 @@ export function WorkflowsView() {
     }
     if (drag && drag.kind === "wire") {
       const tgt = document.elementFromPoint(e.clientX, e.clientY);
-      const srcProduces = byName[nodeById(drag.from).program]?.produces || [];
+      const srcProduces = nodeProduces(nodeById(drag.from));
       const exact = tgt && tgt.closest && tgt.closest(".wf-port.in");
       if (exact && exact.dataset.node && exact.dataset.node !== drag.from) {
         // dropped right on an input dot

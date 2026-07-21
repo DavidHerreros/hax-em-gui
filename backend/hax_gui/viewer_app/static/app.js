@@ -5,6 +5,7 @@ import { createVolume } from "./volume.js";
 import { createScatter, clusterColor } from "./scatter.js";
 import { createCloud } from "./cloud.js";
 import { createHistogram } from "./histogram.js";
+import { createSlices } from "./slices.js";
 
 // Density colormaps (RGB 0–255 control stops, low→high). Default inferno, to
 // match the desktop annotate_space landscape (napari "inferno" over a dark
@@ -27,7 +28,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let renderer, scatter, cloud = null, hist;
 let L = null, umapData = null, points3 = [];
 const clusterCache = {};
-const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 60, pointAlpha: 1, pathExpanded: false, smooth: 6 };
+const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 60, pointAlpha: 1, pathExpanded: false, smooth: 6, pickRestrict: false };
 // `state.fps` is the *motion* rate: timeline frames advanced per second. We render
 // at most DISPLAY_FPS_CAP frames/sec; once the motion rate exceeds that we keep the
 // render rate at the cap and advance several frames per tick instead. That lets a
@@ -52,6 +53,14 @@ let hidePathPicks = false;
 
 // volume ray-marcher (created lazily on first switch to a Volume render mode)
 let volRenderer = null, curVolMeta = null;
+// orthogonal-slice viewer (created lazily on first switch to the Slices render mode)
+let slices = null;
+// landscape orthogonal-slice viewer (left pane; created lazily) + which view the
+// landscape pane shows: the scatter/cloud points, or the density slices.
+let landSlices = null, landView = "points";
+// 2D context of the overlay canvas that draws KMeans centroid markers (virtual points
+// that live off the base cloud), kept in sync with the active projection via onRender.
+let centroidCtx = null;
 
 // lasso + layers
 let lassoArmed = false, lassoing = false, lassoPts = [], lctx = null, lassoMode = "replace";
@@ -59,6 +68,7 @@ let lassoArmed = false, lassoing = false, lassoPts = [], lctx = null, lassoMode 
 // points, or grab an existing waypoint to drag it onto another state. Works on the
 // active 2D or 3D landscape via projectedPoints().
 let pathDrawArmed = false, drawing = false, drawPts = [], draggingWp = -1, draggingCtrl = -1;
+let dragProj = null;   // screen projection of every state, held for the duration of a waypoint drag
 const DRAG_R = 12;   // px: grab radius for a waypoint / control handle
 // A free-spline path layer keeps editable control points in data coords (not snapped
 // to states); it is only snapped to the nearest states silently at morph time.
@@ -68,9 +78,15 @@ let orbiting = false, orbMoved = false, orbX = 0, orbY = 0, orbDownX = 0, orbDow
 const layers = [];   // { name, color(hex), indices[], visible, kind? }  (kind 'path' = ordered morph path)
 let layerSeq = 0;
 let editingPathLayer = null;   // the path layer currently being edited (shift-click add/remove)
-// KMeans centroids: virtual indices >= L.n, with PCA coords + a per-centroid color
+// KMeans centroids: virtual indices >= L.n, with per-embedding coords + a per-centroid color
 let indexColor = {};     // index -> hex (decoded maps of these indices are auto-colored)
-let centroidPCA = {};    // index -> PCA vector (so centroids order along an axis for series)
+// embed -> { index -> coord vector in THAT embedding }. Centroids used to be stored as a
+// single PCA vector and drawn through whatever frame was active, so under UMAP (or raw
+// latent) the markers were plotted in PCA units on a UMAP axis and sat well off their
+// clusters. Each embedding now keeps its own coordinates, fetched on demand.
+let centroidVecs = {};
+let clusterQuery = null;   // the ?k=… / ?seeds=… of the current clustering, for those fetches
+const centroidCoords = () => centroidVecs[state.embedding] || {};
 let exportAvailable = false;
 
 const is3d = () => state.dims === 3;
@@ -92,6 +108,8 @@ function applyTheme(theme) {
   const c = hexToRgb(bg);
   renderer.setBackground(c);
   if (volRenderer) volRenderer.setBackground(c);
+  if (slices) slices.setBackground(bg);
+  if (landSlices) landSlices.setBackground(bg);
   applyLandscapeBg();   // keeps the dark density backdrop across theme toggles
   // Selection rings / path use a theme-aware contrast color computed at draw time,
   // so the landscape must repaint when the theme toggles.
@@ -112,14 +130,19 @@ async function boot() {
   try { renderer = createRenderer($("gl")); }
   catch (err) { status("WebGL2 unavailable: " + err.message, "err"); return; }
   scatter = createScatter($("scatter"), onSelect);
+  scatter.onRender(syncCentroidOverlay);   // keep centroid markers on the 2D projection
+  scatter.setPickFilter(pickAllowed);      // pick-restrict blocks direct clicks too
   hist = createHistogram($("hist"), onLevel);
   applyColormap();
   applyTheme(new URLSearchParams(location.search).get("theme"));
   window.addEventListener("message", (e) => { if (e.data && e.data.type === "hax-theme") applyTheme(e.data.theme); });
 
-  try { L = await (await fetch("./api/landscape?k=5")).json(); }
-  catch (err) { status("Could not load landscape: " + err, "err"); return; }
-  clusterCache[5] = L.cluster.labels;
+  try {
+    L = await (await fetch("./api/landscape")).json();   // metadata only; arrays follow as binary
+    L.pca = await fetchMatrix("./api/pca.bin");
+    L.latents = null;   // fetched on demand — only the "latent" embedding view needs them
+    clusterCache[5] = await fetchLabels("./api/cluster.bin?k=5");
+  } catch (err) { status("Could not load landscape: " + err, "err"); return; }
   $("title").textContent = L.title || "Conformational landscape";
   $("meta").textContent = `${L.n} states · latent dim ${L.dims}`;
   populateAxes();
@@ -152,22 +175,29 @@ function wireControls() {
     state.dims = +e.target.value; const is3 = is3d();
     $("scatter").style.display = is3 ? "none" : ""; $("scatter3d").style.display = is3 ? "" : "none";
     $("zwrap").style.display = is3 ? "" : "none";
-    if (is3 && !cloud) { try { cloud = createCloud($("scatter3d"), onSelect); cloud.setBackground(hexToRgb($("bg").value)); cloud.setColormap(COLORMAPS[state.densMap] || COLORMAPS.viridis); } catch (err) { status("WebGL2 unavailable for 3D: " + err.message, "err"); state.dims = 2; $("dims").value = "2"; $("scatter").style.display = ""; $("scatter3d").style.display = "none"; return; } }
+    if (is3 && !cloud) { try { cloud = createCloud($("scatter3d"), onSelect); cloud.setBackground(hexToRgb($("bg").value)); cloud.setColormap(COLORMAPS[state.densMap] || COLORMAPS.viridis); cloud.onRender(syncCentroidOverlay); cloud.setPickFilter(pickAllowed); } catch (err) { status("WebGL2 unavailable for 3D: " + err.message, "err"); state.dims = 2; $("dims").value = "2"; $("scatter").style.display = ""; $("scatter3d").style.display = "none"; return; } }
+    if (landView === "slices") setLandView("points");   // slices are the flat XY/XZ/YZ cuts; leaving them while toggling dims is confusing
     refreshAxisEnabled();
     updatePoints(); applyColor(); syncSelection();   // re-apply color so 2D↔3D keeps density/cluster/layers
   });
-  $("zaxis").addEventListener("change", (e) => { state.z = +e.target.value; updatePoints(); });
+  $("zaxis").addEventListener("change", (e) => { state.z = +e.target.value; updatePoints(); if (landView === "slices") loadLandSlices(); });
   $("embed").addEventListener("change", async (e) => {
     state.embedding = e.target.value;
-    if (state.embedding === "umap" && !umapData) { status("Computing UMAP…", "busy"); try { umapData = (await (await fetch("./api/embedding?kind=umap")).json()).points; } catch (err) { status("UMAP failed: " + err, "err"); $("embed").value = "pca"; state.embedding = "pca"; return; } status(""); }
+    if (state.embedding === "umap" && !umapData) { status("Computing UMAP…", "busy"); try { umapData = await fetchMatrix("./api/umap.bin"); } catch (err) { status("UMAP failed: " + err, "err"); $("embed").value = "pca"; state.embedding = "pca"; return; } status(""); }
+    // The raw latent coords are big and only this view uses them, so they are not part of
+    // the initial load — fetch them the first time someone actually asks for them.
+    if (state.embedding === "latent" && !L.latents) { status("Loading latent coordinates…", "busy"); try { L.latents = await fetchMatrix("./api/latents.bin"); } catch (err) { status("Could not load latents: " + err, "err"); $("embed").value = "pca"; state.embedding = "pca"; return; } status(""); }
+    await ensureCentroidCoords();   // centroids live in the new embedding's coordinates too
     populateAxes();        // each embedding has its own axis set (PCs / UMAP dims / latent dims)
     refreshAxisEnabled();
     updatePoints();
+    if (landView === "slices") loadLandSlices();
   });
-  $("xaxis").addEventListener("change", (e) => { state.x = +e.target.value; updatePoints(); });
-  $("yaxis").addEventListener("change", (e) => { state.y = +e.target.value; updatePoints(); });
+  $("xaxis").addEventListener("change", (e) => { state.x = +e.target.value; updatePoints(); if (landView === "slices") loadLandSlices(); });
+  $("yaxis").addEventListener("change", (e) => { state.y = +e.target.value; updatePoints(); if (landView === "slices") loadLandSlices(); });
   $("colorby").addEventListener("change", (e) => { state.colorBy = e.target.value; toggleColorWraps(); applyColor(); });
   $("lassoBtn").addEventListener("click", () => setLassoArmed(!lassoArmed));
+  $("landSlicesBtn").addEventListener("click", () => setLandView(landView === "slices" ? "points" : "slices"));
   $("drawBtn").addEventListener("click", () => setPathDrawArmed(!pathDrawArmed));
   $("layersBtn").addEventListener("click", () => {
     const collapsed = $("layersRail").classList.toggle("collapsed");
@@ -175,6 +205,16 @@ function wireControls() {
   });
   $("addLayer").addEventListener("click", addLayerFromSelection);
   $("addPath").addEventListener("click", makePathLayer);
+  // ---- layer visibility: show/hide all + bulk on the checked subset ----
+  $("toggleAllLayers").addEventListener("click", toggleAllLayers);
+  $("selAllLayers").addEventListener("change", (e) => { layers.forEach((l) => (l.selected = e.target.checked)); renderLayers(); });
+  $("showSelLayers").addEventListener("click", () => setCheckedVisible(true));
+  $("hideSelLayers").addEventListener("click", () => setCheckedVisible(false));
+  $("pickRestrict").addEventListener("change", (e) => {
+    state.pickRestrict = e.target.checked;
+    renderLayers();
+    status(state.pickRestrict ? pickScopeMsg() : "Picking any point again.");
+  });
   $("clusterBtn").addEventListener("click", () => computeClusters());
   $("clusterSeedBtn").addEventListener("click", clusterFromPicks);
   $("saveAll").addEventListener("click", saveAllLayers);
@@ -184,29 +224,54 @@ function wireControls() {
   $("pathToggle").addEventListener("click", () => { state.pathExpanded = !state.pathExpanded; updatePathLabel(); });
   $("denssigma").addEventListener("input", (e) => {
     state.densBandwidth = +e.target.value;
+    if (landView === "slices") loadLandSlices();   // the slice field uses the same bandwidth
     if (state.colorBy !== "density") return;
     if (is3d() && cloud) applyColor(); else scatter.setDensityBandwidth(state.densBandwidth);
   });
   $("densint").addEventListener("input", (e) => { state.densIntensity = +e.target.value; if (cloud) cloud.setDensityIntensity(state.densIntensity); });
-  $("densmap").addEventListener("change", (e) => { state.densMap = e.target.value; applyColormap(); if (state.colorBy === "density") applyColor(); });
+  $("densmap").addEventListener("change", (e) => { state.densMap = e.target.value; applyColormap(); if (state.colorBy === "density") applyColor(); if (landSlices) landSlices.setColormap(sliceColormap()); });
   $("light").addEventListener("change", (e) => renderer.setLighting(e.target.value));
-  $("smooth").addEventListener("input", (e) => { state.smooth = +e.target.value; if (state.timeline.length && state.frame > 0) liveFrame(state.frame); else liveDecode(); });
+  // Smoothing is baked into the cached meshes, so changing it invalidates every frame. That
+  // flush also stops the prefetcher (clearFrameCache bumps fillToken), so restart it — and
+  // while playing let the play loop redraw, rather than forcing a full-resolution mesh of
+  // the current frame into the middle of the animation.
+  $("smooth").addEventListener("input", (e) => {
+    state.smooth = +e.target.value;
+    clearFrameCache();
+    scheduleWarm();          // re-decode the morph at the new smoothing, in the background
+    if (playing) { prefetch(true); return; }
+    if (state.timeline.length && state.frame > 0) liveFrame(state.frame, false);
+    else liveDecode();
+  });
   $("color").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setColor(c); if (volRenderer) volRenderer.setColor(c); });
-  $("bg").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setBackground(c); if (volRenderer) volRenderer.setBackground(c); });
-  $("reset").addEventListener("click", () => { renderer.resetView(); if (volRenderer) volRenderer.resetView(); });
+  $("bg").addEventListener("input", (e) => { const c = hexToRgb(e.target.value); renderer.setBackground(c); if (volRenderer) volRenderer.setBackground(c); if (slices) slices.setBackground(e.target.value); if (landSlices) landSlices.setBackground(e.target.value); });
+  $("reset").addEventListener("click", () => { renderer.resetView(); if (volRenderer) volRenderer.resetView(); if (slices) slices.resetZoom(); });
   $("mrc").addEventListener("click", saveMrc);
-  $("saveMap").addEventListener("click", () => savePng(state.render === "surface" ? renderer : volRenderer, "map"));
-  $("saveLand").addEventListener("click", () => savePng(activeLand(), "landscape"));
+  $("saveMap").addEventListener("click", () => savePng(state.render === "surface" ? renderer : state.render === "slices" ? slices : volRenderer, "map"));
+  $("saveLand").addEventListener("click", () => savePng(landView === "slices" ? landSlices : activeLand(), "landscape"));
   $("play").addEventListener("click", togglePlay);
   $("record").addEventListener("click", recordSeries);
   $("stop").addEventListener("click", stopPlayback);
-  $("scrub").addEventListener("input", (e) => { setPlaying(false); if (!state.timeline.length) buildTimeline(); liveFrame(+e.target.value); });
+  // Scrubbing is a drag: draft while it moves, full resolution once it settles.
+  $("scrub").addEventListener("input", async (e) => {
+    const v = +e.target.value;
+    setPlaying(false);
+    if (!state.timeline.length) await buildTimeline();   // async now: it prices the hops
+    liveFrame(v, true);
+  });
+  $("scrub").addEventListener("change", (e) => { if (!playing) liveFrame(+e.target.value, false); });
   $("frames").addEventListener("change", () => { buildTimeline(); });
-  $("speed").addEventListener("input", (e) => { state.fps = +e.target.value; if (playing) backgroundFill(); });
+  $("speed").addEventListener("input", (e) => { state.fps = +e.target.value; if (playing) prefetch(true); });
   $("clearpath").addEventListener("click", clearPath);
   $("rendermode").addEventListener("change", (e) => setRenderMode(e.target.value));
   $("vgamma").addEventListener("input", (e) => { state.vGamma = +e.target.value; if (volRenderer) volRenderer.setGamma(state.vGamma); });
   $("vbright").addEventListener("input", (e) => { state.vBright = +e.target.value; if (volRenderer) volRenderer.setBrightness(state.vBright); });
+  // ---- orthogonal slices (decoded map, right pane) ----
+  $("slicemap").addEventListener("change", (e) => { if (slices) slices.setColormap(e.target.value); });
+  $("slicelo").addEventListener("input", () => { if (slices) slices.setContrast(+$("slicelo").value, +$("slicehi").value); });
+  $("slicehi").addEventListener("input", () => { if (slices) slices.setContrast(+$("slicelo").value, +$("slicehi").value); });
+  $("slicecross").addEventListener("change", (e) => { if (slices) slices.setCrosshair(e.target.checked); });
+  $("sliceReset").addEventListener("click", () => { if (slices) slices.resetZoom(); });
 }
 
 // Save the current morph path ([current, ...path]) as an editable path layer.
@@ -266,15 +331,145 @@ const axesOf = (vec) => viewAxes().map((a) => vec[a]);   // full embedding vecto
 // A curve lives in its embedding; control points carry full embedding vectors, so it
 // renders in any axis/2D/3D view of that embedding (we just read the displayed axes).
 function curveMatchesView(ly) { return ly.embed === state.embedding; }
+// ── nearest state, indexed ───────────────────────────────────────────────────
+// Both curve tools need "which state lies closest to this point in embedding space", and
+// both used to answer it by scanning every row: screenToVec on every mousemove while a
+// handle is being dragged, curveToIndices ~550 times the moment a curve is played. At a
+// million states those scans are what froze the tab.
+//
+// A uniform grid over the first few dimensions turns each query into a local search, and
+// it stays EXACT rather than approximate: distance measured in a subset of the dimensions
+// is a lower bound on the full distance, so once we hold a candidate closer than the
+// nearest unscanned ring could possibly be, nothing further out can beat it.
+//
+// Convention: `dims` lists which coordinate indices to compare, and a query vector `q` is
+// parallel to `dims` (q[j] pairs with dims[j]). That suits both callers — one searches on
+// the two or three displayed axes, the other on every dimension.
+const nnCache = new WeakMap();
+
+function nnIndex(coords, dims) {
+  let per = nnCache.get(coords);
+  if (!per) { per = new Map(); nnCache.set(coords, per); }
+  const key = dims.join(",");
+  const hit = per.get(key);
+  if (hit) return hit;
+
+  const n = coords.length;
+  const m = dims.length;
+  // Flatten the compared columns into one typed array. The rows are arrays-of-arrays, and
+  // chasing those pointers dominates any distance loop over them; this alone makes even a
+  // straight scan several times faster, and it is what the fallback below relies on.
+  const flat = new Float32Array(n * m);
+  for (let i = 0; i < n; i++) {
+    const row = coords[i];
+    for (let j = 0; j < m; j++) flat[i * m + j] = row[dims[j]] || 0;
+  }
+  const gd = dims.slice(0, 3);            // grid on at most three axes
+  const k = gd.length;
+  const mn = new Array(k).fill(Infinity), mx = new Array(k).fill(-Infinity);
+  for (let i = 0; i < n; i++) {
+    for (let g = 0; g < k; g++) { const v = flat[i * m + g]; if (v < mn[g]) mn[g] = v; if (v > mx[g]) mx[g] = v; }
+  }
+  const G = Math.max(1, Math.min(128, Math.round(Math.cbrt(Math.max(1, n / 4)))));   // ~4 points per cell
+  const span = Math.max(...mn.map((_, g) => (mx[g] - mn[g]) || 1));
+  const h = Math.max(1e-9, span / G);
+  const dim = new Array(k);
+  for (let g = 0; g < k; g++) dim[g] = Math.max(1, Math.min(G, Math.ceil(((mx[g] - mn[g]) || 1) / h)));
+  const strides = new Array(k);
+  for (let g = k - 1, s = 1; g >= 0; g--) { strides[g] = s; s *= dim[g]; }
+  const cells = dim.reduce((a, b) => a * b, 1);
+
+  const cellOf = new Int32Array(n), start = new Int32Array(cells + 1);
+  const cellIx = (g, v) => Math.min(dim[g] - 1, Math.max(0, ((v - mn[g]) / h) | 0));
+  for (let i = 0; i < n; i++) {
+    let c = 0;
+    for (let g = 0; g < k; g++) c += cellIx(g, flat[i * m + g]) * strides[g];
+    cellOf[i] = c; start[c + 1]++;
+  }
+  for (let c = 0; c < cells; c++) start[c + 1] += start[c];
+  const items = new Int32Array(n), cur = start.slice(0, cells);
+  for (let i = 0; i < n; i++) items[cur[cellOf[i]]++] = i;
+
+  const maxR = Math.max(...dim);
+  // The ring search is only worth doing when the grid spans *every* compared dimension.
+  // Then the projected distance IS the full distance, the bound is tight, and a query is
+  // a local lookup. With more dimensions than the grid covers (curveToIndices searches all
+  // 8–10 at once) the bound is weak, the rings keep growing, and the search ends up
+  // costing more than the scan it was meant to replace — measurably so. In that case skip
+  // the grid and scan the flat array, which is itself several times faster than the
+  // arrays-of-arrays scan this all replaced.
+  const gridSpansAll = k === m;
+  const qv = new Float32Array(m);   // scratch query vector, reused across queries
+
+  const idx = {
+    // `hint` is an index believed to be near the answer. It only seeds the distance bound,
+    // never the result, so it cannot change what is returned — but a good hint lets the
+    // ring search stop almost at once. curveToIndices walks a spline, so each sample's
+    // answer is an excellent hint for the next.
+    query(q, hint) {
+      if (!n) return -1;
+      for (let j = 0; j < m; j++) qv[j] = q[j] || 0;   // typed, so the scan below stays monomorphic
+      let best = -1, bestD = Infinity;
+      const consider = (i) => {
+        let dd = 0;
+        const o = i * m;
+        for (let j = 0; j < m; j++) { const e = flat[o + j] - qv[j]; dd += e * e; }
+        if (dd < bestD) { bestD = dd; best = i; }
+      };
+      if (hint >= 0 && hint < n) consider(hint);
+
+      if (gridSpansAll) {
+        const qc = new Array(k);
+        for (let g = 0; g < k; g++) qc[g] = cellIx(g, qv[g]);
+        const scan = (c) => { for (let t = start[c]; t < start[c + 1]; t++) consider(items[t]); };
+        for (let r = 0; r <= maxR; r++) {
+          ringCells(qc, r, dim, k, strides, scan);
+          // every unscanned cell is at least r cells away on some axis, so nothing out
+          // there can be nearer than r*h — once we beat that, we are done
+          if (best >= 0 && (r * h) ** 2 >= bestD) return best;
+        }
+        return best;
+      }
+      // Flat scan, hoisted out of `consider` so the whole thing is one tight typed loop.
+      for (let i = 0, o = 0; i < n; i++, o += m) {
+        let dd = 0;
+        for (let j = 0; j < m; j++) { const e = flat[o + j] - qv[j]; dd += e * e; }
+        if (dd < bestD) { bestD = dd; best = i; }
+      }
+      return best;
+    },
+  };
+  per.set(key, idx);
+  return idx;
+}
+
+// Visit every cell whose Chebyshev distance from `qc` is exactly r (clipped to the grid).
+function ringCells(qc, r, dim, k, strides, visit) {
+  const at = new Array(k);
+  const rec = (g) => {
+    if (g === k) {
+      let onRing = r === 0;
+      for (let t = 0; t < k && !onRing; t++) if (Math.abs(at[t] - qc[t]) === r) onRing = true;
+      if (!onRing) return;
+      let c = 0;
+      for (let t = 0; t < k; t++) c += at[t] * strides[t];
+      visit(c);
+      return;
+    }
+    const lo = Math.max(0, qc[g] - r), hi = Math.min(dim[g] - 1, qc[g] + r);
+    for (let v = lo; v <= hi; v++) { at[g] = v; rec(g + 1); }
+  };
+  rec(0);
+}
+
 // Map a screen point to a full embedding vector: the displayed axes are free (where
 // you drew), the remaining axes are borrowed from the nearest state (depth/structure).
 function screenToVec(sx, sy) {
   const disp = activeLand().unproject(sx, sy);
   const coords = embedCoords(state.embedding);
-  if (!disp || !coords) return null;
+  if (!disp || !coords || !coords.length) return null;
   const ax = viewAxes();
-  let best = -1, bestD = Infinity;
-  for (let i = 0; i < coords.length; i++) { let dd = 0; for (let d = 0; d < ax.length; d++) { const e = coords[i][ax[d]] - disp[d]; dd += e * e; } if (dd < bestD) { bestD = dd; best = i; } }
+  const best = nnIndex(coords, ax).query(disp);   // `disp` is parallel to `ax`
   const vec = best >= 0 ? coords[best].slice() : new Array((coords[0] || disp).length).fill(0);
   ax.forEach((a, d) => { vec[a] = disp[d]; });
   return vec;
@@ -317,16 +512,42 @@ function strokeToCtrl(strokePts) {
   return ctrl.length > 24 ? ctrl.filter((_, i) => i % Math.ceil(ctrl.length / 24) === 0) : ctrl;
 }
 // Snap a curve to an ordered, deduped state-index sequence (silent, at morph time).
-function curveToIndices(ly) {
+//
+// Answered by the server, which holds the very same coordinates and can put a k-d tree
+// over them: the whole curve comes back in tens of milliseconds. Doing it here means
+// finding the nearest of a million states for each of ~550 spline samples — billions of
+// distance evaluations on the UI thread, which froze the tab for seconds on a click of ▶.
+// A k-d tree in JS would fix the complexity but not the fact that the work sits on the
+// one thread that has to stay responsive.
+//
+// The local scan is kept as a fallback (below): it is exact, just slow, so a viewer whose
+// backend is unreachable degrades in speed rather than in behaviour.
+async function curveToIndices(ly) {
   const coords = embedCoords(ly.embed);
   if (!coords || !coords.length) return [];
-  const dim = coords[0].length, dense = splineSamples(ly.ctrl, 24), seq = [];
+  const dense = splineSamples(ly.ctrl, 24);
+  if (!dense.length) return [];
+  try {
+    const res = await fetch("./api/snap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // Array.from: a spline sample can be a Float32Array row view, and JSON.stringify
+      // turns one of those into {"0":…,"1":…} rather than a list.
+      body: JSON.stringify({ embed: ly.embed, points: dense.map((p) => Array.from(p)) }),
+    });
+    if (res.ok) return (await res.json()).indices || [];
+  } catch { /* fall through to the local scan */ }
+  return curveToIndicesLocal(coords, dense);
+}
+
+function curveToIndicesLocal(coords, dense) {
+  const dim = coords[0].length, seq = [];
+  const dims = Array.from({ length: dim }, (_, d) => d);
+  const nn = nnIndex(coords, dims);
+  let hint = -1;
   for (const p of dense) {
-    let best = -1, bestD = Infinity;
-    for (let i = 0; i < coords.length; i++) {
-      let dd = 0; for (let d = 0; d < dim; d++) { const e = coords[i][d] - (p[d] || 0); dd += e * e; }
-      if (dd < bestD) { bestD = dd; best = i; }
-    }
+    const best = nn.query(p, hint);   // the previous sample's state is next door on the spline
+    hint = best;
     if (best >= 0 && (!seq.length || seq[seq.length - 1] !== best)) seq.push(best);
   }
   return seq;
@@ -396,7 +617,7 @@ function updatePathLabel() {
   if (!traj.length) $("morphto").textContent = "—";
   else if (!long || state.pathExpanded) $("morphto").textContent = traj.map((i) => `#${i}`).join(" → ");
   else $("morphto").textContent = `${traj.length} states · #${traj[0]} → … → #${traj[traj.length - 1]}`;
-  buildTimeline();        // cheap: just (re)computes the [a,b,t] frame list
+  buildTimeline();        // async (it prices the hops in latent space); nothing here awaits it
   updateMorphButtons();
 }
 function updateMorphButtons() {
@@ -447,9 +668,32 @@ function updatePoints() {
   refreshFreeCurves();
 }
 
+// ── binary transfers ─────────────────────────────────────────────────────────
+// The landscape arrays arrive as raw buffers (see the server's _f32_matrix). At a million
+// states the JSON they replace was a few hundred MB of text that the server spent minutes
+// building — with the GIL held, so it stopped answering anything else — and that the
+// browser then had to parse. There is nothing to parse here.
+//
+// Rows are *views* into the one buffer, not copies: `coords[i][d]`, `.length` and
+// `.slice()` all behave as before, but a row costs a small view object rather than a
+// fresh array of boxed doubles.
+async function fetchMatrix(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const [rows, cols] = new Int32Array(buf, 0, 2);
+  const data = new Float32Array(buf, 8, rows * cols);
+  const out = new Array(rows);
+  for (let i = 0; i < rows; i++) out[i] = data.subarray(i * cols, (i + 1) * cols);
+  return out;
+}
+async function fetchLabels(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const n = new Int32Array(buf, 0, 1)[0];
+  return new Int32Array(buf, 4, n);
+}
+
 async function clusterLabels() {
   let labels = clusterCache[state.k];
-  if (!labels) { try { labels = clusterCache[state.k] = (await (await fetch(`./api/cluster?k=${state.k}`)).json()).labels; } catch { labels = null; } }
+  if (!labels) { try { labels = clusterCache[state.k] = await fetchLabels(`./api/cluster.bin?k=${state.k}`); } catch { labels = null; } }
   return labels;
 }
 
@@ -523,21 +767,131 @@ function layerColorsCSS() {
   return out;
 }
 
-// O(N^2) neighbour count within `frac` of the bbox diagonal -> [0,1].
+// Draw the visible Centroids layer's points as ringed markers. Centroids are virtual
+// states (index >= L.n) that live off the base cloud, so they are never part of the
+// scatter/cloud point set — we project their stored coords onto the active view and
+// stamp them on a dedicated overlay, re-synced after every render (onRender) so the
+// markers track panning and 3D orbit.
+function syncCentroidOverlay() {
+  if (!centroidCtx) return;
+  const co = $("centroidOverlay");
+  sizeOverlays();   // the box may have changed since the last draw — see sizeOverlays
+  centroidCtx.clearRect(0, 0, co.clientWidth, co.clientHeight);
+  if (landView === "slices") return;   // the scatter is hidden behind the slice grid
+  const cen = layers.find((l) => l.kind === "centroid" && l.visible);
+  if (!cen || !cen.indices) return;
+  const land = activeLand();
+  if (!land || !land.projectData) return;
+  const cc = centroidCoords();
+  const dataOf = (i) => axesOf(i < L.n ? (activeCoords() || L.pca)[i] : (cc[i] || []));
+
+  // Morph path that runs through centroids: the base renderers can't draw segments to a
+  // virtual point, so we draw the whole trajectory here, colored to match the centroid.
+  const traj = hidePathPicks ? [] : [state.current, ...state.path].filter((v) => v >= 0);
+  if (traj.length > 1 && traj.some((i) => i >= L.n)) {
+    const tp = land.projectData(traj.map(dataOf));
+    const pcol = editingPathLayer ? editingPathLayer.color : (indexColor[state.current] || "#f472b6");
+    centroidCtx.lineJoin = "round"; centroidCtx.lineCap = "round";
+    const stroke = (color, w) => {
+      centroidCtx.strokeStyle = color; centroidCtx.lineWidth = w;
+      centroidCtx.beginPath(); let started = false;
+      for (const p of tp) { if (!p) { started = false; continue; } if (!started) { centroidCtx.moveTo(p[0], p[1]); started = true; } else centroidCtx.lineTo(p[0], p[1]); }
+      centroidCtx.stroke();
+    };
+    stroke("rgba(15,23,42,0.5)", 4.5);   // dark halo so the line reads on light backgrounds
+    stroke(pcol, 2.5);
+  }
+
+  // Centroid markers, the current one highlighted (its ring, since the base cloud can't).
+  const idxs = cen.indices.filter((i) => cc[i]);
+  const proj = land.projectData(idxs.map((i) => axesOf(cc[i])));
+  for (let k = 0; k < proj.length; k++) {
+    const p = proj[k];
+    if (p) drawCentroidMarker(centroidCtx, p[0], p[1], indexColor[idxs[k]] || cen.color || "#ffffff", idxs[k] === state.current);
+  }
+}
+function drawCentroidMarker(ctx, x, y, hex, current) {
+  const rad = current ? 8 : 6;
+  ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.fillStyle = hex; ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(15,23,42,0.85)"; ctx.stroke();     // dark halo reads on light bg
+  ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.lineWidth = 1.5; ctx.strokeStyle = "rgba(255,255,255,0.95)"; ctx.stroke();
+  if (current) { ctx.beginPath(); ctx.arc(x, y, rad + 4, 0, Math.PI * 2); ctx.lineWidth = 2; ctx.strokeStyle = "#2dd4bf"; ctx.stroke(); }   // selection halo
+}
+
+// Local density in [0,1], within `frac` of the bbox diagonal.
+//
+// Binned: drop the points into a uniform grid, blur it, then read each point back out
+// of its cell. O(N + G) rather than the O(N²) all-pairs neighbour count this replaces
+// — that scan was ~1e12 distance tests at a million points and simply hung the tab.
+//
+// The result is a kernel-density estimate instead of an exact neighbour count. That is
+// no loss: the value only ever tints points and drives the glow overlay, and it is
+// exactly how the 2D view has always computed its density, so the two now agree.
+const DENS_GRID = 64;   // cells along the longest axis -> <=64³ = 262k cells, ~1 MB
+
 function density3(pts, frac = 0.12) {
   const n = pts.length, d = new Float32Array(n);
+  if (!n) return d;
+
   const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
   for (const p of pts) for (let k = 0; k < 3; k++) { const v = p[k] || 0; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
-  let diag = 0; for (let k = 0; k < 3; k++) diag += (mx[k] - mn[k]) ** 2; diag = Math.sqrt(diag) || 1;
-  const r2 = (diag * frac) ** 2;
-  let max = 0;
+  const ext = [0, 1, 2].map((k) => (mx[k] - mn[k]) || 1);
+  const diag = Math.hypot(ext[0], ext[1], ext[2]) || 1;
+
+  // Cubic cells, so a radius in world units is the same number of cells on every axis.
+  const h = Math.max(ext[0], ext[1], ext[2]) / DENS_GRID;
+  const dim = ext.map((e) => Math.max(1, Math.min(DENS_GRID, Math.ceil(e / h))));
+  const [nx, ny, nz] = dim;
+  const grid = new Float32Array(nx * ny * nz);
+
+  // bin (O(N)), remembering each point's cell so the read-back is a lookup, not a search
+  const cellOf = new Int32Array(n);
   for (let i = 0; i < n; i++) {
-    let c = 0;
-    for (let j = 0; j < n; j++) { let dd = 0; for (let k = 0; k < 3; k++) { const a = (pts[i][k] || 0) - (pts[j][k] || 0); dd += a * a; } if (dd <= r2) c++; }
-    d[i] = c; if (c > max) max = c;
+    const p = pts[i];
+    const ix = Math.min(nx - 1, Math.max(0, ((p[0] || 0) - mn[0]) / h | 0));
+    const iy = Math.min(ny - 1, Math.max(0, ((p[1] || 0) - mn[1]) / h | 0));
+    const iz = Math.min(nz - 1, Math.max(0, ((p[2] || 0) - mn[2]) / h | 0));
+    const c = (ix * ny + iy) * nz + iz;
+    cellOf[i] = c;
+    grid[c] += 1;
   }
+
+  // Three separable box passes ≈ a gaussian of the requested radius. Each pass is a
+  // running prefix sum, so the cost does not grow with the radius.
+  const rad = Math.max(1, Math.round((frac * diag) / h / 2));
+  let src = grid, dst = new Float32Array(grid.length);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let axis = 0; axis < 3; axis++) {
+      boxBlurAxis(src, dst, dim, axis, rad);
+      const t = src; src = dst; dst = t;   // ping-pong
+    }
+  }
+
+  let max = 0;
+  for (let i = 0; i < n; i++) { const v = src[cellOf[i]]; d[i] = v; if (v > max) max = v; }
   if (max > 0) for (let i = 0; i < n; i++) d[i] /= max;
   return d;
+}
+
+// One separable box-blur pass along `axis` of a 3D grid, as a sliding window sum, so a
+// cell costs O(1) however wide the kernel is. Edges clamp (the border cell repeats).
+function boxBlurAxis(src, dst, dim, axis, rad) {
+  const strides = [dim[1] * dim[2], dim[2], 1];   // grid index = (ix*ny + iy)*nz + iz
+  const step = strides[axis], len = dim[axis];
+  const [oa, ob] = [0, 1, 2].filter((k) => k !== axis);
+  const cl = (i) => (i < 0 ? 0 : i >= len ? len - 1 : i);
+  const win = 2 * rad + 1;
+  for (let a = 0; a < dim[oa]; a++) {
+    for (let b = 0; b < dim[ob]; b++) {
+      const base = a * strides[oa] + b * strides[ob];
+      let sum = 0;
+      for (let k = -rad; k <= rad; k++) sum += src[base + cl(k) * step];
+      for (let i = 0; i < len; i++) {
+        dst[base + i * step] = sum / win;
+        sum += src[base + cl(i + rad + 1) * step] - src[base + cl(i - rad) * step];
+      }
+    }
+  }
 }
 
 
@@ -555,16 +909,30 @@ function syncSelection() {
   // overlay still conveys the path. state.path is untouched, so decoding is fine.
   const pathPts = hidePathPicks ? [] : state.path;
   const traj = hidePathPicks ? [] : [state.current, ...state.path].filter((v) => v >= 0);
-  const col = editingPathLayer ? editingPathLayer.color : "#f472b6";
+  // The path takes the current centroid's cluster color (so a morph built from centroids
+  // reads in their color, matching the decoded map). A trajectory that touches a centroid
+  // is drawn by the centroid overlay instead — the base renderers can't reach virtual
+  // points — so hand them an empty path to avoid a broken half-line.
+  const col = editingPathLayer ? editingPathLayer.color : (indexColor[state.current] || "#f472b6");
+  const baseTraj = traj.some((i) => i >= L.n) ? [] : traj;
   scatter.select(state.current); scatter.setPath(pathPts); scatter.setSelection(state.selection);
-  scatter.setPathOrder(traj, col);
-  if (cloud) { cloud.select(state.current); cloud.setPath(pathPts); cloud.setSelection(state.selection); cloud.setPathOrder(traj, hexToRgb(col)); }
+  scatter.setPathOrder(baseTraj, col);
+  if (cloud) { cloud.select(state.current); cloud.setPath(pathPts); cloud.setSelection(state.selection); cloud.setPathOrder(baseTraj, hexToRgb(col)); }
+  syncCentroidOverlay();   // path through / marker on centroids follows the selection
 }
 
 async function onSelect(i, opts) {
+  opts = opts || {};
+  // A real click/tap carries coords: resolve it into a base point or a centroid marker,
+  // honoring pick-restrict. Programmatic calls (layer loading, path edits) pass no coords
+  // and select `i` directly.
+  if (opts.cx != null) {
+    i = resolvePick(i, opts.cx, opts.cy);
+    if (i < 0) return;
+  }
   if (playing) setPlaying(false);              // editing the path stops playback
   hidePathPicks = false;                       // manual interaction -> show path picks again
-  if (opts && opts.shift) {
+  if (opts.shift) {
     // shift-click toggles a waypoint: remove it if already on the path, else append
     const at = state.path.indexOf(i);
     if (at >= 0) state.path.splice(at, 1);
@@ -589,64 +957,266 @@ async function onSelect(i, opts) {
   decode();
 }
 
-function onLevel(level) {
+function onLevel(level, dragging) {
   state.sigma = hist.sigma;
+  if (state.render === "slices") return;   // slices show raw density, not a contour
   if (state.render !== "surface" && volRenderer && curVolMeta) { volRenderer.setThreshold(normThreshold()); return; }
-  liveDecode();
+  // With a morph on screen the contour has to move the *reference* the frames are contoured
+  // to, not the frames — see recontourSeries. Re-decoding the selected state here (what this
+  // used to do, unconditionally) painted a static map over the running animation, and the
+  // frames themselves never read sigma at all, so the slider appeared to do nothing.
+  if (state.timeline.length && (playing || state.frame > 0)) { liveSeriesContour(!!dragging); return; }
+  liveDecode(!!dragging);
 }
 
-// Coalescing single-flight runner: fires immediately, and if more updates arrive
-// while a request is in flight, re-runs once with the latest values when it returns.
-// Gives continuous (server-bounded) updates without piling up requests.
+// Re-aim a morph's contour.
+//
+// A morph is contoured at *constant enclosed mass*, not at sigma: as the latent moves, the
+// decoded density's mean and std drift, so holding sigma fixed would make the map appear to
+// breathe and would ruin the shape comparison. `state.refMass` is that reference — the mass
+// the selected state encloses at the chosen sigma — and every frame is then contoured to
+// enclose it. Which is precisely why dragging the contour did nothing during a morph: the
+// frames are contoured to a mass, and the mass never moved.
+//
+// So the slider moves the reference. Every cached frame's contour changes with it, hence the
+// cache flush; and clearFrameCache() cancels the running prefetcher (it bumps fillToken), so
+// it has to be restarted or playback would fall back to decoding on demand.
+async function recontourSeries(draft) {
+  if (state.current < 0) return;
+  try {
+    const res = await fetch(`./api/mass?index=${state.current}`
+                          + `&sigma=${state.sigma.toFixed(3)}&size=${PLAY_GRID}`);
+    if (!res.ok) return;
+    const { mass } = await res.json();
+    if (!(mass > 0)) return;
+    state.refMass = mass;
+    clearFrameCache();                  // every frame's contour — and so its cache key — moved
+    if (playing) prefetch(true);        // ...and the flush stopped the prefetcher
+    else scheduleWarm();                // paused: refill in the background at the new contour
+    await renderFrame(state.frame, playing ? true : draft);
+  } catch { /* a superseded drag frame: the next pointermove supersedes it anyway */ }
+}
+const liveSeriesContour = makeLive((draft) => recontourSeries(draft));
+
+// Coalescing single-flight runner: fires immediately, and if more updates arrive while a
+// request is in flight, re-runs once with the latest values when it returns. Gives
+// continuous (server-bounded) updates without piling up requests.
+//
+// It must *wait* for the in-flight request, not abandon it. This used to abort the fetch
+// on supersede, to avoid downloading a mesh that was already stale — but `/api/decode` is
+// a sync route, so it runs in a threadpool task that cannot be cancelled: aborting freed
+// the browser to fire the next request while the server kept grinding on the abandoned
+// one. A drag therefore stacked up marching-cubes jobs that don't parallelise (8 at once
+// measured ~5x slower *each*), so the further you dragged the slower it got. Waiting keeps
+// the server at exactly one mesh at a time; the draft below is what makes that cheap.
 function makeLive(fn) {
   let busy = false, pending = false, args = [];
   async function run() { busy = true; do { pending = false; try { await fn(...args); } catch { /* ignore */ } } while (pending); busy = false; }
   return (...a) => { args = a; if (busy) pending = true; else run(); };
 }
-const liveDecode = makeLive(() => decode());
-const liveFrame = makeLive((i) => renderFrame(i));
+const liveDecode = makeLive((draft) => decode(draft));
+const liveFrame = makeLive((i, draft) => renderFrame(i, draft));
 
-async function decode() {
+// Draft resolutions. Rather than mesh the full grid, ask the server for a strided one; it
+// scales the result by the stride, so a draft occupies the same [-1,1] cube as the full
+// surface and refines in place instead of jumping. Boxes at or below these sizes are not
+// strided at all, so a small map is unaffected.
+//
+// Two sizes, because the two jobs want different things. A contour drag ends on a still
+// you will look at, so it stays fairly fine. Playback needs a *new* frame every 33 ms —
+// and a morph frame is a fresh latent, so unlike a contour it can never be served from a
+// cache — so it trades detail for rate, which motion hides anyway. Measured on a 320³ box:
+//   full 470 ms (2 fps) · 160³ 99 ms (10 fps) · 107³ 60 ms (17 fps) · 80³ 46 ms (22 fps)
+const DRAFT_GRID = 160;   // contour drag / scrub
+const PLAY_GRID = 128;    // morph playback (-> a 107³ grid at a 320³ box)
+
+// Drafts are smoothed too, lightly. They used to be sent raw, which was backwards: a
+// coarse grid facets *more*, so the draft is exactly where relaxing the surface earns its
+// keep — and leaving it off meant the map visibly changed character when you released the
+// slider or paused.
+//
+// The cap is not a speed compromise. Almost none of the cost of Taubin is the iterating:
+// building the mesh's adjacency and recomputing the normals afterwards are O(edges) and
+// paid once for any k > 0, while each iteration is two sparse matvecs (~1 ms on a draft).
+// Measured on a 320³ box: smooth=0 -> 66 ms, smooth=1 -> 81 ms, smooth=6 -> 85 ms. So one
+// tick costs essentially what six do; the choice is on-or-off. The cap is about *looks*:
+// Taubin relaxes vertices by a fixed amount in mesh units, and a draft's triangles are
+// bigger, so the same k smooths a draft harder than the full surface. Two keeps the draft
+// looking like what you get when you let go.
+const DRAFT_SMOOTH = 2;
+const draftSmooth = () => Math.min(state.smooth, DRAFT_SMOOTH);
+
+let decodedIndex = -1;    // the state whose volume the server has already decoded
+
+async function decode(draft = false) {
+  if (state.render === "slices") { loadSlices(); return; }   // slices ignore contour/mesh
   if (state.current < 0) return;
   const token = ++decodeToken;
-  status("Decoding map…", "busy");
+  // Only a change of *state* runs the network. A contour change re-meshes a volume the
+  // server already holds (Decoder.volume caches it), so say what is really happening.
+  const fresh = state.current !== decodedIndex;
+  status(fresh ? "Decoding map…" : "Contouring…", "busy");
   try {
-    const res = await fetch(`./api/decode?index=${state.current}&sigma=${state.sigma.toFixed(3)}&smooth=${state.smooth}`);
+    const q = `index=${state.current}&sigma=${state.sigma.toFixed(3)}`
+            + (draft ? `&smooth=${draftSmooth()}&size=${DRAFT_GRID}` : `&smooth=${state.smooth}`);
+    const res = await fetch(`./api/decode?${q}`);
     if (!res.ok) throw new Error(await res.text());
     const m = parseMesh(await res.arrayBuffer());
     if (token !== decodeToken) return;
-    state.refMass = m.mass;
+    decodedIndex = state.current;
+    // A draft's mass is only an estimate (it is measured on the strided grid), and refMass
+    // is what constant-mass morphs are keyed off — so only ever take it from a full mesh.
+    if (!draft) state.refMass = m.mass;
     renderer.setMesh(m.positions, m.normals, m.indices);
     renderer.setColor(colorForIndex(state.current));   // centroids carry their cluster color
     if (state.render !== "surface") { loadVolume(state.current); return; }
     if (!m.indices.length) { renderer.clear(); status("No surface at this contour — lower the threshold.", "warn"); return; }
-    status(`${(m.indices.length / 3).toLocaleString()} triangles · σ ${state.sigma.toFixed(1)} · level ${m.level.toFixed(3)}`);
-  } catch (err) { if (token === decodeToken) status("Decode failed: " + err.message, "err"); }
+    const tris = (m.indices.length / 3).toLocaleString();
+    status(draft ? `Contouring · σ ${state.sigma.toFixed(1)} · draft`
+                 : `${tris} triangles · σ ${state.sigma.toFixed(1)} · level ${m.level.toFixed(3)}`);
+  } catch (err) {
+    if (token === decodeToken) status("Decode failed: " + err.message, "err");
+  }
 }
 
-// ---- volume ray-marching mode ----
+// ---- volume ray-marching / orthogonal-slice mode ----
 function setRenderMode(mode) {
   if (mode !== state.render) clearFrameCache();   // surface<->volume payloads differ
-  // The surface and the ray-marcher live on different canvases, each with its own
-  // camera. Hand the outgoing one over so the map does not jump back to a default view.
-  const from = state.render === "surface" ? renderer : volRenderer;
+  const surf = mode === "surface";
+  const isSlices = mode === "slices";
+  const isVol = mode === "mip" || mode === "emission";
+  // Surface and the ray-marcher live on different canvases, each with its own camera;
+  // the slice view has none. Hand the outgoing 3D camera over so the map does not jump
+  // back to a default view when returning from slices to a 3D mode.
+  const from = state.render === "surface" ? renderer : state.render === "slices" ? null : volRenderer;
   const camera = from ? from.getCamera() : null;
   state.render = mode; $("rendermode").value = mode;
-  const surf = mode === "surface";
   $("gl").style.display = surf ? "" : "none";
-  $("glvol").style.display = surf ? "none" : "";
+  $("glvol").style.display = isVol ? "" : "none";
+  $("slices").style.display = isSlices ? "grid" : "none";
   $("lightlbl").style.display = surf ? "" : "none";
   $("smoothlbl").style.display = surf ? "" : "none";
-  $("volctrls").style.display = surf ? "none" : "";
-  if (!surf && !volRenderer) {
+  $("volctrls").style.display = isVol ? "" : "none";
+  $("slicectrls").style.display = isSlices ? "" : "none";
+  $("colorlbl").style.display = isSlices ? "none" : "";
+  $("histStrip").style.display = isSlices ? "none" : "";   // contour is meaningless for raw slices
+  if (isVol && !volRenderer) {
     try { volRenderer = createVolume($("glvol")); volRenderer.setColor(hexToRgb($("color").value)); volRenderer.setBackground(hexToRgb($("bg").value)); volRenderer.setGamma(state.vGamma); volRenderer.setBrightness(state.vBright); }
     catch (err) { status("Volume rendering unavailable: " + err.message, "err"); setRenderMode("surface"); return; }
   }
-  if (volRenderer) volRenderer.setMode(mode === "emission" ? "emission" : "mip");
-  const to = surf ? renderer : volRenderer;
+  if (isSlices && !slices) {
+    try {
+      slices = createSlices($("slices"));
+      slices.setBackground($("bg").value); slices.setColormap($("slicemap").value);
+      slices.setContrast(+$("slicelo").value, +$("slicehi").value); slices.setCrosshair($("slicecross").checked);
+    } catch (err) { status("Slices unavailable: " + err.message, "err"); setRenderMode("surface"); return; }
+  }
+  if (isVol) volRenderer.setMode(mode === "emission" ? "emission" : "mip");
+  const to = surf ? renderer : isVol ? volRenderer : null;
   if (to && to !== from && camera) to.setCamera(camera);
-  if (state.timeline.length && state.frame > 0) renderFrame(state.frame);
+  if (isSlices) { refreshSlices(); return; }
+  if (state.timeline.length && state.frame > 0) renderFrame(state.frame, false);
   else if (state.current >= 0) decode();
+}
+
+// ---- orthogonal slices of the decoded map (right pane) ----
+// Land on the active morph frame when one is loaded (so a paused/looping morph keeps
+// its plane), otherwise slice the currently selected state.
+function refreshSlices() {
+  if (state.timeline.length && state.frame > 0) renderFrame(state.frame, false);
+  else loadSlices();
+}
+async function loadSlices() {
+  if (!slices) return;
+  if (state.current < 0) { status("Pick a state to slice its decoded map.", "warn"); return; }
+  const token = ++decodeToken;
+  status("Loading slices…", "busy");
+  try {
+    const res = await fetch(`./api/grid?index=${state.current}&size=160`);
+    if (!res.ok) throw new Error(await res.text());
+    const g = parseGrid(await res.arrayBuffer());
+    if (token !== decodeToken) return;
+    slices.setVolume(g);
+    status(`Slices ${g.nx}×${g.ny}×${g.nz} · state #${state.current}`);
+  } catch (err) { if (token === decodeToken) status("Slice load failed: " + err.message, "err"); }
+}
+
+// ---- landscape orthogonal-slice view (left pane) ----
+// Slices with a gray-ish default; the slice viewer only knows a handful of maps, so map
+// the density colormap onto the nearest one it supports (else viridis).
+const SLICE_MAPS = new Set(["gray", "viridis", "magma", "inferno", "hot"]);
+const sliceColormap = () => (SLICE_MAPS.has(state.densMap) ? state.densMap : "viridis");
+
+// Swap the landscape pane between the point cloud and an orthogonal-slice density map.
+function setLandView(mode) {
+  landView = mode === "slices" ? "slices" : "points";
+  const on = landView === "slices";
+  $("landSlicesBtn").classList.toggle("active", on);
+  const is3 = is3d();
+  $("scatter").style.display = on ? "none" : (is3 ? "none" : "");
+  $("scatter3d").style.display = on ? "none" : (is3 ? "" : "none");
+  $("centroidOverlay").style.display = on ? "none" : "";
+  $("lassoCanvas").style.display = on ? "none" : "";
+  $("landSlices").style.display = on ? "grid" : "none";
+  if (on) {
+    if (lassoArmed) setLassoArmed(false);        // the point tools have no meaning over slices
+    if (pathDrawArmed) setPathDrawArmed(false);
+    if (!landSlices) {
+      try {
+        landSlices = createSlices($("landSlices"));
+        landSlices.setBackground($("bg").value); landSlices.setColormap(sliceColormap()); landSlices.setCrosshair(true);
+      } catch (err) { status("Slices unavailable: " + err.message, "err"); setLandView("points"); return; }
+    }
+    loadLandSlices();
+  } else {
+    syncCentroidOverlay();
+  }
+}
+
+// Bin the landscape density onto the current X/Y/Z axes and show it as orthogonal cuts.
+function loadLandSlices() {
+  if (!landSlices) return;
+  const g = landscapeDensityGrid();
+  if (!g) { status("No points to build a density field.", "warn"); return; }
+  landSlices.setColormap(sliceColormap());
+  landSlices.setVolume(g);
+  status(`Landscape density slices ${g.nx}×${g.ny}×${g.nz} · ${axisLabel(state.x)} · ${axisLabel(state.y)} · ${axisLabel(state.z)}`);
+}
+
+// Bin the latent cloud (current x/y/z axes) into a 3D grid, blur it to a KDE, and
+// hand it to the slice viewer as a uint8 volume. Reuses the same box-blur passes as
+// the 3D density glow, so the two agree. `boxBlurAxis` works on the (ix*ny+iy)*nz+iz
+// layout; the slice viewer wants (iz*ny+iy)*nx+ix, so we remap on the way out.
+const DENS_SLICE_GRID = 96;
+function landscapeDensityGrid() {
+  const c = activeCoords();
+  if (!c || !c.length) return null;
+  const n = c.length, ax = [state.x, state.y, state.z];
+  const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+  const P = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) { const v = c[i][ax[k]] ?? 0; P[i * 3 + k] = v; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
+  const ext = [0, 1, 2].map((k) => (mx[k] - mn[k]) || 1);
+  const diag = Math.hypot(ext[0], ext[1], ext[2]) || 1;
+  const h = Math.max(ext[0], ext[1], ext[2]) / DENS_SLICE_GRID;
+  const dim = ext.map((e) => Math.max(1, Math.min(DENS_SLICE_GRID, Math.ceil(e / h))));
+  const [nx, ny, nz] = dim;
+  const grid = new Float32Array(nx * ny * nz);   // (ix*ny+iy)*nz+iz
+  for (let i = 0; i < n; i++) {
+    const ix = Math.min(nx - 1, Math.max(0, (P[i * 3] - mn[0]) / h | 0));
+    const iy = Math.min(ny - 1, Math.max(0, (P[i * 3 + 1] - mn[1]) / h | 0));
+    const iz = Math.min(nz - 1, Math.max(0, (P[i * 3 + 2] - mn[2]) / h | 0));
+    grid[(ix * ny + iy) * nz + iz] += 1;
+  }
+  const rad = Math.max(1, Math.round(((0.04 + state.densBandwidth * 0.02) * diag) / h / 2));
+  let src = grid, dst = new Float32Array(grid.length);
+  for (let pass = 0; pass < 3; pass++) for (let axis = 0; axis < 3; axis++) { boxBlurAxis(src, dst, dim, axis, rad); const t = src; src = dst; dst = t; }
+  let max = 0;
+  for (let i = 0; i < src.length; i++) if (src[i] > max) max = src[i];
+  const inv = max > 0 ? 255 / max : 0;
+  const data = new Uint8Array(nx * ny * nz);     // (iz*ny+iy)*nx+ix, x fastest
+  for (let ix = 0; ix < nx; ix++) for (let iy = 0; iy < ny; iy++) for (let iz = 0; iz < nz; iz++)
+    data[(iz * ny + iy) * nx + ix] = src[(ix * ny + iy) * nz + iz] * inv;
+  return { nx, ny, nz, data };
 }
 
 function normThreshold() {
@@ -686,18 +1256,139 @@ function parseGrid(buf) {
 // Build the ordered list of [a,b,t] frames for the current path (forward then back,
 // so playback loops cleanly and the scrubber covers a full there-and-back). Cheap —
 // no network — so it's safe to call on every path edit.
-function buildTimeline() {
+// A morph's cost is (path nodes − 1) × frames-per-segment — the size of the landscape has
+// nothing to do with it. Two limits keep that from running away, because a series taken
+// from a cluster layer can hand us hundreds or thousands of states:
+//
+// MAX_TIMELINE bounds the unique frames, so that a morph is slow once and then plays at the
+// full display rate for ever, rather than slow for ever (never fully cached, so every cycle
+// re-decodes whatever was evicted: see the eviction note above).
+//
+// It is a frame *count*, though, and the budget it is meant to respect is in *bytes* — so it
+// cannot actually guarantee the fit, and this comment used to claim it did ("~1.5 MB per
+// draft mesh, 360 frames is ~540 MB"). A draft mesh costs roughly 180 bytes per cell² of the
+// *strided* grid, and that grid is a sawtooth in the model's box (PLAY_GRID divides it, so
+// the stride jumps): ~1.2 MB/frame at a 160 box, ~2.1 MB at 320, ~3.0 MB at 256 or 384. So
+// 360 frames is ~400 MB at one box and ~1 GB at another, and only boxes with a strided grid
+// of ≤111 cells fit. checkTimelineFits() measures the real figure once frames start landing
+// and says so, rather than letting the morph quietly thrash for ever.
+//
+// MAX_NODES bounds the *waypoints*: every hop needs at least its endpoint, so a path with
+// more nodes than this could not be drawn in MAX_TIMELINE frames at all. Over the limit we
+// resample the node list at even arc length (keeping the ends) — a "tour of the tour".
+const MAX_TIMELINE = 360;
+const MAX_NODES = 120;
+
+// Latent-space hop lengths, memoised on the path itself (rebuilt on every path edit).
+let segCache = { key: "", lengths: null };
+async function segmentLengths(path) {
+  const key = path.join(",");
+  if (segCache.key === key && segCache.lengths) return segCache.lengths;
+  try {
+    const res = await fetch("./api/segments", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ indices: path }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const { lengths } = await res.json();
+    segCache = { key, lengths };
+    return lengths;
+  } catch {
+    // Equal hops: exactly the old behaviour, so a failure here degrades rather than breaks.
+    const lengths = path.slice(1).map(() => 1);
+    segCache = { key, lengths };
+    return lengths;
+  }
+}
+
+// Split `total` frames across the hops in proportion to how far each travels, giving every
+// hop at least `MIN_SEG` (its two endpoints) so no waypoint is skipped. Largest-remainder
+// rounding, so the parts sum to `total` exactly.
+const MIN_SEG = 2;
+function allocate(lengths, total) {
+  const n = lengths.length;
+  const sum = lengths.reduce((a, b) => a + b, 0);
+  const spare = Math.max(0, total - MIN_SEG * n);
+  if (!(sum > 0)) return lengths.map(() => MIN_SEG + Math.floor(spare / n));
+  const raw = lengths.map((L) => MIN_SEG + (spare * L) / sum);
+  const out = raw.map(Math.floor);
+  let left = total - out.reduce((a, b) => a + b, 0);
+  const order = raw.map((v, i) => [i, v - Math.floor(v)]).sort((a, b) => b[1] - a[1]);
+  for (let k = 0; left > 0; k++, left--) out[order[k % n][0]]++;
+  return out;
+}
+
+// Resample a too-long node list at even arc length, always keeping the first and last.
+function thinPath(path, lengths, keep) {
+  const cum = [0];
+  for (const L of lengths) cum.push(cum[cum.length - 1] + L);
+  const total = cum[cum.length - 1];
+  if (!(total > 0)) {                       // degenerate: fall back to even index spacing
+    return Array.from({ length: keep }, (_, i) =>
+      path[Math.round((i * (path.length - 1)) / (keep - 1))]);
+  }
+  const out = [];
+  for (let i = 0; i < keep; i++) {
+    const s = (total * i) / (keep - 1);
+    let j = 0;
+    while (j < cum.length - 1 && cum[j + 1] < s) j++;
+    // Take the *nearer* of the hop's two endpoints. Taking its start (the obvious thing)
+    // silently drops the final state: at the last sample s sits at the end of the last hop,
+    // whose start is the second-to-last node — so the morph would never arrive.
+    const near = (j + 1 < cum.length && Math.abs(cum[j + 1] - s) < Math.abs(cum[j] - s)) ? j + 1 : j;
+    out.push(path[Math.min(near, path.length - 1)]);
+  }
+  return out.filter((v, i) => i === 0 || v !== out[i - 1]);   // collapse any duplicates
+}
+
+async function buildTimeline() {
   clearFrameCache();   // the frame list changed -> any cached frames are stale
-  const path = trajectory();
+  let path = trajectory();
   if (path.length < 2) { state.timeline = []; state.frame = 0; $("scrub").max = "0"; $("scrub").value = "0"; $("framelbl").textContent = "—"; return false; }
-  const frames = Math.max(2, Math.min(120, +$("frames").value || 36));
+
+  let lengths = await segmentLengths(path);
+  let note = "";
+  if (path.length > MAX_NODES) {
+    const before = path.length;
+    path = thinPath(path, lengths, MAX_NODES);
+    lengths = await segmentLengths(path);
+    note = `${before} states thinned to ${path.length}`;
+  }
+
+  const perSeg = Math.max(2, Math.min(120, +$("frames").value || 36));
+  const nominal = perSeg * (path.length - 1);
+  const total = Math.min(nominal, MAX_TIMELINE);
+  const counts = allocate(lengths, total);
+
+  // Frames are placed by arc length, so the map advances at a constant speed through latent
+  // space. Giving every hop the same count (what this used to do) made the morph lurch —
+  // crawling through closely-spaced states and racing through distant ones — which is a
+  // smoothness problem entirely separate from the frame rate, and it bites hardest on a
+  // cluster series, whose representatives are unevenly spaced almost by construction.
+  //
+  // Each hop after the first starts at i=1: its i=0 is the previous hop's endpoint, the very
+  // same latent, and emitting it again would decode the waypoint twice under two cache keys.
   const steps = [];
-  for (let s = 0; s < path.length - 1; s++) { const a = path[s], b = path[s + 1]; for (let i = 0; i < frames; i++) steps.push([a, b, i / (frames - 1)]); }
-  state.timeline = steps.concat(steps.slice(0, -1).reverse());
+  for (let s = 0; s < path.length - 1; s++) {
+    const a = path[s], b = path[s + 1], k = Math.max(2, counts[s]);
+    for (let i = (s === 0 ? 0 : 1); i < k; i++) steps.push([a, b, i / (k - 1)]);
+  }
+  state.timeline = steps.concat(steps.slice(0, -1).reverse());   // there-and-back reuses the keys
   state.frame = Math.min(state.frame, state.timeline.length - 1);
   $("scrub").max = String(state.timeline.length - 1);
   $("scrub").value = String(state.frame);
   $("framelbl").textContent = `${state.frame + 1}/${state.timeline.length}`;
+  // The status line gets overwritten the moment playback starts, so the explanation also
+  // lives on the frame counter, where it stays.
+  const capped = nominal > MAX_TIMELINE || note;
+  $("framelbl").title = capped
+    ? `${steps.length} unique frames over ${path.length} states`
+      + (note ? ` · ${note}` : "")
+      + (nominal > MAX_TIMELINE ? ` · capped from ${nominal}` : "")
+      + " — bounded so the whole morph fits the frame cache and plays back smoothly."
+    : `${steps.length} unique frames over ${path.length} states, spaced by latent-space distance.`;
+  if (capped) status($("framelbl").title, "warn");
+  scheduleWarm();     // decode it now, while nothing is waiting on it
   return true;
 }
 
@@ -713,39 +1404,140 @@ function buildTimeline() {
 // no mid-loop stalls. The budget is what bounds memory — sized by bytes (not a
 // frame count) because a 96³ grid and a marching-cubes mesh differ ~10×.
 const CACHE_BUDGET = 768 * 1024 * 1024;   // ~768 MB of decoded frames (tune freely)
-const frameCache = new Map();      // key -> { surface, payload, bytes }
+const frameCache = new Map();      // key -> { surface, payload, bytes, idx }
 const frameInflight = new Map();   // key -> Promise (single-flight per key)
-const frameCacheKeys = [];         // insertion order, for LRU eviction
 let cacheBytes = 0;
-let fillToken = 0;                  // bumped to cancel an in-flight background fill
+let fillToken = 0;                  // bumped to cancel an in-flight prefetch
+let warmTimer = null;               // pending pre-Play warm (see scheduleWarm)
+let evictions = 0;                  // >0 means the timeline does not fit the budget
+
+// Prefetch shape. The server serialises decodes at 2 slots, so 2 in flight saturates it;
+// more would only make each one slower (they contend for CPU and memory bandwidth).
+const LOOKAHEAD = 64;         // frames kept ready ahead of the playhead
+const LOW_WATER = 8;          // below this the buffer is draining -> pace to the server
+const FETCH_CONCURRENCY = 2;
+
+// Rolling measure of what the server actually sustains, in ms per delivered frame. Used to
+// pace the *first* pass: better to play smoothly at 12 fps than to stutter at a nominal 30.
+//
+// Only intervals during which we were actually decoding count. Averaging the whole window
+// end-to-end (what this used to do) folds in every gap where the prefetcher had nothing to
+// fetch, so the measured "rate" climbed without bound the longer playback ran — and since
+// `pace = max(delay, rate)`, a morph that had gone quiet because it was fully cached ended
+// up throttling itself to a number that described idleness, not the server. The prefetcher
+// also clears the window outright when it finds the look-ahead already cached.
+const doneAt = [];
+const RATE_IDLE_GAP = 4000;   // ms; longer than any plausible draft frame => we were idle
+function decodeRateMs() {
+  if (doneAt.length < 3) return 0;
+  let sum = 0, n = 0;
+  for (let i = 1; i < doneAt.length; i++) {
+    const dt = doneAt[i] - doneAt[i - 1];
+    if (dt > RATE_IDLE_GAP) continue;
+    sum += dt; n++;
+  }
+  return n ? sum / n : 0;
+}
+
+let fitWarned = false;   // one cache-overflow warning per timeline (see checkTimelineFits)
 
 function clearFrameCache() {
-  fillToken++;                     // cancel any running fill (its frames are stale)
-  frameCache.clear(); frameInflight.clear(); frameCacheKeys.length = 0; cacheBytes = 0;
+  fillToken++;                     // cancel any running prefetch (its frames are stale)
+  clearTimeout(warmTimer);         // ...and any warm still pending for the old timeline
+  frameCache.clear(); frameInflight.clear(); cacheBytes = 0; doneAt.length = 0;
+  fitWarned = false; evictions = 0;
+}
+
+// Once enough frames have landed to measure a real bytes/frame, check whether the whole
+// timeline can actually stay resident, and say so once if it cannot. See the MAX_TIMELINE
+// note: the cap is a frame count, the budget is bytes, and which of the two binds depends on
+// the model's box. Without this the morph just never stops re-decoding and never explains why.
+function checkTimelineFits() {
+  if (fitWarned || frameCache.size < 8 || !state.timeline.length) return;
+  // Count the cache keys the playhead will actually ask for, rather than assuming one per
+  // timeline slot. Two things collapse that count, and both are easy to get wrong: the
+  // there-and-back mirror means positions i and n-1-i are the same latent under the same
+  // key, and at step > 1 the playhead skips slots entirely. A 361-slot morph at the default
+  // 60 fps (step 2) is 91 decodes, not 361 and not 181 — assuming otherwise would warn about
+  // an overflow four times bigger than the real one.
+  const n = state.timeline.length;
+  const { step } = playCadence();
+  const keys = new Set();
+  for (const i of upcoming(state.frame, step, Math.ceil(n / Math.max(1, step)))) {
+    const req = frameRequest(i, true);
+    if (req) keys.add(req.key);
+  }
+  const unique = keys.size || 1;
+  const perFrame = cacheBytes / frameCache.size;
+  const need = perFrame * unique;
+  if (need <= CACHE_BUDGET) return;
+  fitWarned = true;
+  const mb = (v) => Math.round(v / (1024 * 1024));
+  const msg = `This morph needs ~${mb(need)} MB of decoded frames (${unique} unique × `
+    + `~${(perFrame / (1024 * 1024)).toFixed(1)} MB) but the cache holds ${mb(CACHE_BUDGET)} MB, `
+    + `so every loop will re-decode part of it. Lower “frames” to keep it fully cached.`;
+  status(msg, "warn");
+  $("framelbl").title = msg;
+}
+
+// Evict down to the budget, dropping the frame furthest AHEAD of the playhead first.
+//
+// This replaces an LRU, which is the worst possible policy for a loop: the least-recently
+// used frame is precisely the one the playhead is about to come round to again, so a
+// timeline that overflowed the budget evicted exactly what it was about to need and hit
+// approximately never — a long morph (a cluster layer) stayed slow on every cycle, for
+// ever. Evicting what we'll want *last* is near-optimal for a cyclic scan.
+//
+// "When we'll want it" has to account for the mirror. The timeline is there-and-back
+// (buildTimeline), so `[a,b,t]` at position i is the same latent — and therefore the same
+// cache key, the same single entry — as position n-1-i. Ranking on `e.idx` alone, the
+// position that happened to insert it, got this exactly backwards for the whole return leg:
+// a frame the playhead was about to reach again was scored as the furthest away and thrown
+// out first. Score each entry by whichever of its two positions comes up soonest.
+function evictTo(budget) {
+  if (cacheBytes <= budget) return;
+  const n = state.timeline.length || 1;
+  const here = state.frame;
+  const cyc = (d) => ((d % n) + n) % n;        // JS % keeps the sign; we want the cycle
+  const untilNeeded = (e) => Math.min(cyc(e.idx - here), cyc((n - 1 - e.idx) - here));
+  const ranked = [...frameCache.entries()]
+    .map(([k, e]) => [k, e, untilNeeded(e)])
+    .sort((x, y) => y[2] - x[2]);              // furthest ahead in playback order first
+  for (const [k, e, dist] of ranked) {
+    if (cacheBytes <= budget) return;
+    if (dist === 0) continue;                  // never evict the frame on screen
+    frameCache.delete(k); cacheBytes -= e.bytes; evictions++;
+  }
 }
 
 // The decode request (query + cache key) for timeline frame i, or null.
-function frameRequest(i) {
+// `draft` asks the server for a strided, lightly-smoothed mesh — see DRAFT_GRID.
+function frameRequest(i, draft) {
   if (!state.timeline.length) return null;
   i = Math.max(0, Math.min(state.timeline.length - 1, i | 0));
   const [a, b, t] = state.timeline[i];
   const mass = state.refMass >= 0 ? state.refMass : null;
+  const at = `index=${a}&index2=${b}&t=${t.toFixed(4)}`;
+  const level = mass != null ? `&mass=${mass}` : `&sigma=${state.sigma.toFixed(3)}`;
   if (state.render === "surface") {
-    const q = `index=${a}&index2=${b}&t=${t.toFixed(4)}&smooth=${state.smooth}` + (mass != null ? `&mass=${mass}` : `&sigma=${state.sigma.toFixed(3)}`);
+    const q = at + (draft ? `&smooth=${draftSmooth()}&size=${PLAY_GRID}` : `&smooth=${state.smooth}`) + level;
     return { surface: true, url: `./api/decode?${q}`, key: `s|${q}` };
   }
-  const q = `index=${a}&index2=${b}&t=${t.toFixed(4)}&size=96`;
+  const q = `${at}&size=96`;
   return { surface: false, url: `./api/grid?${q}`, key: `v|${q}` };
 }
 
-// Decode (or reuse) frame i -> { surface, payload }. Caches the parsed result
-// and coalesces concurrent requests for the same key, so the prefetcher and the
-// render loop never fetch the same frame twice.
-function decodeFrame(i) {
-  const req = frameRequest(i);
+// Decode (or reuse) frame i -> { surface, payload }. Caches the parsed result and
+// coalesces concurrent requests for the same key, so the prefetcher and the render loop
+// never fetch the same frame twice.
+function decodeFrame(i, draft) {
+  const req = frameRequest(i, draft);
   if (!req) return Promise.resolve(null);
   const hit = frameCache.get(req.key);
-  if (hit) return Promise.resolve(hit);
+  // Re-stamp the position it was wanted at. `idx` drives eviction (evictTo), and a shared
+  // mirror entry that was inserted on the outbound leg would otherwise keep that stale
+  // position for ever. Cheap belt-and-braces alongside the mirror-aware scoring.
+  if (hit) { hit.idx = i; return Promise.resolve(hit); }
   const flight = frameInflight.get(req.key);
   if (flight) return flight;
   const p = (async () => {
@@ -754,14 +1546,12 @@ function decodeFrame(i) {
     const bytes = req.surface
       ? payload.positions.byteLength + payload.normals.byteLength + payload.indices.byteLength
       : payload.data.byteLength;
-    const entry = { surface: req.surface, payload, bytes };
-    frameCache.set(req.key, entry); frameCacheKeys.push(req.key); cacheBytes += bytes;
-    // evict oldest until under budget (never the entry we just added: it's at the tail)
-    while (cacheBytes > CACHE_BUDGET && frameCacheKeys.length > 1) {
-      const old = frameCacheKeys.shift();
-      const e = frameCache.get(old);
-      if (e) { cacheBytes -= e.bytes; frameCache.delete(old); }
-    }
+    const entry = { surface: req.surface, payload, bytes, idx: i };
+    frameCache.set(req.key, entry); cacheBytes += bytes;
+    checkTimelineFits();            // measured, before eviction pins cacheBytes to the budget
+    evictTo(CACHE_BUDGET);
+    doneAt.push(performance.now());
+    if (doneAt.length > 12) doneAt.shift();
     return entry;
   })();
   p.finally(() => { if (frameInflight.get(req.key) === p) frameInflight.delete(req.key); });
@@ -769,25 +1559,115 @@ function decodeFrame(i) {
   return p;
 }
 
-// Decode the whole timeline ahead of the playhead, as fast as the server allows
-// (one outstanding request; the fps sleeps leave plenty of idle time). Stops if
-// the cache fills the budget — past that point the look-ahead window is all we
-// can keep, so further filling would just thrash. Re-launched on each play.
-async function backgroundFill() {
-  const my = ++fillToken;
+// The exact sequence of frames the play loop will visit from `from`, in order.
+//
+// This has to agree with togglePlay's advance *exactly*, and it used not to. The loop adds
+// `step` and snaps to 0 on overflow; the prefetcher and the buffer probe both walked
+// `(frame + d*step) % n` instead. Those are not the same walk: the there-and-back timeline
+// makes n odd (n = 2m-1), and step is 2 at the default 60 fps, so the modular walk lands on
+// the odd indices — which the playhead never displays. The prefetcher spent up to LOOKAHEAD
+// decodes per cycle on frames that were never shown, while bufferedAhead reported those same
+// never-shown frames as "not buffered" near every wrap, tripping `draining` and stuttering
+// the morph at the same point on every loop, for ever, even with the whole timeline cached.
+//
+// One generator, so the three consumers cannot drift apart again.
+function* upcoming(from, step, count) {
   const n = state.timeline.length;
-  const { step } = playCadence();
-  const start = state.frame;                            // cover the frames the playhead will show
-  const count = Math.ceil(n / step) + 1;               // one stride past the wrap, in playhead order
+  let i = from;
   for (let d = 0; d < count; d++) {
-    if (my !== fillToken || !playing) return;          // superseded / stopped / timeline rebuilt
-    if (cacheBytes > CACHE_BUDGET * 0.92) return;       // budget reached -> stop pre-filling
-    await decodeFrame((start + d * step) % n).catch(() => {});
+    i += step;
+    if (i >= n) i = 0;      // exactly what the play loop does
+    yield i;
   }
 }
 
+// How many frames the playhead can advance through, right now, without waiting.
+function bufferedAhead(step, draft) {
+  if (!state.timeline.length) return 0;
+  let have = 0;
+  for (const i of upcoming(state.frame, step, LOOKAHEAD)) {
+    const req = frameRequest(i, draft);
+    if (!req || !frameCache.has(req.key)) return have;
+    have++;
+  }
+  return LOOKAHEAD;
+}
+
+// Keep a window of frames ready *ahead* of the playhead, nearest first, with a couple of
+// requests in flight.
+//
+// The old filler walked the timeline one request deep, in lockstep with the playhead —
+// and its premise ("use the idle time during the fps sleeps") was false: when a frame
+// costs a second and the frame period is 33 ms, `sleep(delay - elapsed)` is zero. There is
+// no idle time. All it achieved was a second concurrent request on a server that does not
+// parallelise, making every frame slower for no look-ahead at all.
+//
+// `mode` is "play" — hold a LOOKAHEAD window ahead of a moving playhead, for as long as
+// playback runs — or "warm": fill the whole timeline once, from wherever the playhead is
+// parked, and return when there is nothing left to fetch.
+//
+// Warm mode is the point of the whole exercise. The complete frame list is known the moment
+// buildTimeline resolves, which is normally seconds before anyone presses Play — and that
+// window was the only one in which decoding is free, because nothing is waiting on it. The
+// loop used to be gated on `playing` and refused to use it, so every Play began by paying
+// for frames it could already have had sitting in the cache.
+const WARM_MAX_FAILS = 6;     // consecutive errors before an unattended warm gives up
+async function prefetch(draft, mode = "play") {
+  const my = ++fillToken;
+  const warming = mode === "warm";
+  let fails = 0;
+  while (my === fillToken && (playing || warming)) {
+    const n = state.timeline.length;
+    if (!n) return;
+    // Two ways an unattended warm must stop, neither of which applies to playback (where a
+    // human is watching and can hit Stop):
+    //  - the timeline does not fit the budget, so every further frame evicts one we just
+    //    decoded and the loop would churn the server for ever. checkTimelineFits() has
+    //    already told the user; there is nothing more to gain here.
+    //  - the server is failing. A frame that errors is never cached, so the next pass asks
+    //    for it again — that is an infinite retry unless we count.
+    if (warming && (evictions > 0 || fails >= WARM_MAX_FAILS)) return;
+    const { step } = playCadence();
+    // Warming covers one full cycle of the playhead; playback only needs the window ahead.
+    const span = warming ? Math.ceil(n / Math.max(1, step)) : LOOKAHEAD;
+    const jobs = [];
+    for (const i of upcoming(state.frame, step, span)) {
+      if (frameInflight.size + jobs.length >= FETCH_CONCURRENCY) break;
+      const req = frameRequest(i, draft);
+      if (!req || frameCache.has(req.key) || frameInflight.has(req.key)) continue;
+      jobs.push(decodeFrame(i, draft).then(() => { fails = 0; }, () => { fails += 1; }));
+    }
+    // Window full (or the server is busy): wait for something to change rather than spin.
+    // Nothing to fetch and nothing in flight means the span is fully cached, so the
+    // decode-rate window below is now stale idle time — drop it (see decodeRateMs).
+    if (!jobs.length) {
+      if (!frameInflight.size) {
+        doneAt.length = 0;
+        if (warming) return;           // whole timeline resident: the warm is done
+      }
+      await sleep(30); continue;
+    }
+    await Promise.race(jobs);          // as soon as one lands, re-evaluate the window
+  }
+}
+
+// Start decoding a morph before Play is pressed.
+//
+// Debounced, and that is not optional: updatePathLabel fires buildTimeline un-awaited on
+// every shift-click, and a decode cannot be cancelled once the server route starts (it holds
+// its slot across the whole request), so warming on each click would strand work on paths
+// that were abandoned mid-edit. Waiting for the path to settle costs nothing — the user is
+// still choosing states — and keeps abandoned work to at most FETCH_CONCURRENCY frames.
+const WARM_DEBOUNCE_MS = 600;
+function scheduleWarm() {
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(() => {
+    if (!playing && state.timeline.length) prefetch(true, "warm");
+  }, WARM_DEBOUNCE_MS);
+}
+
 // Render one timeline frame in the current render mode (mass-constant for surfaces).
-async function renderFrame(i) {
+async function renderFrame(i, draft = false) {
   if (!state.timeline.length) return;
   i = Math.max(0, Math.min(state.timeline.length - 1, i | 0));
   state.frame = i; $("scrub").value = String(i); $("framelbl").textContent = `${i + 1}/${state.timeline.length}`;
@@ -796,12 +1676,14 @@ async function renderFrame(i) {
   const col = lerpColor(colorForIndex(a), colorForIndex(b), t);   // smooth cluster-color transition
   const tok = ++decodeToken;
   try {
-    const entry = await decodeFrame(i);
+    const entry = await decodeFrame(i, draft);
     if (tok !== decodeToken || !entry) return;   // a newer frame superseded this one
     if (entry.surface) {
       const m = entry.payload;
       if (m.indices.length) renderer.setMesh(m.positions, m.normals, m.indices);
       renderer.setColor(col);
+    } else if (state.render === "slices") {
+      if (slices) slices.setVolume(entry.payload);   // same dims across frames → view is preserved
     } else if (volRenderer) {
       const g = entry.payload;
       curVolMeta = g; volRenderer.setVolume(g.nx, g.ny, g.nz, g.data, g.boxLo, g.boxHi); volRenderer.setThreshold(normThreshold());
@@ -819,31 +1701,60 @@ function setPlaying(on) {
 
 async function togglePlay() {
   if (playing) { setPlaying(false); return; }
-  if (!state.timeline.length && !buildTimeline()) { status("Build a path first (shift-click states).", "warn"); return; }
+  if (!state.timeline.length && !(await buildTimeline())) { status("Build a path first (shift-click states).", "warn"); return; }
   setPlaying(true);
-  backgroundFill();                            // race ahead of the playhead, filling the cache
+  // Playback runs on draft meshes: a morph frame is a *new* latent every time, so nothing
+  // is ever cached server-side and the full-resolution mesh cannot be made cheap. The
+  // draft is ~15x cheaper, and the frame you settle on is re-rendered at full resolution
+  // when you pause (below).
+  prefetch(true);                              // keep a window ready ahead of the playhead
+  // No preroll. It used to block until 24 frames were buffered — and since it issued no
+  // fetches itself, that was ~24 *serial* decodes of "Preparing morph…" before a single
+  // pixel moved. With the timeline warmed at build time the frames are usually already
+  // here; when they are not, waiting for 24 of them only makes the stall longer and moves
+  // it earlier. Await the one frame we are about to show, and start.
+  //
+  // Showing state.frame (rather than advancing first) also fixes the opening jump: the loop
+  // begins with `frame + step`, so a fresh morph used to open on timeline[2] at the default
+  // 60 fps, already part-way through the first hop. On resume this re-renders the frame
+  // that is on screen as a draft — which is what playback shows anyway.
+  if (playing) await renderFrame(state.frame, true);
   while (playing) {
     const { delay, step } = playCadence();
     let next = state.frame + step;
     if (next >= state.timeline.length) next = 0;     // loop (wrap to start)
     const t0 = performance.now();
-    await renderFrame(next);
+    await renderFrame(next, true);
     if (!playing) break;
-    status(`Playing… frame ${state.frame + 1}/${state.timeline.length}`, "busy");
-    // hold the display rate without double-counting the decode we just paid for
-    await sleep(Math.max(0, delay - (performance.now() - t0)));
+    // Pace to the buffer. With a healthy look-ahead we hold the display rate; while the
+    // prefetcher is still catching up we drop to the rate the server actually sustains,
+    // so the first pass is smooth-but-slower rather than jerky. Once the timeline is
+    // cached the buffer never drains and it runs at full speed.
+    const rate = decodeRateMs();
+    const draining = bufferedAhead(step, true) < LOW_WATER && rate > 0;
+    const pace = draining ? Math.max(delay, rate) : delay;
+    status(draining
+      ? `Playing… frame ${state.frame + 1}/${state.timeline.length} (buffering)`
+      : `Playing… frame ${state.frame + 1}/${state.timeline.length}`, "busy");
+    await sleep(Math.max(0, pace - (performance.now() - t0)));
   }
-  if (!recording) status(`Paused at frame ${state.frame + 1}/${state.timeline.length}.`);
+  fillToken++;                                 // stop the prefetcher
+  if (!recording) {
+    status(`Paused at frame ${state.frame + 1}/${state.timeline.length}.`);
+    renderFrame(state.frame, false);           // settle on the full-resolution surface
+    scheduleWarm();                            // keep filling for the next Play
+  }
 }
 
 function stopPlayback() {
   setPlaying(false); recording = false;
-  if (state.timeline.length) renderFrame(0);
+  fillToken++;
+  if (state.timeline.length) renderFrame(0, false);
   status("Stopped.");
 }
 
 async function recordSeries() {
-  if (!state.timeline.length && !buildTimeline()) { status("Build a path first (shift-click states).", "warn"); return; }
+  if (!state.timeline.length && !(await buildTimeline())) { status("Build a path first (shift-click states).", "warn"); return; }
   const active = state.render === "surface" ? renderer : volRenderer;
   if (!active || !active.captureStream) { status("Recording unavailable for this view.", "err"); return; }
   let rec = null; const chunks = [];
@@ -854,10 +1765,14 @@ async function recordSeries() {
     rec.start();
   } catch (err) { status("Recording unavailable: " + err.message, "err"); return; }
   recording = true; setPlaying(true);
-  backgroundFill();
-  await renderFrame(0);
+  // Recording stays on full-resolution frames — an exported movie is the one place the
+  // draft would be a real loss — but it now prefetches ahead of itself instead of decoding
+  // strictly in lockstep, so the capture stalls less between frames.
+  prefetch(false);
+  await renderFrame(0, false);
   const { delay: recDelay, step: recStep } = playCadence();   // record what playback shows
-  for (let i = recStep; i < state.timeline.length && playing; i += recStep) { await renderFrame(i); status(`Recording… ${i + 1}/${state.timeline.length}`, "busy"); await sleep(recDelay); }
+  for (let i = recStep; i < state.timeline.length && playing; i += recStep) { await renderFrame(i, false); status(`Recording… ${i + 1}/${state.timeline.length}`, "busy"); await sleep(recDelay); }
+  fillToken++;
   setPlaying(false); recording = false;
   rec.stop(); rec.onstop = () => downloadBlob(new Blob(chunks, { type: "video/webm" }), "morph.webm");
   status("Recording saved (morph.webm).");
@@ -885,14 +1800,46 @@ function dragHandle(el, onMove) {
 }
 
 // ---- lasso selection (app-owned overlay; works for the active 2D or 3D view) ----
+
+// Match the overlay canvases' backing stores to their CSS boxes.
+//
+// This has to be re-checked before every draw, not only on window resize. The overlays
+// are stretched to their box by CSS (`.canvas-wrap > canvas { inset: 0 }`), so when the
+// box changes without the *window* changing — clustering adds k+1 rows to the layers
+// rail, which widens it and shrinks the canvas beside it — the backing store keeps its
+// old pixel size and the browser rescales the bitmap into the new box. Everything drawn
+// on it then lands off by that scale factor, which is why the centroid markers sat
+// beside their clusters right after "Cluster" and snapped into place on the next window
+// resize. The scatter renderer already re-syncs itself this way on every frame
+// (scatter.js) — that's why the points were always right and only the overlay was off.
+function sizeOverlays() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  for (const [id, ctx] of [["lassoCanvas", lctx], ["centroidOverlay", centroidCtx]]) {
+    const c = $(id); if (!c) continue;
+    const w = Math.max(1, Math.floor(c.clientWidth * dpr)), h = Math.max(1, Math.floor(c.clientHeight * dpr));
+    // Only on a real change: assigning width/height clears the canvas, and this now runs
+    // per render (an in-progress lasso path would blink away every frame otherwise).
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+}
 function sizeLasso() {
-  const lc = $("lassoCanvas"); const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  lc.width = Math.max(1, lc.clientWidth * dpr); lc.height = Math.max(1, lc.clientHeight * dpr);
-  if (lctx) lctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  sizeOverlays();
+  syncCentroidOverlay();
 }
 function setupLasso() {
-  const lc = $("lassoCanvas"); lctx = lc.getContext("2d"); sizeLasso();
+  const lc = $("lassoCanvas"); lctx = lc.getContext("2d");
+  centroidCtx = $("centroidOverlay").getContext("2d");
+  sizeLasso();
   window.addEventListener("resize", sizeLasso);
+  // Layout changes that no resize event reports: the layers rail growing, the pane
+  // divider being dragged, the panel collapsing. Watching the boxes themselves catches
+  // all of them. Safe from feedback loops — the canvases are absolutely positioned and
+  // sized by CSS, so writing width/height cannot change their layout.
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => sizeLasso());
+    ro.observe(lc); ro.observe($("centroidOverlay"));
+  }
   // Middle-mouse drag pans the active landscape even while a tool is armed (the
   // overlay otherwise swallows drags for lasso / draw). Capture phase + stop-
   // propagation so it beats the tool handlers below; routes to the 2D or 3D view.
@@ -954,7 +1901,10 @@ function setupLasso() {
     if (editingPathLayer) {                                // index-path waypoint editing
       const proj = activeLand().projectedPoints();
       const wp = hitWaypoint(e.offsetX, e.offsetY, currentTrajectory(), proj);
-      if (wp >= 0) { draggingWp = wp; drawDragPreview(currentTrajectory(), wp, [e.offsetX, e.offsetY], proj); return; }
+      // Hold the projection for the whole drag: dragging a waypoint cannot move the
+      // camera, so it never changes — and recomputing it per mousemove re-projects and
+      // re-allocates every state (a million [x,y] arrays, which froze the drag outright).
+      if (wp >= 0) { draggingWp = wp; dragProj = proj; drawDragPreview(currentTrajectory(), wp, [e.offsetX, e.offsetY], proj); return; }
     }
     drawing = true; drawPts = [[e.offsetX, e.offsetY]];     // stroke or tap (resolved on pointerup)
   });
@@ -965,7 +1915,7 @@ function setupLasso() {
       orbX = e.clientX; orbY = e.clientY; return;
     }
     if (draggingCtrl >= 0) { const v = screenToVec(e.offsetX, e.offsetY); if (v) { editCurve.ctrl[draggingCtrl] = v; refreshFreeCurves(); } return; }
-    if (draggingWp >= 0) { drawDragPreview(currentTrajectory(), draggingWp, [e.offsetX, e.offsetY], activeLand().projectedPoints()); return; }
+    if (draggingWp >= 0) { drawDragPreview(currentTrajectory(), draggingWp, [e.offsetX, e.offsetY], dragProj || activeLand().projectedPoints()); return; }
     if (drawing) { drawPts.push([e.offsetX, e.offsetY]); drawStroke(); }
   });
   lc.addEventListener("pointerup", (e) => {
@@ -983,8 +1933,8 @@ function setupLasso() {
     }
     lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
     if (draggingWp >= 0) {                                  // drop the dragged waypoint on the nearest state
-      const proj = activeLand().projectedPoints();
-      const i = nearestPointTo(e.offsetX, e.offsetY, proj), pos = draggingWp; draggingWp = -1;
+      const proj = dragProj || activeLand().projectedPoints();
+      const i = nearestPointTo(e.offsetX, e.offsetY, proj), pos = draggingWp; draggingWp = -1; dragProj = null;
       if (i >= 0) { const traj = currentTrajectory(); traj[pos] = i; applyTrajectory(traj, pos === 0); status(`Moved waypoint ${pos + 1} → state #${i}.`); }
       return;
     }
@@ -1010,8 +1960,9 @@ function setupLasso() {
 function commitCurve() { renderLayers(); refreshFreeCurves(); }
 const pathHexColor = () => (editCurve ? editCurve.color : editingPathLayer ? editingPathLayer.color : "#f472b6");
 function nearestPointTo(sx, sy, proj) {
+  const scope = pickScopeSet();   // Feature 3: only consider points in the checked layers
   let best = -1, bestD = Infinity;
-  for (let i = 0; i < proj.length; i++) { const p = proj[i]; if (!p) continue; const dd = (p[0] - sx) ** 2 + (p[1] - sy) ** 2; if (dd < bestD) { bestD = dd; best = i; } }
+  for (let i = 0; i < proj.length; i++) { const p = proj[i]; if (!p) continue; if (scope && !scope.has(i)) continue; const dd = (p[0] - sx) ** 2 + (p[1] - sy) ** 2; if (dd < bestD) { bestD = dd; best = i; } }
   return best;
 }
 function hitWaypoint(sx, sy, traj, proj) {
@@ -1085,7 +2036,7 @@ function setPathDrawArmed(on) {
   pathDrawArmed = on;
   if (on && lassoArmed) setLassoArmed(false);
   if (!on) {
-    drawing = false; draggingWp = -1; draggingCtrl = -1; drawPts = []; orbiting = false;
+    drawing = false; draggingWp = -1; draggingCtrl = -1; drawPts = []; orbiting = false; dragProj = null;
     const finished = editCurve || editingPathLayer;
     editCurve = null;                                  // curve layers stay visible via refreshFreeCurves
     if (lctx) lctx.clearRect(0, 0, $("lassoCanvas").clientWidth, $("lassoCanvas").clientHeight);
@@ -1114,8 +2065,9 @@ function finishLasso() {
   const lc = $("lassoCanvas"); lctx.clearRect(0, 0, lc.clientWidth, lc.clientHeight);
   if (poly.length < 3) return;
   const proj = activeLand().projectedPoints();
+  const scope = pickScopeSet();   // Feature 3: lasso only grabs points in the checked layers
   const enclosed = [];
-  for (let i = 0; i < proj.length; i++) if (proj[i] && pointInPoly(proj[i], poly)) enclosed.push(i);
+  for (let i = 0; i < proj.length; i++) if (proj[i] && (!scope || scope.has(i)) && pointInPoly(proj[i], poly)) enclosed.push(i);
   let next;
   if (lassoMode === "add") { const s = new Set(state.selection); enclosed.forEach((i) => s.add(i)); next = [...s].sort((a, b) => a - b); }
   else if (lassoMode === "remove") { const s = new Set(state.selection); enclosed.forEach((i) => s.delete(i)); next = [...s]; }
@@ -1155,17 +2107,21 @@ function iconBtn(txt, title, fn) {
 function renderLayers() {
   const ul = $("layerList"); ul.innerHTML = "";
   $("noLayers").style.display = layers.length ? "none" : "";
+  $("layerSelRow").style.display = layers.length ? "" : "none";
   layers.forEach((ly) => {
     const isCurve = ly.kind === "curve";
     const editing = editingPathLayer === ly || editCurve === ly;
-    const li = document.createElement("li"); li.className = "layer-item" + (ly.visible ? "" : " hidden") + (editing ? " editing" : "") + (ly.kind === "path" || isCurve ? " path" : "");
+    const inScope = state.pickRestrict && ly.selected && ly.indices && ly.indices.length > 0;
+    const li = document.createElement("li"); li.className = "layer-item" + (ly.visible ? "" : " hidden") + (editing ? " editing" : "") + (ly.kind === "path" || isCurve ? " path" : "") + (inScope ? " in-scope" : "");
+    const chk = document.createElement("input"); chk.type = "checkbox"; chk.className = "lsel"; chk.checked = !!ly.selected; chk.title = "Select layer (bulk show / hide · pick-restrict scope)";
+    chk.addEventListener("change", () => { ly.selected = chk.checked; syncSelAll(); if (state.pickRestrict) { renderLayers(); status(pickScopeMsg()); } });
     const eye = iconBtn(ly.visible ? "◉" : "○", "Show / hide", () => { ly.visible = !ly.visible; renderLayers(); if (state.colorBy === "layers") applyColor(); });
     const sw = document.createElement("input"); sw.type = "color"; sw.className = "swatch"; sw.value = ly.color; sw.title = "Layer color";
     sw.addEventListener("input", (e) => { ly.color = e.target.value; if (state.colorBy === "layers") applyColor(); if (isCurve) refreshFreeCurves(); if (editingPathLayer === ly) syncSelection(); });
     const name = document.createElement("span"); name.className = "lname"; name.textContent = (ly.kind === "path" ? "↳ " : isCurve ? "∿ " : "") + ly.name; name.title = "Click to rename";
     name.addEventListener("click", () => { const v = prompt("Layer name", ly.name); if (v) { ly.name = v.trim() || ly.name; renderLayers(); } });
     const cnt = document.createElement("span"); cnt.className = "lcount"; cnt.textContent = `${isCurve ? ly.ctrl.length : ly.indices.length}`;
-    li.append(eye, sw, name, cnt);
+    li.append(chk, eye, sw, name, cnt);
     if (ly.kind === "path") li.append(iconBtn(editing ? "✓" : "✎", editing ? "Finish editing this path" : "Edit waypoints (shift-click to add/remove)", () => editPathLayer(ly)));
     if (isCurve) li.append(iconBtn(editing ? "✓" : "✎", editing ? "Finish editing this curve" : "Edit the curve (drag handles · alt-click delete · tap to insert)", () => editCurveLayer(ly)));
     li.append(iconBtn("▶", isCurve ? "Morph along this curve (snaps to nearest states)" : ly.kind === "path" ? "Morph along this path" : "Morph through this layer as a volume series", () => playLayerSeries(ly)));
@@ -1173,7 +2129,93 @@ function renderLayers() {
     li.append(iconBtn("✕", "Delete layer", () => removeLayer(ly)));
     ul.appendChild(li);
   });
+  syncSelAll();
   refreshFreeCurves();
+  syncCentroidOverlay();   // reflect centroid-layer visibility toggles immediately
+}
+
+// ---- bulk layer visibility + pick-scope (Features 1–3) ----
+const checkedLayers = () => layers.filter((l) => l.selected);
+
+// Feature 1: one button flips every layer on / off. If any are visible, hide all;
+// otherwise show all — so a single press always changes something visible.
+function toggleAllLayers() {
+  const anyVisible = layers.some((l) => l.visible);
+  layers.forEach((l) => (l.visible = !anyVisible));
+  renderLayers();
+  if (state.colorBy === "layers") applyColor();
+}
+
+// Feature 2: show / hide the checked layers. With none checked it falls back to
+// acting on every layer, so the buttons are never dead.
+function setCheckedVisible(v) {
+  const target = checkedLayers();
+  (target.length ? target : layers).forEach((l) => (l.visible = v));
+  renderLayers();
+  if (state.colorBy === "layers") applyColor();
+}
+
+// Keep the master "select" checkbox in sync (checked / indeterminate / clear).
+function syncSelAll() {
+  const box = $("selAllLayers");
+  if (!box) return;
+  const on = layers.filter((l) => l.selected).length;
+  box.checked = layers.length > 0 && on === layers.length;
+  box.indeterminate = on > 0 && on < layers.length;
+}
+
+// Feature 3: the union of indices in the checked layers (base states *and* centroids —
+// both are selectable), or null when the restriction is off / nothing is checked
+// (→ no restriction). Centroids (index >= L.n) aren't in the base cloud, so the renderer
+// can't pick them; resolvePick() hit-tests their markers app-side instead.
+function pickScopeSet() {
+  if (!state.pickRestrict || !L) return null;
+  const s = new Set();
+  for (const l of checkedLayers()) if (l.indices) for (const i of l.indices) s.add(i);
+  return s.size ? s : null;
+}
+function pickScopeMsg() {
+  const s = pickScopeSet();
+  if (!s) return "Pick-restrict on — check one or more layers to limit picking to their points.";
+  return `Picking limited to ${s.size} point(s) in the checked layers.`;
+}
+// Pick filter handed to the scatter/cloud renderers: their base-point click/hover picking
+// consults this on every pick, so pick-restrict limits which *base* points are selectable.
+// Centroids are handled separately in resolvePick(). Reads the live scope each time.
+const pickAllowed = (i) => { const s = pickScopeSet(); return !s || s.has(i); };
+
+// Resolve a click at client (cx,cy) into a selectable index. The renderer hands us the
+// nearest in-scope BASE point (or -1). We additionally hit-test the visible, in-scope
+// Centroids — which the renderers can't pick at all — and let a click on a centroid
+// marker win. This is what makes centroid picking (and "pick only Centroids") work.
+const activeCanvas = () => (is3d() && cloud ? $("scatter3d") : $("scatter"));
+function screenPosOf(idx) {
+  const vec = idx < L.n ? (activeCoords() || L.pca)[idx] : centroidCoords()[idx];
+  if (!vec) return null;
+  return (activeLand().projectData([axesOf(vec)]) || [null])[0];
+}
+const CENTROID_HIT2 = 12 * 12;   // CSS px²; a click this close to a marker selects it
+function resolvePick(baseIdx, cx, cy) {
+  const canvas = activeCanvas();
+  if (!canvas) return baseIdx;
+  const r = canvas.getBoundingClientRect();
+  const px = cx - r.left, py = cy - r.top;
+  const scope = pickScopeSet();
+  const cen = layers.find((l) => l.kind === "centroid" && l.visible);
+  let nc = null;   // nearest in-scope centroid
+  const cc = centroidCoords();
+  if (cen) for (const idx of cen.indices) {
+    if (!cc[idx] || (scope && !scope.has(idx))) continue;
+    const p = screenPosOf(idx); if (!p) continue;
+    const d = (p[0] - px) ** 2 + (p[1] - py) ** 2;
+    if (!nc || d < nc.d) nc = { idx, d };
+  }
+  if (nc && nc.d <= CENTROID_HIT2) return nc.idx;   // clicked on a centroid marker
+  if (baseIdx < 0) return nc ? nc.idx : -1;         // no in-scope base point (e.g. centroids-only)
+  if (!nc) return baseIdx;
+  const bp = screenPosOf(baseIdx);
+  const bd = bp ? (bp[0] - px) ** 2 + (bp[1] - py) ** 2 : Infinity;
+  return nc.d < bd ? nc.idx : baseIdx;             // whichever is nearer the click
 }
 
 // Delete a layer. Removing a cluster layer also drops its matching point from the
@@ -1187,7 +2229,8 @@ function removeLayer(ly) {
     if (cen) {
       const at = cen.indices.indexOf(ly.centroid);
       if (at >= 0) cen.indices.splice(at, 1);
-      delete indexColor[ly.centroid]; delete centroidPCA[ly.centroid];
+      delete indexColor[ly.centroid];
+      for (const m of Object.values(centroidVecs)) delete m[ly.centroid];
       if (!cen.indices.length) layers.splice(layers.indexOf(cen), 1);
     }
   }
@@ -1195,8 +2238,26 @@ function removeLayer(ly) {
   renderLayers(); refreshFreeCurves(); if (state.colorBy === "layers") applyColor();
 }
 
-const coordOf = (i) => (i >= L.n ? (centroidPCA[i] ? centroidPCA[i][state.x] : 0) : (activeCoords() || L.pca)[i][state.x]);
+const coordOf = (i) => (i >= L.n ? (centroidCoords()[i] ? centroidCoords()[i][state.x] : 0) : (activeCoords() || L.pca)[i][state.x]);
 const orderAlongAxis = (idx) => [...idx].sort((a, b) => coordOf(a) - coordOf(b));
+
+// Centroid coordinates for the *active* embedding, fetched once per embedding and kept.
+// The server returns them in cluster order, so coords[j] is the virtual index base + j —
+// the same order the centroid layer was built in. A no-op once they're cached, and when
+// there is no clustering yet.
+async function ensureCentroidCoords() {
+  if (!clusterQuery || centroidVecs[state.embedding]) return;
+  try {
+    const d = await (await fetch(`./api/centroid_coords?embed=${state.embedding}&${clusterQuery.q}`)).json();
+    const m = {};
+    d.coords.forEach((v, j) => { m[clusterQuery.base + j] = v; });
+    centroidVecs[state.embedding] = m;
+  } catch (err) {
+    // Leave the map absent rather than falling back to another embedding's coordinates:
+    // no marker beats a marker drawn in the wrong units.
+    status("Could not place the centroids in this view: " + err, "warn");
+  }
+}
 
 // ---- KMeans clustering -> one layer per cluster + a decodable centroid layer ----
 // Use your shift-clicked states (the morph picks) as the initial cluster centers.
@@ -1208,30 +2269,35 @@ function clusterFromPicks() {
 async function computeClusters(seeds) {
   const seeded = Array.isArray(seeds) && seeds.length >= 2;
   const k = Math.max(2, Math.min(20, +$("clusterK").value || 5));
-  const space = $("clusterSpace").value === "network" ? "network" : "view";
-  const q = (seeded ? `seeds=${seeds.join(",")}` : `k=${k}`) + `&space=${space}`;
+  const q = seeded ? `seeds=${seeds.join(",")}` : `k=${k}`;
   const url = `./api/kmeans?${q}`;
-  const spaceLbl = space === "network" ? "full network space" : "viewed space";
-  const label = (seeded ? `seeded KMeans (${seeds.length} picks)` : `KMeans (k=${k})`) + ` on ${spaceLbl}`;
+  const label = seeded ? `seeded KMeans (${seeds.length} picks)` : `KMeans (k=${k})`;
   status(`Computing ${label}…`, "busy");
-  let d;
-  try { d = await (await fetch(url)).json(); }
-  catch (err) { status("Clustering failed: " + err, "err"); return; }
+  let d, kLabels;
+  // Metadata and the per-state labels come over separately — the labels as binary. The
+  // server memoises the clustering, so the second request is a lookup, not a second run.
+  try {
+    d = await (await fetch(url)).json();
+    kLabels = await fetchLabels(`./api/kmeans.bin?${q}`);
+  } catch (err) { status("Clustering failed: " + err, "err"); return; }
   if (seeded) $("clusterK").value = d.k;   // reflect the seed-derived cluster count
   // drop previous auto-generated cluster/centroid layers (keep manual ones)
   for (let i = layers.length - 1; i >= 0; i--) if (layers[i].kind === "cluster" || layers[i].kind === "centroid") layers.splice(i, 1);
-  indexColor = {}; centroidPCA = {};
+  indexColor = {}; centroidVecs = {}; clusterQuery = { q, base: d.base };
   const groups = Array.from({ length: d.k }, () => []);
-  d.labels.forEach((lab, i) => groups[lab] && groups[lab].push(i));
+  for (let i = 0; i < kLabels.length; i++) { const g = groups[kLabels[i]]; if (g) g.push(i); }
   // Tag each cluster with its centroid's virtual index so deleting the cluster
   // can drop the matching point from the Centroids layer.
   groups.forEach((idxs, j) => layers.push({ name: `Cluster ${j + 1}`, color: clusterColor(j), indices: idxs, visible: true, kind: "cluster", centroid: d.base + j }));
   const cents = [];
-  for (let j = 0; j < d.k; j++) { const idx = d.base + j; cents.push(idx); indexColor[idx] = clusterColor(j); centroidPCA[idx] = d.centroid_pca[j]; }
+  const pcaMap = {};
+  for (let j = 0; j < d.k; j++) { const idx = d.base + j; cents.push(idx); indexColor[idx] = clusterColor(j); pcaMap[idx] = d.centroid_pca[j]; }
+  centroidVecs.pca = pcaMap;
+  await ensureCentroidCoords();   // the active view may not be PCA
   layers.push({ name: "Centroids", color: "#ffffff", indices: cents, visible: true, kind: "centroid" });
   $("colorby").value = "layers"; state.colorBy = "layers"; toggleColorWraps();
   renderLayers(); applyColor();
-  status(`${seeded ? "Seeded KMeans" : "KMeans"} k=${d.k} on ${spaceLbl}: ${d.k} cluster layers + a centroid layer (▶ to morph between clusters).`);
+  status(`${seeded ? "Seeded KMeans" : "KMeans"} k=${d.k}: ${d.k} cluster layers + a centroid layer (▶ to morph between clusters).`);
 }
 
 // Surface/volume color for a decoded state: cluster color for centroids, else the picker.
@@ -1264,7 +2330,8 @@ async function saveAllLayers() {
 
 async function playLayerSeries(ly) {
   // curve = snap the spline to states (silently); path = stored waypoint order; else order along the axis
-  const ordered = ly.kind === "curve" ? curveToIndices(ly)
+  if (ly.kind === "curve") status("Snapping the curve to states…", "busy");
+  const ordered = ly.kind === "curve" ? await curveToIndices(ly)
     : ly.kind === "path" ? ly.indices.filter((v) => v >= 0)
       : orderAlongAxis(ly.indices);
   if (ordered.length < 2) { status(ly.kind === "curve" ? "Draw the curve across at least two states." : "A series needs ≥2 states.", "warn"); return; }
@@ -1273,6 +2340,10 @@ async function playLayerSeries(ly) {
   state.current = ordered[0]; state.path = ordered.slice(1); state.frame = 0;
   syncSelection(); updatePathLabel(); $("sel").textContent = `state #${ordered[0]}`;
   try { const h = await (await fetch(`./api/histogram?index=${ordered[0]}`)).json(); hist.setData(h, h.mean + state.sigma * h.std); } catch { /* keep */ }
+  // Explicitly, before playing: a cluster series can arrive with hundreds of states, and
+  // buildTimeline is what thins it and prices the hops. (updatePathLabel fires it too, but
+  // does not await it — and togglePlay must not race a half-built timeline.)
+  await buildTimeline();
   await decode();                              // sets refMass for the constant-mass series
   togglePlay();
 }

@@ -92,14 +92,28 @@ def build_app(volume: np.ndarray, title: str = "Map", filename: str = "") -> Fas
             "sigma_level": level_for_sigma(vol, 2.5),
         }
 
+    # Strided copies of the map, cached per draft size (the map itself never changes here).
+    _drafts: dict[int, tuple[np.ndarray, int]] = {}
+
     @app.get("/api/decode")
     def decode(
         sigma: float = Query(2.5),
         mass: float = Query(-1.0),     # >=0 -> contour at constant enclosed mass
         smooth: int = Query(0),        # Taubin smoothing iterations on the surface
+        size: int = Query(0),          # >0 -> draft mesh from a strided grid this big
     ) -> Response:
-        level = level_for_mass(vol, mass) if mass >= 0 else level_for_sigma(vol, sigma)
-        return Response(content=mesh_at(vol, level, smooth=max(0, min(50, smooth))),
+        full = max(vol.shape)
+        if 0 < size < full:
+            # Live draft while the contour is being dragged; see server.py's decode.
+            if size not in _drafts:
+                _drafts[size] = _downsample(vol, int(size))
+            grid, step = _drafts[size]
+        else:
+            grid, step = vol, 1
+        level = (level_for_mass(grid, mass / float(step) ** 3) if mass >= 0
+                 else level_for_sigma(grid, sigma))
+        return Response(content=mesh_at(grid, level, smooth=max(0, min(50, smooth)),
+                                        step=step, full_size=full),
                         media_type="application/octet-stream")
 
     @app.get("/api/grid")

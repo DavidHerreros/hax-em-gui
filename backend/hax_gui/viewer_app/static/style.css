@@ -88,7 +88,8 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .pane-body { flex: 1; display: flex; min-height: 0; min-width: 0; }
 .layers { width: 196px; flex-shrink: 0; border-right: 1px solid var(--border); background: rgba(15, 23, 42, 0.55); display: flex; flex-direction: column; min-height: 0; }
 .layers.collapsed { display: none; }
-.layers-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); flex-shrink: 0; }
+.layers-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; row-gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); flex-shrink: 0; }
+.layers-head #toggleAllLayers { font-size: 15px; margin-right: auto; }
 .layer-list { list-style: none; margin: 0; padding: 6px; display: flex; flex-direction: column; gap: 5px; overflow: auto; }
 .layer-item { display: flex; align-items: center; gap: 6px; padding: 5px 6px; border: 1px solid var(--border); border-radius: 7px; font-size: 12px; background: var(--panel); }
 .layer-item .swatch { width: 13px; height: 13px; border-radius: 3px; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.15); padding: 0; cursor: pointer; }
@@ -105,6 +106,12 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .cluster-row input[type="number"] { width: 48px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 2px 5px; }
 .cluster-row .btn { white-space: nowrap; }
 .cluster-row .btn:first-of-type { margin-left: auto; }
+/* the layer bulk-action row keeps its controls grouped left (not pushed apart) */
+.layer-sel-row .btn:first-of-type { margin-left: 0; }
+.layer-sel-row label { cursor: pointer; }
+.layer-item .lsel { flex-shrink: 0; margin: 0; cursor: pointer; }
+/* a layer inside the active pick scope reads brighter than the rest */
+.layer-item.in-scope { border-color: var(--accent); }
 
 /* ── canvas area ── */
 .canvas-wrap { flex: 1; position: relative; min-width: 0; min-height: 0; }

@@ -10,6 +10,7 @@ import { errorBox } from "./ui.js";
 import { openFilePicker } from "./filePicker.js";
 import { jobLabelChips } from "./labels.js";
 import { metricsPanel } from "./metricsPanel.js";
+import { runBrowser, folderName } from "./runBrowser.js";
 
 export function MetricsView() {
   const root = h("div", { class: "view metrics-view" });
@@ -23,31 +24,31 @@ export function MetricsView() {
   root.appendChild(h("header", { class: "page-head" }, h("h1", null, "Metrics"),
     h("p", { class: "subtitle" }, "Training curves, image panels and the latent space, read straight from a run's logs.")));
 
-  // -- available runs (jobs with event files) ---------------------------
+  // -- available runs (jobs with event files), grouped by project + filterable -------
   const runsBox = h("div", { style: { marginBottom: "20px" } });
   root.appendChild(runsBox);
 
-  function loadRuns() {
-    mount(runsBox, h("p", { class: "muted small", style: { margin: "8px 0" } }, "Loading available runs…"));
-    api.metricsJobs()
-      .then((jobs) => mount(runsBox, renderRuns(jobs)))
-      .catch((err) => mount(runsBox, errorBox(err)));
-  }
-
-  function renderRuns(jobs) {
-    const header = h("div", { class: "row section-head" },
-      h("h2", { class: "section", style: { margin: 0 } }, "Available runs"),
-      h("button", { class: "btn-icon", title: "Refresh", style: { marginLeft: "auto" }, onclick: loadRuns }, icon("refresh", 15)));
-    if (!jobs.length) {
-      return h("div", null, header, h("p", { class: "muted small" }, "No runs with metrics yet. Train a model, then refresh."));
-    }
-    return h("div", null, header, ...jobs.map((j) => h("button", { class: "run-row", onclick: () => open(j.workdir, j.program, j.id) },
-      h("span", { class: "run-prog mono" }, j.program),
-      j.project_name ? h("span", { class: "proj-chip" }, icon("box", 12), j.project_name) : null,
+  const browser = runBrowser({
+    renderRow: (j) => h("button", { class: "run-row", onclick: () => open(j.workdir, j.name || j.program, j.id) },
+      h("span", { class: "run-prog mono" }, j.name || j.program),
+      j.name ? h("span", { class: "run-sub mono" }, j.program) : null,
       h("span", { class: "run-folder mono" }, folderName(j.workdir)),
       (j.labels && j.labels.length) ? jobLabelChips(j) : null,
       h("span", { class: "run-time" }, new Date(j.created_at).toLocaleString()),
-      h("span", { class: "run-open" }, icon("chart", 14), "Open"))));
+      h("span", { class: "run-open" }, icon("chart", 14), "Open")),
+    emptyText: "No runs with metrics yet. Train a model, then refresh.",
+  });
+  mount(runsBox, h("div", null,
+    h("div", { class: "row section-head" },
+      h("h2", { class: "section", style: { margin: 0 } }, "Available runs"),
+      h("button", { class: "btn-icon", title: "Refresh", style: { marginLeft: "auto" }, onclick: loadRuns }, icon("refresh", 15))),
+    browser.el));
+
+  function loadRuns() {
+    browser.setStatus(h("p", { class: "muted small", style: { margin: "8px 0" } }, "Loading available runs…"));
+    api.metricsJobs()
+      .then((jobs) => browser.setJobs(jobs))
+      .catch((err) => browser.setStatus(errorBox(err)));
   }
 
   // -- manual launch ----------------------------------------------------
@@ -119,9 +120,4 @@ export function MetricsView() {
       panels.clear();
     },
   };
-}
-
-function folderName(p) {
-  const parts = (p || "").replace(/\/+$/, "").split("/");
-  return parts[parts.length - 1] || "run";
 }

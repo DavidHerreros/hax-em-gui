@@ -41,6 +41,40 @@ def status() -> dict:
         return {"available": False, "error": str(e)}
 
 
+def reindex_docs(*, force: bool = True) -> dict:
+    """Rebuild the docs vector index in place from the current hax-em-docs
+    checkout, so doc edits are picked up without restarting the GUI process."""
+    if not _INSTALLED:
+        return {"ok": False, "reason": "assistant not installed", "chunks": 0}
+    try:
+        return _get().reindex_docs(force=force)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": str(e), "chunks": 0}
+
+
+def list_gpus() -> list[dict]:
+    """Visible GPUs (for the prepare-motion confirmation's GPU picker)."""
+    if not _INSTALLED:
+        return []
+    try:
+        from hax_assistant.actions import list_gpus as _lg
+        return _lg()
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def plan_prepare_motion(run_dir: str) -> dict:
+    """Read-only plan of what preparing regional motion for a run would do."""
+    from hax_assistant.actions import plan_motion_preparation
+    return plan_motion_preparation(run_dir)
+
+
+def run_prepare_motion(run_dir: str, gpu, *, on_progress=None) -> str:
+    """Execute the (confirmed) prepare-motion pipeline; returns the deformation dir."""
+    from hax_assistant.actions import prepare_motion
+    return prepare_motion(run_dir, gpu, on_progress=on_progress)
+
+
 def stream_reply(messages: list[dict], grounded: bool = True,
                  run: Optional[dict] = None) -> Iterator[str]:
     """Yield reply tokens for a conversation (list of {role, content})."""
@@ -71,6 +105,17 @@ def generate_report(out_path: str, *, run_dir: Optional[str] = None,
 
     session = _get()
     measured, _steps = session.build_run_context(run_dir=run_dir, latents=latents, volumes=volumes)
+
+    # Per-domain regional motion (exact from the deformation field when exported,
+    # else an honest density-only description). Best-effort — never blocks the report.
+    regional = None
+    if volumes or run_dir:
+        try:
+            from hax_assistant.context.regional import analyze_regional_motion
+            regional = analyze_regional_motion(volumes=volumes, run_dir=run_dir)
+        except Exception:  # noqa: BLE001
+            regional = None
+
     # Request only the discussion sections whose data is present, so each
     # paragraph lines up with the figure it introduces in the report.
     keys = ["overview"]
@@ -80,8 +125,11 @@ def generate_report(out_path: str, *, run_dir: Optional[str] = None,
         keys.append("metrics")
     if volumes:
         keys.append("motion")
+    if regional is not None and regional.regions:
+        keys.append("regional")
     sections = (session.narrate_run_sections(measured, keys)
                 if (narrate and measured) else {})
     inp = ReportInputs(title=title, subtitle=subtitle, run_dir=run_dir, latents=latents,
-                       volumes=volumes, measured_text=measured, sections=sections)
+                       volumes=volumes, measured_text=measured, sections=sections,
+                       regional=regional)
     return build_report(out_path, inp)

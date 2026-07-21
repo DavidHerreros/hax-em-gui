@@ -3,6 +3,24 @@
 Single-server, plain-subprocess execution (PLAN.md §10). Jobs run detached from
 any one client so long trainings survive browser disconnects; the UI reattaches
 to live logs on reconnect. Job metadata lives in SQLite; full logs are files.
+
+Jobs also outlive the *server*. Stopping, restarting or updating the GUI leaves a
+running training alone, and the next server process reattaches to it. Three things
+make that work, and all three are load-bearing:
+
+* **The job owns its log file descriptors** (`_launch`). They used to be pipes whose
+  only read end lived in this process, so the moment the server exited the job's next
+  write got EPIPE and the whole tree — the program and every grain worker that
+  inherited the fd — died. `start_new_session=True` never protected against that: the
+  pipe, not a signal, was the leash. Writing straight to the file changes nothing about
+  what is written (a pipe and a file are both non-TTYs, so the program emits the same
+  ANSI and the same `\\r` progress frames), it just stops the server's exit from
+  killing the job.
+* **The job records its own exit status** (`_wrap`). After a restart we are no longer
+  the job's parent, so `waitpid` is gone and a reattached job could only ever be seen
+  to vanish, never to have succeeded or failed.
+* **Identity, not just a pid** (`_proc_key`). Pids get recycled, so a stored pid alone
+  is not safe to signal after a restart — it could name an innocent process by then.
 """
 
 from __future__ import annotations
@@ -12,6 +30,7 @@ import codecs
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -92,6 +111,107 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# How often a reattached job's log file is polled for new bytes. The old pipe reader
+# woke on every write; this is a poll, so it trades a little latency for the job being
+# able to outlive us. The terminal collapses `\r` frames anyway, so coalescing a few
+# progress updates into one chunk looks no different on screen.
+TAIL_INTERVAL = 0.2
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # exists, just not ours to signal
+    return True
+
+
+def _proc_key(pid: int) -> str | None:
+    """A cheap identity for a pid: its start time, in clock ticks since boot.
+
+    A pid on its own is *not* safe to signal across a restart — the kernel recycles
+    them, so a pid stored yesterday may name something else entirely today, and
+    `killpg` on it would take out an innocent process group. Pairing the pid with its
+    start time makes reuse detectable: a recycled pid is necessarily younger than the
+    one we recorded.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    # Field 2 (comm) is parenthesised and may itself contain spaces and ')', so split
+    # only what follows the *last* ')'. starttime is field 22 overall, i.e. index 19
+    # of the remainder.
+    try:
+        rest = data[data.rindex(b")") + 2:].split()
+        return rest[19].decode()
+    except (ValueError, IndexError):
+        return None
+
+
+def _group_alive(pgid: int, key: str | None) -> bool:
+    """Is the job's process-group leader still the very process we launched?"""
+    if not pgid or pgid <= 0 or not _pid_alive(pgid):
+        return False
+    if not key:
+        return True          # pre-migration row: no identity recorded, trust the pid
+    now = _proc_key(pgid)
+    return now is not None and now == key
+
+
+def _group_members(pgid: int) -> list[int]:
+    """Every live pid in a process group."""
+    out: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out
+    for d in entries:
+        if not d.isdigit():
+            continue
+        pid = int(d)
+        try:
+            if os.getpgid(pid) == pgid:
+                out.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return out
+
+
+def _exit_path(log_path: str) -> str:
+    """Where the job records its own exit status: run.log -> run.exit."""
+    p = Path(log_path)
+    return str(p.with_name(p.stem + ".exit"))
+
+
+def _size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _read_exit(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _wrap(command: list[str], exit_path: str) -> list[str]:
+    """Run `command`, then leave its exit status somewhere a future server can read it.
+
+    `exit $rc` keeps the wrapper's own exit code equal to the program's, so the common
+    case — we are still the parent and simply wait on it — behaves exactly as before.
+    """
+    return ["/bin/sh", "-c",
+            f'{shlex.join(command)}; rc=$?; printf %s "$rc" > {shlex.quote(exit_path)}; exit $rc']
+
+
 class JobManager:
     def __init__(self) -> None:
         self._db: sqlite3.Connection | None = None
@@ -130,23 +250,60 @@ class JobManager:
             """
         )
         # Add columns to pre-existing databases (idempotent).
-        for col in ("project_id TEXT", "workdir TEXT", "cwd TEXT", "name TEXT", "bindings TEXT"):
+        for col in ("project_id TEXT", "workdir TEXT", "cwd TEXT", "name TEXT", "bindings TEXT",
+                    "pgid INTEGER", "proc_key TEXT"):
             try:
                 self._db.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
-        # Any job still marked active from a previous run lost its process.
-        self._db.execute(
-            "UPDATE jobs SET status='interrupted', finished_at=? WHERE status IN ('pending','running')",
-            (_now(),),
-        )
-        # A job left mid-cancel ('cancelling') also lost its process — finalise it
-        # as cancelled so it never sticks at 'cancelling' across a restart.
-        self._db.execute(
-            "UPDATE jobs SET status='cancelled', finished_at=? WHERE status='cancelling'",
-            (_now(),),
-        )
+        self._reconcile()
+
+    def _reconcile(self) -> None:
+        """Work out what actually happened to the jobs of the previous server process.
+
+        This used to be a blanket "anything that was running is now interrupted", which
+        was true only because the log pipe killed every job when the server exited. Jobs
+        now survive that, so we have to look: a job whose process group is still alive is
+        still *running* and gets picked up by :meth:`reattach`; one that finished while we
+        were down left its exit status behind (see `_wrap`) and is finalised from it.
+        """
+        assert self._db is not None
+        rows = self._db.execute(
+            "SELECT id, pgid, proc_key, status, log_path FROM jobs "
+            "WHERE status IN ('pending','running','cancelling')"
+        ).fetchall()
+        self._reattach: list[dict[str, Any]] = []
+        for r in rows:
+            pgid = int(r["pgid"] or 0)
+            if _group_alive(pgid, r["proc_key"]):
+                self._reattach.append(dict(r))     # outlived us; reattach() resumes it
+                continue
+            # Gone. Did it get to say why? ('pending' never launched, so it never can.)
+            rc = _read_exit(_exit_path(r["log_path"]))
+            if r["status"] == "cancelling":
+                final = "cancelled"
+            elif rc is None:
+                final = "interrupted"              # killed from outside, or the box went down
+            else:
+                final = "succeeded" if rc == 0 else "failed"
+            self._db.execute(
+                "UPDATE jobs SET status=?, return_code=?, finished_at=? WHERE id=?",
+                (final, rc, _now(), r["id"]),
+            )
         self._db.commit()
+
+    async def reattach(self) -> None:
+        """Resume supervision of the jobs that outlived the previous server process."""
+        pending, self._reattach = getattr(self, "_reattach", []), []
+        for r in pending:
+            out_path = r["log_path"]
+            err_path = self._err_path(out_path)
+            # Tail from the current end: the UI replays the history from the file itself
+            # (read_log), so re-publishing it over the socket would only duplicate it.
+            asyncio.create_task(self._supervise_detached(
+                r["id"], int(r["pgid"] or 0), r["proc_key"], out_path, err_path,
+                _size(out_path), _size(err_path),
+            ))
 
     # -- creation / launch -------------------------------------------------
     async def create(
@@ -193,13 +350,27 @@ class JobManager:
         if out_arg:
             values[out_arg] = str(workdir)
 
-        # Auto-fill the SSD scratch dir (shared per project+program) when a
-        # scratch root is configured, so users never pass an SSD path.
+        # Auto-fill the SSD scratch dir (shared per project) when a scratch root is
+        # configured, so users never pass an SSD path.
+        #
+        # Shared by every program in the project, deliberately. hax caches the particle
+        # images inside this folder as an array-record copy, and that copy is expensive:
+        # building it means reading the whole stack once (410 GB for 1M particles at box
+        # 320 -- an hour off a spinning disk). It is also program-agnostic -- HetSIREN,
+        # MoDART and reconstruct_volume all build and read exactly the same shards -- so a
+        # per-program folder made each of them pay that price separately. One folder per
+        # project means whoever runs first pays, and everyone after reads from the SSD.
+        #
+        # This is safe because hax names each cache directory after the *dataset* it holds
+        # (MetaDataGenerator._cache_dir: a digest of the metadata path, particle count, box
+        # and precision). Two datasets in one project therefore get two directories rather
+        # than silently sharing one -- which is what previously made a shared folder
+        # dangerous, and why this used to be split per program.
         ssd_dir = None
         ssd_arg = registry.ssd_arg(program)
         ssd_root = settings_store.ssd_scratch_root()
         if ssd_arg and ssd_root is not None:
-            ssd_dir = ssd_root / project_id / program
+            ssd_dir = ssd_root / project_id
             values[ssd_arg] = str(ssd_dir)
 
         # The run folder is created up-front so bound inputs (derived from a
@@ -213,12 +384,16 @@ class JobManager:
             shutil.rmtree(workdir, ignore_errors=True)
             raise
         if ssd_dir is not None:
-            # The SSD scratch is shared per project+program and reused across runs
-            # (the generator skips rebuilding when cached shards exist). Optionally
-            # discard it so it's rebuilt from the current inputs — only on an actual
-            # launch, so a merely-saved job can't clobber a concurrent run's scratch.
+            # The SSD scratch is shared per project and reused across runs (the generator
+            # skips rebuilding when cached shards exist). Optionally discard it so it's
+            # rebuilt from the current inputs — only on an actual launch, so a merely-saved
+            # job can't clobber a concurrent run's scratch.
+            #
+            # Only THIS job's dataset is discarded, never the whole folder: it now holds the
+            # caches of every dataset in the project, and wiping it would throw away hours of
+            # rebuilding for datasets this run has nothing to do with.
             if recreate_ssd and launch and ssd_dir.exists():
-                shutil.rmtree(ssd_dir, ignore_errors=True)
+                self._purge_dataset_cache(ssd_dir, values.get(registry.working_dir_arg(program)))
             ssd_dir.mkdir(parents=True, exist_ok=True)
 
         # Launch from the metadata file's folder so relative image references in
@@ -374,6 +549,55 @@ class JobManager:
         self._exec("UPDATE jobs SET name=? WHERE id=?", ((name or "").strip() or None, job_id))
         return self.get(job_id)
 
+    def copy_prefill(self, job_id: str) -> dict[str, Any]:
+        """The recipe for re-creating a job in *another* project, as a launcher prefill.
+
+        We copy the program and its parameters, but not anything tied to the source
+        project or its run folder: the auto-managed output/SSD dirs are dropped (the new
+        project regenerates them), and every job-derived input field is cleared -- both
+        real bindings (which point at the source project's jobs) and literal data paths
+        (raw metadata etc.) -- so they are chosen fresh in the target project. The result
+        seeds the New Run form; nothing is created until the user saves or launches."""
+        job = self.get(job_id)
+        if job is None:
+            raise JobNotFound(job_id)
+        program = job["program"]
+        values = dict(job.get("args") or {})
+        for auto in (registry.output_arg(program), registry.ssd_arg(program)):
+            if auto:
+                values.pop(auto, None)
+        for field in adapters.bindable_fields(program):
+            values.pop(field, None)
+        return {"program": program, "gpu": job.get("gpu") or "", "values": values, "name": job.get("name") or ""}
+
+    @staticmethod
+    def _purge_dataset_cache(ssd_dir: Path, md_path: str | None) -> None:
+        """Delete the cached images of one dataset from the project's shared scratch folder.
+
+        hax writes each cache as ``<scratch>/images_mmap*_<digest>/`` with a ``manifest.json``
+        naming the dataset it holds, so we match on that rather than recomputing the digest
+        here — the GUI must not have to know how hax hashes a dataset. A cache with no
+        manifest predates that scheme (or isn't ours) and is left alone.
+
+        With no metadata path to match (a program whose scratch isn't keyed to an ``--md``),
+        nothing is deleted: silently wiping every dataset in the project would be far worse
+        than ignoring the checkbox.
+
+        Deleting shards from under a job that is *currently* streaming them is safe on POSIX:
+        the reader holds the files open, so the data survives until it closes. The next run
+        rebuilds them.
+        """
+        if not md_path:
+            return
+        target = os.path.abspath(str(md_path))
+        for manifest in ssd_dir.glob("images_mmap*/manifest.json"):
+            try:
+                held = json.loads(manifest.read_text()).get("md")
+            except (OSError, json.JSONDecodeError):
+                continue
+            if held and os.path.abspath(str(held)) == target:
+                shutil.rmtree(manifest.parent, ignore_errors=True)
+
     @staticmethod
     def _launch_cwd(program: str, values: dict[str, Any], workdir: Path) -> str:
         wd_arg = registry.working_dir_arg(program)
@@ -390,84 +614,176 @@ class JobManager:
 
     async def _launch(self, job_id: str, command: list[str], log_path: str, cwd: str | None = None,
                       append_out: bool = False) -> None:
+        out_path, err_path = log_path, self._err_path(log_path)
+        exit_path = _exit_path(log_path)
+        with contextlib.suppress(OSError):
+            os.remove(exit_path)   # a stale status from a previous run must not be read back
+        # On an in-place continue stdout is appended (its history is kept) and we stream
+        # from where it already ended; stderr always starts fresh.
+        out_off = _size(out_path) if append_out else 0
+
+        try:
+            # The job owns these fds — this is what lets it outlive the server. They used
+            # to be pipes whose only read end was ours, so our exit gave the job (and every
+            # grain worker that inherited the fd) EPIPE on its next write and killed the
+            # whole tree. What gets *written* is unchanged: a pipe and a regular file are
+            # both non-TTYs, so the program emits the same ANSI and the same `\r` progress
+            # frames, and the terminal in the UI still overwrites them in place.
+            out_f = open(out_path, "ab" if append_out else "wb")
+            err_f = open(err_path, "wb")
+        except OSError as exc:
+            self._fail_launch(job_id, exc)
+            return
+
         try:
             proc = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                # Keep stderr on its own pipe so the UI can show it in a separate
-                # tab (its own log file, buffer and stream-tagged chunks).
-                stderr=asyncio.subprocess.PIPE,
+                *_wrap(command, exit_path),
+                stdout=out_f,
+                stderr=err_f,
                 cwd=cwd,
-                # hax colorizes output only on a TTY (honoring NO_COLOR/FORCE_COLOR).
-                # We capture stdout through a pipe (not a TTY), but the log viewer
-                # renders ANSI, so request colors explicitly with FORCE_COLOR.
+                # hax colorizes output only on a TTY (honoring NO_COLOR/FORCE_COLOR). The
+                # log viewer renders ANSI, so ask for colors explicitly.
                 env={**os.environ, "FORCE_COLOR": "1"},
-                # Own session/process group: a hax program spawns its real workers
-                # via `forkserver` (JAX/CUDA), and those grandchildren inherit the
-                # stdout pipe. Cancelling must signal the whole group, or they keep
-                # the pipe open, the reader never sees EOF, and the job is stuck
-                # "cancelling" forever. start_new_session => pgid == proc.pid.
+                # Own session/process group: a hax program spawns its real workers via
+                # `forkserver` (JAX/CUDA). Signalling must reach the whole group, or the
+                # workers survive the leader and keep holding the GPU.
+                # start_new_session => pgid == proc.pid.
                 start_new_session=True,
             )
         except OSError as exc:
-            self._exec(
-                "UPDATE jobs SET status='failed', return_code=-1, finished_at=? WHERE id=?",
-                (_now(), job_id),
-            )
-            self._publish(job_id, {"type": "chunk", "stream": "err", "data": f"[launch error] {exc}\n"})
-            self._publish(job_id, {"type": "status", "status": "failed", "return_code": -1})
+            self._fail_launch(job_id, exc)
             return
+        finally:
+            out_f.close()   # the child has its own dup; we must not keep these open
+            err_f.close()
 
+        key = _proc_key(proc.pid)
         self._procs[job_id] = proc
         self._exec(
-            "UPDATE jobs SET status='running', pid=?, started_at=? WHERE id=?",
-            (proc.pid, _now(), job_id),
+            "UPDATE jobs SET status='running', pid=?, pgid=?, proc_key=?, started_at=? WHERE id=?",
+            (proc.pid, proc.pid, key, _now(), job_id),
         )
         self._publish(job_id, {"type": "status", "status": "running", "pid": proc.pid})
-        asyncio.create_task(self._reader(job_id, proc, log_path, append_out))
+        asyncio.create_task(self._supervise(job_id, proc, out_path, err_path, out_off, 0))
 
-    async def _reader(self, job_id: str, proc: asyncio.subprocess.Process, log_path: str,
-                      append_out: bool = False) -> None:
-        # Drain stdout and stderr concurrently into their own log files, then wait
-        # for exit. Both pipes must reach EOF before proc.wait() returns — the hax
-        # program's forkserver workers inherit them, so a subset closing isn't done.
-        # On an in-place continue stdout is appended (its history is kept); stderr
-        # always starts fresh.
-        await asyncio.gather(
-            self._pump(job_id, proc.stdout, log_path, "out", append=append_out),
-            self._pump(job_id, proc.stderr, self._err_path(log_path), "err"),
+    def _fail_launch(self, job_id: str, exc: OSError) -> None:
+        self._exec(
+            "UPDATE jobs SET status='failed', return_code=-1, finished_at=? WHERE id=?",
+            (_now(), job_id),
         )
-        return_code = await proc.wait()
-        self._procs.pop(job_id, None)
+        self._publish(job_id, {"type": "chunk", "stream": "err", "data": f"[launch error] {exc}\n"})
+        self._publish(job_id, {"type": "status", "status": "failed", "return_code": -1})
+
+    async def _supervise(self, job_id: str, proc: asyncio.subprocess.Process,
+                         out_path: str, err_path: str, out_off: int, err_off: int) -> None:
+        """Watch a job we launched: stream its logs, then record how it ended."""
+        stop = asyncio.Event()
+        tails = [
+            asyncio.create_task(self._tail(job_id, out_path, "out", out_off, stop)),
+            asyncio.create_task(self._tail(job_id, err_path, "err", err_off, stop)),
+        ]
+        try:
+            # `_wrap` re-raises the program's own code, so this is still the real one.
+            return_code = await proc.wait()
+        finally:
+            self._procs.pop(job_id, None)
+        stop.set()
+        await asyncio.gather(*tails, return_exceptions=True)
+        await self._reap_group(job_id, proc.pid)
+        self._finalize(job_id, return_code)
+
+    async def _supervise_detached(self, job_id: str, pgid: int, key: str | None,
+                                  out_path: str, err_path: str, out_off: int, err_off: int) -> None:
+        """Watch a job that outlived the previous server process.
+
+        We are not its parent any more — it was reparented to init when the old server
+        died — so there is no `wait()` to await and no exit code to collect from the
+        kernel. Poll the process group instead, and take the status the job left behind.
+        """
+        self._publish(job_id, {"type": "status", "status": "running", "pid": pgid})
+        stop = asyncio.Event()
+        tails = [
+            asyncio.create_task(self._tail(job_id, out_path, "out", out_off, stop)),
+            asyncio.create_task(self._tail(job_id, err_path, "err", err_off, stop)),
+        ]
+        while _group_alive(pgid, key):
+            await asyncio.sleep(1.0)
+        stop.set()
+        await asyncio.gather(*tails, return_exceptions=True)
+        await self._reap_group(job_id, pgid)
+        self._finalize(job_id, _read_exit(_exit_path(out_path)))
+
+    async def _tail(self, job_id: str, path: str, kind: str, offset: int,
+                    stop: asyncio.Event) -> None:
+        """Stream one of a job's log files to the live subscribers.
+
+        Replaces reading the subprocess' pipe. The job writes the file itself now, so we
+        forward the bytes exactly as it wrote them — ANSI intact, `\\r` progress frames
+        intact — which is what keeps the terminal overwriting progress lines in place
+        rather than scrolling them.
+        """
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        pos = offset
+        while True:
+            data = b""
+            try:
+                with open(path, "rb") as f:
+                    f.seek(pos)
+                    data = f.read()
+            except OSError:
+                pass
+            if data:
+                pos += len(data)
+                text = decoder.decode(data)
+                if text:
+                    self._buffer_append(job_id, text, kind)
+                    self._publish(job_id, {"type": "chunk", "stream": kind, "data": text})
+                continue                      # keep draining while there is more
+            if stop.is_set():
+                return                        # the job is gone and the file is drained
+            await asyncio.sleep(TAIL_INTERVAL)
+
+    def _finalize(self, job_id: str, return_code: int | None) -> None:
         current = self.get(job_id)
-        status = "cancelled" if current and current["status"] == "cancelling" else (
-            "succeeded" if return_code == 0 else "failed"
-        )
+        if current is None:
+            return
+        if current["status"] == "cancelling":
+            status = "cancelled"
+        elif return_code is None:
+            # The process is gone but never recorded a status: killed from outside, or the
+            # machine went down under it. We cannot invent a return code for it.
+            status = "interrupted"
+        else:
+            status = "succeeded" if return_code == 0 else "failed"
         self._exec(
             "UPDATE jobs SET status=?, return_code=?, finished_at=? WHERE id=?",
             (status, return_code, _now(), job_id),
         )
         self._publish(job_id, {"type": "status", "status": status, "return_code": return_code})
 
-    async def _pump(self, job_id: str, stream: asyncio.StreamReader | None, path: str, kind: str,
-                    append: bool = False) -> None:
-        """Drain one output stream: raw bytes to its log file (ANSI preserved),
-        decoded text to the in-memory tail and to WS subscribers tagged by stream.
-        ``append`` keeps the existing file (an in-place continue) instead of truncating."""
-        if stream is None:
+    async def _reap_group(self, job_id: str, pgid: int) -> None:
+        """Kill whatever is left in a finished job's process group.
+
+        hax runs its data loaders as grain/forkserver children. If the program dies
+        abnormally they are orphaned and keep running — holding GPU memory — and nothing
+        has ever cleaned them up: with the old pipe the server just blocked forever
+        waiting for an EOF they were still holding open. Once the leader has exited,
+        anything still in its group is exactly that debris.
+        """
+        left = [p for p in _group_members(pgid) if p != pgid]
+        if not left:
             return
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        with open(path, "ab" if append else "wb") as log:
-            while True:
-                data = await stream.read(4096)
-                if not data:
-                    break
-                log.write(data)
-                log.flush()
-                text = decoder.decode(data)
-                if text:
-                    self._buffer_append(job_id, text, kind)
-                    self._publish(job_id, {"type": "chunk", "stream": kind, "data": text})
+        self._publish(job_id, {"type": "chunk", "stream": "err",
+                               "data": f"\n[hax-gui] cleaning up {len(left)} orphaned "
+                                       f"worker process(es) left by this job\n"})
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGTERM)
+        for _ in range(20):                                   # 5s to go quietly
+            await asyncio.sleep(0.25)
+            if not [p for p in _group_members(pgid) if p != pgid]:
+                return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
 
     @staticmethod
     def _err_path(log_path: str) -> str:
@@ -480,26 +796,32 @@ class JobManager:
         self._buflens[job_id] = {s: 0 for s in STREAMS}
 
     async def cancel(self, job_id: str) -> None:
-        proc = self._procs.get(job_id)
-        if proc is None:
-            return
-        self._exec("UPDATE jobs SET status='cancelling' WHERE id=?", (job_id,))
-        # Terminate the whole process group (workers + the launcher), not just the
-        # direct child — otherwise grandchildren keep the stdout pipe open and the
-        # reader never reaches the terminal-status update. SIGTERM first for a
-        # clean shutdown, then SIGKILL if it doesn't exit promptly.
-        self._signal_group(proc, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            self._signal_group(proc, signal.SIGKILL)
+        """Stop a running job — including one inherited from a previous server process.
 
-    @staticmethod
-    def _signal_group(proc: asyncio.subprocess.Process, sig: int) -> None:
-        # The process may exit on its own between our check and the signal; a group
-        # owned by another user (shouldn't happen here) raises PermissionError.
+        Driven off the persisted pgid rather than the in-memory handle, which is empty
+        after a restart (that is why cancelling a reattached job used to be a silent
+        no-op). The identity check matters: pids are recycled, so signalling a stored pid
+        without confirming it is still *our* process could kill a stranger.
+        """
+        job = self.get(job_id)
+        if job is None or job["status"] not in ACTIVE:
+            return
+        pgid, key = int(job.get("pgid") or 0), job.get("proc_key")
+        if not _group_alive(pgid, key):
+            return                                   # already gone; the supervisor will finalise it
+        self._exec("UPDATE jobs SET status='cancelling' WHERE id=?", (job_id,))
+        self._publish(job_id, {"type": "status", "status": "cancelling"})
+        # Signal the whole group, not just the leader: hax spawns its real workers via
+        # forkserver, and killing only the leader leaves them running on the GPU.
+        # SIGTERM for a clean shutdown, then SIGKILL if it does not go promptly.
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(os.getpgid(proc.pid), sig)
+            os.killpg(pgid, signal.SIGTERM)
+        for _ in range(20):                          # 5s grace
+            await asyncio.sleep(0.25)
+            if not _group_alive(pgid, key):
+                return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
 
     def delete(self, job_id: str) -> None:
         """Remove a finished job: its DB record and its run folder (outputs+log)."""
@@ -639,6 +961,10 @@ class JobManager:
         data["command"] = json.loads(data["command"])
         data["bindings"] = json.loads(data["bindings"]) if data.get("bindings") else None
         data["active"] = data["status"] in ACTIVE
+        # The kinds this run can feed downstream, narrowed by its mode (a train run
+        # yields its checkpoint but no latents/particles, a predict run the reverse),
+        # so the chaining UI won't offer a train run where a predict run is required.
+        data["produces"] = adapters.job_produces(data.get("program", ""), data["args"])
         return data
 
     def _exec(self, sql: str, params: tuple = (), fetch: str | None = None):

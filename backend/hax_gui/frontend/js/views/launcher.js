@@ -132,10 +132,10 @@ export function buildLauncher() {
     // The SSD scratch is shared per project+program and reused across runs; offer to
     // rebuild it from scratch (applies only when a scratch root is configured).
     if (schema.ssd_arg) {
-      fields.appendChild(h("label", { class: "recreate-ssd", title: "Delete this program's cached scratch data (mmap / array-record shards) so it's rebuilt from the current inputs. Only applies when a scratch root is configured in Settings." },
+      fields.appendChild(h("label", { class: "recreate-ssd", title: "Delete the cached images of THIS dataset (mmap / array-record shards) so they are rebuilt from the current inputs. The scratch folder is shared by every program in the project — other datasets cached there are left untouched. Only applies when a scratch root is configured in Settings." },
         h("input", { type: "checkbox", onchange: (e) => (recreateSsd = e.target.checked) }),
-        h("span", null, "Recreate the SSD scratch folder"),
-        h("span", { class: "muted small" }, "discard cached images and rebuild for this run")));
+        h("span", null, "Recreate the SSD scratch cache"),
+        h("span", { class: "muted small" }, "discard this dataset's cached images and rebuild for this run")));
     }
     for (const f of visibleFields(schema)) fields.appendChild(fieldRow(f, values, errorEls, ctx));
     body.appendChild(formErr);

@@ -1,7 +1,7 @@
 // Minimal WebGL2 3D point-cloud renderer for the latent landscape (3 PCs).
 // Orbit camera (shared style with gl.js), per-point color, selection/target
 // rings, CPU-side picking, and high-DPI / transparent snapshots. No deps.
-import { projection, halfFovY, lookAt, multiply, mulVec4, invert } from "./mat4.js";
+import { projection, lookAt, multiply, mulVec4, invert } from "./mat4.js";
 import { createOrbit } from "./orbit.js";
 
 const VERT = `#version 300 es
@@ -87,6 +87,35 @@ uniform vec3 uColor;
 out vec4 outColor;
 void main() { outColor = vec4(uColor, 1.0); }`;
 
+// ID pass: the same point sprites, but each fragment writes its point's *index* instead
+// of a colour. Reading one pixel back then turns picking into an O(1) lookup. The CPU
+// projection scans this replaces were O(N) and ran on every hover frame and every
+// mouse-down — at a million points that is what made the 3D view crawl.
+//
+// `precision highp int` is not optional: an ES 3.00 fragment shader defaults to mediump
+// int, which is only guaranteed 16 bits, and would silently mangle any index past 32767.
+const VERT_PICK = `#version 300 es
+precision highp float;
+precision highp int;
+layout(location=0) in vec3 aPos;
+uniform mat4 uProj; uniform mat4 uView; uniform float uSize;
+flat out uint vId;
+void main() {
+  vId = uint(gl_VertexID) + 1u;              // 0 is reserved for "background"
+  gl_Position = uProj * uView * vec4(aPos, 1.0);
+  gl_PointSize = uSize;
+}`;
+
+const FRAG_PICK = `#version 300 es
+precision highp float;
+precision highp int;
+flat in uint vId;
+out vec4 outColor;
+void main() {
+  if (length(gl_PointCoord - vec2(0.5)) > 0.5) discard;   // same round footprint as the drawn dot
+  outColor = vec4(float(vId & 0xffu), float((vId >> 8) & 0xffu), float((vId >> 16) & 0xffu), 255.0) / 255.0;
+}`;
+
 // Editable control-point handles: white discs with a dark rim, drawn as point sprites.
 const VERT_HANDLE = `#version 300 es
 precision highp float;
@@ -105,6 +134,7 @@ void main() {
 export function createCloud(canvas, onSelect) {
   const gl = canvas.getContext("webgl2", { antialias: true, depth: true, preserveDrawingBuffer: true, premultipliedAlpha: false });
   if (!gl) throw new Error("WebGL2 is not available in this browser.");
+  let pickFilter = null;   // when set, selection picks (not camera/path picks) only accept ids where pickFilter(i) is true
 
   const prog = link(gl, VERT, FRAG);
   const u = (n) => gl.getUniformLocation(prog, n);
@@ -156,6 +186,100 @@ export function createCloud(canvas, onSelect) {
   let colorData = null;   // persisted per-point RGB so points are never left black
   let showDens = false, hasDens = false, densIntensity = 0.22, pointAlpha = 1.0;
   let selected = -1, hover = -1, pathArr = [], selArr = [];
+  // Mid-export the canvas is deliberately off its on-screen size. gl_PointSize is in
+  // device px, so the dots have to grow with it or a 4x PNG comes out full of specks.
+  let snapping = false;
+  const ratio = () => (snapping
+    ? canvas.width / Math.max(1, canvas.clientWidth)
+    : Math.min(window.devicePixelRatio || 1, 2));
+  let pathSet = new Set(), selSet = new Set();   // membership tests for the per-point flag ladder
+
+  // ── id buffer ─────────────────────────────────────────────────────────────
+  // Off-screen render of the point indices, re-made only when the camera or the point set
+  // moves under it (a hover, which changes neither, reuses it). Everything that needs to
+  // know "which point is at this pixel" reads it back instead of projecting all N points.
+  const pickProg = link(gl, VERT_PICK, FRAG_PICK);
+  const pProj = gl.getUniformLocation(pickProg, "uProj");
+  const pView = gl.getUniformLocation(pickProg, "uView");
+  const pSize = gl.getUniformLocation(pickProg, "uSize");
+  let pickFbo = null, pickTex = null, pickRbo = null, pickW = 0, pickH = 0, pickDirty = true;
+  const invalidatePick = () => { pickDirty = true; };
+
+  function ensurePickTargets() {
+    const w = canvas.width, h = canvas.height;
+    if (pickFbo && pickW === w && pickH === h) return;
+    if (pickTex) gl.deleteTexture(pickTex);
+    if (pickRbo) gl.deleteRenderbuffer(pickRbo);
+    if (pickFbo) gl.deleteFramebuffer(pickFbo);
+    pickW = w; pickH = h;
+    pickTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, pickTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    pickRbo = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, pickRbo);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+    pickFbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, pickTex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, pickRbo);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    pickDirty = true;
+  }
+
+  function ensurePickBuffer() {
+    if (!count || !norm) return false;
+    ensurePickTargets();
+    if (!pickDirty) return true;
+    const { proj, view } = matrices();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
+    gl.viewport(0, 0, pickW, pickH);
+    gl.clearColor(0, 0, 0, 0);                       // id 0 = nothing here
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST);
+    gl.useProgram(pickProg);
+    gl.uniformMatrix4fv(pProj, false, proj);
+    gl.uniformMatrix4fv(pView, false, view);
+    gl.uniform1f(pSize, 6.0 * dpr);                  // the sprite size the points are drawn at
+    gl.bindVertexArray(vao);                         // aPos is location 0 here too
+    gl.drawArrays(gl.POINTS, 0, count);
+    gl.bindVertexArray(null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    pickDirty = false;
+    return true;
+  }
+
+  // Nearest drawn point to (px, py), both in device px with a GL bottom-up y, within
+  // `tolPx`. Depth-tested, so an occluded point can no longer win over the one in front
+  // of it — which the old screen-space scan happily let happen.
+  function pickAt(px, py, tolPx, useFilter) {
+    if (!ensurePickBuffer()) return -1;
+    const r = Math.max(1, Math.round(tolPx));
+    const x0 = Math.max(0, Math.round(px) - r), x1 = Math.min(pickW - 1, Math.round(px) + r);
+    const y0 = Math.max(0, Math.round(py) - r), y1 = Math.min(pickH - 1, Math.round(py) + r);
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    if (w <= 0 || h <= 0) return -1;
+    const buf = new Uint8Array(w * h * 4);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, pickFbo);
+    gl.readPixels(x0, y0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    let best = -1, bestD = Infinity;
+    for (let j = 0; j < h; j++) {
+      for (let i = 0; i < w; i++) {
+        const o = (j * w + i) * 4;
+        const id = buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16);
+        if (!id) continue;
+        if (useFilter && pickFilter && !pickFilter(id - 1)) continue;   // out of the pick scope
+        const dx = (x0 + i) - px, dy = (y0 + j) - py;
+        const dd = dx * dx + dy * dy;
+        if (dd < bestD) { bestD = dd; best = id - 1; }
+      }
+    }
+    return best;
+  }
+  const glY = (cssY) => canvas.height - 1 - cssY * Math.min(window.devicePixelRatio || 1, 2);
 
   // Distance from the eye to the nearest point under the centre of the window, which the
   // camera turns into a ChimeraX-style centre of rotation: zoom into a lobe of the
@@ -164,21 +288,18 @@ export function createCloud(canvas, onSelect) {
   const COFR_TOL_PX = 24;   // a point cloud is sparse, so accept points a little off-centre
   function centreDepth() {
     if (!norm || !count) return null;
+    const r = Math.min(window.devicePixelRatio || 1, 2);
+    const i = pickAt(canvas.width / 2, canvas.height / 2, COFR_TOL_PX * r);
+    if (i < 0) return null;
     const { view } = matrices();   // view = lookAt · model, so this lands straight in view space
-    const tanF = Math.tan(halfFovY(canvas.width / Math.max(1, canvas.height)));   // vertical field follows the window
-    const halfH = Math.max(1, canvas.clientHeight) / 2;
-    let best = null;
-    for (let i = 0; i < count; i++) {
-      const v = mulVec4(view, [norm[i * 3], norm[i * 3 + 1], norm[i * 3 + 2], 1]);
-      const t = -v[2];                              // view-space z is negative in front of the eye
-      if (t <= 0 || (best !== null && t >= best)) continue;
-      const r = (COFR_TOL_PX / halfH) * tanF * t;   // that pixel radius, in world units at this depth
-      if (v[0] * v[0] + v[1] * v[1] <= r * r) best = t;
-    }
-    return best;
+    const v = mulVec4(view, [norm[i * 3], norm[i * 3 + 1], norm[i * 3 + 2], 1]);
+    const t = -v[2];               // view-space z is negative in front of the eye
+    return t > 0 ? t : null;
   }
 
-  const orbit = createOrbit(canvas, () => render(), (e) => { const i = pick(e.clientX, e.clientY); if (i >= 0) onSelect(i, { shift: e.shiftKey }); },
+  // invalidatePick on every camera change: the id buffer is rendered from this camera, so
+  // it goes stale the moment the camera moves — but *not* when only the hover changes.
+  const orbit = createOrbit(canvas, () => { invalidatePick(); render(); }, (e) => { const i = pick(e.clientX, e.clientY); onSelect(i, { shift: e.shiftKey, cx: e.clientX, cy: e.clientY }); },
     // normalizePoints() scales the largest extent to 1.8; fitRadius 1.41 is the height the
     // old 45°-vertical camera showed at its default distance, so the cloud keeps its framing.
     { probeDepth: centreDepth, modelWidth: 1.8, fitRadius: 1.41 });
@@ -190,7 +311,8 @@ export function createCloud(canvas, onSelect) {
     return { proj, view };
   }
   function resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (snapping) return;   // the export canvas is sized deliberately; leave it alone
+    const dpr = ratio();
     const w = Math.max(1, Math.floor(canvas.clientWidth * dpr)), h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   }
@@ -200,7 +322,7 @@ export function createCloud(canvas, onSelect) {
     gl.clearColor(bg[0], bg[1], bg[2], alpha);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     if (!count) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = ratio();
     // density glow overlay (additive, behind the points, no depth writes)
     if (showDens && hasDens) {
       gl.useProgram(splatProg);
@@ -277,33 +399,41 @@ export function createCloud(canvas, onSelect) {
 
   // Written weakest-first, so a point that is several things at once shows the one that
   // matters most: hover < selection < path < current.
+  let flags = null;   // CPU mirror of the flag attribute, so single points can be patched
   function uploadFlags() {
-    const f = new Float32Array(count);
-    if (hover >= 0 && hover < count) f[hover] = 4;                    // hover = light
-    for (const si of selArr) if (si >= 0 && si < count) f[si] = 3;    // selection = white
-    for (const pi of pathArr) if (pi >= 0 && pi < count) f[pi] = 2;   // path = pink
-    if (selected >= 0 && selected < count) f[selected] = 1;           // current = teal (wins)
-    gl.bindBuffer(gl.ARRAY_BUFFER, flagBuf); gl.bufferData(gl.ARRAY_BUFFER, f, gl.DYNAMIC_DRAW);
+    if (!flags || flags.length !== count) flags = new Float32Array(count);
+    flags.fill(0);
+    if (hover >= 0 && hover < count) flags[hover] = 4;                    // hover = light
+    for (const si of selArr) if (si >= 0 && si < count) flags[si] = 3;    // selection = white
+    for (const pi of pathArr) if (pi >= 0 && pi < count) flags[pi] = 2;   // path = pink
+    if (selected >= 0 && selected < count) flags[selected] = 1;           // current = teal (wins)
+    gl.bindBuffer(gl.ARRAY_BUFFER, flagBuf); gl.bufferData(gl.ARRAY_BUFFER, flags, gl.DYNAMIC_DRAW);
+  }
+  // The same ladder, for one point — the value it *should* have right now.
+  function flagValue(i) {
+    if (i === selected) return 1;
+    if (pathSet.has(i)) return 2;
+    if (selSet.has(i)) return 3;
+    if (i === hover) return 4;
+    return 0;
+  }
+  // A hover move touches exactly two points, so patch those two floats in place. The full
+  // rebuild above reallocates and re-uploads the whole attribute — 4 MB at a million
+  // points, which it used to do on every mouse move.
+  function patchFlag(i) {
+    if (i < 0 || i >= count || !flags) return;
+    const v = flagValue(i);
+    if (flags[i] === v) return;
+    flags[i] = v;
+    gl.bindBuffer(gl.ARRAY_BUFFER, flagBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, i * 4, flags, i, 1);
   }
 
   function pick(cx, cy) {
-    if (!norm) return -1;
+    if (!norm || !count) return -1;
     const rect = canvas.getBoundingClientRect();
     const r = Math.min(window.devicePixelRatio || 1, 2);
-    const px = (cx - rect.left) * r, py = (cy - rect.top) * r;
-    const { proj, view } = matrices();
-    const mvp = multiply(proj, view);
-    let best = -1, bestD = Infinity;
-    for (let i = 0; i < count; i++) {
-      const c = mulVec4(mvp, [norm[i * 3], norm[i * 3 + 1], norm[i * 3 + 2], 1]);
-      if (c[3] <= 0) continue;
-      const sx = (c[0] / c[3] * 0.5 + 0.5) * canvas.width;
-      const sy = (1 - (c[1] / c[3] * 0.5 + 0.5)) * canvas.height;
-      const dd = (sx - px) ** 2 + (sy - py) ** 2;
-      if (dd < bestD) { bestD = dd; best = i; }
-    }
-    const tol = (16 * r) ** 2;   // ignore clicks far from any point
-    return bestD <= tol ? best : -1;
+    return pickAt((cx - rect.left) * r, glY(cy - rect.top), 16 * r, true);   // selection pick: honor the pick filter
   }
 
   window.addEventListener("resize", render);
@@ -317,8 +447,9 @@ export function createCloud(canvas, onSelect) {
   let hoverPending = 0, hx = 0, hy = 0;
   function setHover(i) {
     if (i === hover) return;
+    const prev = hover;
     hover = i;
-    uploadFlags();
+    patchFlag(prev); patchFlag(i);   // two floats, not a 4 MB re-upload
     render();
   }
   canvas.addEventListener("mousemove", (e) => {
@@ -334,6 +465,7 @@ export function createCloud(canvas, onSelect) {
       norm = normalizePoints(pts); count = pts.length;
       hover = -1;                // the old hover index means nothing in a new cloud
       orbit.invalidatePivot();   // a new cloud is a new front surface
+      invalidatePick();          // ...and new ids in the pick buffer
       gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, norm, gl.STATIC_DRAW);
       // (re)seed colors so a fresh point set is never drawn black before applyColor()
       if (!colorData || colorData.length !== count * 3) { colorData = new Float32Array(count * 3); for (let i = 0; i < count * 3; i++) colorData[i] = [0.58, 0.64, 0.74][i % 3]; }
@@ -341,6 +473,8 @@ export function createCloud(canvas, onSelect) {
       uploadFlags(); render();
     },
     setColors(colors) { colorData = colors; gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW); render(); },
+    setPickFilter(fn) { pickFilter = typeof fn === "function" ? fn : null; },   // restrict selection picks to ids where fn(i) is true
+
     setDensityField(values) { hasDens = !!(values && values.length === count); gl.bindBuffer(gl.ARRAY_BUFFER, densBuf); gl.bufferData(gl.ARRAY_BUFFER, values || new Float32Array(count), gl.STATIC_DRAW); render(); },
     showDensity(on) { showDens = on; render(); },
     setDensityIntensity(v) { densIntensity = Math.max(0, v); render(); },
@@ -353,7 +487,7 @@ export function createCloud(canvas, onSelect) {
     },
     setPointAlpha(a) { pointAlpha = Math.max(0, Math.min(1, a)); render(); },
     select(i) { selected = i; uploadFlags(); render(); },
-    setPath(arr) { pathArr = arr || []; uploadFlags(); render(); },
+    setPath(arr) { pathArr = arr || []; pathSet = new Set(pathArr); uploadFlags(); render(); },
     setPathOrder(arr, colorRgb) {
       const ids = (arr || []).filter((i) => i >= 0 && i < count);
       const buf = new Float32Array(ids.length * 3);
@@ -386,25 +520,29 @@ export function createCloud(canvas, onSelect) {
       }
       return out;
     },
-    // Unproject a CSS screen px to data coords, taking depth from the nearest state.
+    // Unproject a CSS screen px to data coords. The screen tells us x and y; the depth has
+    // to come from the cloud, and it comes from the point under the cursor — an id-buffer
+    // read, where this used to scan all N points on every mouse move while drawing a curve.
+    //
+    // Over empty space the id buffer has nothing to offer, so fall back to the plane
+    // through the cloud's centre. The old scan returned the globally nearest point's
+    // depth, however far away it was; a stable centre plane is both cheaper and a steadier
+    // surface to draw on.
     unproject(sx, sy) {
       if (!norm || !count) return null;
       const { proj, view } = matrices(), mvp = multiply(proj, view);
       const W = canvas.clientWidth, H = canvas.clientHeight;
-      let best = -1, bestD = Infinity, ndcZ = 0;
-      for (let i = 0; i < count; i++) {
-        const c = mulVec4(mvp, [norm[i * 3], norm[i * 3 + 1], norm[i * 3 + 2], 1]);
-        if (c[3] <= 0) continue;
-        const px = (c[0] / c[3] * 0.5 + 0.5) * W, py = (1 - (c[1] / c[3] * 0.5 + 0.5)) * H;
-        const dd = (px - sx) ** 2 + (py - sy) ** 2;
-        if (dd < bestD) { bestD = dd; best = i; ndcZ = c[2] / c[3]; }
-      }
-      if (best < 0) return null;
+      const r = Math.min(window.devicePixelRatio || 1, 2);
+      const i = pickAt(sx * r, glY(sy), 96 * r);
+      const at = i >= 0 ? [norm[i * 3], norm[i * 3 + 1], norm[i * 3 + 2], 1] : [0, 0, 0, 1];
+      const c = mulVec4(mvp, at);
+      if (c[3] <= 0) return null;
+      const ndcZ = c[2] / c[3];
       const im = invert(mvp); if (!im) return null;
       const w = mulVec4(im, [sx / W * 2 - 1, (1 - sy / H) * 2 - 1, ndcZ, 1]);
       return normToData([w[0] / w[3], w[1] / w[3], w[2] / w[3]]);
     },
-    setSelection(arr) { selArr = arr || []; uploadFlags(); render(); },
+    setSelection(arr) { selArr = arr || []; selSet = new Set(selArr); uploadFlags(); render(); },
     // CSS-space screen coords of every point (null where behind the camera)
     projectedPoints() {
       const out = new Array(count).fill(null);
@@ -429,9 +567,12 @@ export function createCloud(canvas, onSelect) {
     get selected() { return selected; },
     async snapshot({ scale = 2, transparent = false } = {}) {
       const ow = canvas.width, oh = canvas.height;
-      canvas.width = Math.floor(canvas.clientWidth * scale); canvas.height = Math.floor(canvas.clientHeight * scale);
+      snapping = true;
+      canvas.width = Math.max(1, Math.floor(canvas.clientWidth * scale));
+      canvas.height = Math.max(1, Math.floor(canvas.clientHeight * scale));
       drawScene(transparent ? 0 : 1);
       const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
+      snapping = false;
       canvas.width = ow; canvas.height = oh; render();
       return blob;
     },

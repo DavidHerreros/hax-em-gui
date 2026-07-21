@@ -1,6 +1,10 @@
 // ChimeraX-style contour widget: draws the volume's value histogram (log counts)
 // with a draggable vertical threshold line. Emits the chosen absolute level.
 // No dependencies.
+//
+// `onLevel(level, dragging)` — `dragging` is true for every frame of a drag and false for
+// the last one, when the pointer is released. Callers use it to show a cheap draft surface
+// while the pointer is down and compute the full-resolution one only once, on release.
 export function createHistogram(canvas, onLevel) {
   const ctx = canvas.getContext("2d");
   let data = null;   // { counts, edges, min, max, mean, std }
@@ -47,16 +51,21 @@ export function createHistogram(canvas, onLevel) {
     ctx.beginPath(); ctx.arc(lx, 8 * dpr(), 4 * dpr(), 0, Math.PI * 2); ctx.fill();
   }
 
-  function pick(clientX) {
+  function pick(clientX, live) {
     const rect = canvas.getBoundingClientRect();
     const px = (clientX - rect.left) * dpr();
     level = Math.max(data.min, Math.min(data.max, vOf(px)));
     draw();
-    onLevel(level);
+    onLevel(level, live);
   }
-  canvas.addEventListener("pointerdown", (e) => { if (!data) return; dragging = true; canvas.setPointerCapture(e.pointerId); pick(e.clientX); });
-  canvas.addEventListener("pointermove", (e) => { if (dragging) pick(e.clientX); });
-  canvas.addEventListener("pointerup", (e) => { dragging = false; try { canvas.releasePointerCapture(e.pointerId); } catch {} });
+  canvas.addEventListener("pointerdown", (e) => { if (!data) return; dragging = true; canvas.setPointerCapture(e.pointerId); pick(e.clientX, true); });
+  canvas.addEventListener("pointermove", (e) => { if (dragging) pick(e.clientX, true); });
+  canvas.addEventListener("pointerup", (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try { canvas.releasePointerCapture(e.pointerId); } catch {}
+    onLevel(level, false);        // settled: the caller now computes the full-res surface
+  });
   window.addEventListener("resize", draw);
 
   return {

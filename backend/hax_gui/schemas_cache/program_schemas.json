@@ -2817,6 +2817,180 @@
         }
       ]
     },
+    "reconstruct_volume": {
+      "name": "reconstruct_volume",
+      "module": "hax.programs.reconstruct_volume",
+      "description": "Consensus volume reconstruction from posed particles (single pass, with FSC denoising and gray scale calibration)",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Whether the images carry a CTF. The reconstruction only needs to know if they do: apply, wiener and precorrect all mean they do (the slices are CTF weighted and the quotient deconvolves them), while None means they do not. NOTE: this must match your data -- weighting CTF-free images by a CTF is not a harmless no-op, it reweights the slices and degrades the map.",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "tau",
+          "flags": [
+            "--tau"
+          ],
+          "flag": "--tau",
+          "required": false,
+          "help": "Wiener floor of the reconstruction quotient (set by default to 0.05). This is only a numerical regularizer to keep the shells with little CTF power from blowing up -- the resolution of the map is set by the data, not by this. Raise it if the map looks noisy at high frequency, lower it if it looks over-smoothed.",
+          "default": 0.05,
+          "type": "number"
+        },
+        {
+          "name": "no_denoise",
+          "flags": [
+            "--no_denoise"
+          ],
+          "flag": "--no_denoise",
+          "required": false,
+          "help": "Skip the FSC based denoising. By default the particles are split into two independent halves, the FSC between the resulting half maps measures the spectral signal-to-noise, and the combined map is filtered with it, so the shells carrying signal pass untouched and the shells that are only noise are removed (the measured resolution is printed). Pass this flag to get the raw, unfiltered map instead.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "no_gray_scale_calibration",
+          "flags": [
+            "--no_gray_scale_calibration"
+          ],
+          "flag": "--no_gray_scale_calibration",
+          "required": false,
+          "help": "Skip the global gray-scale calibration. By default the finished map is forward-projected at a subset of the real poses and least-squares scaled against the input images, so that re-projecting it reproduces their contrast and value range. Pass this flag to keep the raw amplitudes.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "write_mask",
+          "flags": [
+            "--write_mask"
+          ],
+          "flag": "--write_mask",
+          "required": false,
+          "help": "Also write a binary mask of the protein region derived from the reconstructed map (consensus_mask.mrc). This is the mask HetSIREN/MoDART expect in their --mask parameter.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mask_threshold",
+          "flags": [
+            "--mask_threshold"
+          ],
+          "flag": "--mask_threshold",
+          "required": false,
+          "help": "Only used with --write_mask: fraction of the map's maximum above which a voxel is considered protein (set by default to 0.02). Raise it for a tighter mask, lower it for a looser one.",
+          "default": 0.02,
+          "type": "number"
+        },
+        {
+          "name": "mask_dilate",
+          "flags": [
+            "--mask_dilate"
+          ],
+          "flag": "--mask_dilate",
+          "required": false,
+          "help": "Only used with --write_mask: how many voxels to grow the mask by (set by default to 2), so that a deformation estimated later has somewhere to move the mass into.",
+          "default": 2,
+          "type": "integer"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "How many images are read and inserted at once (set by default to 1024). The images are read on a thread pool while the GPU accumulates, so peak RAM tracks this value rather than the number of particles - lower it if you run out of memory, raise it to read fewer, larger chunks.",
+          "default": 1024,
+          "type": "integer"
+        },
+        {
+          "name": "threads",
+          "flags": [
+            "--threads"
+          ],
+          "flag": "--threads",
+          "required": false,
+          "help": "Number of reader threads feeding the GPU with image chunks (set by default to 8). NOTE: on a spinning disk (HDD) several threads read different regions of the stack at once and the head seeks between them, so a lower value (1 or 2) can be faster there than the default.",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, new metadata...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "Path to a folder on a fast (SSD/NVMe) disk. The reconstruction has to read every particle once, so on a slow disk the read is the run: 1M particles at box 320 is 410 GB, which an HDD needs roughly an hour to deliver, and the GPU spends that hour idle. Given this parameter, the images are cached as a local float16 copy (half the bytes) and streamed from there. NOTE: building the cache still costs one full read of the original stack, so it does not make a single cold run faster - it pays off because the copy is reused, both by later runs and by the other hax programs (HetSIREN, Zernike3Deep, MoDART...) pointed at the same scratch folder, which build and read exactly the same cache.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
+        }
+      ]
+    },
     "update": {
       "name": "update",
       "module": "hax.cli.updater",

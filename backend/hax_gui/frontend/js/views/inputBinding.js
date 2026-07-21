@@ -21,7 +21,7 @@ function prettyKind(kind) {
 export function makeJobDraggable(el, job) {
   el.setAttribute("draggable", "true");
   el.addEventListener("dragstart", (e) => {
-    e.dataTransfer.setData(JOB_DRAG_TYPE, JSON.stringify({ id: job.id, program: job.program, name: job.name || null }));
+    e.dataTransfer.setData(JOB_DRAG_TYPE, JSON.stringify({ id: job.id, program: job.program, name: job.name || null, produces: job.produces || null }));
     e.dataTransfer.setData("text/plain", job.name || job.program);
     e.dataTransfer.effectAllowed = "copy";
     el.classList.add("dragging");
@@ -69,7 +69,10 @@ export function bindingControl({ field, kind, producers, bindings, fieldEl, valu
       e.preventDefault();
       let job;
       try { job = JSON.parse(raw); } catch { return; }
-      if (!producers.includes(job.program)) { flash(fieldEl); return; }
+      // Prefer the run's own produced kinds (mode-aware: a train run doesn't list
+      // latents/particles), falling back to the per-program list if absent.
+      const ok = Array.isArray(job.produces) ? job.produces.includes(kind) : producers.includes(job.program);
+      if (!ok) { flash(fieldEl); return; }
       setBinding({ job_id: job.id, kind, label: job.name || job.program });
     });
   }

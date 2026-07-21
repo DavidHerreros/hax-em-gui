@@ -67,9 +67,134 @@ class WorkflowManager:
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(workflows)").fetchall()}
         if "kind" not in cols:
             self._db.execute("ALTER TABLE workflows ADD COLUMN kind TEXT NOT NULL DEFAULT 'standalone'")
-        # A workflow left 'running' from a previous server process is stale.
-        self._db.execute("UPDATE workflows SET status='interrupted' WHERE status='running'")
+        # `resumable`: parked mid-run, waiting for the user to say whether to carry on.
+        if "resumable" not in cols:
+            self._db.execute("ALTER TABLE workflows ADD COLUMN resumable INTEGER NOT NULL DEFAULT 0")
         self._db.commit()
+        self._plan_resume()
+
+    def _plan_resume(self) -> None:
+        """Decide what becomes of the workflows the previous server process left running.
+
+        A scheduler is not a process — it is an ``asyncio`` task living inside the server —
+        so it always dies with the server, even though the *job* it was waiting on now
+        survives (see jobs.py). Every 'running' workflow therefore has to be re-judged
+        against the jobs table, which ``JobManager._reconcile`` has already made truthful:
+        it recovered the exit status of anything that finished while we were down, and
+        pid-reuse-checked anything that claims to still be alive.
+
+        Three outcomes. The question that separates them is *would resuming start new
+        compute right now, with nobody watching?* — not how long the server was down,
+        which is only a proxy for it and a poor one (a training happily survives an
+        overnight outage; one can equally be OOM-killed during a five-second restart):
+
+        * **a step is still running** → resume immediately. Nothing new is launched; the
+          scheduler simply re-adopts the job already in flight. This is the update-restart
+          case, and prompting here would strand a GPU until someone clicked a dialog.
+        * **nothing alive, but the next step is ready** → park it (``resumable``). Resuming
+          *would* launch a training, so it waits for an explicit go-ahead.
+        * **nothing left to run** → hand it to the scheduler anyway; with nothing ready it
+          launches nothing and just settles the final status. A workflow that quietly
+          finished while we were down should not nag to be resumed.
+        """
+        assert self._db is not None
+        self._auto: list[str] = []
+        for row in self._db.execute("SELECT id FROM workflows WHERE status='running'").fetchall():
+            wid = row["id"]
+            try:
+                wf = self.get(wid)
+                if wf is None:
+                    continue
+                state = self._adopt_job_states(wid)
+                live = any(s.get("status") == "running" for s in state.values())
+                ready, _ = self._partition(wf["graph"], state)
+                if not live and ready:
+                    self._db.execute(
+                        "UPDATE workflows SET status='interrupted', resumable=1 WHERE id=?", (wid,))
+                else:
+                    self._auto.append(wid)
+            except Exception:  # noqa: BLE001 - a broken graph must never block startup
+                self._db.execute("UPDATE workflows SET status='interrupted' WHERE id=?", (wid,))
+        self._db.commit()
+
+    async def resume_all(self) -> None:
+        """Restart the schedulers of the workflows that survived (see :meth:`_plan_resume`)."""
+        pending, self._auto = getattr(self, "_auto", []), []
+        for wid in pending:
+            self._running[wid] = asyncio.create_task(self._execute(wid, resumed=True))
+
+    def _adopt_job_states(self, wid: str) -> dict[str, Any]:
+        """Rebuild run_state from the jobs' real statuses, and persist it.
+
+        run_state is only the scheduler's *memory* of what it last saw. Across a restart
+        that memory is stale — a step it remembers as 'running' may have finished hours ago
+        — and the jobs table is the truth. (Project workflows self-healed this way already,
+        via :meth:`reconcile`; standalone ones never did, which is why resuming one used to
+        strand its finished steps and re-run them from scratch.)
+        """
+        state = self._fresh_state(wid)
+        for nid, s in list(state.items()):
+            jid = s.get("job_id")
+            if not jid:
+                continue                      # queued but never launched: nothing to adopt
+            job = jobs.get(jid)
+            if job is None:
+                state[nid] = {"job_id": None, "status": "idle", "error": None}
+                continue
+            st = job["status"]
+            if st in ACTIVE or st == "cancelling":
+                st = "running"                # still in flight; the scheduler adopts it
+            state[nid] = {
+                "job_id": jid, "status": st,
+                "error": None if st in ("running", "succeeded")
+                else s.get("error") or "step did not finish (see the job log)",
+            }
+        self._db.execute("UPDATE workflows SET run_state=? WHERE id=?", (json.dumps(state), wid))
+        self._db.commit()
+        return state
+
+    # -- resume (user-driven) ----------------------------------------------
+    def list_resumable(self) -> list[dict[str, Any]]:
+        """The workflows parked by :meth:`_plan_resume`, with enough detail to decide."""
+        rows = self._db.execute(
+            "SELECT id, name, project_id, run_state, updated_at FROM workflows "
+            "WHERE resumable=1 ORDER BY updated_at DESC"
+        ).fetchall()
+        out = []
+        for r in rows:
+            state = json.loads(r["run_state"]) if r["run_state"] else {}
+            counts: dict[str, int] = {}
+            for s in state.values():
+                counts[s.get("status")] = counts.get(s.get("status"), 0) + 1
+            out.append({
+                "id": r["id"], "name": r["name"], "project_id": r["project_id"],
+                "updated_at": r["updated_at"],
+                "done": counts.get("succeeded", 0),
+                "remaining": counts.get("pending", 0),
+                "total": sum(n for st, n in counts.items() if st != "idle"),
+            })
+        return out
+
+    async def resume(self, wid: str) -> dict[str, Any]:
+        """Carry on a parked workflow. Only the steps that never ran are launched: the
+        ones that already succeeded keep their jobs, and the steps downstream bind to
+        those jobs, so nothing that already completed is recomputed."""
+        wf = self.get(wid)
+        if wf is None:
+            raise KeyError(wid)
+        if self._is_live(wid):
+            return wf
+        state = self._adopt_job_states(wid)
+        self._set_run(wid, "running", state)          # also clears `resumable`
+        self._running[wid] = asyncio.create_task(self._execute(wid, resumed=True))
+        return self.get(wid)
+
+    def dismiss_resume(self, wid: str) -> dict[str, Any] | None:
+        """Stop offering to resume this one. The queue is left in run_state, so it can
+        still be picked up by hand from the canvas later."""
+        self._db.execute("UPDATE workflows SET resumable=0 WHERE id=?", (wid,))
+        self._db.commit()
+        return self.get(wid)
 
     # -- CRUD --------------------------------------------------------------
     def save(self, project_id: str | None, name: str | None, graph: dict[str, Any],
@@ -192,8 +317,14 @@ class WorkflowManager:
             (project_id,),
         ).fetchone()
         if row is not None:
-            wid = self._row(row)["id"]
-            graph, state = self._synced_graph(self._row(row)["graph"], project_id)
+            wf = self._row(row)
+            wid = wf["id"]
+            # Parked awaiting a resume decision: re-syncing would rebuild run_state from the
+            # jobs alone, flattening the steps that never launched (no job to sync from) to
+            # 'idle' — quietly emptying the queue we are offering to resume. Leave it be.
+            if wf.get("resumable"):
+                return wf
+            graph, state = self._synced_graph(wf["graph"], project_id)
             self._db.execute(
                 "UPDATE workflows SET graph=?, run_state=?, updated_at=? WHERE id=?",
                 (json.dumps(graph), json.dumps(state), _now(), wid),
@@ -214,6 +345,11 @@ class WorkflowManager:
         if wf is None:
             return None
         if wf.get("kind") != "project" or not wf.get("project_id"):
+            return wf
+        # Parked awaiting a resume decision: its run_state holds the queue that resuming
+        # will pick up, and _synced_graph would flatten those never-launched steps (no
+        # job_id) to 'idle' — quietly emptying the queue we are asking about.
+        if wf.get("resumable"):
             return wf
         # Skip only while *this* process is genuinely running the workflow (its
         # _execute task owns run_state then). A stored status of 'running' with no
@@ -304,6 +440,40 @@ class WorkflowManager:
         )
         self._db.commit()
         return self.get(wid)
+
+    def copy_to_project(self, wid: str, target_project_id: str, name: str | None = None) -> dict[str, Any]:
+        """Clone a workflow's graph into a new standalone workflow owned by another
+        project, so an entire pipeline can be reused elsewhere.
+
+        The clone is self-contained and unlinked from the source: every node's `job_id`
+        is dropped (so nothing points at the source project's jobs) and the run-state
+        starts fresh. Dependencies *within* the copied graph travel as edges and rebind
+        automatically at run time; data inputs coming from *outside* the graph (a node's
+        bindable field with no incoming edge -- raw metadata, an un-copied job's output)
+        are cleared, to be set in the target project before the copy runs. Auto-managed
+        output/SSD dirs are dropped too, as they are per run."""
+        src = self.get(wid)
+        if src is None:
+            raise KeyError(wid)
+        if projects.dir_for(target_project_id) is None:
+            raise KeyError(target_project_id)
+        graph = json.loads(json.dumps(src.get("graph") or {"nodes": [], "edges": [], "orientation": "horizontal"}))
+        for node in graph.get("nodes", []) or []:
+            node.pop("job_id", None)               # unlink from the source project's jobs
+            program = node.get("program")
+            args = dict(node.get("args") or {})
+            for auto in (registry.output_arg(program), registry.ssd_arg(program)):
+                if auto:
+                    args.pop(auto, None)
+            # Data inputs are never carried as literals in a portable copy: an input fed
+            # by another step travels as an edge (rebinds at run time), and one from
+            # outside the graph is cleared to be set in the target project. Either way
+            # the field is dropped here — so no source-project path can leak through.
+            for field in adapters.bindable_fields(program):
+                args.pop(field, None)
+            node["args"] = args
+        new_name = (name or "").strip() or f"{src.get('name') or 'Workflow'} (copy)"
+        return self.save(target_project_id, new_name, graph, kind="standalone")
 
     # -- validation --------------------------------------------------------
     @staticmethod
@@ -405,10 +575,18 @@ class WorkflowManager:
                     state[nid] = {"job_id": None, "status": "pending", "error": None}
             else:
                 s = prev.get(nid, {"job_id": None, "status": "idle", "error": None})
-                # A leftover pending/running from an interrupted run isn't real: leave it
-                # and the scheduler would wait on it forever, stalling its dependents.
+                # A pending/running left over from a run with no scheduler behind it is a
+                # memory, not a fact — believe the job instead. Leaving it as-is would
+                # stall its dependents forever; blanket-idling it (what this used to do)
+                # threw away a step that had really finished, forcing a recompute.
                 if not live and s.get("status") in self.WAITING:
-                    s = {**s, "status": "idle"}
+                    job = jobs.get(s.get("job_id") or "")
+                    if job is None:
+                        s = {**s, "status": "idle"}            # never launched: a stale queue entry
+                    elif job["status"] in ACTIVE or job["status"] == "cancelling":
+                        s = {**s, "status": "running"}         # still training: adopt, don't relaunch
+                    else:
+                        s = {**s, "status": job["status"]}     # it did finish — keep its result
                 state[nid] = s
         self._set_run(wid, "running", state)
         if not live:
@@ -442,8 +620,36 @@ class WorkflowManager:
         task = self._running.get(wid)
         return task is not None and not task.done()
 
-    async def _execute(self, wid: str) -> None:
+    def _partition(self, graph: dict[str, Any], state: dict[str, Any]) -> tuple[list[str], list[str]]:
+        """Split the queued steps into (ready, blocked).
+
+        A queued step is ready once every upstream has succeeded; it stays queued while an
+        upstream is still queued/running, and is blocked once an upstream can no longer
+        succeed (failed, or never queued at all).
+        """
+        edges = graph["edges"]
+        ready: list[str] = []
+        blocked: list[str] = []
+        for nid in self.topo_order(graph["nodes"], edges):
+            if state.get(nid, {}).get("status") != "pending":
+                continue
+            dep_st = [state.get(e["from"], {}).get("status") for e in edges if e["to"] == nid]
+            if any(s != "succeeded" and s not in self.WAITING for s in dep_st):
+                blocked.append(nid)
+            elif any(s in self.WAITING for s in dep_st):
+                continue
+            else:
+                ready.append(nid)
+        return ready, blocked
+
+    async def _execute(self, wid: str, resumed: bool = False) -> None:
+        # `resumed`: this scheduler is picking up a run started by a previous server
+        # process. Seed the judged set from what that run already got through, or a resume
+        # with nothing left to do would settle on 'idle' instead of its real verdict.
         executed: set[str] = set()
+        if resumed:
+            executed = {nid for nid, s in self._fresh_state(wid).items()
+                        if s.get("status") not in (None, "idle")}
         try:
             while True:
                 wf = self.get(wid)
@@ -454,21 +660,18 @@ class WorkflowManager:
                 edges = graph["edges"]
                 state = self._sync_state(wid, nodes)
 
-                # A queued node is ready once every upstream has succeeded; it stays
-                # queued while an upstream is still queued/running, and is blocked once
-                # an upstream can no longer succeed (failed, or never queued at all).
-                ready: list[str] = []
-                blocked: list[str] = []
-                for nid in self.topo_order(graph["nodes"], edges):
-                    if state.get(nid, {}).get("status") != "pending":
-                        continue
-                    dep_st = [state.get(e["from"], {}).get("status") for e in edges if e["to"] == nid]
-                    if any(s != "succeeded" and s not in self.WAITING for s in dep_st):
-                        blocked.append(nid)
-                    elif any(s in self.WAITING for s in dep_st):
-                        continue
-                    else:
-                        ready.append(nid)
+                # A step left 'running' by a previous server process has nothing awaiting
+                # it: the _run_node that was watching it died with that server, while the
+                # job itself kept on training. Adopt it — wait it out exactly as _run_node
+                # would have. Never relaunch it; it is still on the GPU.
+                orphan = next((nid for nid, s in state.items()
+                               if s.get("status") == "running" and s.get("job_id")), None)
+                if orphan:
+                    executed.add(orphan)
+                    await self._await_node(wid, orphan, state[orphan]["job_id"])
+                    continue                       # it is terminal now: re-evaluate
+
+                ready, blocked = self._partition(graph, state)
 
                 if blocked:
                     state = self._fresh_state(wid)
@@ -480,12 +683,8 @@ class WorkflowManager:
                     continue                       # blocking cascades: re-evaluate
 
                 if not ready:
-                    # Steps are awaited inline, so nothing should be mid-flight here —
-                    # but never exit the loop out from under a running step.
-                    if any(s.get("status") == "running" for s in state.values()):
-                        await asyncio.sleep(1.0)
-                        continue
-                    break                          # queue drained
+                    break                          # queue drained (a running step is an
+                                                   # orphan by now, handled above)
 
                 nid = ready[0]                     # strictly sequential: one step at a time
                 executed.add(nid)
@@ -511,6 +710,18 @@ class WorkflowManager:
         every await: a step may have been queued onto this live run while we waited, and
         writing back a stale copy would silently drop it."""
         state = self._fresh_state(wid)
+        # Never launch a step whose job is already running — adopt it and wait it out.
+        # Without this, a workflow resumed while its step was still training would start a
+        # *second* training on the same GPU, and for a project workflow `replace` below
+        # would delete the run folder the first one is still writing into.
+        alive = state.get(nid, {}).get("job_id") or node.get("job_id")
+        if alive:
+            existing = jobs.get(alive)
+            if existing and existing["status"] in ACTIVE:
+                state[nid] = {"job_id": alive, "status": "running", "error": None}
+                self._set_run(wid, "running", state)
+                await self._await_node(wid, nid, alive)
+                return
         args = dict(node.get("args", {}))
         for auto in (registry.output_arg(node["program"]), registry.ssd_arg(node["program"])):
             if auto:
@@ -549,6 +760,11 @@ class WorkflowManager:
         state[nid] = {"job_id": jid, "status": "running", "error": None}
         self._set_run(wid, "running", state)
 
+        await self._await_node(wid, nid, jid)
+
+    async def _await_node(self, wid: str, nid: str, jid: str) -> None:
+        """Wait a step's job out and record how it ended. Split out of :meth:`_run_node` so
+        a scheduler resumed after a restart can adopt a job it never launched."""
         final = await self._wait_job(jid)
         state = self._fresh_state(wid)
         state[nid] = {"job_id": jid, "status": final,
@@ -615,8 +831,10 @@ class WorkflowManager:
 
     # -- helpers -----------------------------------------------------------
     def _set_run(self, wid: str, status: str, state: dict) -> None:
+        # A scheduler is driving this workflow again, so the parked "resume?" offer is
+        # spent — whether it was taken up, superseded by a fresh Run, or stopped.
         self._db.execute(
-            "UPDATE workflows SET status=?, run_state=?, updated_at=? WHERE id=?",
+            "UPDATE workflows SET status=?, run_state=?, resumable=0, updated_at=? WHERE id=?",
             (status, json.dumps(state), _now(), wid),
         )
         self._db.commit()
@@ -625,6 +843,7 @@ class WorkflowManager:
         data = dict(row)
         data["graph"] = json.loads(data["graph"]) if data.get("graph") else {"nodes": [], "edges": []}
         data["run_state"] = json.loads(data["run_state"]) if data.get("run_state") else None
+        data["resumable"] = bool(data.get("resumable"))
         return data
 
 

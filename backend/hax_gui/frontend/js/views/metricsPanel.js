@@ -78,7 +78,19 @@ export function metricsPanel({ logdir, jobId }) {
   let timer = null;
   let destroyed = false;
 
-  // -- head: sub-tabs + live toggle + the TensorBoard escape hatch ----------
+  // Export settings live on the panel so a plot and the latent landscape come out of the
+  // same run looking alike — same idea (and same wording) as the annotate viewer's.
+  const exportOpts = { scale: 2, transparent: false };
+  const dpiSel = h("select", {
+    class: "input mx-select", title: "Image scale / DPI",
+    onchange: (e) => (exportOpts.scale = +e.target.value),
+  }, ...[1, 2, 3, 4].map((s) => h("option", { value: String(s), selected: s === 2 }, `${s}×`)));
+  const transpBox = h("input", {
+    type: "checkbox",
+    onchange: (e) => (exportOpts.transparent = e.target.checked),
+  });
+
+  // -- head: sub-tabs + export + live toggle + the TensorBoard escape hatch --
   const subtabs = h("div", { class: "mx-subtabs" });
   const liveBox = h("input", { type: "checkbox", checked: true, onchange: (e) => { live = e.target.checked; schedule(); } });
   const tbBtn = h("button", {
@@ -89,6 +101,8 @@ export function metricsPanel({ logdir, jobId }) {
   root.appendChild(h("div", { class: "mx-head" },
     subtabs,
     h("div", { class: "mx-spacer" }),
+    h("label", { class: "mx-live", title: "Resolution of saved PNGs" }, "Export", dpiSel),
+    h("label", { class: "mx-live", title: "Save with no background, to drop onto a slide or a figure" }, transpBox, "Transparent"),
     h("label", { class: "mx-live", title: "Re-read the event files every few seconds" }, liveBox, "Live"),
     tbBtn));
   root.appendChild(body);
@@ -144,7 +158,8 @@ export function metricsPanel({ logdir, jobId }) {
     const known = new Set(selected);   // tags a live run starts logging later get selected too
     let smoothing = 0.6, logY = false, xAxis = "step";
     let data = {};                       // {tag: {run: [[step, wall, value], …]}}
-    const plots = new Map();             // tag -> { card, plot, legend }
+    const plots = new Map();             // tag -> { card, plot, legend, styleBox }
+    const curveStyles = new Map();       // "tag\0run" -> { color, dash, width, alpha }
     let filter = "";
 
     const search = h("input", {
@@ -199,12 +214,68 @@ export function metricsPanel({ logdir, jobId }) {
       return isFinite(t0) ? t0 : 0;
     }
 
+    // Per-curve appearance, remembered per (tag, run) so it survives re-polls, tag
+    // re-selection and a smoothing change. Seeded from the palette on first sight.
+    function styleFor(tag, run, i) {
+      const key = `${tag}\u0000${run}`;
+      let st = curveStyles.get(key);
+      if (!st) {
+        st = { color: colorAt(i), dash: "solid", width: 1.5, alpha: 1, hidden: false };
+        curveStyles.set(key, st);
+      }
+      return st;
+    }
+
+    // Every curve of the tag, hidden ones included: the legend needs them all (that is
+    // where you switch one back on), the plot takes only the visible subset.
     function seriesFor(tag, t0) {
       const runs = data[tag] || {};
       return Object.entries(runs).map(([run, pts], i) => {
+        const st = styleFor(tag, run, i);
         let p = pts.map(([step, wall, v]) => [xAxis === "step" ? step : (wall - t0) / 60, v]);
         if (logY) p = p.map(([x, y]) => [x, y != null && y > 0 ? Math.log10(y) : null]);
-        return { name: runLabel(run, tag), color: colorAt(i), points: smooth(p, smoothing) };
+        return {
+          name: runLabel(run, tag), points: smooth(p, smoothing),
+          color: st.color, dash: st.dash, width: st.width, alpha: st.alpha,
+          hidden: st.hidden, style: st,
+        };
+      });
+    }
+
+    // The style editor: one row per curve on the card it belongs to, so you tweak what
+    // you are looking at instead of hunting for it in a global settings pane.
+    function buildStyleBox(tag, box) {
+      clear(box);
+      const runs = Object.keys(data[tag] || {});
+      if (!runs.length) return;
+      runs.forEach((run, i) => {
+        const st = styleFor(tag, run, i);
+        const apply = () => refresh();
+        box.appendChild(h("div", { class: "mx-styrow" },
+          h("input", {
+            type: "checkbox", checked: !st.hidden, title: "Plot this curve",
+            onchange: (e) => { st.hidden = !e.target.checked; apply(); },
+          }),
+          h("input", {
+            type: "color", class: "mx-color", value: st.color, title: "Curve colour",
+            oninput: (e) => { st.color = e.target.value; apply(); },
+          }),
+          h("span", { class: "mx-styname", title: runLabel(run, tag) }, runLabel(run, tag)),
+          h("select", {
+            class: "input mx-select", title: "Line style",
+            onchange: (e) => { st.dash = e.target.value; apply(); },
+          }, ...["solid", "dashed", "dotted"].map((d) =>
+            h("option", { value: d, selected: d === st.dash }, d))),
+          h("select", {
+            class: "input mx-select", title: "Line width",
+            onchange: (e) => { st.width = +e.target.value; apply(); },
+          }, ...[1, 1.5, 2, 3].map((w) =>
+            h("option", { value: String(w), selected: w === st.width }, `${w}px`))),
+          h("input", {
+            type: "range", min: "0.1", max: "1", step: "0.05", value: String(st.alpha),
+            class: "mx-range mx-alpha", title: "Opacity",
+            oninput: (e) => { st.alpha = +e.target.value; apply(); },
+          })));
       });
     }
 
@@ -224,18 +295,32 @@ export function metricsPanel({ logdir, jobId }) {
         if (plots.has(tag)) continue;
         const canvas = h("canvas", { class: "mx-canvas" });
         const legend = h("div", { class: "mx-legend" });
+        const styleBox = h("div", { class: "mx-stylebox", style: { display: "none" } });
+        const styleBtn = h("button", {
+          class: "btn-icon", title: "Customise the curves (colour, style, width, opacity)",
+          onclick: () => {
+            const open = styleBox.style.display === "none";
+            styleBox.style.display = open ? "" : "none";
+            styleBtn.classList.toggle("active", open);
+            if (open) buildStyleBox(tag, styleBox);
+          },
+        }, icon("sliders", 14));
         const card = h("div", { class: "mx-card" },
           h("div", { class: "mx-card-head" },
             h("span", { class: "mx-card-title", title: tag }, tag),
             legend,
+            styleBtn,
             h("button", {
-              class: "btn-icon", title: "Save as PNG",
-              onclick: async () => download(await plots.get(tag).plot.snapshot({ scale: 2 }), `${tag.replace(/[^\w.-]+/g, "_")}.png`),
+              class: "btn-icon", title: "Save as PNG (uses the export settings above)",
+              onclick: async () => download(
+                await plots.get(tag).plot.snapshot({ ...exportOpts }),
+                `${tag.replace(/[^\w.-]+/g, "_")}${exportOpts.scale}x.png`),
             }, icon("image", 14)),
             h("button", { class: "btn-icon", title: "Download CSV", onclick: () => exportCsv(tag) }, icon("fileText", 14))),
+          styleBox,
           canvas);
         cards.appendChild(card);
-        plots.set(tag, { card, plot: createPlot(canvas), legend });
+        plots.set(tag, { card, plot: createPlot(canvas), legend, styleBox });
       }
       refresh();
     }
@@ -255,14 +340,26 @@ export function metricsPanel({ logdir, jobId }) {
       const xlab = xAxis === "step" ? "step" : "minutes";
       for (const [tag, entry] of plots) {
         const ss = seriesFor(tag, t0);
-        entry.plot.setSeries("line", ss, { x: xlab, y: ylab });
+        entry.plot.setSeries("line", ss.filter((s) => !s.hidden), { x: xlab, y: ylab });
         clear(entry.legend);
         if (ss.length > 1) {
+          // The legend doubles as the on/off switch — clicking a name drops that curve
+          // from the plot (and from the autoscale), clicking it again brings it back.
           for (const s of ss) {
-            entry.legend.appendChild(h("span", { class: "mx-legitem" },
-              h("i", { class: "mx-swatch", style: { background: s.color } }), s.name));
+            entry.legend.appendChild(h("button", {
+              class: "mx-legitem" + (s.hidden ? " off" : ""),
+              title: s.hidden ? `Show "${s.name}"` : `Hide "${s.name}"`,
+              onclick: () => {
+                s.style.hidden = !s.style.hidden;
+                refresh();
+                if (entry.styleBox.style.display !== "none") buildStyleBox(tag, entry.styleBox);
+              },
+            }, h("i", { class: "mx-swatch", style: { background: s.color, opacity: String(s.alpha) } }), s.name));
           }
         }
+        if (entry.styleBox.style.display !== "none" && entry.styleBox.childElementCount !== ss.length) {
+          buildStyleBox(tag, entry.styleBox);   // only when the curve set changed: a rebuild
+        }                                       // mid-drag would replace the slider you hold
       }
     }
 
@@ -414,6 +511,14 @@ export function metricsPanel({ logdir, jobId }) {
     const range = h("input", { type: "range", min: "0", max: "0", value: "0", class: "mx-range grow", oninput: (e) => { idx = +e.target.value; show(); } });
     const playBtn = h("button", { class: "btn-icon", title: "Play through the epochs", onclick: togglePlay }, icon("play", 15));
     const resetBtn = h("button", { class: "btn-icon", title: "Reset the camera", style: { display: "none" }, onclick: () => cloud?.resetView() }, icon("refresh", 15));
+    const saveBtn = h("button", {
+      class: "btn-icon", title: "Save the landscape as PNG (uses the export settings above)",
+      onclick: async () => {
+        const src = dims === 3 ? cloud : scatter;
+        const blob = await src?.snapshot({ ...exportOpts });
+        if (blob) download(blob, `latent_${dims}d_epoch${steps()[idx]}_${exportOpts.scale}x.png`);
+      },
+    }, icon("image", 15));
     const info = h("div", { class: "mx-info" });
     const colorSel = h("select", { class: "input mx-select", onchange: (e) => { colorBy = +e.target.value; paintColors(); } });
     const colorRow = h("label", { class: "mx-ctl", style: { display: "none" } }, h("span", null, "Colour by"), colorSel);
@@ -475,7 +580,7 @@ export function metricsPanel({ logdir, jobId }) {
     el.appendChild(side);
     el.appendChild(h("div", { class: "mx-latent-main" },
       h("div", { class: "mx-scatterwrap" }, canvas2d, canvas3d),
-      h("div", { class: "mx-transport" }, playBtn, range, stepLabel, resetBtn)));
+      h("div", { class: "mx-transport" }, playBtn, range, stepLabel, saveBtn, resetBtn)));
 
     function resetCaches() {
       bases[2] = bases[3] = null;

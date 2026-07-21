@@ -3,6 +3,7 @@ import { h } from "../h.js";
 import { icon } from "../icons.js";
 import { UpdateBanner } from "../updates.js";
 import { SetupNotice } from "./setupNotice.js";
+import { ResumeNotice } from "./resumeNotice.js";
 
 const DOCS = "https://davidherreros.github.io/hax-em-docs/";
 
@@ -25,6 +26,7 @@ export function HomeView() {
     { class: "view" },
     UpdateBanner(),
     SetupNotice(),
+    ResumeNotice(),
     hero(),
     section("Documentation", h("div", { class: "grid", style: { marginBottom: "36px" } }, ...DOC_CARDS.map(docCard))),
     section("Using the GUI", h("div", { class: "steps" }, ...STEPS.map(step)))

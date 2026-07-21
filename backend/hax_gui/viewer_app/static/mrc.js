@@ -83,23 +83,38 @@ async function fetchGrid(size) {
 // again meanwhile. Gives continuous (server-bounded) updates without piling up
 // requests — same helper the landscape app uses.
 function makeLive(fn) {
-  let busy = false, pending = false;
-  async function run() { busy = true; do { pending = false; try { await fn(); } catch { /* fn reports */ } } while (pending); busy = false; }
-  return () => { if (busy) pending = true; else run(); };
+  let busy = false, pending = false, args = [];
+  async function run() { busy = true; do { pending = false; try { await fn(...args); } catch { /* fn reports */ } } while (pending); busy = false; }
+  return (...a) => { args = a; if (busy) pending = true; else run(); };
 }
 
-// One contour costs a full marching-cubes pass over the whole volume plus a
-// multi-MB mesh download, and the histogram fires this on every pointermove. Left
-// unthrottled a single drag queues one such request per pixel crossed; each reads
-// the *current* level, so coalescing converges on the level you released at.
-async function surfaceOnce() {
+// One contour costs a full marching-cubes pass over the whole volume plus a multi-MB mesh
+// download, and the histogram fires this on every pointermove. Left unthrottled a single
+// drag queues one such request per pixel crossed; each reads the *current* level, so
+// coalescing converges on the level you released at.
+//
+// Even coalesced, a full pass is ~750 ms and ~21 MB at a 320³ box — steady, but not live.
+// So while the pointer is down we ask for a draft: a strided grid, lightly smoothed (~80 ms,
+// ~3.8 MB), and take the full mesh once on release. The server scales the draft by its
+// stride, so it sits in the same [-1,1] cube and refines in place rather than jumping.
+const DRAFT_GRID = 160;
+// Drafts carry light smoothing too: a coarse grid facets more, and Taubin's cost is
+// almost all fixed setup (one tick costs what six do), so leaving it off bought nothing
+// and made the surface change character when you let go of the slider. See app.js.
+const DRAFT_SMOOTH = 2;
+
+async function surfaceOnce(draft) {
   status("Contouring…", "busy");
   try {
-    const buf = await (await fetch(`./api/decode?sigma=${state.sigma.toFixed(3)}&smooth=${state.smooth}`)).arrayBuffer();
+    const q = `sigma=${state.sigma.toFixed(3)}`
+            + (draft ? `&smooth=${Math.min(state.smooth, DRAFT_SMOOTH)}&size=${DRAFT_GRID}` : `&smooth=${state.smooth}`);
+    const buf = await (await fetch(`./api/decode?${q}`)).arrayBuffer();
     if (state.render !== "surface") return;   // mode switched while we were waiting
     const m = parseMesh(buf);
     renderer.setMesh(m.positions, m.normals, m.indices);
-    status(m.indices.length ? `Surface · σ ${state.sigma.toFixed(2)}` : "Empty surface at this contour", m.indices.length ? "" : "warn");
+    if (!m.indices.length) { status("Empty surface at this contour", "warn"); return; }
+    status(draft ? `Surface · σ ${state.sigma.toFixed(2)} · draft`
+                 : `Surface · σ ${state.sigma.toFixed(2)}`);
   } catch (err) { status("Contour failed: " + err.message, "err"); }
 }
 const loadSurface = makeLive(surfaceOnce);
@@ -130,9 +145,9 @@ function normThreshold() {
   return (lvl - gridVol.vmin) / ((gridVol.vmax - gridVol.vmin) || 1);
 }
 
-function onLevel(level) {
+function onLevel(level, dragging) {
   state.sigma = info ? (level - info.mean) / (info.std || 1) : hist.sigma;
-  if (state.render === "surface") loadSurface();
+  if (state.render === "surface") loadSurface(!!dragging);
   else if (state.render === "mip" || state.render === "emission") volRenderer.setThreshold(normThreshold());
 }
 

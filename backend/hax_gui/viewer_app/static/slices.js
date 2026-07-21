@@ -202,9 +202,18 @@ export function createSlices(container) {
 
   return {
     el: container,
+    // Swap in a new volume. When the grid keeps the same dimensions (e.g. successive
+    // frames of a morph), the current cut positions, zoom and pan are preserved so the
+    // view does not jump — you keep watching the same plane as the density moves through
+    // it. A change of dimensions re-centers, as on a first load.
     setVolume(g) {
+      const same = grid && grid.nx === g.nx && grid.ny === g.ny && grid.nz === g.nz;
       grid = g;
-      pos.x = g.nx >> 1; pos.y = g.ny >> 1; pos.z = g.nz >> 1;
+      if (same) {
+        pos.x = Math.min(pos.x, g.nx - 1); pos.y = Math.min(pos.y, g.ny - 1); pos.z = Math.min(pos.z, g.nz - 1);
+      } else {
+        pos.x = g.nx >> 1; pos.y = g.ny >> 1; pos.z = g.nz >> 1;
+      }
       for (const k in panels) {
         const p = panels[k];
         const n = p.cut.axis === "z" ? g.nz : p.cut.axis === "y" ? g.ny : g.nx;
