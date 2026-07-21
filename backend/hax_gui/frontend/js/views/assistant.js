@@ -13,6 +13,8 @@ import { assistantChat, api } from "../api.js";
 import { renderMarkdown } from "../markdown.js";
 import { store } from "../store.js";
 import { createTerminal } from "./terminal.js";
+import { runBrowser, folderName } from "./runBrowser.js";
+import { jobLabelChips } from "./labels.js";
 
 const GREETING =
   "Hi! I can help you pick programs and parameters, explain options from the docs, "
@@ -183,16 +185,41 @@ export function AssistantView() {
   async function loadJobs() {
     try { jobsCache = await api.jobs(); } catch { jobsCache = []; }
   }
-  function relevantJobs() {
-    return ctrl.currentChatProject
-      ? jobsCache.filter((j) => j.project_id === ctrl.currentChatProject)
-      : jobsCache.slice();  // api.jobs() is already newest-first
+  // ── run picker (modal): every run grouped by project, with filters + labels,
+  //    so a run is easy to find by project / program / name / folder. ──────────
+  let runPicker = null;
+  function closeRunPicker() {
+    if (!runPicker) return;
+    runPicker.remove();
+    document.removeEventListener("keydown", onRunPickerKey);
+    runPicker = null;
   }
-  function jobOptionLabel(j) {
-    const bits = [j.program];
-    if (j.name && j.name !== j.program) bits.push(j.name);
-    if (j.status && j.status !== "succeeded") bits.push(`(${j.status})`);
-    return bits.join(" · ");
+  function onRunPickerKey(e) { if (e.key === "Escape") closeRunPicker(); }
+  function attachRunRow(j) {
+    return h("button", { class: "run-row", onclick: () => { closeRunPicker(); attachJob(j.id); } },
+      h("span", { class: "run-prog mono" }, j.name || j.program),
+      j.name ? h("span", { class: "run-sub mono" }, j.program) : null,
+      h("span", { class: "run-folder mono" }, folderName(j.workdir)),
+      (j.status && j.status !== "succeeded") ? h("span", { class: "run-status" }, j.status) : null,
+      (j.labels && j.labels.length) ? jobLabelChips(j) : null,
+      h("span", { class: "run-time" }, new Date(j.created_at).toLocaleString()),
+      h("span", { class: "run-open" }, icon("paperclip", 14), "Attach"));
+  }
+  function openRunPicker() {
+    const browser = runBrowser({
+      renderRow: attachRunRow,
+      emptyText: "No runs yet. Launch a program, then attach its run here.",
+    });
+    const modal = h("div", { class: "modal run-picker", onclick: (e) => e.stopPropagation() },
+      h("div", { class: "modal-head" }, h("span", null, "Attach a run"),
+        h("button", { class: "btn-icon", style: { border: "none" }, onclick: closeRunPicker }, icon("x", 18))),
+      h("div", { class: "run-picker-list" }, browser.el));
+    runPicker = h("div", { class: "overlay", onclick: closeRunPicker }, modal);
+    document.body.appendChild(runPicker);
+    document.addEventListener("keydown", onRunPickerKey);
+    browser.setStatus(h("p", { class: "muted", style: { padding: "12px" } }, "Loading runs…"));
+    // Refresh on open so a just-finished run shows; the cache is the fallback.
+    loadJobs().then(() => { if (runPicker) browser.setJobs(jobsCache); });
   }
   function renderAttachRow() {
     attachRow.replaceChildren();
@@ -218,14 +245,12 @@ export function AssistantView() {
       attachRow.appendChild(chip);
       return;
     }
-    const opts = [h("option", { value: "" }, "— attach a run —")];
-    for (const j of relevantJobs()) opts.push(h("option", { value: j.id }, jobOptionLabel(j)));
     attachRow.appendChild(h("span", { class: "muted chat-attach-lead" }, icon("paperclip", 13), "Run"));
-    attachRow.appendChild(h("select", {
-      class: "chat-attach-select",
+    attachRow.appendChild(h("button", {
+      class: "chat-attach-btn",
       title: "Attach a run so the assistant can summarize its metrics, landscape and volume motions",
-      onchange: (e) => attachJob(e.target.value),
-    }, ...opts));
+      onclick: openRunPicker,
+    }, icon("paperclip", 13), "Attach a run…"));
   }
   async function attachJob(id) {
     if (!id) { ctrl.attachedRun = null; renderAttachRow(); return; }

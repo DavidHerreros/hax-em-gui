@@ -220,12 +220,14 @@ export function metricsPanel({ logdir, jobId }) {
       const key = `${tag}\u0000${run}`;
       let st = curveStyles.get(key);
       if (!st) {
-        st = { color: colorAt(i), dash: "solid", width: 1.5, alpha: 1 };
+        st = { color: colorAt(i), dash: "solid", width: 1.5, alpha: 1, hidden: false };
         curveStyles.set(key, st);
       }
       return st;
     }
 
+    // Every curve of the tag, hidden ones included: the legend needs them all (that is
+    // where you switch one back on), the plot takes only the visible subset.
     function seriesFor(tag, t0) {
       const runs = data[tag] || {};
       return Object.entries(runs).map(([run, pts], i) => {
@@ -235,6 +237,7 @@ export function metricsPanel({ logdir, jobId }) {
         return {
           name: runLabel(run, tag), points: smooth(p, smoothing),
           color: st.color, dash: st.dash, width: st.width, alpha: st.alpha,
+          hidden: st.hidden, style: st,
         };
       });
     }
@@ -249,6 +252,10 @@ export function metricsPanel({ logdir, jobId }) {
         const st = styleFor(tag, run, i);
         const apply = () => refresh();
         box.appendChild(h("div", { class: "mx-styrow" },
+          h("input", {
+            type: "checkbox", checked: !st.hidden, title: "Plot this curve",
+            onchange: (e) => { st.hidden = !e.target.checked; apply(); },
+          }),
           h("input", {
             type: "color", class: "mx-color", value: st.color, title: "Curve colour",
             oninput: (e) => { st.color = e.target.value; apply(); },
@@ -333,12 +340,21 @@ export function metricsPanel({ logdir, jobId }) {
       const xlab = xAxis === "step" ? "step" : "minutes";
       for (const [tag, entry] of plots) {
         const ss = seriesFor(tag, t0);
-        entry.plot.setSeries("line", ss, { x: xlab, y: ylab });
+        entry.plot.setSeries("line", ss.filter((s) => !s.hidden), { x: xlab, y: ylab });
         clear(entry.legend);
         if (ss.length > 1) {
+          // The legend doubles as the on/off switch — clicking a name drops that curve
+          // from the plot (and from the autoscale), clicking it again brings it back.
           for (const s of ss) {
-            entry.legend.appendChild(h("span", { class: "mx-legitem" },
-              h("i", { class: "mx-swatch", style: { background: s.color, opacity: String(s.alpha) } }), s.name));
+            entry.legend.appendChild(h("button", {
+              class: "mx-legitem" + (s.hidden ? " off" : ""),
+              title: s.hidden ? `Show "${s.name}"` : `Hide "${s.name}"`,
+              onclick: () => {
+                s.style.hidden = !s.style.hidden;
+                refresh();
+                if (entry.styleBox.style.display !== "none") buildStyleBox(tag, entry.styleBox);
+              },
+            }, h("i", { class: "mx-swatch", style: { background: s.color, opacity: String(s.alpha) } }), s.name));
           }
         }
         if (entry.styleBox.style.display !== "none" && entry.styleBox.childElementCount !== ss.length) {

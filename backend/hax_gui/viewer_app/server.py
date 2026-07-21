@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import threading
+import time
 from pathlib import Path
 
 # Be a good GPU citizen: don't preallocate the whole device.
@@ -25,6 +26,25 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 _DECODE_SLOTS = threading.BoundedSemaphore(
     max(1, int(os.environ.get("HAX_VIEWER_DECODE_CONCURRENCY", "2")))
 )
+
+# HAX_VIEWER_TIMING=1 prints a per-frame breakdown of where a morph frame's time actually
+# goes: network vs copy-home vs marching cubes + smoothing.
+#
+# That split has never been measured. The estimates in the comments below ("~700 ms of the
+# ~750") were taken at a 320³ box at *full* resolution, but `size=` shrinks the meshing ~15x
+# while shrinking the network by exactly nothing (it always evaluates the model's own box —
+# see `_decode_latent`), so at playback resolution the ratio could be anything. Whether it is
+# worth attacking the decode or the mesher depends entirely on this number, so measure it
+# rather than inheriting the assumption.
+_TIMING = os.environ.get("HAX_VIEWER_TIMING", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _timing(stage: str, **parts: float) -> None:
+    """Print one timing line. `parts` are seconds; shown as ms in declaration order."""
+    if not _TIMING:
+        return
+    body = " | ".join(f"{k} {v * 1e3:8.1f} ms" for k, v in parts.items())
+    print(f"[viewer:timing] {stage:12s} {body}", flush=True)
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -117,27 +137,24 @@ class Landscape:
                     n_init=1 if init is not None else 10, random_state=0)
         return km.fit_predict(data)
 
-    def kmeans_full(self, k: int, seeds: list[int] | None = None, space: str = "view"):
+    def kmeans_full(self, k: int, seeds: list[int] | None = None):
         """KMeans -> (labels, decodable centroid latents, centroid PCA coords).
 
-        ``space`` selects which coordinates the clustering runs on:
-        - ``"view"``    : the display latents (the reduced space when one was
-                          supplied, else the full latents) — matches what's shown.
-        - ``"network"`` : the full network latent space (``decode``), i.e. every
-                          original dimension at once.
-        Either way each row still maps to one state, so labels/centroids project
-        onto the current embedding for display, and centroids are the per-cluster
-        mean of the *decode* latents so they always remain decodable.
+        Clustering always runs on the display latents (the reduced space when one was
+        supplied, else the full latents) — i.e. on latent coordinates, never on the
+        PCA/UMAP projection, which is display-only. Each row maps to one state, so labels
+        and centroids project onto whatever embedding is on screen, and the centroids are
+        the per-cluster mean of the *decode* latents so they always remain decodable.
 
         When ``seeds`` (state indices) are given, they are used as the initial
         cluster centers and fix the cluster count (k = number of unique seeds)."""
         _ = self.pca  # ensure the PCA basis exists
-        data = self.decode if space == "network" else self.latents
+        data = self.latents
         seeds = [int(s) for s in (seeds or []) if 0 <= int(s) < self.n]
         seeds = list(dict.fromkeys(seeds))  # de-dup, keep order
         # Memoised: this used to be the one clustering path with no cache at all, so every
         # click of "Cluster" re-ran a full KMeans over every state.
-        ckey = (int(k), tuple(seeds), str(space))
+        ckey = (int(k), tuple(seeds))
         hit = self._kmeans.get(ckey)
         if hit is not None:
             return hit
@@ -156,6 +173,21 @@ class Landscape:
         out = (labels, centroids, cpca)
         self._kmeans[ckey] = out
         return out
+
+    def centroid_coords(self, embed: str, k: int, seeds: list[int] | None = None) -> np.ndarray:
+        """Where the cluster centroids sit *in the coordinate table `embed` is drawn from*.
+
+        A centroid marker has to be plotted in the same units as the points around it.
+        Only PCA is a linear map of the display latents, so a stored PCA vector cannot be
+        reused for the UMAP or raw-latent views — UMAP in particular has no usable basis
+        to project a new point through. Instead take, per cluster, the mean of its
+        members' coordinates in that embedding: defined for every embedding, and it lands
+        the marker in the middle of the cluster it belongs to, which is what it means.
+
+        ``kmeans_full`` is memoised, so this reuses the existing labels."""
+        labels, _c, _p = self.kmeans_full(k, seeds)
+        coords = np.asarray(self._coords(embed))
+        return np.stack([coords[labels == c].mean(0) for c in np.unique(labels)]).astype(np.float32)
 
     @property
     def pca_var(self):
@@ -245,6 +277,34 @@ class Landscape:
         return self._clusters[k]
 
 
+def _model_box(network) -> int | None:
+    """The decoded volume's grid edge, read off a loaded model, or None if it can't be.
+
+    Every het decoder allocates its output as ``jnp.zeros((B, s, s, s))`` and keeps ``s``
+    on the module: the volume decoder submodule holds it as ``volume_size`` (HetSIREN,
+    ReconSIREN) or ``xsize`` (Zernike3Deep), and the top-level network mirrors it as
+    ``xsize``. Probed most-direct-first — the submodule attribute is literally the shape
+    used to allocate the grid, the top-level one is a mirror that could in principle drift.
+
+    Returns None rather than guessing, so the caller keeps the old decode-to-learn-it path.
+    """
+    probes = (
+        lambda: network.delta_volume_decoder.volume_size,
+        lambda: network.volume_decoder.volume_size,
+        lambda: network.delta_volume_decoder.xsize,
+        lambda: network.xsize,
+        lambda: network.volume_size,
+    )
+    for probe in probes:
+        try:
+            box = int(probe())
+        except Exception:  # noqa: BLE001 - attribute absent, or not an int; try the next
+            continue
+        if box > 0:
+            return box
+    return None
+
+
 # --------------------------------------------------------------------------
 # Decoder: load network + latents, decode a latent -> density grid (lazy JAX).
 # --------------------------------------------------------------------------
@@ -276,6 +336,7 @@ class Decoder:
         # is the one that actually bounds memory once the box gets large (see _trim_caches).
         self._budget = int(os.environ.get("HAX_VIEWER_VOL_CACHE_MB", "1024")) * 1024 * 1024
         self._box: int | None = None        # the model's grid size, learned on first decode
+        self._decodes = 0                   # counter, for the HAX_VIEWER_TIMING breakdown
         self.extra: list[np.ndarray] = []   # centroid latents, addressed as indices n..n+m-1
 
     @property
@@ -328,6 +389,14 @@ class Decoder:
 
         self._jnp = jnp
         self._decode = _decode
+        # The box is a property of the checkpoint, so read it off the model here. `draft`
+        # needs it to choose the stride, and it used to learn it by decoding a whole volume
+        # *unstrided* and copying it home — ~85 ms of PCIe on top of the decode (see
+        # `_decode_latent`), paid on the first morph frame of every session, purely to find
+        # out an integer the model was already carrying. `_decode_latent` still sets the
+        # authoritative value from the real output shape; this only avoids the trip.
+        if self._box is None:
+            self._box = _model_box(network)
 
     def _decode_latent(self, latent: np.ndarray, stride: int = 1) -> np.ndarray:
         """Decode one latent to a density grid. With ``stride > 1`` the grid is subsampled
@@ -341,20 +410,42 @@ class Decoder:
         only what we are going to mesh (~16 MB, ~10 ms), which is what makes a morph — a
         fresh latent every frame, so nothing is ever cached — playable at all.
         """
+        load0 = time.perf_counter()
         self._ensure_model()
+        load = time.perf_counter() - load0        # nonzero only on the very first call
         jnp = self._jnp
+        t0 = time.perf_counter()
         vol = self._decode(jnp.asarray(latent))
         vol = jnp.squeeze(vol)
         if vol.ndim == 4:
             vol = vol[0]
         if vol.ndim != 3:
             raise RuntimeError(f"decode_volume returned shape {vol.shape}, expected a 3D grid")
-        self._box = int(max(vol.shape))     # learned once; the box is a property of the model
+        box = int(max(vol.shape))
+        if self._box is not None and self._box != box:
+            # _ensure_model read the box off the checkpoint; the real output disagrees. The
+            # decoded shape wins, but say so — one frame was strided for the wrong box
+            # before we got here, and _model_box's probe list needs updating for this model.
+            print(f"[viewer] checkpoint reports box {self._box} but decode_volume returned "
+                  f"{box}; using {box}.", flush=True)
+        self._box = box                     # authoritative: the box is a property of the model
         if stride > 1:
             vol = vol[::stride, ::stride, ::stride]      # still a device op
+        t1 = time.perf_counter()            # dispatch only so far: JAX ops are async
+        if _TIMING:
+            vol.block_until_ready()         # so `device` below is compute, not queueing
+        t2 = time.perf_counter()
         # np.array (not asarray) forces a writable copy -- JAX arrays are
         # read-only and skimage.marching_cubes needs a writable buffer.
-        return np.ascontiguousarray(np.array(vol, dtype=np.float32))
+        out = np.ascontiguousarray(np.array(vol, dtype=np.float32))
+        t3 = time.perf_counter()
+        self._decodes += 1
+        _timing(f"decode #{self._decodes}", dispatch=t1 - t0, device=t2 - t1, copy_home=t3 - t2,
+                **({"model_load": load} if load > 0.01 else {}))
+        if _TIMING and self._decodes == 1:
+            print(f"[viewer:timing]   ^ first decode: includes the XLA trace/compile and the "
+                  f"checkpoint load; box={box}, stride={stride}, out={out.shape}", flush=True)
+        return out
 
     @property
     def box(self) -> int | None:
@@ -376,7 +467,9 @@ class Decoder:
           ``_decode_latent``) so the full volume never crosses PCIe.
         """
         if self._box is None:
-            self.volume(index)                     # one full decode: learns the box, caches it
+            self._ensure_model()                   # reads the box straight off the checkpoint
+        if self._box is None:
+            self.volume(index)                     # model didn't expose it: learn it the old way
         step = max(1, int(np.ceil(self._box / float(max(1, size)))))
         if step <= 1:                              # asked for a draft no coarser than the box
             vol = (self.volume_interp(index, index2, t) if index2 is not None
@@ -692,6 +785,16 @@ class Exporter:
         return {"folder": str(folder), "files": files, "n": len(idx), "n_particles": n_particles}
 
 
+def _parse_seeds(seeds: str) -> list[int] | None:
+    """"3,17,42" -> [3, 17, 42]; empty or malformed -> None (i.e. unseeded KMeans)."""
+    if not seeds.strip():
+        return None
+    try:
+        return [int(x) for x in seeds.split(",") if x.strip() != ""]
+    except ValueError:
+        return None
+
+
 def build_app(decoder: Decoder, title: str = "Conformational landscape",
               metadata: str | None = None, project_dir: str | None = None) -> FastAPI:
     app = FastAPI(title="Hax WebGL viewer")
@@ -763,19 +866,12 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         return _i32_vector(ls.clusters(k))
 
     @app.get("/api/kmeans")
-    def kmeans(k: int = Query(5), seeds: str = Query(""), space: str = Query("view")) -> dict:
+    def kmeans(k: int = Query(5), seeds: str = Query("")) -> dict:
         """KMeans -> per-state labels + decodable centroids (virtual indices base..base+k-1).
         ``seeds`` is an optional comma-separated list of state indices used as the
-        initial cluster centers (then k = number of unique seeds). ``space`` is
-        ``"view"`` (display latents) or ``"network"`` (full original latent space)."""
-        seed_list = None
-        if seeds.strip():
-            try:
-                seed_list = [int(x) for x in seeds.split(",") if x.strip() != ""]
-            except ValueError:
-                seed_list = None
-        space = "network" if space == "network" else "view"
-        _labels, centroids, cpca = ls.kmeans_full(k, seed_list, space=space)
+        initial cluster centers (then k = number of unique seeds)."""
+        seed_list = _parse_seeds(seeds)
+        _labels, centroids, cpca = ls.kmeans_full(k, seed_list)
         base = decoder.set_centroids(centroids)
         # The per-state labels come back through /api/kmeans.bin instead of riding along
         # here as a million boxed Python ints. kmeans_full is memoised, so that second
@@ -797,16 +893,19 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             raise HTTPException(status_code=422, detail=str(exc))
 
     @app.get("/api/kmeans.bin")
-    def kmeans_bin(k: int = Query(5), seeds: str = Query(""), space: str = Query("view")) -> Response:
-        seed_list = None
-        if seeds.strip():
-            try:
-                seed_list = [int(x) for x in seeds.split(",") if x.strip() != ""]
-            except ValueError:
-                seed_list = None
-        space = "network" if space == "network" else "view"
-        labels, _c, _p = ls.kmeans_full(k, seed_list, space=space)
+    def kmeans_bin(k: int = Query(5), seeds: str = Query("")) -> Response:
+        labels, _c, _p = ls.kmeans_full(k, _parse_seeds(seeds))
         return _i32_vector(labels)
+
+    @app.get("/api/centroid_coords")
+    def centroid_coords(embed: str = Query("pca"), k: int = Query(5), seeds: str = Query("")) -> dict:
+        """Centroid positions in one embedding's coordinates (see Landscape.centroid_coords).
+
+        The browser asks for these when it switches to an embedding it hasn't got centroid
+        coordinates for yet — a marker drawn in PCA units on a UMAP frame lands nowhere
+        near its cluster."""
+        embed = embed if embed in ("pca", "umap", "latent") else "pca"
+        return {"embed": embed, "coords": ls.centroid_coords(embed, k, _parse_seeds(seeds)).tolist()}
 
     def _resolve_volume(index: int, index2: int | None, t: float) -> np.ndarray:
         """The decoded volume. Cheap on a repeat: `Decoder.volume` caches, so moving the
@@ -862,6 +961,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             raise HTTPException(status_code=404, detail="latent index out of range")
         other = index2 if (0 <= index2 < decoder.total and index2 != index) else None
         with _DECODE_SLOTS:
+            t_grid = time.perf_counter()
             try:
                 if size > 0:
                     # Draft: mesh a strided grid instead of the full one. ~15x cheaper at
@@ -877,11 +977,18 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
 
+            t_level = time.perf_counter()
             full = decoder.box or max(grid.shape)
             level = (level_for_mass(grid, mass / float(step) ** 3) if mass >= 0
                      else level_for_sigma(grid, sigma))
+            t_mesh = time.perf_counter()
             body = mesh_at(grid, level, smooth=max(0, min(50, smooth)),
                            step=step, full_size=full)
+            t_end = time.perf_counter()
+            # The number the whole performance question turns on: how a playback frame
+            # actually divides between the network and the host-side mesher.
+            _timing("/api/decode", grid=t_level - t_grid, level=t_mesh - t_level,
+                    mesh=t_end - t_mesh, total=t_end - t_grid)
         return Response(content=body, media_type="application/octet-stream")
 
     @app.get("/api/grid")

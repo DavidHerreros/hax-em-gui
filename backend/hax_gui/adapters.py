@@ -43,7 +43,14 @@ BINDABLE_FIELDS: dict[str, dict[str, str]] = {
     "image_gray_scale_adjustment": {"reload": "image_adjust_model", "md": "particles", "vol": "volume"},
     "volume_gray_scale_adjustment": {"reload": "volume_adjust_model", "md": "particles", "vol": "volume"},
     "estimate_latent_covariances": {"md": "particles"},
-    "modart": {"md": "particles", "vol": "volume"},
+    # `motion_correction` is a --reload in disguise: MoDART loads a trained motion
+    # decoder (HetSIREN w/ transport of mass, or Zernike3Deep) to correct particles
+    # while reconstructing, so it auto-wires from such a run just like a reload.
+    "modart": {"md": "particles", "vol": "volume", "motion_correction": "motion_model"},
+    # Same wiring as modart, minus `vol`: the Fourier-gridding reconstructor builds its
+    # map from the particles alone, so it takes no reference volume. Its motion kind is
+    # narrower than modart's -- see `transport_motion_model`.
+    "reconstruct_motion_corrected": {"md": "particles", "motion_correction": "transport_motion_model"},
     # reconstruct_volume needs nothing but the posed particles: it reconstructs the
     # consensus map from their alignments, so it takes no reference volume to wire in.
     "reconstruct_volume": {"md": "particles"},
@@ -100,6 +107,16 @@ _MODEL_KINDS: dict[str, dict[str, Any]] = {
     "image_adjust_model": {"programs": ["image_gray_scale_adjustment"], "form": "parent"},
     "volume_adjust_model": {"programs": ["volume_gray_scale_adjustment"], "form": "parent"},
     "decoder_model": {"programs": ["hetsiren", "zernike3deep", "reconsiren", "reconsiren_het_only"], "form": "dir"},
+    # MoDART's motion_correction loads the checkpoint path directly and calls
+    # decode_field on it, which only HetSIREN and Zernike3Deep implement -- so this
+    # kind is narrower than decoder_model (no reconsiren variants).
+    "motion_model": {"programs": ["hetsiren", "zernike3deep"], "form": "dir"},
+    # reconstruct_motion_corrected queries the displacement field at arbitrary points
+    # (decode_field_at), which only HetSIREN's mass-transport decoder implements -- a
+    # Zernike3Deep or fixed-grid HetSIREN checkpoint makes it exit with a UserWarning.
+    # Hence a kind narrower than motion_model, further filtered on --transport_mass by
+    # `job_produces` so only a run that actually trained one is offered.
+    "transport_motion_model": {"programs": ["hetsiren"], "form": "dir"},
 }
 
 # Artifacts referenced *in place* (no copy): the consumer is handed the producer's
@@ -116,6 +133,19 @@ _ARTIFACT_PRODUCERS: dict[str, list[dict[str, Any]]] = {
             "style": "path",
             "programs": {"preprocess_particles"},
             "globs": ["preprocessed_particles.xmd", "preprocessed_particles.star"],
+        },
+        {
+            # A network predict run's refined metadata: the same particle stack, now
+            # carrying the network's refined poses/shifts (and a latent column), so it
+            # feeds anywhere a preprocessed particle set does -- reconstruct_volume,
+            # modart, estimate_latent_covariances, ... Referenced in place like the
+            # preprocessed set: it points at the same image stack. Each program writes
+            # exactly one of these names (latents for the decoders, pose_shifts for the
+            # reconstruction nets), so listing all four picks whichever the run wrote.
+            "style": "path",
+            "programs": {"hetsiren", "zernike3deep", "reconsiren", "reconsiren_het_only"},
+            "globs": ["predicted_latents.xmd", "predicted_latents.star",
+                      "predicted_pose_shifts.xmd", "predicted_pose_shifts.star"],
         },
     ],
     "volume": [
@@ -220,6 +250,31 @@ def produces(program: str) -> list[str]:
         if program in info["programs"]:
             kinds.add(kind)
     return sorted(kinds)
+
+
+def job_produces(program: str, args: dict[str, Any] | None = None) -> list[str]:
+    """The kinds a *specific* run can feed downstream, narrowed by its ``--mode``.
+
+    ``produces(program)`` is the program's static capability, but a moded network
+    only writes different artifacts per mode: in ``train`` it saves its checkpoint
+    (a ``*_model`` kind) and no predict metadata; in ``predict`` it writes that
+    metadata (``latents`` + ``particles``) and no checkpoint. So a *train* run must
+    not be offered as a latents/particles source, nor a *predict* run as a model.
+    Programs without a train/predict mode carry no such ``mode`` and are unaffected.
+    """
+    kinds = produces(program)
+    args = args or {}
+    # Only a HetSIREN trained with --transport_mass carries a displacement field, and
+    # reconstruct_motion_corrected hard-fails without one. The flag is a store_true, so
+    # a truthy value in the run's args is exactly "the checkpoint has a motion field".
+    if not args.get("transport_mass"):
+        kinds = [k for k in kinds if k != "transport_motion_model"]
+    mode = args.get("mode")
+    if mode == "predict":
+        return [k for k in kinds if not k.endswith("_model")]
+    if mode == "train":
+        return [k for k in kinds if k.endswith("_model")]
+    return kinds
 
 
 def producers_for(program: str) -> dict[str, list[str]]:

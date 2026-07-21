@@ -78,9 +78,15 @@ let orbiting = false, orbMoved = false, orbX = 0, orbY = 0, orbDownX = 0, orbDow
 const layers = [];   // { name, color(hex), indices[], visible, kind? }  (kind 'path' = ordered morph path)
 let layerSeq = 0;
 let editingPathLayer = null;   // the path layer currently being edited (shift-click add/remove)
-// KMeans centroids: virtual indices >= L.n, with PCA coords + a per-centroid color
+// KMeans centroids: virtual indices >= L.n, with per-embedding coords + a per-centroid color
 let indexColor = {};     // index -> hex (decoded maps of these indices are auto-colored)
-let centroidPCA = {};    // index -> PCA vector (so centroids order along an axis for series)
+// embed -> { index -> coord vector in THAT embedding }. Centroids used to be stored as a
+// single PCA vector and drawn through whatever frame was active, so under UMAP (or raw
+// latent) the markers were plotted in PCA units on a UMAP axis and sat well off their
+// clusters. Each embedding now keeps its own coordinates, fetched on demand.
+let centroidVecs = {};
+let clusterQuery = null;   // the ?k=… / ?seeds=… of the current clustering, for those fetches
+const centroidCoords = () => centroidVecs[state.embedding] || {};
 let exportAvailable = false;
 
 const is3d = () => state.dims === 3;
@@ -181,6 +187,7 @@ function wireControls() {
     // The raw latent coords are big and only this view uses them, so they are not part of
     // the initial load — fetch them the first time someone actually asks for them.
     if (state.embedding === "latent" && !L.latents) { status("Loading latent coordinates…", "busy"); try { L.latents = await fetchMatrix("./api/latents.bin"); } catch (err) { status("Could not load latents: " + err, "err"); $("embed").value = "pca"; state.embedding = "pca"; return; } status(""); }
+    await ensureCentroidCoords();   // centroids live in the new embedding's coordinates too
     populateAxes();        // each embedding has its own axis set (PCs / UMAP dims / latent dims)
     refreshAxisEnabled();
     updatePoints();
@@ -231,6 +238,7 @@ function wireControls() {
   $("smooth").addEventListener("input", (e) => {
     state.smooth = +e.target.value;
     clearFrameCache();
+    scheduleWarm();          // re-decode the morph at the new smoothing, in the background
     if (playing) { prefetch(true); return; }
     if (state.timeline.length && state.frame > 0) liveFrame(state.frame, false);
     else liveDecode();
@@ -767,13 +775,15 @@ function layerColorsCSS() {
 function syncCentroidOverlay() {
   if (!centroidCtx) return;
   const co = $("centroidOverlay");
+  sizeOverlays();   // the box may have changed since the last draw — see sizeOverlays
   centroidCtx.clearRect(0, 0, co.clientWidth, co.clientHeight);
   if (landView === "slices") return;   // the scatter is hidden behind the slice grid
   const cen = layers.find((l) => l.kind === "centroid" && l.visible);
   if (!cen || !cen.indices) return;
   const land = activeLand();
   if (!land || !land.projectData) return;
-  const dataOf = (i) => axesOf(i < L.n ? (activeCoords() || L.pca)[i] : (centroidPCA[i] || []));
+  const cc = centroidCoords();
+  const dataOf = (i) => axesOf(i < L.n ? (activeCoords() || L.pca)[i] : (cc[i] || []));
 
   // Morph path that runs through centroids: the base renderers can't draw segments to a
   // virtual point, so we draw the whole trajectory here, colored to match the centroid.
@@ -793,8 +803,8 @@ function syncCentroidOverlay() {
   }
 
   // Centroid markers, the current one highlighted (its ring, since the base cloud can't).
-  const idxs = cen.indices.filter((i) => centroidPCA[i]);
-  const proj = land.projectData(idxs.map((i) => axesOf(centroidPCA[i])));
+  const idxs = cen.indices.filter((i) => cc[i]);
+  const proj = land.projectData(idxs.map((i) => axesOf(cc[i])));
   for (let k = 0; k < proj.length; k++) {
     const p = proj[k];
     if (p) drawCentroidMarker(centroidCtx, p[0], p[1], indexColor[idxs[k]] || cen.color || "#ffffff", idxs[k] === state.current);
@@ -982,6 +992,7 @@ async function recontourSeries(draft) {
     state.refMass = mass;
     clearFrameCache();                  // every frame's contour — and so its cache key — moved
     if (playing) prefetch(true);        // ...and the flush stopped the prefetcher
+    else scheduleWarm();                // paused: refill in the background at the new contour
     await renderFrame(state.frame, playing ? true : draft);
   } catch { /* a superseded drag frame: the next pointermove supersedes it anyway */ }
 }
@@ -1249,11 +1260,18 @@ function parseGrid(buf) {
 // nothing to do with it. Two limits keep that from running away, because a series taken
 // from a cluster layer can hand us hundreds or thousands of states:
 //
-// MAX_TIMELINE bounds the unique frames so the whole morph *fits the frame cache*. That is
-// the difference between a morph that is slow for ever (it never caches, so every cycle
-// re-decodes: see the eviction note above) and one that is slow once and then plays at the
-// full display rate for ever. At ~1.5 MB per draft mesh, 360 frames is ~540 MB — inside the
-// 768 MB budget, with room for the full-resolution frame you land on when you pause.
+// MAX_TIMELINE bounds the unique frames, so that a morph is slow once and then plays at the
+// full display rate for ever, rather than slow for ever (never fully cached, so every cycle
+// re-decodes whatever was evicted: see the eviction note above).
+//
+// It is a frame *count*, though, and the budget it is meant to respect is in *bytes* — so it
+// cannot actually guarantee the fit, and this comment used to claim it did ("~1.5 MB per
+// draft mesh, 360 frames is ~540 MB"). A draft mesh costs roughly 180 bytes per cell² of the
+// *strided* grid, and that grid is a sawtooth in the model's box (PLAY_GRID divides it, so
+// the stride jumps): ~1.2 MB/frame at a 160 box, ~2.1 MB at 320, ~3.0 MB at 256 or 384. So
+// 360 frames is ~400 MB at one box and ~1 GB at another, and only boxes with a strided grid
+// of ≤111 cells fit. checkTimelineFits() measures the real figure once frames start landing
+// and says so, rather than letting the morph quietly thrash for ever.
 //
 // MAX_NODES bounds the *waypoints*: every hop needs at least its endpoint, so a path with
 // more nodes than this could not be drawn in MAX_TIMELINE frames at all. Over the limit we
@@ -1370,6 +1388,7 @@ async function buildTimeline() {
       + " — bounded so the whole morph fits the frame cache and plays back smoothly."
     : `${steps.length} unique frames over ${path.length} states, spaced by latent-space distance.`;
   if (capped) status($("framelbl").title, "warn");
+  scheduleWarm();     // decode it now, while nothing is waiting on it
   return true;
 }
 
@@ -1389,25 +1408,76 @@ const frameCache = new Map();      // key -> { surface, payload, bytes, idx }
 const frameInflight = new Map();   // key -> Promise (single-flight per key)
 let cacheBytes = 0;
 let fillToken = 0;                  // bumped to cancel an in-flight prefetch
+let warmTimer = null;               // pending pre-Play warm (see scheduleWarm)
+let evictions = 0;                  // >0 means the timeline does not fit the budget
 
 // Prefetch shape. The server serialises decodes at 2 slots, so 2 in flight saturates it;
 // more would only make each one slower (they contend for CPU and memory bandwidth).
-const PREROLL_FRAMES = 24;    // buffered before playback starts at all
 const LOOKAHEAD = 64;         // frames kept ready ahead of the playhead
 const LOW_WATER = 8;          // below this the buffer is draining -> pace to the server
 const FETCH_CONCURRENCY = 2;
 
 // Rolling measure of what the server actually sustains, in ms per delivered frame. Used to
 // pace the *first* pass: better to play smoothly at 12 fps than to stutter at a nominal 30.
+//
+// Only intervals during which we were actually decoding count. Averaging the whole window
+// end-to-end (what this used to do) folds in every gap where the prefetcher had nothing to
+// fetch, so the measured "rate" climbed without bound the longer playback ran — and since
+// `pace = max(delay, rate)`, a morph that had gone quiet because it was fully cached ended
+// up throttling itself to a number that described idleness, not the server. The prefetcher
+// also clears the window outright when it finds the look-ahead already cached.
 const doneAt = [];
+const RATE_IDLE_GAP = 4000;   // ms; longer than any plausible draft frame => we were idle
 function decodeRateMs() {
   if (doneAt.length < 3) return 0;
-  return (doneAt[doneAt.length - 1] - doneAt[0]) / (doneAt.length - 1);
+  let sum = 0, n = 0;
+  for (let i = 1; i < doneAt.length; i++) {
+    const dt = doneAt[i] - doneAt[i - 1];
+    if (dt > RATE_IDLE_GAP) continue;
+    sum += dt; n++;
+  }
+  return n ? sum / n : 0;
 }
+
+let fitWarned = false;   // one cache-overflow warning per timeline (see checkTimelineFits)
 
 function clearFrameCache() {
   fillToken++;                     // cancel any running prefetch (its frames are stale)
+  clearTimeout(warmTimer);         // ...and any warm still pending for the old timeline
   frameCache.clear(); frameInflight.clear(); cacheBytes = 0; doneAt.length = 0;
+  fitWarned = false; evictions = 0;
+}
+
+// Once enough frames have landed to measure a real bytes/frame, check whether the whole
+// timeline can actually stay resident, and say so once if it cannot. See the MAX_TIMELINE
+// note: the cap is a frame count, the budget is bytes, and which of the two binds depends on
+// the model's box. Without this the morph just never stops re-decoding and never explains why.
+function checkTimelineFits() {
+  if (fitWarned || frameCache.size < 8 || !state.timeline.length) return;
+  // Count the cache keys the playhead will actually ask for, rather than assuming one per
+  // timeline slot. Two things collapse that count, and both are easy to get wrong: the
+  // there-and-back mirror means positions i and n-1-i are the same latent under the same
+  // key, and at step > 1 the playhead skips slots entirely. A 361-slot morph at the default
+  // 60 fps (step 2) is 91 decodes, not 361 and not 181 — assuming otherwise would warn about
+  // an overflow four times bigger than the real one.
+  const n = state.timeline.length;
+  const { step } = playCadence();
+  const keys = new Set();
+  for (const i of upcoming(state.frame, step, Math.ceil(n / Math.max(1, step)))) {
+    const req = frameRequest(i, true);
+    if (req) keys.add(req.key);
+  }
+  const unique = keys.size || 1;
+  const perFrame = cacheBytes / frameCache.size;
+  const need = perFrame * unique;
+  if (need <= CACHE_BUDGET) return;
+  fitWarned = true;
+  const mb = (v) => Math.round(v / (1024 * 1024));
+  const msg = `This morph needs ~${mb(need)} MB of decoded frames (${unique} unique × `
+    + `~${(perFrame / (1024 * 1024)).toFixed(1)} MB) but the cache holds ${mb(CACHE_BUDGET)} MB, `
+    + `so every loop will re-decode part of it. Lower “frames” to keep it fully cached.`;
+  status(msg, "warn");
+  $("framelbl").title = msg;
 }
 
 // Evict down to the budget, dropping the frame furthest AHEAD of the playhead first.
@@ -1417,17 +1487,26 @@ function clearFrameCache() {
 // timeline that overflowed the budget evicted exactly what it was about to need and hit
 // approximately never — a long morph (a cluster layer) stayed slow on every cycle, for
 // ever. Evicting what we'll want *last* is near-optimal for a cyclic scan.
+//
+// "When we'll want it" has to account for the mirror. The timeline is there-and-back
+// (buildTimeline), so `[a,b,t]` at position i is the same latent — and therefore the same
+// cache key, the same single entry — as position n-1-i. Ranking on `e.idx` alone, the
+// position that happened to insert it, got this exactly backwards for the whole return leg:
+// a frame the playhead was about to reach again was scored as the furthest away and thrown
+// out first. Score each entry by whichever of its two positions comes up soonest.
 function evictTo(budget) {
   if (cacheBytes <= budget) return;
   const n = state.timeline.length || 1;
   const here = state.frame;
+  const cyc = (d) => ((d % n) + n) % n;        // JS % keeps the sign; we want the cycle
+  const untilNeeded = (e) => Math.min(cyc(e.idx - here), cyc((n - 1 - e.idx) - here));
   const ranked = [...frameCache.entries()]
-    .map(([k, e]) => [k, e, (e.idx - here + n) % n])
+    .map(([k, e]) => [k, e, untilNeeded(e)])
     .sort((x, y) => y[2] - x[2]);              // furthest ahead in playback order first
-  for (const [k, e] of ranked) {
+  for (const [k, e, dist] of ranked) {
     if (cacheBytes <= budget) return;
-    if (e.idx === here) continue;              // never evict the frame on screen
-    frameCache.delete(k); cacheBytes -= e.bytes;
+    if (dist === 0) continue;                  // never evict the frame on screen
+    frameCache.delete(k); cacheBytes -= e.bytes; evictions++;
   }
 }
 
@@ -1455,7 +1534,10 @@ function decodeFrame(i, draft) {
   const req = frameRequest(i, draft);
   if (!req) return Promise.resolve(null);
   const hit = frameCache.get(req.key);
-  if (hit) return Promise.resolve(hit);
+  // Re-stamp the position it was wanted at. `idx` drives eviction (evictTo), and a shared
+  // mirror entry that was inserted on the outbound leg would otherwise keep that stale
+  // position for ever. Cheap belt-and-braces alongside the mirror-aware scoring.
+  if (hit) { hit.idx = i; return Promise.resolve(hit); }
   const flight = frameInflight.get(req.key);
   if (flight) return flight;
   const p = (async () => {
@@ -1466,6 +1548,7 @@ function decodeFrame(i, draft) {
       : payload.data.byteLength;
     const entry = { surface: req.surface, payload, bytes, idx: i };
     frameCache.set(req.key, entry); cacheBytes += bytes;
+    checkTimelineFits();            // measured, before eviction pins cacheBytes to the budget
     evictTo(CACHE_BUDGET);
     doneAt.push(performance.now());
     if (doneAt.length > 12) doneAt.shift();
@@ -1476,13 +1559,36 @@ function decodeFrame(i, draft) {
   return p;
 }
 
+// The exact sequence of frames the play loop will visit from `from`, in order.
+//
+// This has to agree with togglePlay's advance *exactly*, and it used not to. The loop adds
+// `step` and snaps to 0 on overflow; the prefetcher and the buffer probe both walked
+// `(frame + d*step) % n` instead. Those are not the same walk: the there-and-back timeline
+// makes n odd (n = 2m-1), and step is 2 at the default 60 fps, so the modular walk lands on
+// the odd indices — which the playhead never displays. The prefetcher spent up to LOOKAHEAD
+// decodes per cycle on frames that were never shown, while bufferedAhead reported those same
+// never-shown frames as "not buffered" near every wrap, tripping `draining` and stuttering
+// the morph at the same point on every loop, for ever, even with the whole timeline cached.
+//
+// One generator, so the three consumers cannot drift apart again.
+function* upcoming(from, step, count) {
+  const n = state.timeline.length;
+  let i = from;
+  for (let d = 0; d < count; d++) {
+    i += step;
+    if (i >= n) i = 0;      // exactly what the play loop does
+    yield i;
+  }
+}
+
 // How many frames the playhead can advance through, right now, without waiting.
 function bufferedAhead(step, draft) {
-  const n = state.timeline.length;
-  if (!n) return 0;
-  for (let d = 1; d <= LOOKAHEAD; d++) {
-    const req = frameRequest((state.frame + d * step) % n, draft);
-    if (!req || !frameCache.has(req.key)) return d - 1;
+  if (!state.timeline.length) return 0;
+  let have = 0;
+  for (const i of upcoming(state.frame, step, LOOKAHEAD)) {
+    const req = frameRequest(i, draft);
+    if (!req || !frameCache.has(req.key)) return have;
+    have++;
   }
   return LOOKAHEAD;
 }
@@ -1495,38 +1601,69 @@ function bufferedAhead(step, draft) {
 // costs a second and the frame period is 33 ms, `sleep(delay - elapsed)` is zero. There is
 // no idle time. All it achieved was a second concurrent request on a server that does not
 // parallelise, making every frame slower for no look-ahead at all.
-async function prefetch(draft) {
+//
+// `mode` is "play" — hold a LOOKAHEAD window ahead of a moving playhead, for as long as
+// playback runs — or "warm": fill the whole timeline once, from wherever the playhead is
+// parked, and return when there is nothing left to fetch.
+//
+// Warm mode is the point of the whole exercise. The complete frame list is known the moment
+// buildTimeline resolves, which is normally seconds before anyone presses Play — and that
+// window was the only one in which decoding is free, because nothing is waiting on it. The
+// loop used to be gated on `playing` and refused to use it, so every Play began by paying
+// for frames it could already have had sitting in the cache.
+const WARM_MAX_FAILS = 6;     // consecutive errors before an unattended warm gives up
+async function prefetch(draft, mode = "play") {
   const my = ++fillToken;
-  while (my === fillToken && playing) {
+  const warming = mode === "warm";
+  let fails = 0;
+  while (my === fillToken && (playing || warming)) {
     const n = state.timeline.length;
     if (!n) return;
+    // Two ways an unattended warm must stop, neither of which applies to playback (where a
+    // human is watching and can hit Stop):
+    //  - the timeline does not fit the budget, so every further frame evicts one we just
+    //    decoded and the loop would churn the server for ever. checkTimelineFits() has
+    //    already told the user; there is nothing more to gain here.
+    //  - the server is failing. A frame that errors is never cached, so the next pass asks
+    //    for it again — that is an infinite retry unless we count.
+    if (warming && (evictions > 0 || fails >= WARM_MAX_FAILS)) return;
     const { step } = playCadence();
+    // Warming covers one full cycle of the playhead; playback only needs the window ahead.
+    const span = warming ? Math.ceil(n / Math.max(1, step)) : LOOKAHEAD;
     const jobs = [];
-    for (let d = 1; d <= LOOKAHEAD; d++) {
+    for (const i of upcoming(state.frame, step, span)) {
       if (frameInflight.size + jobs.length >= FETCH_CONCURRENCY) break;
-      const i = (state.frame + d * step) % n;
       const req = frameRequest(i, draft);
       if (!req || frameCache.has(req.key) || frameInflight.has(req.key)) continue;
-      jobs.push(decodeFrame(i, draft).catch(() => {}));
+      jobs.push(decodeFrame(i, draft).then(() => { fails = 0; }, () => { fails += 1; }));
     }
     // Window full (or the server is busy): wait for something to change rather than spin.
-    if (!jobs.length) { await sleep(30); continue; }
+    // Nothing to fetch and nothing in flight means the span is fully cached, so the
+    // decode-rate window below is now stale idle time — drop it (see decodeRateMs).
+    if (!jobs.length) {
+      if (!frameInflight.size) {
+        doneAt.length = 0;
+        if (warming) return;           // whole timeline resident: the warm is done
+      }
+      await sleep(30); continue;
+    }
     await Promise.race(jobs);          // as soon as one lands, re-evaluate the window
   }
 }
 
-// Fill a starting buffer before the first frame is shown, so playback does not begin by
-// stalling. Instant on a second play (everything is already cached).
-async function preroll(draft) {
-  const n = state.timeline.length;
-  const { step } = playCadence();
-  const want = Math.max(1, Math.min(PREROLL_FRAMES, Math.ceil(n / step) - 1));
-  while (playing) {
-    const have = bufferedAhead(step, draft);
-    if (have >= want) return;
-    status(`Preparing morph… ${have}/${want} frames`, "busy");
-    await sleep(60);
-  }
+// Start decoding a morph before Play is pressed.
+//
+// Debounced, and that is not optional: updatePathLabel fires buildTimeline un-awaited on
+// every shift-click, and a decode cannot be cancelled once the server route starts (it holds
+// its slot across the whole request), so warming on each click would strand work on paths
+// that were abandoned mid-edit. Waiting for the path to settle costs nothing — the user is
+// still choosing states — and keeps abandoned work to at most FETCH_CONCURRENCY frames.
+const WARM_DEBOUNCE_MS = 600;
+function scheduleWarm() {
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(() => {
+    if (!playing && state.timeline.length) prefetch(true, "warm");
+  }, WARM_DEBOUNCE_MS);
 }
 
 // Render one timeline frame in the current render mode (mass-constant for surfaces).
@@ -1571,7 +1708,17 @@ async function togglePlay() {
   // draft is ~15x cheaper, and the frame you settle on is re-rendered at full resolution
   // when you pause (below).
   prefetch(true);                              // keep a window ready ahead of the playhead
-  await preroll(true);                         // don't start by stalling
+  // No preroll. It used to block until 24 frames were buffered — and since it issued no
+  // fetches itself, that was ~24 *serial* decodes of "Preparing morph…" before a single
+  // pixel moved. With the timeline warmed at build time the frames are usually already
+  // here; when they are not, waiting for 24 of them only makes the stall longer and moves
+  // it earlier. Await the one frame we are about to show, and start.
+  //
+  // Showing state.frame (rather than advancing first) also fixes the opening jump: the loop
+  // begins with `frame + step`, so a fresh morph used to open on timeline[2] at the default
+  // 60 fps, already part-way through the first hop. On resume this re-renders the frame
+  // that is on screen as a draft — which is what playback shows anyway.
+  if (playing) await renderFrame(state.frame, true);
   while (playing) {
     const { delay, step } = playCadence();
     let next = state.frame + step;
@@ -1595,6 +1742,7 @@ async function togglePlay() {
   if (!recording) {
     status(`Paused at frame ${state.frame + 1}/${state.timeline.length}.`);
     renderFrame(state.frame, false);           // settle on the full-resolution surface
+    scheduleWarm();                            // keep filling for the next Play
   }
 }
 
@@ -1652,13 +1800,31 @@ function dragHandle(el, onMove) {
 }
 
 // ---- lasso selection (app-owned overlay; works for the active 2D or 3D view) ----
-function sizeLasso() {
+
+// Match the overlay canvases' backing stores to their CSS boxes.
+//
+// This has to be re-checked before every draw, not only on window resize. The overlays
+// are stretched to their box by CSS (`.canvas-wrap > canvas { inset: 0 }`), so when the
+// box changes without the *window* changing — clustering adds k+1 rows to the layers
+// rail, which widens it and shrinks the canvas beside it — the backing store keeps its
+// old pixel size and the browser rescales the bitmap into the new box. Everything drawn
+// on it then lands off by that scale factor, which is why the centroid markers sat
+// beside their clusters right after "Cluster" and snapped into place on the next window
+// resize. The scatter renderer already re-syncs itself this way on every frame
+// (scatter.js) — that's why the points were always right and only the overlay was off.
+function sizeOverlays() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   for (const [id, ctx] of [["lassoCanvas", lctx], ["centroidOverlay", centroidCtx]]) {
     const c = $(id); if (!c) continue;
-    c.width = Math.max(1, c.clientWidth * dpr); c.height = Math.max(1, c.clientHeight * dpr);
+    const w = Math.max(1, Math.floor(c.clientWidth * dpr)), h = Math.max(1, Math.floor(c.clientHeight * dpr));
+    // Only on a real change: assigning width/height clears the canvas, and this now runs
+    // per render (an in-progress lasso path would blink away every frame otherwise).
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
     if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
+}
+function sizeLasso() {
+  sizeOverlays();
   syncCentroidOverlay();
 }
 function setupLasso() {
@@ -1666,6 +1832,14 @@ function setupLasso() {
   centroidCtx = $("centroidOverlay").getContext("2d");
   sizeLasso();
   window.addEventListener("resize", sizeLasso);
+  // Layout changes that no resize event reports: the layers rail growing, the pane
+  // divider being dragged, the panel collapsing. Watching the boxes themselves catches
+  // all of them. Safe from feedback loops — the canvases are absolutely positioned and
+  // sized by CSS, so writing width/height cannot change their layout.
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => sizeLasso());
+    ro.observe(lc); ro.observe($("centroidOverlay"));
+  }
   // Middle-mouse drag pans the active landscape even while a tool is armed (the
   // overlay otherwise swallows drags for lasso / draw). Capture phase + stop-
   // propagation so it beats the tool handlers below; routes to the 2D or 3D view.
@@ -2016,7 +2190,7 @@ const pickAllowed = (i) => { const s = pickScopeSet(); return !s || s.has(i); };
 // marker win. This is what makes centroid picking (and "pick only Centroids") work.
 const activeCanvas = () => (is3d() && cloud ? $("scatter3d") : $("scatter"));
 function screenPosOf(idx) {
-  const vec = idx < L.n ? (activeCoords() || L.pca)[idx] : centroidPCA[idx];
+  const vec = idx < L.n ? (activeCoords() || L.pca)[idx] : centroidCoords()[idx];
   if (!vec) return null;
   return (activeLand().projectData([axesOf(vec)]) || [null])[0];
 }
@@ -2029,8 +2203,9 @@ function resolvePick(baseIdx, cx, cy) {
   const scope = pickScopeSet();
   const cen = layers.find((l) => l.kind === "centroid" && l.visible);
   let nc = null;   // nearest in-scope centroid
+  const cc = centroidCoords();
   if (cen) for (const idx of cen.indices) {
-    if (!centroidPCA[idx] || (scope && !scope.has(idx))) continue;
+    if (!cc[idx] || (scope && !scope.has(idx))) continue;
     const p = screenPosOf(idx); if (!p) continue;
     const d = (p[0] - px) ** 2 + (p[1] - py) ** 2;
     if (!nc || d < nc.d) nc = { idx, d };
@@ -2054,7 +2229,8 @@ function removeLayer(ly) {
     if (cen) {
       const at = cen.indices.indexOf(ly.centroid);
       if (at >= 0) cen.indices.splice(at, 1);
-      delete indexColor[ly.centroid]; delete centroidPCA[ly.centroid];
+      delete indexColor[ly.centroid];
+      for (const m of Object.values(centroidVecs)) delete m[ly.centroid];
       if (!cen.indices.length) layers.splice(layers.indexOf(cen), 1);
     }
   }
@@ -2062,8 +2238,26 @@ function removeLayer(ly) {
   renderLayers(); refreshFreeCurves(); if (state.colorBy === "layers") applyColor();
 }
 
-const coordOf = (i) => (i >= L.n ? (centroidPCA[i] ? centroidPCA[i][state.x] : 0) : (activeCoords() || L.pca)[i][state.x]);
+const coordOf = (i) => (i >= L.n ? (centroidCoords()[i] ? centroidCoords()[i][state.x] : 0) : (activeCoords() || L.pca)[i][state.x]);
 const orderAlongAxis = (idx) => [...idx].sort((a, b) => coordOf(a) - coordOf(b));
+
+// Centroid coordinates for the *active* embedding, fetched once per embedding and kept.
+// The server returns them in cluster order, so coords[j] is the virtual index base + j —
+// the same order the centroid layer was built in. A no-op once they're cached, and when
+// there is no clustering yet.
+async function ensureCentroidCoords() {
+  if (!clusterQuery || centroidVecs[state.embedding]) return;
+  try {
+    const d = await (await fetch(`./api/centroid_coords?embed=${state.embedding}&${clusterQuery.q}`)).json();
+    const m = {};
+    d.coords.forEach((v, j) => { m[clusterQuery.base + j] = v; });
+    centroidVecs[state.embedding] = m;
+  } catch (err) {
+    // Leave the map absent rather than falling back to another embedding's coordinates:
+    // no marker beats a marker drawn in the wrong units.
+    status("Could not place the centroids in this view: " + err, "warn");
+  }
+}
 
 // ---- KMeans clustering -> one layer per cluster + a decodable centroid layer ----
 // Use your shift-clicked states (the morph picks) as the initial cluster centers.
@@ -2075,11 +2269,9 @@ function clusterFromPicks() {
 async function computeClusters(seeds) {
   const seeded = Array.isArray(seeds) && seeds.length >= 2;
   const k = Math.max(2, Math.min(20, +$("clusterK").value || 5));
-  const space = $("clusterSpace").value === "network" ? "network" : "view";
-  const q = (seeded ? `seeds=${seeds.join(",")}` : `k=${k}`) + `&space=${space}`;
+  const q = seeded ? `seeds=${seeds.join(",")}` : `k=${k}`;
   const url = `./api/kmeans?${q}`;
-  const spaceLbl = space === "network" ? "full network space" : "viewed space";
-  const label = (seeded ? `seeded KMeans (${seeds.length} picks)` : `KMeans (k=${k})`) + ` on ${spaceLbl}`;
+  const label = seeded ? `seeded KMeans (${seeds.length} picks)` : `KMeans (k=${k})`;
   status(`Computing ${label}…`, "busy");
   let d, kLabels;
   // Metadata and the per-state labels come over separately — the labels as binary. The
@@ -2091,18 +2283,21 @@ async function computeClusters(seeds) {
   if (seeded) $("clusterK").value = d.k;   // reflect the seed-derived cluster count
   // drop previous auto-generated cluster/centroid layers (keep manual ones)
   for (let i = layers.length - 1; i >= 0; i--) if (layers[i].kind === "cluster" || layers[i].kind === "centroid") layers.splice(i, 1);
-  indexColor = {}; centroidPCA = {};
+  indexColor = {}; centroidVecs = {}; clusterQuery = { q, base: d.base };
   const groups = Array.from({ length: d.k }, () => []);
   for (let i = 0; i < kLabels.length; i++) { const g = groups[kLabels[i]]; if (g) g.push(i); }
   // Tag each cluster with its centroid's virtual index so deleting the cluster
   // can drop the matching point from the Centroids layer.
   groups.forEach((idxs, j) => layers.push({ name: `Cluster ${j + 1}`, color: clusterColor(j), indices: idxs, visible: true, kind: "cluster", centroid: d.base + j }));
   const cents = [];
-  for (let j = 0; j < d.k; j++) { const idx = d.base + j; cents.push(idx); indexColor[idx] = clusterColor(j); centroidPCA[idx] = d.centroid_pca[j]; }
+  const pcaMap = {};
+  for (let j = 0; j < d.k; j++) { const idx = d.base + j; cents.push(idx); indexColor[idx] = clusterColor(j); pcaMap[idx] = d.centroid_pca[j]; }
+  centroidVecs.pca = pcaMap;
+  await ensureCentroidCoords();   // the active view may not be PCA
   layers.push({ name: "Centroids", color: "#ffffff", indices: cents, visible: true, kind: "centroid" });
   $("colorby").value = "layers"; state.colorBy = "layers"; toggleColorWraps();
   renderLayers(); applyColor();
-  status(`${seeded ? "Seeded KMeans" : "KMeans"} k=${d.k} on ${spaceLbl}: ${d.k} cluster layers + a centroid layer (▶ to morph between clusters).`);
+  status(`${seeded ? "Seeded KMeans" : "KMeans"} k=${d.k}: ${d.k} cluster layers + a centroid layer (▶ to morph between clusters).`);
 }
 
 // Surface/volume color for a decoded state: cluster color for centroids, else the picker.

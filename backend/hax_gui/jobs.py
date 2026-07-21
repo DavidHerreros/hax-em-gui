@@ -961,6 +961,10 @@ class JobManager:
         data["command"] = json.loads(data["command"])
         data["bindings"] = json.loads(data["bindings"]) if data.get("bindings") else None
         data["active"] = data["status"] in ACTIVE
+        # The kinds this run can feed downstream, narrowed by its mode (a train run
+        # yields its checkpoint but no latents/particles, a predict run the reverse),
+        # so the chaining UI won't offer a train run where a predict run is required.
+        data["produces"] = adapters.job_produces(data.get("program", ""), data["args"])
         return data
 
     def _exec(self, sql: str, params: tuple = (), fetch: str | None = None):
