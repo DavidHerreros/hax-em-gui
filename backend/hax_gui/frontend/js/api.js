@@ -150,6 +150,8 @@ export const api = {
   jobMrcs: (jobId) => req(`/api/jobs/${jobId}/mrcs`),
   mrcViewerFromJob: (jobId, path) => req(`/api/mrcviewer/from-job/${jobId}?path=${encodeURIComponent(path)}`, { method: "POST" }),
   mrcViewer: (path, title) => req("/api/mrcviewer", { method: "POST", body: JSON.stringify({ path, title: title || null }) }),
+  // Several maps in ONE viewer (a model panel + morph), not one tab each.
+  mrcViewerMulti: (paths, title) => req("/api/mrcviewer", { method: "POST", body: JSON.stringify({ paths, title: title || null }) }),
   stopMrcViewer: (id) => req(`/api/mrcviewer/${id}`, { method: "DELETE" }),
 
   // Files a job took as inputs (maps + metadata referenced in its args)

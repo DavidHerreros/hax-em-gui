@@ -155,7 +155,8 @@
         <span class="hist-label muted">contour</span>
         <canvas id="hist"></canvas>
       </div>
-      <div class="canvas-wrap"><canvas id="gl"></canvas><canvas id="glvol" style="display:none"></canvas><div id="slices" class="slices" style="display:none"></div></div>
+      <!-- Same gesture set as the map viewer; the rim spin has no cursor of its own. -->
+      <div class="canvas-wrap" title="Drag to rotate · drag near the edge to spin in-plane · middle-drag to pan · wheel to zoom"><canvas id="gl"></canvas><canvas id="glvol" style="display:none"></canvas><div id="slices" class="slices" style="display:none"></div></div>
       <div class="morph-bar">
         <span class="muted">Path <button id="pathToggle" class="iconbtn" title="Show / hide the full path" style="display:none">▸</button> <span id="morphto" class="mono">—</span></span>
         <button id="clearpath" class="btn" title="Clear the morph path">Clear</button>

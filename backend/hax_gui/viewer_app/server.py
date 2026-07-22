@@ -593,22 +593,26 @@ def _downsample(vol: np.ndarray, size: int) -> tuple[np.ndarray, int]:
     return np.ascontiguousarray(vol[::step, ::step, ::step], dtype=np.float32), step
 
 
-def grid_box(full_shape, ds_shape, step: int):
+def grid_box(full_shape, ds_shape, step: int, full_size: int | None = None, offset=None):
     """Model-space corners of a strided grid inside the `[-1,1]` cube `mesh_at`
     normalizes into, so the volume ray-marcher and the marching-cubes surface frame
     the map identically.
 
-    `mesh_at` maps voxel `i` (any axis) to `(i - S/2)/(S/2)`, `S = max(full_shape)`.
+    `mesh_at` maps voxel `i` (any axis) to `(i + off - S/2)/(S/2)`, `S = max(full_shape)`.
     The strided grid samples voxels `{0, step, 2*step, ...}`, so its sample `j` sits at
-    `2*j*step/S - 1` — exactly where the mesh puts that voxel. Corners are edge-extended
-    by half a cell so a ray-marcher recovers the texture coord with a plain
+    `2*(j*step + off)/S - 1` — exactly where the mesh puts that voxel. Corners are
+    edge-extended by half a cell so a ray-marcher recovers the texture coord with a plain
     `(p - lo)/(hi - lo)`. Returned per **model axis** = numpy axis (X=axis 0, Y=axis 1,
     Z=axis 2), matching the marching-cubes vertex order — the ray-marcher swaps to its
-    own texture-axis order itself."""
-    S = float(max(full_shape))
+    own texture-axis order itself.
+
+    `full_size` and `offset` mirror `mesh_at`'s: pass the same values there and here, or
+    the surface and the ray-march will disagree about where the map is."""
+    S = float(full_size if full_size else max(full_shape))
+    off = [0.0, 0.0, 0.0] if offset is None else [float(o) for o in offset]
     half = step / S                                   # half a strided cell, model units
-    lo = [-1.0 - half] * 3
-    hi = [(2 * n - 1) * step / S - 1.0 for n in ds_shape]
+    lo = [2.0 * o / S - 1.0 - half for o in off]
+    hi = [(2 * (n * step + off[a]) - step) / S - 1.0 for a, n in enumerate(ds_shape)]
     return lo, hi
 
 
@@ -677,7 +681,7 @@ def _taubin_smooth(verts: np.ndarray, faces: np.ndarray, iterations: int,
 
 
 def mesh_at(vol: np.ndarray, level: float, smooth: int = 0,
-            step: int = 1, full_size: int | None = None) -> bytes:
+            step: int = 1, full_size: int | None = None, offset=None) -> bytes:
     """Marching-cubes mesh of `vol` at an absolute `level`, packed as binary:
 
     int32 nverts, int32 nfaces, float32 level, float32 mass, float32 vmax,
@@ -692,6 +696,13 @@ def mesh_at(vol: np.ndarray, level: float, smooth: int = 0,
     in place rather than jumping when the final mesh replaces it. Enclosed mass is scaled
     back up by `step**3` for the same reason: so a draft's reported mass is comparable to
     a full one (the client keys constant-mass morphs off it).
+
+    `offset` shifts the vertices by that many voxels of the *full* grid before
+    normalizing. One map alone never needs it (it is its own frame of reference), but
+    several maps shown together do: pass a common `full_size` and a per-map `offset` and
+    boxes of different sizes come out concentric and to relative scale, instead of each
+    filling the cube on its own and pretending to be the same size. Default None keeps
+    the single-map normalization byte-for-byte.
     """
     from skimage import measure
 
@@ -709,7 +720,8 @@ def mesh_at(vol: np.ndarray, level: float, smooth: int = 0,
         normals = _vertex_normals(verts, faces)   # recompute from the relaxed surface
 
     size = float(full_size if full_size else max(vol.shape))
-    verts = (verts.astype(np.float32) * float(step) - size / 2.0) / (size / 2.0)
+    off = np.zeros(3, np.float32) if offset is None else np.asarray(offset, np.float32)
+    verts = (verts.astype(np.float32) * float(step) + off - size / 2.0) / (size / 2.0)
 
     header = (
         np.array([verts.shape[0], faces.shape[0]], dtype="<i4").tobytes()

@@ -12,6 +12,7 @@ import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
 import { promptModal } from "./promptModal.js";
 import { createTerminal } from "./terminal.js";
+import { openFileBrowser } from "./filePicker.js";
 import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
 
 export function JobDetailView(params) {
@@ -177,9 +178,18 @@ export function JobDetailView(params) {
     if (mapsF.length) parts.push(`${mapsF.length} map${mapsF.length > 1 ? "s" : ""}`);
     if (tablesF.length) parts.push(`${tablesF.length} metadata`);
     const label = total ? `${parts.join(" · ")} ${kindWord}` : `no ${kindWord} yet`;
+    // The lists above only surface maps and metadata; the run folder holds checkpoints,
+    // logs and everything else, so give it a way in. Outputs only — a run's inputs are
+    // scattered wherever they came from, and there is no single folder to open.
+    const browse = kindWord === "produced" && job && job.workdir
+      ? h("button", { class: "btn-icon", title: "Browse this run's output folder — tick several maps or tables to open them together",
+          onclick: () => openFileBrowser(job.workdir) }, icon("folderOpen", 14))
+      : null;
     container.appendChild(h("div", { class: "row section-head", style: { margin: "0 0 8px" } },
       h("span", { class: "muted small" }, icon("box", 13), " ", label),
-      h("button", { class: "btn-icon", title: "Refresh", style: { marginLeft: "auto" }, onclick: reload }, icon("refresh", 14))));
+      h("span", { class: "ml-auto" }),
+      browse,
+      h("button", { class: "btn-icon", title: "Refresh", onclick: reload }, icon("refresh", 14))));
     if (total) {
       container.appendChild(h("div", { class: "map-list" },
         ...mapsF.map((f) => fileRow(f, "map")),

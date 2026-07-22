@@ -18,6 +18,11 @@ precision highp sampler3D;
 in vec2 vUv;
 out vec4 outColor;
 uniform sampler3D uVol;
+// Second volume + blend weight: a morph is a linear blend of two densities, and doing
+// it here rather than by uploading a new texture per frame is what makes it run at
+// screen rate instead of at the speed of the network. uMix 0 = uVol alone.
+uniform sampler3D uVolB;
+uniform float uMix;
 uniform mat4 uInvVP;
 uniform vec3 uEye;
 uniform vec3 uColor;
@@ -31,6 +36,14 @@ uniform int uMode;          // 0 = MIP, 1 = emission/absorption
 uniform int uSteps;
 
 vec3 toWorld(vec3 ndc) { vec4 p = uInvVP * vec4(ndc, 1.0); return p.xyz / p.w; }
+
+// The density at a texture coordinate, blended if a morph is running. Both volumes
+// share a grid (the backend refuses to morph maps that do not), so one coordinate
+// samples both.
+float density(vec3 p) {
+  float a = texture(uVol, p).r;
+  return uMix > 0.0 ? mix(a, texture(uVolB, p).r, uMix) : a;
+}
 
 void main() {
   vec3 ro = uEye;
@@ -52,7 +65,7 @@ void main() {
     float m = 0.0;
     for (int i = 0; i < 512; i++) {
       if (i >= steps) break;
-      float s = texture(uVol, ((ro + rd * t - uBoxLo) * boxInv).zyx).r;
+      float s = density(((ro + rd * t - uBoxLo) * boxInv).zyx);
       m = max(m, s); t += dt;
     }
     float v = pow(clamp((m - uThreshold) / denom, 0.0, 1.0), uGamma) * uBright;
@@ -61,7 +74,7 @@ void main() {
     vec3 acc = vec3(0.0); float alpha = 0.0;
     for (int i = 0; i < 512; i++) {
       if (i >= steps) break;
-      float s = texture(uVol, ((ro + rd * t - uBoxLo) * boxInv).zyx).r;
+      float s = density(((ro + rd * t - uBoxLo) * boxInv).zyx);
       float d = pow(clamp((s - uThreshold) / denom, 0.0, 1.0), uGamma) * uBright;
       float a = clamp(d * 0.12, 0.0, 1.0) * (1.0 - alpha);
       acc += a * uColor; alpha += a;
@@ -80,7 +93,8 @@ export function createVolume(canvas) {
   const u = (n) => gl.getUniformLocation(prog, n);
   const uInvVP = u("uInvVP"), uEye = u("uEye"), uColor = u("uColor"), uBg = u("uBg"),
     uBoxLo = u("uBoxLo"), uBoxHi = u("uBoxHi"),
-    uThreshold = u("uThreshold"), uGamma = u("uGamma"), uBright = u("uBright"), uMode = u("uMode"), uSteps = u("uSteps"), uVol = u("uVol");
+    uThreshold = u("uThreshold"), uGamma = u("uGamma"), uBright = u("uBright"), uMode = u("uMode"), uSteps = u("uSteps"),
+    uVol = u("uVol"), uVolB = u("uVolB"), uMix = u("uMix");
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -91,19 +105,36 @@ export function createVolume(canvas) {
   gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
   gl.bindVertexArray(null);
 
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_3D, tex);
-  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+  function makeVolTex() {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_3D, t);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  const tex = makeVolTex();      // the map, or the "from" end of a morph
+  const texB = makeVolTex();     // the "to" end; only sampled while mixing
 
   let color = [0.784, 0.784, 0.784], bg = [0.016, 0.024, 0.06];
   let threshold = 0.45, gamma = 1.4, bright = 1.2, mode = 0, steps = 160;
   let hasTex = false;
   let boxLo = [-1, -1, -1], boxHi = [1, 1, 1];   // model-space cube the grid fills; set per volume so it coincides with the surface mesh
   let grid = null;   // { nx, ny, nz, data } kept on the CPU so the ray-march can be repeated here
+  let gridB = null;  // the morph's far end, same shape; null when not morphing
+  let mix = 0;       // blend weight in [0,1]; 0 = `grid` alone
+
+  // Reads the density the *shader* is drawing, so the centre of rotation and the
+  // displayed bounds follow a morph instead of describing whichever map happens to be
+  // at the near end. Returns a plain indexed read when nothing is blending, so the
+  // common case pays nothing for the morph case.
+  function sampler() {
+    if (!gridB || mix <= 0) { const d = grid.data; return (i) => d[i]; }
+    const a = grid.data, b = gridB.data, w = mix;
+    return (i) => a[i] + (b[i] - a[i]) * w;
+  }
 
   // Distance from the eye to the first voxel at or above the display threshold along
   // the view axis — the surface you see at the centre of the window. There is no
@@ -121,7 +152,8 @@ export function createVolume(canvas) {
     }
     if (tf <= tn) return null;                 // the box is behind us, or we missed it
 
-    const { nx, ny, nz, data } = grid;         // data is C-order (numpy axis0=nz slowest, axis2=nx fastest)
+    const { nx, ny, nz } = grid;              // data is C-order (numpy axis0=nz slowest, axis2=nx fastest)
+    const sample = sampler();
     const cut = threshold * 255;               // the shader compares the sample in [0,1] against uThreshold
     const steps3 = 2 * Math.max(nx, ny, nz);   // Nyquist-ish along the ray
     const texel = (v, lo, hi, n) => Math.min(n - 1, Math.max(0, Math.round(((v - lo) / (hi - lo)) * n - 0.5)));
@@ -131,14 +163,50 @@ export function createVolume(canvas) {
       const i0 = texel(origin[0] + dir[0] * t, boxLo[0], boxHi[0], nz);
       const i1 = texel(origin[1] + dir[1] * t, boxLo[1], boxHi[1], ny);
       const i2 = texel(origin[2] + dir[2] * t, boxLo[2], boxHi[2], nx);
-      if (data[(i0 * ny + i1) * nx + i2] >= cut) return t;
+      if (sample((i0 * ny + i1) * nx + i2) >= cut) return t;
     }
     return null;                               // the ray passed through empty space
   }
 
+  // Model-space box enclosing the voxels at or above the display threshold — what the
+  // ray-march actually paints, as opposed to the grid box, most of which is empty
+  // padding. The camera uses it to decide whether the map is fully framed. One pass over
+  // a ~96³ grid, recomputed only when the volume or the threshold changes.
+  let boundsCache = null;
+  function displayedBounds() {
+    if (!grid) return null;
+    if (boundsCache) return boundsCache;
+    const { nx, ny, nz } = grid;
+    const sample = sampler();
+    const cut = threshold * 255;
+    let a0 = nz, b0 = -1, a1 = ny, b1 = -1, a2 = nx, b2 = -1;
+    for (let i0 = 0; i0 < nz; i0++) {
+      for (let i1 = 0; i1 < ny; i1++) {
+        const row = (i0 * ny + i1) * nx;
+        for (let i2 = 0; i2 < nx; i2++) {
+          if (sample(row + i2) < cut) continue;
+          if (i0 < a0) a0 = i0; if (i0 > b0) b0 = i0;
+          if (i1 < a1) a1 = i1; if (i1 > b1) b1 = i1;
+          if (i2 < a2) a2 = i2; if (i2 > b2) b2 = i2;
+        }
+      }
+    }
+    if (b0 < 0) return null;   // nothing is above the threshold
+    // Voxel index -> model coordinate, taking the outer face of the extreme voxels so
+    // the box encloses them rather than passing through their centres. Model axes are in
+    // numpy-axis order (X -> axis0 = nz, Y -> axis1 = ny, Z -> axis2 = nx), as in centreDepth.
+    const at = (a, idx, n) => boxLo[a] + (idx / n) * (boxHi[a] - boxLo[a]);
+    boundsCache = {
+      lo: [at(0, a0, nz), at(1, a1, ny), at(2, a2, nx)],
+      hi: [at(0, b0 + 1, nz), at(1, b1 + 1, ny), at(2, b2 + 1, nx)],
+    };
+    return boundsCache;
+  }
+
   // 1.41 = the height this view has always shown (old camera: 3.4·tan(22.5°)), so the map
   // keeps its size and its registration with the surface view across a render-mode switch.
-  const orbit = createOrbit(canvas, () => render(), null, { fitRadius: 1.41, probeDepth: centreDepth });
+  const orbit = createOrbit(canvas, () => render(), null,
+    { fitRadius: 1.41, probeDepth: centreDepth, modelBounds: displayedBounds });
 
   function resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -165,26 +233,47 @@ export function createVolume(canvas) {
     gl.uniform3fv(uBoxLo, boxLo); gl.uniform3fv(uBoxHi, boxHi);
     gl.uniform1f(uThreshold, threshold); gl.uniform1f(uGamma, gamma); gl.uniform1f(uBright, bright);
     gl.uniform1i(uMode, mode); gl.uniform1i(uSteps, steps);
+    gl.uniform1f(uMix, gridB ? mix : 0);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, tex); gl.uniform1i(uVol, 0);
+    // Always bound, even when not morphing: sampling an incomplete texture unit is
+    // undefined behaviour on some drivers even where the branch never reads it.
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_3D, gridB ? texB : tex); gl.uniform1i(uVolB, 1);
     gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null);
   }
   function render() { resize(); drawScene(1); }
 
-  function setVolume(nx, ny, nz, u8, lo, hi) {
-    gl.bindTexture(gl.TEXTURE_3D, tex);
+  function upload(target, nx, ny, nz, u8) {
+    gl.bindTexture(gl.TEXTURE_3D, target);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, nx, ny, nz, 0, gl.RED, gl.UNSIGNED_BYTE, u8);
+  }
+
+  function setVolume(nx, ny, nz, u8, lo, hi) {
+    upload(tex, nx, ny, nz, u8);
     grid = { nx, ny, nz, data: u8 };
     if (lo && hi) { boxLo = lo.slice(); boxHi = hi.slice(); }   // the cube the surface mesh uses, so the two modes coincide
-    hasTex = true; orbit.invalidatePivot(); render();
+    hasTex = true; boundsCache = null; orbit.invalidatePivot(); render();
   }
 
   window.addEventListener("resize", render);
 
   return {
     setVolume, render,
+    // The far end of a morph. Pass null to stop morphing and go back to one volume.
+    setVolumeB(nx, ny, nz, u8) {
+      if (!u8) { gridB = null; mix = 0; boundsCache = null; orbit.invalidatePivot(); render(); return; }
+      upload(texB, nx, ny, nz, u8);
+      gridB = { nx, ny, nz, data: u8 };
+      boundsCache = null; orbit.invalidatePivot(); render();
+    },
+    // Blend weight, 0 = the near map, 1 = the far one. Called every animation frame, so
+    // it must stay cheap: no pivot invalidation and no bounds rescan here — those are
+    // gesture-time concerns, and re-deriving them 60 times a second would cost more
+    // than the render.
+    setMix(t) { mix = Math.max(0, Math.min(1, t)); render(); },
     setMode(m) { mode = m === "emission" ? 1 : 0; render(); },
-    setThreshold(v) { threshold = Math.max(0, Math.min(1, v)); orbit.invalidatePivot(); render(); },   // a new contour is a new front surface
+    // A new contour is a new front surface — and a different set of voxels on screen.
+    setThreshold(v) { threshold = Math.max(0, Math.min(1, v)); boundsCache = null; orbit.invalidatePivot(); render(); },
     setGamma(g) { gamma = Math.max(0.2, g); render(); },
     setBrightness(b) { bright = Math.max(0.1, b); render(); },
     setColor(rgb) { color = rgb; render(); },

@@ -6,7 +6,6 @@ import { api, ApiError } from "../api.js";
 import { navigate } from "../router.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
-import { openFilePicker } from "./filePicker.js";
 import { initialValues, visibleFields } from "./formFields.js";
 import { paramForm } from "./paramForm.js";
 import { bindingControl } from "./inputBinding.js";
@@ -76,8 +75,6 @@ export function buildLauncher() {
     const body = h("div", { class: "launcher-body" });
     content.appendChild(body);
     mount(body, h("p", { class: "muted", style: { padding: "12px" } }, "Loading…"));
-
-    if (name === "display_metrics") return renderMetricsLauncher(body);
 
     Promise.all([api.program(name), api.gpus().catch(() => [])])
       .then(([schema, gpus]) => buildForm(body, schema, gpus))
@@ -235,29 +232,6 @@ export function buildLauncher() {
         runBtn.lastChild.textContent = "Run";
         saveBtn.lastChild.textContent = "Save job";
       }
-    }
-  }
-
-  // -- display_metrics: open a run's logs in the Metrics view ----------
-  function renderMetricsLauncher(body) {
-    clear(body);
-    let logdir = "";
-    const input = h("input", { class: "input", placeholder: "server log directory", oninput: (e) => (logdir = e.target.value) });
-    const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; logdir = p; }, input.value) }, icon("folderOpen", 16));
-    const openBtn = h("button", { class: "btn", style: { width: "100%", marginTop: "10px", justifyContent: "center" }, onclick: open }, icon("chart", 18), h("span", null, "Open metrics"));
-    const err = h("div", { style: { marginTop: "10px" } });
-    body.appendChild(h("div", { class: "launcher-fields" },
-      h("p", { class: "field-help", style: { margin: "0 0 10px" } },
-        "Open a run's output directory as a Metrics tab: curves, image panels and the latent space, " +
-        "read from its TensorBoard logs. TensorBoard itself is one click away inside the tab."),
-      h("div", { class: "path-row" }, input, browse), openBtn, err));
-
-    function open() {
-      const dir = logdir.trim();
-      if (!dir) { mount(err, errorBox("Choose a log directory first.")); return; }
-      clear(err);
-      store.openMetrics({ logdir: dir });
-      navigate("/metrics");
     }
   }
 

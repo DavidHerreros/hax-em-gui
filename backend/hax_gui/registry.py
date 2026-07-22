@@ -189,8 +189,24 @@ def _has_train_predict_mode(schema: dict[str, Any]) -> bool:
     return False
 
 
+# hax entry points that are not batch jobs, so they must not appear in the launcher
+# or the workflow palette. Both would be actively wrong as a job:
+#   display_metrics — starts TensorBoard and blocks forever; as a workflow step it
+#     would never terminate and its dependents would never run. The GUI reads the
+#     same logs natively (see the Metrics tab and hax_gui/tensorboard.py).
+#   update — runs `pip install -U` / `git pull` and prompts for confirmation. The GUI
+#     has its own Updater (updater.py) with restart handling; running this as a job
+#     would upgrade hax underneath the server that launched it.
+# Only the *catalog* is filtered. `get_schema` and friends still resolve these names,
+# so a job or workflow node saved before this change keeps working.
+_NOT_A_JOB = frozenset({"display_metrics", "update"})
+
+
 def list_programs() -> list[dict[str, Any]]:
     """Lightweight catalog entries (no fields), sorted by category then name.
+
+    Programs in :data:`_NOT_A_JOB` are omitted — this list feeds the launcher and the
+    workflow palette, which offer to *run* what they show.
 
     ``moded`` (has a train/predict ``--mode``) and ``latents_decoder`` (a predict
     run yields latents + a reloadable decoder) are derived flags so the frontend
@@ -199,6 +215,8 @@ def list_programs() -> list[dict[str, Any]]:
     latents_decoders = set(adapters.latents_decoder_programs())
     out = []
     for name, schema in all_programs().items():
+        if name in _NOT_A_JOB:
+            continue
         out.append(
             {
                 "name": name,

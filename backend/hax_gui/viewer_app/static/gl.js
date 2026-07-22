@@ -182,15 +182,26 @@ export function createRenderer(canvas) {
   const ssaoP = ssaoOK ? makeProg(gl, VERT_FS, FRAG_SSAO) : null;
   const blurP = ssaoOK ? makeProg(gl, VERT_FS, FRAG_BLUR) : null;
 
-  // mesh geometry
-  const vao = gl.createVertexArray();
-  const posBuf = gl.createBuffer(), normBuf = gl.createBuffer(), idxBuf = gl.createBuffer();
-  let indexCount = 0;
-  gl.bindVertexArray(vao);
-  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-  gl.bindBuffer(gl.ARRAY_BUFFER, normBuf); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
-  gl.bindVertexArray(null);
+  // Mesh geometry, one entry per model in the scene. A lone map is just the case where
+  // there is one of them, so the single-map path is not a separate code path.
+  //   { vao, posBuf, normBuf, idxBuf, count, color|null, visible, bounds }
+  // Insertion order is draw order; `color: null` means "use the viewer's global colour",
+  // which is what a single unnamed map has always used.
+  const models = new Map();
+
+  function makeModel() {
+    const m = { vao: gl.createVertexArray(), posBuf: gl.createBuffer(), normBuf: gl.createBuffer(),
+                idxBuf: gl.createBuffer(), count: 0, color: null, visible: true, bounds: null };
+    gl.bindVertexArray(m.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.normBuf); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.idxBuf);
+    gl.bindVertexArray(null);
+    return m;
+  }
+  const drawable = () => [...models.values()].filter((m) => m.visible && m.count);
+  // Whether *anything* is on screen. SSAO and the snapshot path both key off this.
+  const anyGeometry = () => drawable().length > 0;
   const quadVao = gl.createVertexArray();   // empty VAO for fullscreen passes
   gl.enable(gl.DEPTH_TEST);
 
@@ -237,7 +248,7 @@ export function createRenderer(canvas) {
   // background, which leaves the camera on the pivot it already had.
   function centreDepth() {
     const W = canvas.width, H = canvas.height, N = 5;   // a few px wide, so a 1px gap doesn't read as "empty"
-    if (!ssaoOK || !indexCount || !gFbo || W < N || H < N) return null;
+    if (!ssaoOK || !anyGeometry() || !gFbo || W < N || H < N) return null;
     const x = (W >> 1) - (N >> 1), y = (H >> 1) - (N >> 1);
     let px;
     try {
@@ -271,7 +282,8 @@ export function createRenderer(canvas) {
   // fitRadius 1.33 keeps the map the on-screen size it has always been (the old
   // 45°-vertical camera at dist 3.2 showed 3.2·tan(22.5°) ≈ 1.33 world units of height);
   // the camera now reaches that framing from further back, through ChimeraX's field.
-  const orbit = createOrbit(canvas, () => render(), null, { fitRadius: 1.33, probeDepth: centreDepth });
+  const orbit = createOrbit(canvas, () => render(), null,
+    { fitRadius: 1.33, probeDepth: centreDepth, modelBounds: sceneBounds });
 
   function resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -327,7 +339,17 @@ export function createRenderer(canvas) {
     const view = lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]);   // camera fixed; model carries the trackball rotation + pan
     return { proj, view, model: orbit.model };
   }
-  function drawMesh() { gl.bindVertexArray(vao); gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_INT, 0); gl.bindVertexArray(null); }
+  // Draw every visible model. `colorLoc` is the beauty shader's uColor — passed so the
+  // colour is set per model rather than once per pass; the geometry prepass has no
+  // colour and passes null.
+  function drawModels(colorLoc) {
+    for (const m of drawable()) {
+      if (colorLoc) gl.uniform3fv(colorLoc, m.color || color);
+      gl.bindVertexArray(m.vao);
+      gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+    }
+    gl.bindVertexArray(null);
+  }
   function drawQuad() { gl.bindVertexArray(quadVao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null); }
 
   function setMatrices(p) {
@@ -337,7 +359,6 @@ export function createRenderer(canvas) {
     gl.uniformMatrix4fv(p.u("uModel"), false, model);
   }
   function setLighting(useSSAO) {
-    gl.uniform3fv(beauty.u("uColor"), color);
     gl.uniform1f(beauty.u("uAmbient"), light.ambient);
     gl.uniform1f(beauty.u("uFill"), light.fill);
     gl.uniform1f(beauty.u("uSpec"), light.spec);
@@ -362,7 +383,7 @@ export function createRenderer(canvas) {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.useProgram(geomP.prog);
     setMatrices(geomP);
-    drawMesh();
+    drawModels(null);
 
     // 2. SSAO
     gl.bindFramebuffer(gl.FRAMEBUFFER, aoFbo);
@@ -398,7 +419,7 @@ export function createRenderer(canvas) {
     setMatrices(beauty);
     setLighting(true);
     bindTex(3, blurTex);
-    drawMesh();
+    drawModels(beauty.u("uColor"));
   }
 
   function drawForward(alpha) {
@@ -407,38 +428,93 @@ export function createRenderer(canvas) {
     gl.enable(gl.DEPTH_TEST);
     gl.clearColor(bg[0], bg[1], bg[2], alpha);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (!indexCount) return;
+    if (!anyGeometry()) return;
     gl.useProgram(beauty.prog);
     setMatrices(beauty);
     setLighting(false);
     bindTex(3, whiteTex);
-    drawMesh();
+    drawModels(beauty.u("uColor"));
   }
 
   function bindTex(unit, tex) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); }
 
   function paint(alpha) {
-    if (ssaoOK && indexCount) { ensureTargets(); }
-    if (ssaoOK && indexCount) drawSSAO(alpha);
+    if (ssaoOK && anyGeometry()) { ensureTargets(); }
+    if (ssaoOK && anyGeometry()) drawSSAO(alpha);
     else drawForward(alpha);
   }
 
   function render() { resize(); paint(1); }
 
-  function setMesh(positions, normals, indices) {
-    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
-    gl.bindBuffer(gl.ARRAY_BUFFER, normBuf); gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
-    indexCount = indices.length;
+  // Axis-aligned box enclosing the vertices, for the camera's centre-of-rotation rule.
+  // A single pass over the positions, once per contour — the surface is what the box is
+  // meant to describe, and it is the only thing here that knows where the surface is.
+  function aabb(positions) {
+    if (!positions.length) return null;
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < positions.length; i += 3) {
+      for (let a = 0; a < 3; a++) {
+        const v = positions[i + a];
+        if (v < lo[a]) lo[a] = v;
+        if (v > hi[a]) hi[a] = v;
+      }
+    }
+    return isFinite(lo[0]) ? { lo, hi } : null;
+  }
+
+  // Union of what is on screen — the camera frames and pivots on the whole scene, not
+  // on whichever model happens to be first.
+  function sceneBounds() {
+    let lo = null, hi = null;
+    for (const m of drawable()) {
+      if (!m.bounds) continue;
+      if (!lo) { lo = m.bounds.lo.slice(); hi = m.bounds.hi.slice(); continue; }
+      for (let a = 0; a < 3; a++) {
+        lo[a] = Math.min(lo[a], m.bounds.lo[a]);
+        hi[a] = Math.max(hi[a], m.bounds.hi[a]);
+      }
+    }
+    return lo ? { lo, hi } : null;
+  }
+
+  function setModelMesh(id, positions, normals, indices) {
+    let m = models.get(id);
+    if (!m) models.set(id, (m = makeModel()));
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf); gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.normBuf); gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.idxBuf); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+    m.count = indices.length;
+    m.bounds = indices.length ? aabb(positions) : null;
     orbit.invalidatePivot();   // a new contour is a new front surface
+    render();
+  }
+
+  function dropModel(id) {
+    const m = models.get(id);
+    if (!m) return;
+    gl.deleteVertexArray(m.vao);
+    gl.deleteBuffer(m.posBuf); gl.deleteBuffer(m.normBuf); gl.deleteBuffer(m.idxBuf);
+    models.delete(id);
+    orbit.invalidatePivot();
     render();
   }
 
   window.addEventListener("resize", render);
 
   return {
-    setMesh, render,
-    clear() { indexCount = 0; render(); },
+    render,
+    // Single-map callers (the landscape viewer) address the one implicit model.
+    setMesh: (positions, normals, indices) => setModelMesh(0, positions, normals, indices),
+    setModelMesh, dropModel,
+    setModelColor(id, rgb) { const m = models.get(id); if (m) { m.color = rgb; render(); } },
+    setModelVisible(id, on) {
+      const m = models.get(id);
+      if (!m || m.visible === !!on) return;
+      m.visible = !!on;
+      orbit.invalidatePivot();   // hiding the front map exposes a different front surface
+      render();
+    },
+    clear() { for (const id of [...models.keys()]) dropModel(id); render(); },
     setColor(rgb) { color = rgb; render(); },
     setBackground(rgb) { bg = rgb; render(); },
     setLighting(mode) { light = { ...(LIGHTING[mode] || LIGHTING.standard) }; render(); },
@@ -450,7 +526,7 @@ export function createRenderer(canvas) {
       const ow = canvas.width, oh = canvas.height;
       canvas.width = Math.floor(canvas.clientWidth * scale);
       canvas.height = Math.floor(canvas.clientHeight * scale);
-      if (ssaoOK && indexCount) ensureTargets();
+      if (ssaoOK && anyGeometry()) ensureTargets();
       paint(transparent ? 0 : 1);
       const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
       canvas.width = ow; canvas.height = oh; render();

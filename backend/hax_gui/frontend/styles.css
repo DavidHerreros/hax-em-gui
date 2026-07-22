@@ -426,7 +426,19 @@ body.vwin-dragging iframe { pointer-events: none; }
 .filelist .entry-map:hover { background: var(--hover); }
 .filelist .entry-map .entry { flex: 1; }
 .filelist .entry-map .entry:hover { background: none; }
-.modal-foot { height: 48px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: flex-end; padding: 0 16px; }
+.modal-foot { height: 48px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 8px; justify-content: flex-end; padding: 0 16px; }
+/* `hidden` has to be spelled out: the UA's [hidden] { display: none } loses to the
+   display declarations above and on .btn, both of which are more specific. */
+.modal-foot[hidden], .modal-foot .btn[hidden] { display: none; }
+
+/* Tick boxes for opening several maps / tables at once, and the errors that come back
+   when some of them fail to open. */
+.filelist .fp-pick { flex: 0 0 auto; margin: 0 0 0 8px; cursor: pointer; }
+/* A file the browse-only picker can't do anything with: readable, but not a target. */
+.filelist .entry.inert { opacity: .55; cursor: default; }
+.filelist .entry.inert:hover { background: none; }
+.fp-openerr:empty { display: none; }
+.fp-openerr { padding: 10px 16px 0; }
 
 /* maps a run produced, listed in the job detail view */
 .job-maps { margin: -4px 0 16px; }
@@ -1214,3 +1226,10 @@ body.vwin-dragging iframe { pointer-events: none; }
 .chat-action-open { display: inline-flex; align-items: center; gap: 6px; }
 .chat-action-note { font-size: 11px; }
 .chat-action-done { font-size: 12px; margin-top: 6px; }
+/* "Select all in this folder", above the picker's listing. Only appears when the
+   folder actually holds openable files. */
+.fp-selectall { display: flex; align-items: center; gap: 8px; padding: 8px 16px;
+  border-bottom: 1px solid var(--border); font-size: 12.5px; color: var(--muted); cursor: pointer; user-select: none; }
+.fp-selectall:hover { color: var(--text); }
+.fp-selectall[hidden] { display: none; }
+.fp-selectall .fp-pick { margin: 0; }

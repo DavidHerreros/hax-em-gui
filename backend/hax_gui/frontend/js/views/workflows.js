@@ -18,6 +18,7 @@ import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
 import { pickProject } from "./pickProject.js";
 import { loadProgramGroups, isModed } from "../programGroups.js";
+import { layeredLayout } from "./wfLayout.js";
 
 const LAST_WF_KEY = "hax_gui_last_workflow";   // reopen this workflow on next visit
 
@@ -930,23 +931,26 @@ export function WorkflowsView() {
     autoLayout(); dirty = true;
   }
 
-  // Arrange nodes into longest-path dependency tiers along the layout axis.
+  // Arrange nodes into dependency tiers, one independent subworkflow at a time, with
+  // every step centred between the ones it feeds off. The algorithm lives in
+  // wfLayout.js and is orientation-agnostic: it works in (main, cross), and all this
+  // has to say is which screen axis each of those is and how big a node is across.
   function autoLayout() {
-    const order = topoLocal();
-    if (!order) { flash("Can't auto-layout: the graph has a cycle.", "err"); return; }
-    const depth = {};
-    for (const n of graph.nodes) depth[n.id] = 0;
-    for (const id of order) for (const e of graph.edges) if (e.from === id) depth[e.to] = Math.max(depth[e.to] || 0, (depth[id] || 0) + 1);
-    const tiers = {};
-    for (const n of graph.nodes) (tiers[depth[n.id] || 0] ||= []).push(n);
-    const PAD = 40, GAP_MAIN = 100, GAP_CROSS = 26;
-    Object.keys(tiers).map(Number).sort((a, b) => a - b).forEach((d) => {
-      let cross = PAD;
-      for (const n of tiers[d]) {
-        if (horiz()) { n.x = PAD + d * (NODE_W + GAP_MAIN); n.y = cross; cross += nodeHeight(n) + GAP_CROSS; }
-        else { n.y = PAD + d * (HEADER_H + 3 * ROW_H + 70); n.x = cross; cross += NODE_W + GAP_CROSS; }
-      }
+    const PAD = 40, GAP_MAIN = 100, GAP_CROSS = 26, GAP_COMP = 72;
+    const H = horiz();
+    const laid = layeredLayout(graph.nodes, graph.edges, {
+      // Horizontal spreads nodes down the screen, where their heights differ; vertical
+      // spreads them across, where every node is one width.
+      crossSize: (n) => (H ? nodeHeight(n) : NODE_W),
+      mainStep: H ? NODE_W + GAP_MAIN : HEADER_H + 3 * ROW_H + 70,
+      pad: PAD, gapCross: GAP_CROSS, gapComp: GAP_COMP,
     });
+    if (!laid) { flash("Can't auto-layout: the graph has a cycle.", "err"); return; }
+    for (const n of graph.nodes) {
+      // `cross` is a centre; nodes are positioned by their top-left corner.
+      if (H) { n.x = laid.main[n.id]; n.y = laid.cross[n.id] - nodeHeight(n) / 2; }
+      else { n.y = laid.main[n.id]; n.x = laid.cross[n.id] - NODE_W / 2; }
+    }
     // shift the laid-out graph to the middle of the scrollable content so there's
     // room to pan on every side, then center the viewport on it
     const b = graphBBox();
@@ -957,16 +961,6 @@ export function WorkflowsView() {
     renderNodes();
     centerView();
   }
-  function topoLocal() {
-    const ids = graph.nodes.map((n) => n.id);
-    const indeg = Object.fromEntries(ids.map((i) => [i, 0]));
-    const adj = Object.fromEntries(ids.map((i) => [i, []]));
-    for (const e of graph.edges) if (adj[e.from] && e.to in indeg) { adj[e.from].push(e.to); indeg[e.to]++; }
-    const q = ids.filter((i) => indeg[i] === 0), order = [];
-    while (q.length) { const i = q.shift(); order.push(i); for (const j of adj[i]) if (--indeg[j] === 0) q.push(j); }
-    return order.length === ids.length ? order : null;
-  }
-
   // ── view: center, pan, minimap ──
   function graphBBox() {
     if (!graph.nodes.length) return null;

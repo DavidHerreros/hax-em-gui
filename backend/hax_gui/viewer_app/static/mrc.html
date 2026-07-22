@@ -72,10 +72,51 @@
         <span class="hist-label muted">contour</span>
         <canvas id="hist"></canvas>
       </div>
-      <div class="canvas-wrap">
-        <canvas id="gl"></canvas>
-        <canvas id="glvol" style="display:none"></canvas>
-        <div id="slices" class="slices" style="display:none"></div>
+      <!-- Canvas + model rail side by side, ChimeraX-style: the rail costs width, which
+           there is plenty of, rather than height, which the map needs. -->
+      <div class="stage" id="stage">
+        <!-- The rim gesture has no cursor of its own (ChimeraX has none either), so the
+             tooltip is the only place it is discoverable. -->
+        <div class="canvas-wrap"
+             title="Drag to rotate · drag near the edge to spin in-plane · middle-drag to pan · wheel to zoom">
+          <canvas id="gl"></canvas>
+          <canvas id="glvol" style="display:none"></canvas>
+          <div id="slices" class="slices" style="display:none"></div>
+          <!-- Reopens the rail once collapsed; the rail itself is gone by then. -->
+          <button id="modelsReopen" class="models-reopen" title="Show the model panel" hidden>Models</button>
+        </div>
+        <div class="rail-resize" id="modelsResize"></div>
+        <!-- Hidden entirely for a single map: a list of one is just noise, and a lone
+             map is what this viewer has always shown. -->
+        <aside class="models" id="models" hidden>
+          <div class="models-head">
+            <span class="models-title">Models</span>
+            <button id="modelsAll" class="lnk" title="Show every map">all</button>
+            <button id="modelsNone" class="lnk" title="Hide every map">none</button>
+            <button id="modelsCollapse" class="iconbtn" title="Hide the model panel">×</button>
+          </div>
+          <div class="models-list" id="modelsList"></div>
+        </aside>
+      </div>
+      <!-- Morph strip. Below the canvas rather than in the rail: a scrubber wants width,
+           and the rail is deliberately narrow. Shown only when the maps share a grid. -->
+      <div class="morph" id="morph" hidden>
+        <span class="morph-title">Morph</span>
+        <span id="morphSeq" class="morph-seq muted">pick maps in the panel →</span>
+        <label>frames <input id="morphFrames" type="number" min="2" max="120" value="24" title="Interpolated frames between each pair of maps" /></label>
+        <label title="Contour every frame at the same enclosed mass instead of the same sigma. Averaging two maps lowers the variance, so a fixed sigma makes the surface breathe mid-morph."><input id="morphMass" type="checkbox" checked /> constant mass</label>
+        <label>quality
+          <select id="morphQuality" title="Draft prepares in seconds; full is slower to prepare but is what you want in a recording">
+            <option value="draft" selected>draft</option>
+            <option value="full">full</option>
+          </select>
+        </label>
+        <button id="morphPrepare" class="btn" title="Compute the frames">Prepare</button>
+        <button id="morphPlay" class="btn" disabled>▶</button>
+        <input id="morphScrub" type="range" min="0" max="0" value="0" disabled title="Scrub through the morph" />
+        <label>fps <input id="morphFps" type="number" min="1" max="60" value="30" /></label>
+        <button id="morphRecord" class="btn" disabled title="Play once and save it as a video">● Record</button>
+        <button id="morphClear" class="lnk" title="Clear the morph and go back to the maps">clear</button>
       </div>
     </section>
   </main>

@@ -1724,7 +1724,7 @@ def job_inputs(job_id: str) -> dict[str, Any]:
     }
 
 
-async def _ensure_mrc_viewer(mrc: str, title: str) -> dict[str, Any]:
+async def _ensure_mrc_viewer(mrc: str | list[str], title: str) -> dict[str, Any]:
     try:
         return await mrc_viewer_manager.ensure(mrc, title)
     except (FileNotFoundError, ValueError) as exc:
@@ -1734,20 +1734,34 @@ async def _ensure_mrc_viewer(mrc: str, title: str) -> dict[str, Any]:
 
 
 class MrcViewerStart(BaseModel):
-    path: str
+    # One map, or several to show together in one scene. `path` is kept so existing
+    # single-map callers are unchanged; exactly one of the two must be given.
+    path: str | None = None
+    paths: list[str] | None = None
     title: str | None = None
 
 
 @app.post("/api/mrcviewer", dependencies=[Depends(auth)])
 async def start_mrc_viewer(body: MrcViewerStart) -> dict[str, Any]:
-    """Open the map viewer for any .mrc within the sandboxed file roots."""
-    try:
-        path = filebrowser.resolve(body.path)   # confines to HAX_GUI_FILE_ROOTS
-    except filebrowser.AccessDenied as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="file not found")
-    return await _ensure_mrc_viewer(str(path), body.title or path.name)
+    """Open the map viewer for .mrc files within the sandboxed file roots.
+
+    Several maps open as one viewer (a model panel you can toggle and morph
+    through), not as several tabs."""
+    wanted = body.paths if body.paths else ([body.path] if body.path else [])
+    if not wanted:
+        raise HTTPException(status_code=422, detail="give `path` or `paths`")
+    resolved = []
+    for one in wanted:
+        try:
+            path = filebrowser.resolve(one)   # confines to HAX_GUI_FILE_ROOTS
+        except filebrowser.AccessDenied as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"file not found: {one}")
+        resolved.append(str(path))
+    default = (Path(resolved[0]).name if len(resolved) == 1
+               else f"{len(resolved)} maps")
+    return await _ensure_mrc_viewer(resolved, body.title or default)
 
 
 @app.post("/api/mrcviewer/from-job/{job_id}", dependencies=[Depends(auth)])

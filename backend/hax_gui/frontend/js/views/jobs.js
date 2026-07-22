@@ -6,6 +6,7 @@ import { errorBox, skeleton } from "./ui.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
 import { pickProject } from "./pickProject.js";
+import { openFileBrowser } from "./filePicker.js";
 import { jobLabelChips, loadLabels } from "./labels.js";
 import { store } from "../store.js";
 
@@ -183,6 +184,9 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
       { label: "Rename", icon: icon("pencil", 15), onClick: rename },
       { label: "Copy to project…", icon: icon("copy", 15), onClick: copyToProject },
     );
+    // Straight into the run folder, without going through the detail view first.
+    // A saved-but-never-run job has no folder yet.
+    if (job.workdir) items.push({ label: "Output folder…", icon: icon("folderOpen", 15), onClick: () => openFileBrowser(job.workdir) });
     if (!job.active) items.push({ label: "Delete", icon: icon("trash", 15), danger: true, onClick: del });
     openContextMenu(anchor, items);
   }
