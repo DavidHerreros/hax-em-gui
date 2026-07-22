@@ -12,7 +12,7 @@ import { api } from "../api.js";
 import { store, getState } from "../store.js";
 import { errorBox } from "./ui.js";
 import { visibleFields } from "./formFields.js";
-import { openFilePicker } from "./filePicker.js";
+import { paramForm } from "./paramForm.js";
 import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
@@ -28,7 +28,9 @@ const CONTENT_W = 4000; // scrollable canvas content size (matches the wires SVG
 const CONTENT_H = 3000;
 const SVG_NS = "http://www.w3.org/2000/svg";
 
-// Concrete colors for the minimap (canvas 2D can't read CSS custom properties).
+// Concrete status colors for the overview map. Canvas 2D takes only resolved colors,
+// and these are semantic (green succeeded / red failed) rather than themed, so unlike
+// the map's ink they are literals rather than read off the computed style.
 const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", running: "#38bdf8", succeeded: "#22c55e", failed: "#ef4444", blocked: "#f59e0b", cancelling: "#f59e0b", cancelled: "#94a3b8", interrupted: "#f59e0b", idle: "#94a3b8" };
 
 // Programs that expose a train/predict mode (derived from the backend, see
@@ -81,7 +83,10 @@ export function WorkflowsView() {
   let drag = null;          // active node drag / wiring / pan gesture
   let nodeSeq = 1, edgeSeq = 1;
   let minimapOn = true;     // overview window visible?
+  let mmCollapsed = false;  // overview shrunk to its title pill?
   let mmXform = null;       // last minimap transform (for click-to-navigate)
+  let mmView = null;        // last viewport rect drawn, in minimap px (for grab-testing)
+  let mmPulse = null;       // rAF handle: only alive while a step is running
 
   const horiz = () => graph.orientation !== "vertical";
 
@@ -92,7 +97,8 @@ export function WorkflowsView() {
   // a ⋮ menu for file actions), the view (one View menu + the zoom readout), and the
   // actions. The action cluster is rebuilt by syncActions() because it depends on run
   // state and selection: while a run is live it offers Stop and "Queue selected"
-  // (steps appended to the live queue); otherwise a Run split button.
+  // (steps appended to the live queue); otherwise a Run split button. Queued steps
+  // start as soon as their device has a free slot, so several can be running at once.
   const nameInput = h("input", { class: "wf-name", placeholder: "Workflow name", value: "" });
   nameInput.addEventListener("input", () => { dirty = true; });
   const wfSelect = h("select", { class: "wf-select", title: "Open a saved workflow" });
@@ -106,8 +112,17 @@ export function WorkflowsView() {
   const viewMenuBtn = h("button", { class: "btn small", title: "View & layout",
     onclick: (e) => openContextMenu(e.currentTarget, viewMenuItems()) }, icon("sliders", 14), "View");
 
+  // Steps run concurrently, capped per device: a step's GPU (or the CPU) is the resource
+  // it contends for, so branches on different GPUs already run side by side at 1. Raising
+  // this stacks that many steps on the *same* card — nothing checks free VRAM, so it is a
+  // deliberate "I know these two fit" setting.
+  const parSel = h("select", { class: "btn small wf-par",
+    title: "How many steps may run at once on any one device.\n\n1 — one step per GPU. Independent branches on different GPUs still run in parallel.\n2+ — stack that many steps on the same GPU. Only do this if you know they fit in its memory; nothing here checks." },
+    ...[1, 2, 3, 4].map((n) => h("option", { value: String(n) }, n === 1 ? "1 / device" : `${n} / device`)));
+  parSel.addEventListener("change", setParallelism);
+
   const topbar = h("div", { class: "wf-topbar" },
-    h("div", { class: "wf-zone" }, h("strong", null, "Workflow"), wfSelect, nameInput, wfMenuBtn),
+    h("div", { class: "wf-zone" }, h("strong", null, "Workflow"), wfSelect, nameInput, parSel, wfMenuBtn),
     h("div", { class: "wf-zone" }, viewMenuBtn, zoomLabel),
     h("span", { class: "wf-spacer" }),
     statusEl, actionsEl);
@@ -148,7 +163,7 @@ export function WorkflowsView() {
       { label: "Tidy — arrange by dependency", icon: icon("sliders", 15), onClick: () => { autoLayout(); dirty = true; } },
       { label: horiz() ? "Switch to vertical" : "Switch to horizontal", icon: icon(horiz() ? "chevronRight" : "arrowRight", 15), onClick: toggleOrientation },
       { label: "Center in view", icon: icon("orbit", 15), onClick: centerView },
-      { label: minimapOn ? "Hide minimap" : "Show minimap", icon: icon("grid", 15), onClick: toggleMinimap },
+      { label: minimapOn ? "Hide overview map" : "Show overview map", icon: icon("grid", 15), onClick: toggleMinimap },
       { label: "Pin this layout", icon: icon("bookmark", 15), onClick: saveLayout },
     ];
     if (graph.savedLayout && graph.savedLayout.pos) {
@@ -165,7 +180,26 @@ export function WorkflowsView() {
         h("span", { class: "split-chevron" }, icon("chevronUp", 13))));
   }
 
+  // Persist the per-device cap on its own (not via save()), so changing it never drags
+  // an unsaved canvas along with it. The scheduler re-reads it each tick, so raising it
+  // mid-run takes effect as soon as a step frees a slot.
+  async function setParallelism() {
+    const n = Number(parSel.value) || 1;
+    if (!wf) return;                       // unsaved workflow: applied when it is created
+    try {
+      wf = await api.updateWorkflow(wf.id, { max_per_device: n });
+      flash(n === 1
+        ? "One step per device — branches on different GPUs still run in parallel."
+        : `Up to ${n} steps per device. Make sure they fit in one GPU's memory.`, "muted");
+    } catch (err) {
+      parSel.value = String((wf && wf.max_per_device) || 1);
+      flash("Could not change the step limit: " + (err.detail || err.message), "err");
+    }
+  }
+
   function syncActions() {
+    parSel.value = String((wf && wf.max_per_device) || 1);
+    parSel.disabled = !wf;
     clear(actionsEl);
     const running = !!(wf && wf.status === "running");
     const n = selectedSet.size;
@@ -177,10 +211,10 @@ export function WorkflowsView() {
     }
     actionsEl.appendChild(saveBtn);
     if (running) {
-      if (n) actionsEl.appendChild(h("button", { class: "btn secondary", title: "Queue the selected step(s) onto the running workflow — each starts when its turn comes",
+      if (n) actionsEl.appendChild(h("button", { class: "btn secondary", title: "Queue the selected step(s) onto the running workflow — each starts as soon as its dependencies are met and its device is free",
         onclick: () => runNodes([...selectedSet]) }, icon("plus", 15), "Queue selected"));
       actionsEl.appendChild(h("button", { class: "btn secondary", style: { color: "var(--warn)", borderColor: "var(--warn)" },
-        title: "Stop the run: cancel the step running now and dequeue the rest", onclick: stopRun }, icon("ban", 15), "Stop"));
+        title: "Stop the run: cancel every step running now and dequeue the rest", onclick: stopRun }, icon("ban", 15), "Stop"));
     } else {
       actionsEl.appendChild(splitButton(
         { icon: "play", label: "Run all", title: "Run the whole workflow", onClick: () => runNodes(null) },
@@ -209,7 +243,20 @@ export function WorkflowsView() {
   const contentLayer = h("div", { class: "wf-content", style: { width: CONTENT_W + "px", height: CONTENT_H + "px" } }, svg, nodesLayer);
   const sizer = h("div", { class: "wf-sizer" }, contentLayer);
   const canvas = h("div", { class: "wf-canvas" }, sizer);
-  const minimap = h("canvas", { class: "wf-minimap", title: "Overview — click to jump" });
+  // ── overview panel ──
+  // A titled card rather than a bare canvas: the header carries the one number that
+  // is hard to read off a 200px map (how many steps, and how many are live) and the
+  // collapse control, so the map itself stays pure graph.
+  const mmCanvas = h("canvas", { class: "wf-mm-canvas" });
+  const mmCount = h("span", { class: "wf-mm-count" }, "");
+  const mmCollapse = h("button", { class: "wf-mm-btn", title: "Collapse overview",
+    onclick: (e) => { e.stopPropagation(); setMinimapCollapsed(!mmCollapsed); } }, icon("chevronUp", 13));
+  const mmBar = h("div", { class: "wf-mm-bar", title: "Overview" },
+    icon("grid", 12), h("span", { class: "wf-mm-title" }, "Overview"), mmCount, mmCollapse);
+  // Clicking the bar while collapsed reopens it — the whole pill is the target, not
+  // just the 13px chevron.
+  mmBar.addEventListener("click", () => { if (mmCollapsed) setMinimapCollapsed(false); });
+  const minimap = h("div", { class: "wf-mm" }, mmBar, mmCanvas);
   const canvasWrap = h("div", { class: "wf-canvas-wrap" }, canvas, minimap);
   // Rubber-band selection rectangle. Lives inside contentLayer (content units), so
   // it scales/scrolls with the nodes; it survives renderNodes() (which only clears
@@ -309,16 +356,44 @@ export function WorkflowsView() {
     }
   });
   canvas.addEventListener("scroll", drawMinimap);
-  minimap.addEventListener("pointerdown", (e) => {
-    e.stopPropagation();
+  // The panel is sized in CSS (and shrinks with the canvas on narrow screens), so the
+  // backing store has to follow it rather than be set once.
+  if (window.ResizeObserver) new ResizeObserver(() => drawMinimap()).observe(mmCanvas);
+  // The minimap drives the viewport by dragging, not just by clicking: press inside
+  // the viewport rectangle to grab it where you touched it (no jump), press outside
+  // to recentre there and keep dragging from that point. Both are the same gesture,
+  // so a click is simply a drag of zero length.
+  mmCanvas.addEventListener("pointerdown", (e) => {
+    e.stopPropagation(); e.preventDefault();
     if (!mmXform) return;
-    const r = minimap.getBoundingClientRect();
-    const cx = mmXform.gx0 + (e.clientX - r.left - mmXform.ox) / mmXform.s;
-    const cy = mmXform.gy0 + (e.clientY - r.top - mmXform.oy) / mmXform.s;
-    canvas.scrollLeft = Math.max(0, cx * zoom - canvas.clientWidth / 2);
-    canvas.scrollTop = Math.max(0, cy * zoom - canvas.clientHeight / 2);
-    drawMinimap();
+    const r = mmCanvas.getBoundingClientRect();
+    const px = e.clientX - r.left, py = e.clientY - r.top;
+    const inside = mmView && px >= mmView.x && px <= mmView.x + mmView.w
+                           && py >= mmView.y && py <= mmView.y + mmView.h;
+    // Offset from the viewport centre, so grabbing an edge doesn't snap it to the cursor.
+    const offX = inside ? px - (mmView.x + mmView.w / 2) : 0;
+    const offY = inside ? py - (mmView.y + mmView.h / 2) : 0;
+    const move = (ev) => {
+      const mx = ev.clientX - r.left - offX, my = ev.clientY - r.top - offY;
+      scrollToContent(mmXform.gx0 + (mx - mmXform.ox) / mmXform.s,
+                      mmXform.gy0 + (my - mmXform.oy) / mmXform.s);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      mmCanvas.classList.remove("dragging");
+    };
+    mmCanvas.classList.add("dragging");
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    move(e);
   });
+  // Wheel over the map zooms the canvas about the viewport centre rather than
+  // scrolling the page behind it.
+  mmCanvas.addEventListener("wheel", (e) => {
+    e.preventDefault(); e.stopPropagation();
+    zoomTo(zoom * Math.exp(-e.deltaY * 0.0015), canvas.clientWidth / 2, canvas.clientHeight / 2);
+  }, { passive: false });
 
   // drag-and-drop a palette program onto the canvas (drop on a node => auto-wire)
   canvas.addEventListener("dragover", (e) => { if (drag?.kind !== "node") { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; canvas.classList.add("wf-drop"); } });
@@ -594,7 +669,7 @@ export function WorkflowsView() {
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
       st ? h("span", { class: "wf-node-st", style: { color: statusColor(st) } }, st) : null,
-      h("button", { class: "wf-node-run", title: running ? "Queue this step onto the running workflow" : "Run this step", onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon(running ? "plus" : "play", 12)),
+      h("button", { class: "wf-node-run", title: running ? "Queue this step onto the running workflow — it starts when its device is free" : "Run this step", onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon(running ? "plus" : "play", 12)),
       h("button", { class: "wf-node-run", title: "Duplicate this step (un-run copy)", onclick: (e) => { e.stopPropagation(); duplicateNodes([n.id]); } }, icon("copy", 12)),
       h("button", { class: "wf-node-x", title: "Remove step (deletes its job + outputs)", onclick: (e) => { e.stopPropagation(); removeNodes([n.id]); } }, "×"));
     head.addEventListener("pointerdown", (e) => startNodeDrag(e, n));
@@ -810,54 +885,38 @@ export function WorkflowsView() {
     const schema = schemaCache[n.program];
     if (!schema) { loadSchema(n.program).then(() => { if (selected === n.id) renderInspector(); }); inspBody.appendChild(h("div", { class: "muted small" }, "Loading parameters…")); return; }
     const bindable = byName[n.program]?.bindable || {};
-    inspBody.appendChild(h("div", { class: "wf-insp-sub muted small" }, "Parameters"));
-    for (const f of visibleFields(schema)) {
-      const wiredAll = graph.edges.filter((e) => e.to === n.id && e.field === f.name);
-      const multi = isMultiField(n.program, f.name);
-      if (wiredAll.length) {
-        const chips = wiredAll.map((w) => {
+    // Same grouped/searchable form as the launcher, at compact density. A node
+    // stores only the arguments that differ from the program's defaults, so a
+    // default changed in hax-em is picked up on the next run — hence the sparse
+    // `set` that deletes rather than storing an empty value.
+    inspBody.appendChild(paramForm(schema, visibleFields(schema), {
+      density: "compact",
+      get: (name) => n.args[name],
+      set: (name, v, f) => {
+        const numeric = f.type === "integer" || f.type === "number";
+        if (v === "" || v == null) delete n.args[name];
+        else n.args[name] = numeric && v !== "" ? Number(v) : v;
+        dirty = true;
+      },
+      // A wired input is fed by the graph, so it shows its source(s) instead of
+      // an editable control.
+      override: (f) => {
+        const wired = graph.edges.filter((e) => e.to === n.id && e.field === f.name);
+        if (!wired.length) return null;
+        return h("div", { class: "wf-wired" }, ...wired.map((w) => {
           const src = nodeById(w.from);
           return h("div", { class: "wf-wired-chip" }, icon("link", 12),
             h("span", { style: { flex: "1" } }, `from ${src ? (src.name || src.program) : "?"} · ${w.kind}`),
             h("button", { class: "wf-chip-x", title: "Remove connection", onclick: () => removeEdge(w.id) }, "×"));
-        });
-        inspBody.appendChild(h("label", { class: "wf-lbl" },
-          f.name + (multi ? ` (${wiredAll.length})` : "") + (multi ? "  — wire more sources to add" : ""), ...chips));
-        continue;
-      }
-      inspBody.appendChild(h("label", { class: "wf-lbl", title: f.help || "" },
-        f.name + (f.required ? " *" : "") + (f.name in bindable ? (multi ? "  (wirable, multi)" : "  (wirable)") : ""), argInput(n, f)));
-    }
-  }
-
-  function argInput(n, f) {
-    const cur = n.args[f.name];
-    const set = (v) => { if (v === "" || v == null) delete n.args[f.name]; else n.args[f.name] = v; dirty = true; };
-    const choices = f.choices || f.enum;
-    const t = (f.type || "string").toLowerCase();
-    if (t === "boolean" || t === "bool") {
-      const cb = h("input", { type: "checkbox" }); cb.checked = cur ?? !!f.default;
-      cb.addEventListener("change", () => set(cb.checked));
-      return h("span", { class: "wf-bool" }, cb);
-    }
-    if (Array.isArray(choices) && choices.length) {
-      const sel = h("select", { class: "wf-field" }, h("option", { value: "" }, "— default —"),
-        ...choices.map((c) => h("option", { value: String(c) }, String(c))));
-      sel.value = cur != null ? String(cur) : "";
-      sel.addEventListener("change", () => set(sel.value));
-      return sel;
-    }
-    const numeric = ["integer", "int", "number", "float"].includes(t);
-    const inp = h("input", { class: "wf-field", type: numeric ? "number" : "text",
-      placeholder: f.default != null ? String(f.default) : "", value: cur != null ? String(cur) : "" });
-    inp.addEventListener("input", () => set(numeric && inp.value !== "" ? Number(inp.value) : inp.value));
-    // file/dir parameters get a "browse the server" button (same picker as the form)
-    if (f.widget === "path") {
-      const browse = h("button", { class: "wf-browse btn-icon", type: "button", title: "Browse server",
-        onclick: () => openFilePicker(f.path_kind || "file", (p) => { inp.value = p; set(p); }, inp.value) }, icon("folderOpen", 15));
-      return h("div", { class: "wf-path-row" }, inp, browse);
-    }
-    return inp;
+        }), isMultiField(n.program, f.name)
+          ? h("p", { class: "field-help" }, "Wire more sources to add to this input.")
+          : null);
+      },
+      tag: (f) => {
+        if (!(f.name in bindable)) return null;
+        return isMultiField(n.program, f.name) ? "wirable, multi" : "wirable";
+      },
+    }).el);
   }
 
   function loadSchema(program) {
@@ -927,48 +986,181 @@ export function WorkflowsView() {
     drawMinimap();
   }
   function toggleMinimap() { minimapOn = !minimapOn; minimap.classList.toggle("hidden", !minimapOn); drawMinimap(); }
+  function setMinimapCollapsed(v) {
+    mmCollapsed = v;
+    minimap.classList.toggle("collapsed", v);
+    mmCollapse.title = v ? "Show overview" : "Collapse overview";
+    drawMinimap();
+  }
+  // Centre the viewport on a content-space point, clamped to the scrollable extent.
+  function scrollToContent(cx, cy) {
+    canvas.scrollLeft = Math.max(0, Math.min(CONTENT_W * zoom - canvas.clientWidth, cx * zoom - canvas.clientWidth / 2));
+    canvas.scrollTop = Math.max(0, Math.min(CONTENT_H * zoom - canvas.clientHeight, cy * zoom - canvas.clientHeight / 2));
+    drawMinimap();
+  }
+
+  // Canvas 2D can't resolve `var(--x)`, but it can be handed the *computed* value —
+  // so the map follows the light/dark theme instead of hardcoding one palette.
+  function themeInk() {
+    const cs = getComputedStyle(minimap);
+    const v = (name, fallback) => (cs.getPropertyValue(name).trim() || fallback);
+    return {
+      line: v("--border", "#1e293b"),
+      muted: v("--muted", "#94a3b8"),
+      text: v("--text", "#f1f5f9"),
+      accent: v("--accent", "#2dd4bf"),
+      // Derived from the ground's luminance rather than matched against a known hex,
+      // so re-tuning the palette can't silently flip the scrim to the wrong one.
+      dark: luminance(v("--bg", "#020617")) < 0.5,
+    };
+  }
+  // Rough perceptual lightness of a #rgb / #rrggbb token; 0.5 on anything unparseable
+  // is harmless — the scrim only picks between two tints.
+  function luminance(css) {
+    const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(css);
+    if (!m) return 0.5;
+    const hex = m[1].length === 3 ? m[1].replace(/./g, (c) => c + c) : m[1];
+    const n = parseInt(hex, 16);
+    return (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  }
+
+  // Recompute the summary in the panel header. Cheap enough to call on every draw.
+  function updateMinimapCount() {
+    const n = graph.nodes.length;
+    const live = runState ? graph.nodes.filter((x) => runState[x.id] && runState[x.id].status === "running").length : 0;
+    mmCount.textContent = live ? `${n} · ${live} running` : `${n} step${n === 1 ? "" : "s"}`;
+    mmCount.classList.toggle("live", live > 0);
+  }
 
   function drawMinimap() {
+    schedulePulse();          // before the early-outs, so hiding the panel stops the loop
     if (!minimapOn) return;
-    const W = minimap.clientWidth, H = minimap.clientHeight;
+    updateMinimapCount();
+    if (mmCollapsed) { mmXform = null; mmView = null; return; }
+    const W = mmCanvas.clientWidth, H = mmCanvas.clientHeight;
     if (!W || !H) return;
     const dpr = window.devicePixelRatio || 1;
-    minimap.width = Math.round(W * dpr); minimap.height = Math.round(H * dpr);
-    const ctx = minimap.getContext("2d");
+    // Only resize the backing store when it actually changed: assigning width/height
+    // clears the canvas and reallocates, and this runs on every scroll frame.
+    const bw = Math.round(W * dpr), bh = Math.round(H * dpr);
+    if (mmCanvas.width !== bw || mmCanvas.height !== bh) { mmCanvas.width = bw; mmCanvas.height = bh; }
+    const ctx = mmCanvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
+    const ink = themeInk();
     const b = graphBBox();
-    if (!b) { mmXform = null; return; }
-    const pad = 60;
+    if (!b) {
+      mmXform = null; mmView = null;
+      ctx.fillStyle = ink.muted; ctx.globalAlpha = 0.65;
+      ctx.font = "11px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("No steps yet", W / 2, H / 2);
+      ctx.globalAlpha = 1;
+      return;
+    }
+    // Fit the graph with a margin proportional to the graph itself, so a two-node
+    // workflow isn't blown up to fill the panel and a large one still breathes.
+    const pad = Math.max(40, Math.max(b.w, b.h) * 0.06);
     const gx0 = b.x0 - pad, gy0 = b.y0 - pad, gw = b.w + 2 * pad, gh = b.h + 2 * pad;
     const s = Math.min(W / gw, H / gh);
     const ox = (W - gw * s) / 2, oy = (H - gh * s) / 2;
     mmXform = { gx0, gy0, ox, oy, s };
     const tx = (x) => ox + (x - gx0) * s, ty = (y) => oy + (y - gy0) * s;
-    // edges — connect tile centers (the tiles are small squares centered on each
-    // node), so wires visibly join the boxes; tiles are drawn after, on top.
-    const center = (n) => ({ x: n.x + NODE_W / 2, y: n.y + nodeHeight(n) / 2 });
-    ctx.strokeStyle = "#64748b"; ctx.lineWidth = 1.25;
-    for (const e of graph.edges) {
-      const sN = nodeById(e.from), dN = nodeById(e.to); if (!sN || !dN) continue;
-      const p1 = center(sN), p2 = center(dN);
-      ctx.beginPath(); ctx.moveTo(tx(p1.x), ty(p1.y)); ctx.lineTo(tx(p2.x), ty(p2.y)); ctx.stroke();
-    }
-    // nodes — small rounded squares colored by run status. Size from the node's
-    // *smaller* dimension (its height) so stacked tier neighbours never overlap
-    // (nodes are much wider than tall, and stack closer vertically than NODE_W).
+
+    // Node footprints in map px, kept to a legible minimum. Real proportions (not
+    // squares) are what makes the map recognisable as the graph you just left.
+    const MIN_W = 9, MIN_H = 5;
+    const boxes = new Map();
     for (const n of graph.nodes) {
-      const st = runState && runState[n.id] ? runState[n.id].status : null;
-      const col = (st && MINI_STATUS[st]) || "#94a3b8";
-      const side = Math.max(7, Math.min(NODE_W, nodeHeight(n)) * s * 0.82);
-      const cx = tx(n.x + NODE_W / 2) - side / 2, cy = ty(n.y + nodeHeight(n) / 2) - side / 2;
-      roundRectPath(ctx, cx, cy, side, side, Math.max(2, side * 0.28));
-      ctx.fillStyle = col; ctx.fill();
-      ctx.lineWidth = 1; ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.stroke();
+      const w = Math.max(MIN_W, NODE_W * s), hh = Math.max(MIN_H, nodeHeight(n) * s);
+      boxes.set(n.id, { x: tx(n.x + NODE_W / 2) - w / 2, y: ty(n.y + nodeHeight(n) / 2) - hh / 2, w, h: hh });
     }
-    // current viewport rectangle (scroll is in scaled px → /zoom for content coords)
-    ctx.strokeStyle = "#2dd4bf"; ctx.lineWidth = 1.5;
-    ctx.strokeRect(tx(canvas.scrollLeft / zoom), ty(canvas.scrollTop / zoom), (canvas.clientWidth / zoom) * s, (canvas.clientHeight / zoom) * s);
+
+    // Wires — the same bezier shape as the canvas, so the map reads as the same
+    // picture. Anchored on the box edges the ports live on, not the centres.
+    ctx.lineCap = "round";
+    for (const e of graph.edges) {
+      const a = boxes.get(e.from), c = boxes.get(e.to);
+      if (!a || !c) continue;
+      const p1 = horiz() ? { x: a.x + a.w, y: a.y + a.h / 2 } : { x: a.x + a.w / 2, y: a.y + a.h };
+      const p2 = horiz() ? { x: c.x, y: c.y + c.h / 2 } : { x: c.x + c.w / 2, y: c.y };
+      const st = runState && runState[e.from] ? runState[e.from].status : null;
+      ctx.strokeStyle = (st && MINI_STATUS[st]) || ink.muted;
+      ctx.globalAlpha = st ? 0.75 : 0.4;
+      ctx.lineWidth = 1.25;
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      if (horiz()) {
+        const dx = Math.max(6, Math.abs(p2.x - p1.x) * 0.5);
+        ctx.bezierCurveTo(p1.x + dx, p1.y, p2.x - dx, p2.y, p2.x, p2.y);
+      } else {
+        const dy = Math.max(6, Math.abs(p2.y - p1.y) * 0.5);
+        ctx.bezierCurveTo(p1.x, p1.y + dy, p2.x, p2.y - dy, p2.x, p2.y);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // Steps — a translucent status wash inside a solid status edge. At this size a
+    // flat fill loses the outline against a same-hue wire, and a pure outline is too
+    // faint to scan; the pair keeps both the colour and the shape readable.
+    const phase = mmPulse !== null ? (performance.now() % 1600) / 1600 : 0;
+    for (const n of graph.nodes) {
+      const bx = boxes.get(n.id);
+      const st = runState && runState[n.id] ? runState[n.id].status : null;
+      const col = (st && MINI_STATUS[st]) || ink.muted;
+      const r = Math.min(3, bx.h / 2.5);
+      // A running step breathes, which is the one thing worth animating here: it is
+      // exactly what you glance at the map to check.
+      if (st === "running") {
+        const grow = 2.5 + 2.5 * Math.sin(phase * Math.PI * 2);   // 0..5, never inset
+        ctx.globalAlpha = 0.28;
+        ctx.fillStyle = col;
+        roundRectPath(ctx, bx.x - grow, bx.y - grow, bx.w + 2 * grow, bx.h + 2 * grow, r + grow);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+      roundRectPath(ctx, bx.x, bx.y, bx.w, bx.h, r);
+      ctx.globalAlpha = st ? 0.55 : 0.3;
+      ctx.fillStyle = col; ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 1.25; ctx.strokeStyle = col; ctx.stroke();
+      // Selection reads as a ring in the text colour — never a status hue, so it
+      // can't be mistaken for a state.
+      if (selectedSet.has(n.id)) {
+        roundRectPath(ctx, bx.x - 1.75, bx.y - 1.75, bx.w + 3.5, bx.h + 3.5, r + 1.75);
+        ctx.lineWidth = 1.25; ctx.strokeStyle = ink.text; ctx.globalAlpha = 0.85; ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // Viewport — everything outside it is scrimmed, so the visible region reads as a
+    // lit window rather than one more rectangle among the wires.
+    const vx = tx(canvas.scrollLeft / zoom), vy = ty(canvas.scrollTop / zoom);
+    const vw = (canvas.clientWidth / zoom) * s, vh = (canvas.clientHeight / zoom) * s;
+    mmView = { x: vx, y: vy, w: vw, h: vh };
+    ctx.fillStyle = ink.dark ? "rgba(2,6,23,0.55)" : "rgba(15,23,42,0.18)";
+    ctx.beginPath();
+    ctx.rect(0, 0, W, H);
+    ctx.rect(vx, vy, vw, vh);
+    ctx.fill("evenodd");
+    ctx.strokeStyle = ink.accent; ctx.lineWidth = 1.5;
+    roundRectPath(ctx, vx + 0.75, vy + 0.75, Math.max(2, vw - 1.5), Math.max(2, vh - 1.5), 3);
+    ctx.stroke();
+  }
+
+  // Drive the running-step pulse only while something is running — a permanent rAF
+  // loop behind an idle panel is pure battery burn.
+  function schedulePulse() {
+    // root.isConnected stops the loop when the router swaps the view out: this view
+    // has no teardown hook, so the check has to live here.
+    const live = minimapOn && !mmCollapsed && runState && root.isConnected
+      && graph.nodes.some((n) => runState[n.id] && runState[n.id].status === "running");
+    if (live && mmPulse === null) {
+      const tick = () => { mmPulse = requestAnimationFrame(tick); drawMinimap(); };
+      mmPulse = requestAnimationFrame(tick);
+    } else if (!live && mmPulse !== null) {
+      cancelAnimationFrame(mmPulse); mmPulse = null;
+    }
   }
 
   // ── open a project as a live workflow ──
@@ -1070,7 +1262,7 @@ export function WorkflowsView() {
     }
   }
 
-  // Halt the run: the backend cancels the step executing now and dequeues the rest.
+  // Halt the run: the backend cancels every step executing now and dequeues the rest.
   async function stopRun() {
     if (!wf) return;
     try {
@@ -1078,7 +1270,7 @@ export function WorkflowsView() {
       runState = wf.run_state || null;
       stopPolling();
       renderNodes();
-      flash("Stopped — the running step was cancelled and the queue cleared.", "warn");
+      flash("Stopped — the running steps were cancelled and the queue cleared.", "warn");
     } catch (err) { flash("Stop failed: " + (err.detail || err.message), "err"); }
   }
 
@@ -1120,7 +1312,7 @@ export function WorkflowsView() {
     if (!id) {
       wf = null; graph = { nodes: [], edges: [], orientation: "horizontal" }; runState = null; selected = null; nameInput.value = "";
       wfSelect.value = ""; rememberWorkflow(null);
-      renderNodes(); renderInspector(); flash("New workflow.", "muted"); return;
+      renderNodes(); renderInspector(); syncActions(); flash("New workflow.", "muted"); return;
     }
     try {
       wf = await api.workflow(id);
@@ -1131,6 +1323,7 @@ export function WorkflowsView() {
       if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
       else { renderNodes(); centerView(); }
       renderInspector();
+      syncActions();          // the run controls and the per-device cap follow the workflow
       flash(wf.status && wf.status !== "idle" ? `${wf.status} — ${countStatuses()}` : "Loaded.", "muted");
       if (wf.status === "running") startPolling();
     } catch (err) {

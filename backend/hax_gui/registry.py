@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from . import adapters
+from . import adapters, groups
 from .config import settings
 
 # Human-facing category per hax subpackage, plus display order. Matched in order,
@@ -156,15 +156,18 @@ _EXTRA_FIELDS: dict[str, list[dict[str, Any]]] = {
 
 @lru_cache(maxsize=None)
 def get_schema(name: str) -> dict[str, Any] | None:
-    """Cached form-schema, augmented with GUI-only field defaults and extra
-    (non-introspectable) fields. Returned read-only; callers must not mutate it."""
+    """Cached form-schema, augmented with GUI-only field defaults, extra
+    (non-introspectable) fields, and the ``group``/``advanced`` annotations the
+    form groups by. Returned read-only; callers must not mutate it.
+
+    Grouping is applied here rather than baked into the schema cache, so tuning
+    the rules in :mod:`hax_gui.groups` takes effect without regenerating schemas.
+    """
     raw = all_programs().get(name)
     if raw is None:
         return None
     extras = _EXTRA_FIELDS.get(name, [])
     overrides = field_defaults(name)
-    if not extras and not overrides:
-        return raw
     fields = [
         {**f, "default": overrides[f["name"]]} if f["name"] in overrides else f
         for f in raw["fields"]
@@ -173,7 +176,7 @@ def get_schema(name: str) -> dict[str, Any] | None:
     for extra in extras:
         if extra["name"] not in present:
             fields.append(dict(extra))
-    return {**raw, "fields": fields}
+    return {**raw, "fields": groups.annotate(fields)}
 
 
 def _has_train_predict_mode(schema: dict[str, Any]) -> bool:

@@ -70,6 +70,10 @@ class WorkflowManager:
         # `resumable`: parked mid-run, waiting for the user to say whether to carry on.
         if "resumable" not in cols:
             self._db.execute("ALTER TABLE workflows ADD COLUMN resumable INTEGER NOT NULL DEFAULT 0")
+        # `max_per_device`: how many steps may run at once on any one device (see
+        # :meth:`_device_of`). 1 — one training per GPU — is the safe default.
+        if "max_per_device" not in cols:
+            self._db.execute("ALTER TABLE workflows ADD COLUMN max_per_device INTEGER NOT NULL DEFAULT 1")
         self._db.commit()
         self._plan_resume()
 
@@ -209,13 +213,18 @@ class WorkflowManager:
         self._db.commit()
         return self.get(wid)
 
-    def update(self, wid: str, name: str | None = None, graph: dict[str, Any] | None = None) -> dict[str, Any]:
+    def update(self, wid: str, name: str | None = None, graph: dict[str, Any] | None = None,
+               max_per_device: int | None = None) -> dict[str, Any]:
         wf = self.get(wid)
         if wf is None:
             raise KeyError(wid)
         sets, params = [], []
         if name is not None:
             sets.append("name=?"); params.append(name.strip() or "Untitled workflow")
+        if max_per_device is not None:
+            # Takes effect on the next scheduler tick, so raising it mid-run starts using
+            # the extra slots as soon as a step finishes — no need to stop and re-run.
+            sets.append("max_per_device=?"); params.append(max(1, min(8, int(max_per_device))))
         if graph is not None:
             # Carry over node->job links the client doesn't know about. Saving during a
             # live run (which is how you queue a new step onto it) posts the graph as the
@@ -541,14 +550,39 @@ class WorkflowManager:
     # -- execution ---------------------------------------------------------
     # The runner is a re-entrant scheduler, not a one-shot walk over a snapshot taken at
     # launch. Each tick it re-reads the graph and run_state from the DB, so steps queued
-    # onto a live run — and edits saved while it runs — are picked up. Steps still
-    # execute strictly one at a time (two trainings at once would fight for the GPU).
+    # onto a live run — and edits saved while it runs — are picked up.
+    #
+    # Steps run concurrently, limited by the resource they actually contend for: the
+    # device. Every ready step whose device has a free slot starts; the rest wait. With
+    # the default `max_per_device` of 1 that means one training per GPU, so two branches
+    # pinned to GPU 0 and GPU 1 run side by side while two steps both on GPU 0 still
+    # queue. Raising it to 2 is the deliberate "I know these two fit on one card"
+    # setting — nothing here checks free VRAM.
+    #
+    # Concurrency is safe here only because of a discipline the sequential runner already
+    # kept: run_state is re-read from the DB immediately before every write, with no
+    # `await` in between. That makes each read-modify-write atomic with respect to the
+    # event loop, so two steps finishing at once cannot clobber each other's status.
     WAITING = ("pending", "running")
+    CPU_DEVICE = "cpu"
+
+    @staticmethod
+    def _device_of(node: dict[str, Any]) -> str:
+        """The contended resource a step occupies: a GPU index, or the CPU.
+
+        Anything that isn't a GPU index shares one notional CPU device, so two heavy
+        CPU steps (``preprocess_volumes``) don't both start just because neither
+        claimed a card.
+        """
+        gpu = node.get("gpu")
+        gpu = "" if gpu is None else str(gpu).strip()
+        return gpu if gpu and gpu.lower() != "cpu" else WorkflowManager.CPU_DEVICE
 
     async def run(self, wid: str, only: list[str] | None = None) -> dict[str, Any]:
         """Queue nodes for execution: `only` selects a subset, omit it for the whole
-        graph. If a run is already in flight the nodes are *appended to its queue* and
-        the live scheduler picks them up when their turn comes; otherwise a run starts.
+        graph. If a run is already in flight the nodes are *appended to its queue* and the
+        live scheduler starts each as soon as its dependencies are met and its device has
+        a free slot; otherwise a run starts.
         Nodes outside the set keep their existing state, so an already-succeeded
         upstream node still supplies its job to the nodes being queued."""
         wf = self.get(wid)
@@ -594,9 +628,9 @@ class WorkflowManager:
         return self.get(wid)
 
     async def stop(self, wid: str) -> dict[str, Any]:
-        """Stop a live run: halt the scheduler, cancel the step currently executing, and
+        """Stop a live run: halt the scheduler, cancel every step currently executing, and
         drop everything still queued back to idle. The scheduler only ever *polled* jobs,
-        so the running subprocess has to be cancelled explicitly here."""
+        so the running subprocesses have to be cancelled explicitly here."""
         wf = self.get(wid)
         if wf is None:
             raise KeyError(wid)
@@ -650,6 +684,10 @@ class WorkflowManager:
         if resumed:
             executed = {nid for nid, s in self._fresh_state(wid).items()
                         if s.get("status") not in (None, "idle")}
+        # Steps currently in flight, each with the task watching it and the device it
+        # occupies. A step is only ever in here once.
+        inflight: dict[str, asyncio.Task] = {}
+        device: dict[str, str] = {}
         try:
             while True:
                 wf = self.get(wid)
@@ -663,13 +701,14 @@ class WorkflowManager:
                 # A step left 'running' by a previous server process has nothing awaiting
                 # it: the _run_node that was watching it died with that server, while the
                 # job itself kept on training. Adopt it — wait it out exactly as _run_node
-                # would have. Never relaunch it; it is still on the GPU.
-                orphan = next((nid for nid, s in state.items()
-                               if s.get("status") == "running" and s.get("job_id")), None)
-                if orphan:
-                    executed.add(orphan)
-                    await self._await_node(wid, orphan, state[orphan]["job_id"])
-                    continue                       # it is terminal now: re-evaluate
+                # would have. Never relaunch it; it is still on the GPU. It also occupies
+                # a device slot, so nothing new is scheduled onto the card it is using.
+                for nid, s in state.items():
+                    if s.get("status") == "running" and s.get("job_id") and nid not in inflight:
+                        executed.add(nid)
+                        device[nid] = self._device_of(nodes.get(nid, {}))
+                        inflight[nid] = asyncio.create_task(
+                            self._guarded(wid, nid, self._await_node(wid, nid, s["job_id"])))
 
                 ready, blocked = self._partition(graph, state)
 
@@ -682,27 +721,82 @@ class WorkflowManager:
                     self._set_run(wid, "running", state)
                     continue                       # blocking cascades: re-evaluate
 
-                if not ready:
-                    break                          # queue drained (a running step is an
-                                                   # orphan by now, handled above)
+                # Start every ready step whose device still has a free slot. `ready` is in
+                # topological order, so when slots are scarce the earlier steps win.
+                cap = max(1, int(wf.get("max_per_device") or 1))
+                used: dict[str, int] = {}
+                for nid in inflight:
+                    used[device[nid]] = used.get(device[nid], 0) + 1
+                for nid in ready:
+                    # A step stays 'pending' until its _run_node gets past jobs.create —
+                    # which suspends, since it launches a subprocess. A sibling finishing
+                    # inside that window ticks the scheduler, which would otherwise see
+                    # this step as still queued and launch it a *second* time. The `used`
+                    # accounting below hides this at a cap of 1 (the step already holds the
+                    # only slot on its device); at 2+ it does not, and the result is two
+                    # trainings of the same step on one GPU.
+                    if nid in inflight:
+                        continue
+                    dev = self._device_of(nodes[nid])
+                    if used.get(dev, 0) >= cap:
+                        continue                   # that device is busy; it waits its turn
+                    used[dev] = used.get(dev, 0) + 1
+                    executed.add(nid)
+                    device[nid] = dev
+                    deps = [e for e in edges if e["to"] == nid]
+                    inflight[nid] = asyncio.create_task(self._guarded(
+                        wid, nid,
+                        self._run_node(wid, nid, nodes[nid], deps, wf["project_id"],
+                                       wf.get("kind") == "project")))
 
-                nid = ready[0]                     # strictly sequential: one step at a time
-                executed.add(nid)
-                deps = [e for e in edges if e["to"] == nid]
-                await self._run_node(wid, nid, nodes[nid], deps, wf["project_id"],
-                                     wf.get("kind") == "project")
-                # loop round: re-reads the graph, so steps queued while that job ran run next
+                if not inflight:
+                    break                          # nothing running and nothing startable:
+                                                   # the queue is drained (or every ready
+                                                   # step's device is held by a step this
+                                                   # scheduler does not own — see below)
+
+                # Wait for the first step to finish, then loop: re-reads the graph, so
+                # steps queued while these ran are picked up, and the slot just freed is
+                # handed to whatever is ready now.
+                done, _ = await asyncio.wait(inflight.values(), return_when=asyncio.FIRST_COMPLETED)
+                for nid, task in list(inflight.items()):
+                    if task in done:
+                        del inflight[nid]
+                        device.pop(nid, None)
 
             self._finish(wid, executed)
         except asyncio.CancelledError:
+            # Stop the watchers too, or they would outlive the scheduler and keep writing
+            # into run_state after stop() has settled it.
+            for task in inflight.values():
+                task.cancel()
             wf = self.get(wid)
             self._set_run(wid, "cancelled", (wf or {}).get("run_state") or {})
             raise
         except Exception:  # noqa: BLE001
+            for task in inflight.values():
+                task.cancel()
             wf = self.get(wid)
             self._set_run(wid, "failed", (wf or {}).get("run_state") or {})
         finally:
             self._running.pop(wid, None)
+
+    async def _guarded(self, wid: str, nid: str, coro) -> None:
+        """Run one step's coroutine so an unexpected failure sinks that step, not the run.
+
+        With steps sequential an exception here could only ever end the workflow that was
+        already stuck on it; concurrently it would also abandon the sibling steps still
+        training, which is much worse than recording one failed node.
+        """
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            state = self._fresh_state(wid)
+            state[nid] = {"job_id": state.get(nid, {}).get("job_id"), "status": "failed",
+                          "error": str(exc) or "the step's scheduler failed"}
+            self._set_run(wid, "running", state)
 
     async def _run_node(self, wid: str, nid: str, node: dict[str, Any], deps: list[dict[str, Any]],
                         project_id: str | None, is_project: bool) -> None:
@@ -844,6 +938,7 @@ class WorkflowManager:
         data["graph"] = json.loads(data["graph"]) if data.get("graph") else {"nodes": [], "edges": []}
         data["run_state"] = json.loads(data["run_state"]) if data.get("run_state") else None
         data["resumable"] = bool(data.get("resumable"))
+        data["max_per_device"] = int(data.get("max_per_device") or 1)
         return data
 
 

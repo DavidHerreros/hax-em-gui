@@ -7,7 +7,9 @@ import { navigate } from "../router.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
 import { openFilePicker } from "./filePicker.js";
-import { initialValues, visibleFields, fieldRow } from "./formFields.js";
+import { initialValues, visibleFields } from "./formFields.js";
+import { paramForm } from "./paramForm.js";
+import { bindingControl } from "./inputBinding.js";
 
 const CATEGORY_ORDER = ["Preprocessing", "Networks", "Post-processing", "Metrics", "Viewers", "Other"];
 
@@ -111,15 +113,16 @@ export function buildLauncher() {
       store.clearPrefill();
     }
 
-    const errorEls = {};
     const formErr = h("div", { style: { padding: "0 14px" } });
-    const ctx = { bindable: schema.bindable || {}, producers: schema.producers || {}, bindings };
+    const bindable = schema.bindable || {};
 
-    const fields = h("div", { class: "launcher-fields" });
-    fields.appendChild(h("p", { class: "field-help", style: { margin: "0 0 12px" } }, schema.description));
+    // Everything above the search bar: what the program is, plus the run-level
+    // settings that aren't program parameters at all.
+    const intro = h("div", { class: "pf-intro" });
+    intro.appendChild(h("p", { class: "field-help", style: { margin: "0 0 12px" } }, schema.description));
 
     // Optional custom run name (makes executions easy to identify).
-    fields.appendChild(h("div", { class: "field" },
+    intro.appendChild(h("div", { class: "field" },
       h("div", { class: "field-label" }, h("span", { class: "flag" }, "Run name"), h("span", { class: "ctype" }, "optional")),
       h("input", { class: "input", placeholder: "e.g. hetsiren run 1", oninput: (e) => (runName = e.target.value) })));
 
@@ -127,19 +130,44 @@ export function buildLauncher() {
       const note = schema.ssd_arg
         ? "Output and SSD scratch folders are created automatically inside the project."
         : "Output folder is created automatically inside the project.";
-      fields.appendChild(h("p", { class: "managed-note" }, icon("folder", 14), note));
+      intro.appendChild(h("p", { class: "managed-note" }, icon("folder", 14), note));
     }
     // The SSD scratch is shared per project+program and reused across runs; offer to
     // rebuild it from scratch (applies only when a scratch root is configured).
     if (schema.ssd_arg) {
-      fields.appendChild(h("label", { class: "recreate-ssd", title: "Delete the cached images of THIS dataset (mmap / array-record shards) so they are rebuilt from the current inputs. The scratch folder is shared by every program in the project — other datasets cached there are left untouched. Only applies when a scratch root is configured in Settings." },
+      intro.appendChild(h("label", { class: "recreate-ssd", title: "Delete the cached images of THIS dataset (mmap / array-record shards) so they are rebuilt from the current inputs. The scratch folder is shared by every program in the project — other datasets cached there are left untouched. Only applies when a scratch root is configured in Settings." },
         h("input", { type: "checkbox", onchange: (e) => (recreateSsd = e.target.checked) }),
         h("span", null, "Recreate the SSD scratch cache"),
         h("span", { class: "muted small" }, "discard this dataset's cached images and rebuild for this run")));
     }
-    for (const f of visibleFields(schema)) fields.appendChild(fieldRow(f, values, errorEls, ctx));
+
+    const form = paramForm(schema, visibleFields(schema), {
+      get: (name) => values[name],
+      set: (name, v) => { values[name] = v; },
+      density: "comfortable",
+      intro,
+      // Bindable inputs get the "use a job's output" control (and become a drop
+      // target for dragged runs) underneath the plain value input.
+      augment: (field, control, row) => {
+        const kind = bindable[field.name];
+        if (!kind) return null;
+        row.classList.add("bindable");
+        // Path fields wrap their input in a .path-row; plain ones are the input.
+        const valueInput = control.querySelector("input.input")
+          || (control.tagName === "INPUT" ? control : null);
+        if (bindings[field.name] && valueInput) valueInput.disabled = true;
+        return bindingControl({
+          field, kind,
+          producers: (schema.producers && schema.producers[kind]) || [],
+          bindings,
+          fieldEl: row,
+          valueInput,
+          onChange: () => form.clearErrors(),
+        });
+      },
+    });
     body.appendChild(formErr);
-    body.appendChild(fields);
+    body.appendChild(form.el);
 
     // run bar (reflects active project)
     const gpuSel = gpus && gpus.length
@@ -174,7 +202,7 @@ export function buildLauncher() {
       const proj = store.activeProject();
       if (!proj) return;
       clear(formErr);
-      Object.values(errorEls).forEach((e) => (e.textContent = ""));
+      form.clearErrors();
       runBtn.disabled = true;
       saveBtn.disabled = true;
       const activeBtn = launch ? runBtn : saveBtn;
@@ -194,7 +222,8 @@ export function buildLauncher() {
         navigate("/projects");
       } catch (err) {
         if (err instanceof ApiError && err.status === 422 && err.detail && err.detail.errors) {
-          for (const [k, v] of Object.entries(err.detail.errors)) if (errorEls[k]) errorEls[k].textContent = v;
+          // Opens the groups holding the offending fields and scrolls to the first.
+          form.setErrors(err.detail.errors);
         } else {
           mount(formErr, errorBox(err));
         }

@@ -85,8 +85,38 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
-def field_for_action(action: argparse.Action) -> dict[str, Any] | None:
-    """Map one argparse action to a JSON form-field descriptor."""
+# argparse's own containers, which carry no grouping intent.
+_DEFAULT_GROUP_TITLES = {"positional arguments", "options", "optional arguments"}
+
+
+def group_titles(parser: argparse.ArgumentParser) -> dict[str, str]:
+    """Map ``action.dest`` -> the title of the ``add_argument_group`` it belongs to.
+
+    A program opts into grouping simply by building its parser with
+    ``parser.add_argument_group("Regularisation", ...)`` — which also improves its
+    ``--help`` — and the form picks it up with no extra convention. Programs that
+    don't are absent from this map and fall back to the heuristic in
+    :mod:`hax_gui.groups`.
+    """
+    titles: dict[str, str] = {}
+    for group in getattr(parser, "_action_groups", []):
+        title = _clean(getattr(group, "title", None))
+        if not title or title.lower() in _DEFAULT_GROUP_TITLES:
+            continue
+        for action in getattr(group, "_group_actions", []):
+            titles[action.dest] = title
+    return titles
+
+
+def field_for_action(action: argparse.Action, group: str | None = None) -> dict[str, Any] | None:
+    """Map one argparse action to a JSON form-field descriptor.
+
+    ``group`` is the enclosing ``add_argument_group`` title, if any. ``advanced``
+    is read off the action itself: ``add_argument`` returns the action and actions
+    are plain objects, so ``a.advanced = True`` in hax-em is invisible to argparse
+    but reaches the form. Both keys are omitted when absent so the heuristic in
+    :mod:`hax_gui.groups` can supply them without being overridden by a ``None``.
+    """
     if action.dest == "help" or isinstance(action, argparse._HelpAction):
         return None
 
@@ -98,6 +128,10 @@ def field_for_action(action: argparse.Action) -> dict[str, Any] | None:
         "help": _clean(action.help),
         "default": _json_safe(action.default),
     }
+    if group:
+        field["group"] = group
+    if getattr(action, "advanced", False):
+        field["advanced"] = True
 
     if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
         field["type"] = "boolean"
@@ -133,7 +167,11 @@ def field_for_action(action: argparse.Action) -> dict[str, Any] | None:
 def schema_for_program(program_name: str, module_path: str, description: str) -> dict[str, Any]:
     """Build the full form-schema for one program."""
     parser = extract_parser(module_path, program_name)
-    fields = [f for a in parser._actions if (f := field_for_action(a)) is not None]
+    titles = group_titles(parser)
+    fields = [
+        f for a in parser._actions
+        if (f := field_for_action(a, titles.get(a.dest))) is not None
+    ]
     return {
         "name": program_name,
         "module": module_path,

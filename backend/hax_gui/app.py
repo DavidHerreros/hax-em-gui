@@ -28,7 +28,7 @@ from . import chats as chat_store
 from . import metrics as metrics_reader
 from . import ollama as ollama_manager_mod
 from . import files as filebrowser
-from . import branches, gpus, projects, registry, settings_store, updates
+from . import branches, gpus, groups, projects, registry, settings_store, updates
 from .branches import BranchError
 from .updater import UpdateBlocked, UpdateBusy, updater
 from .command import ValidationError
@@ -552,8 +552,10 @@ def program(name: str) -> dict[str, Any]:
     # The project manager auto-fills the output + SSD scratch dirs, so the form
     # hides those args. `bindable` marks fields that can be fed from a previous
     # job's output, and `producers` lists which programs can feed each kind.
+    # `group_order` is the accordion order for the `group` on each field.
     return {
         **schema,
+        "group_order": groups.GROUP_ORDER,
         "output_arg": registry.output_arg(name),
         "ssd_arg": registry.ssd_arg(name),
         "bindable": adapters.bindable_fields(name),
@@ -1898,6 +1900,9 @@ class WorkflowBody(BaseModel):
 class WorkflowUpdate(BaseModel):
     name: str | None = None
     graph: dict[str, Any] | None = None
+    # How many steps may run at once on any one device (GPU index, or the CPU).
+    # 1 = one training per GPU; raise it only when you know two fit on one card.
+    max_per_device: int | None = None
 
 
 class WorkflowRun(BaseModel):
@@ -1968,7 +1973,8 @@ def get_workflow(wid: str) -> dict[str, Any]:
 @app.put("/api/workflows/{wid}", dependencies=[Depends(auth)])
 def update_workflow(wid: str, body: WorkflowUpdate) -> dict[str, Any]:
     try:
-        return wf_manager.update(wid, name=body.name, graph=body.graph)
+        return wf_manager.update(wid, name=body.name, graph=body.graph,
+                                 max_per_device=body.max_per_device)
     except KeyError:
         raise HTTPException(status_code=404, detail="workflow not found")
 
