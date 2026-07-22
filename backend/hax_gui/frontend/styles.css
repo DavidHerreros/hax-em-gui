@@ -167,12 +167,56 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .feature p { margin: 0; color: var(--muted); line-height: 1.55; font-size: 13.5px; }
 .feature .ext { color: var(--accent); font-size: 13px; margin-top: 12px; display: inline-flex; align-items: center; gap: 6px; }
 
-.steps { counter-reset: step; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
-.step { position: relative; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 20px 20px 20px 20px; animation: fade-in .3s ease-out both; }
-.step .num { counter-increment: step; width: 28px; height: 28px; border-radius: 50%; background: var(--brand-600); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; margin-bottom: 12px; }
-.step .num::before { content: counter(step); }
-.step h3 { margin: 0 0 6px; font-size: 14px; }
-.step p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+/* ---- getting started (home) ---- */
+.gs { border: 1px solid var(--border); border-radius: 16px; background: var(--panel); padding: 22px 22px 20px; margin-bottom: 36px; animation: fade-in .3s ease-out both; }
+.gs-head { display: flex; align-items: baseline; gap: 12px; }
+.gs-head h2 { margin: 0; font-size: 15px; }
+.gs-count { margin-left: auto; font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.gs-sub { margin: 4px 0 14px; font-size: 13px; color: var(--muted); }
+.gs-track { height: 5px; border-radius: 3px; background: var(--hover); overflow: hidden; margin-bottom: 16px; }
+.gs-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--brand), var(--accent)); transition: width .45s cubic-bezier(.4,0,.2,1); }
+
+.gs-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+/* Only in the re-opened all-done view, where the list follows the heading directly —
+   elsewhere the sub-line and progress bar already carry that space. */
+.gs-head + .gs-list { margin-top: 16px; }
+.gs-step { display: grid; grid-template-columns: 26px 1fr auto; gap: 14px; align-items: start; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 14px 16px; }
+.gs-step.now { border-color: var(--active-ring); background: var(--surface-hover); box-shadow: 0 0 0 1px var(--active-ring); }
+.gs-step.done { padding: 8px 16px; align-items: center; }
+.gs-step h3 { margin: 0; font-size: 14px; }
+.gs-step.done h3 { font-size: 13px; font-weight: 500; color: var(--muted); }
+.gs-step p { margin: 5px 0 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.gs-why { display: block; margin-top: 6px; font-size: 12px; color: var(--faint); }
+.gs-dot { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; border: 1px solid var(--border-2); color: var(--faint); }
+.gs-step.now .gs-dot { background: var(--brand-600); border-color: var(--brand-600); color: #fff; }
+.gs-step.done .gs-dot { width: 22px; height: 22px; border-color: transparent; background: var(--active-bg); color: var(--ok); }
+.gs-tag { font-size: 12px; color: var(--ok); white-space: nowrap; }
+.gs-step .btn { white-space: nowrap; }
+
+.gs-done { display: flex; align-items: center; gap: 12px; padding: 12px 18px; font-size: 13px; }
+.gs-tick { color: var(--ok); display: flex; }
+.gs-donetext { flex: 1; color: var(--muted); }
+.gs-link { background: none; border: 0; padding: 0; font: inherit; font-size: 13px; color: var(--brand-300); cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+
+.gs-recipe { margin-top: 18px; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 12px; background: var(--surface); padding: 16px 18px; }
+.gs-recipe h3 { margin: 0 0 4px; font-size: 14px; }
+.gs-recipe > p { margin: 0 0 13px; font-size: 13px; color: var(--muted); }
+.gs-chain { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 13px; }
+.gs-prog { flex: 1 1 190px; border: 1px solid var(--border-2); border-radius: 10px; background: var(--panel); padding: 10px 12px; }
+.gs-nm { font-family: "JetBrains Mono", monospace; font-size: 12.5px; font-weight: 600; color: var(--accent); word-break: break-all; }
+.gs-io { display: block; margin-top: 4px; font-size: 12px; color: var(--faint); }
+.gs-arrow { align-self: center; color: var(--faint); display: flex; }
+.gs-recipe-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.gs-recipe-foot .gs-why { margin-top: 0; flex: 1 1 220px; }
+.gs-err { margin: 10px 0 0; font-size: 12.5px; color: var(--err); }
+
+/* ---- coach mark ---- */
+.cm-layer { position: fixed; inset: 0; z-index: 900; }
+.cm-hole { position: fixed; border-radius: 12px; pointer-events: none; box-shadow: 0 0 0 9999px var(--overlay), 0 0 0 2px var(--brand), 0 0 22px 3px var(--active-ring); transition: top .2s, left .2s, width .2s, height .2s; }
+.cm-card { position: fixed; width: 262px; background: var(--modal-bg); border: 1px solid var(--border-2); border-radius: 12px; padding: 14px 16px; box-shadow: 0 16px 34px var(--shadow); }
+.cm-card h4 { margin: 0 0 5px; font-size: 13.5px; }
+.cm-card p { margin: 0; font-size: 12.5px; color: var(--muted); line-height: 1.55; }
+.cm-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
 
 /* ---- forms ---- */
 .field { margin-bottom: 18px; }

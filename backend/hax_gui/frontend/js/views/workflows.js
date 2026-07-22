@@ -22,6 +22,13 @@ import { layeredLayout } from "./wfLayout.js";
 
 const LAST_WF_KEY = "hax_gui_last_workflow";   // reopen this workflow on next visit
 
+// Point the *next* visit to this page at `id`. Used by callers that create a
+// workflow elsewhere (the getting-started recipe) and then navigate here: the view
+// already reopens whatever was left open, so this is all the handoff that's needed.
+export function rememberWorkflowToOpen(id) {
+  try { localStorage.setItem(LAST_WF_KEY, id); } catch { /* storage unavailable */ }
+}
+
 const NODE_W = 196;     // node width (px)
 const HEADER_H = 34;    // node header height
 const ROW_H = 26;       // per-input-port row height
