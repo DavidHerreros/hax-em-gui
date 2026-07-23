@@ -177,7 +177,7 @@ export function paramForm(schema, fields, opts = {}) {
       const changed = modifiedIn(list);
       const head = h("button", {
         class: "pf-head" + (open ? " open" : ""), type: "button", "aria-expanded": String(open),
-        onclick: () => { open ? ui.open.delete(g.name) : ui.open.add(g.name); renderGroups(); },
+        onclick: () => toggleGroup(g, head, list),
       },
         h("span", { class: "pf-chev" }, icon("chevronRight", 12)),
         h("span", { class: "pf-head-name" }, g.name),
@@ -185,6 +185,24 @@ export function paramForm(schema, fields, opts = {}) {
         h("span", { class: "pf-head-n mono" }, String(list.length)));
       groupsEl.appendChild(head);
       if (open) groupsEl.appendChild(h("div", { class: "pf-fields" }, ...list.map((f) => fieldRow(f, "", false))));
+    }
+  }
+
+  // Open/close one section *in place*. Re-rendering the whole list instead (which is
+  // what this used to do) empties the container first, and the panel scrolled around
+  // it clamps its scrollTop to the momentarily-zero content height — so every click
+  // threw the user back to the top of the form. Only this section's body moves now.
+  function toggleGroup(g, head, list) {
+    const wasOpen = ui.open.has(g.name);
+    if (wasOpen) ui.open.delete(g.name);
+    else ui.open.add(g.name);
+    head.classList.toggle("open", !wasOpen);
+    head.setAttribute("aria-expanded", String(!wasOpen));
+    const body = head.nextElementSibling;
+    if (wasOpen) {
+      if (body && body.classList.contains("pf-fields")) body.remove();
+    } else {
+      head.after(h("div", { class: "pf-fields" }, ...list.map((f) => fieldRow(f, "", false))));
     }
   }
 

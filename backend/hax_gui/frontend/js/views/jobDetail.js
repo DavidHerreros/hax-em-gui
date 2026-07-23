@@ -73,7 +73,10 @@ export function JobDetailView(params) {
     if (job && job.project_name) head.appendChild(h("span", { class: "proj-chip" }, icon("box", 12), job.project_name));
     if (job) head.appendChild(jobLabelChips(job, { editable: true }));
     const running = status === "running" || status === "pending";
-    if (job && job.return_code != null && !running) {
+    // Being torn down: no longer cancellable, not finished either — the final
+    // status arrives over the WS once the process group has been reaped.
+    const cancelling = status === "cancelling";
+    if (job && job.return_code != null && !running && !cancelling) {
       head.appendChild(h("span", { class: "muted", style: { fontSize: "12px" } }, "exit " + job.return_code));
     }
     if (job && status === "saved") {
@@ -92,6 +95,12 @@ export function JobDetailView(params) {
           const b = e.currentTarget; b.disabled = true; b.lastChild.textContent = "Cancelling…";
           api.cancelJob(id).catch(() => { b.disabled = false; b.lastChild.textContent = "Cancel"; });
         } }, icon("ban", 15), "Cancel")));
+    } else if (cancelling && job) {
+      head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
+        job.has_metrics ? metricsBtn() : null,
+        viewable(job) ? viewerBtn() : null,
+        h("button", { class: "btn ghost", style: { color: "var(--warn)" }, disabled: true,
+          title: "Stopping this run and its workers…" }, icon("ban", 15), "Cancelling…")));
     } else if (job) {
       // A cancelled/failed/interrupted run that already committed an intermediate
       // checkpoint can be resumed in place (backend sets job.resumable). Paired
@@ -109,7 +118,7 @@ export function JobDetailView(params) {
           [{ icon: icon("copy", 15), label: "Edit & rerun", onClick: editRerun }]),
         h("button", { class: "btn ghost", style: { color: "var(--err)" }, onclick: del }, icon("trash", 15), "Delete")));
     }
-    renderProgress(running);
+    renderProgress(running || cancelling);
   }
 
   function editRerun() {
@@ -162,7 +171,7 @@ export function JobDetailView(params) {
     const tablesF = t.status === "fulfilled" ? (t.value.files || []) : [];
     // While the run is active, keep the section (with a refresh) visible even when
     // empty, so files show up as they're written without reopening the view.
-    const active = status === "running" || status === "pending";
+    const active = isActive();
     renderGroup(maps, "produced", mapsF, tablesF, loadOutputs, active);
   }
   async function loadInputs() {
@@ -303,8 +312,11 @@ export function JobDetailView(params) {
   // Poll the run folder while the job is active so new outputs appear without
   // reopening the view; stop once it's finished.
   let poll = null;
+  // 'cancelling' counts as active: the run is still being torn down and its final
+  // status is still to come, so keep polling/streaming until it lands.
+  const isActive = () => status === "running" || status === "pending" || status === "cancelling";
   function updatePolling() {
-    const active = status === "running" || status === "pending";
+    const active = isActive();
     if (active && !poll) poll = setInterval(loadOutputs, 4000);
     else if (!active && poll) { clearInterval(poll); poll = null; }
   }

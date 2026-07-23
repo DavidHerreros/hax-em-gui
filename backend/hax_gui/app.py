@@ -33,7 +33,7 @@ from .branches import BranchError
 from .updater import UpdateBlocked, UpdateBusy, updater
 from .command import ValidationError
 from .config import settings
-from .jobs import JobActive, JobNotFound, JobNotResumable, JobNotSaved, ProjectNotFound, manager
+from .jobs import ACTIVE, JobActive, JobNotFound, JobNotResumable, JobNotSaved, ProjectNotFound, manager
 from .labels import manager as label_manager
 from .workflows import WorkflowError, manager as wf_manager
 from .projects import ProjectsRootUnset
@@ -993,7 +993,10 @@ async def job_log_ws(websocket: WebSocket, job_id: str) -> None:
                 break  # server is shutting down
             message = getter.result()
             await websocket.send_json(message)
-            if message.get("type") == "status" and message.get("status") not in ("running",):
+            # Close only on a *terminal* status. 'cancelling' is a transition — the
+            # real end state ('cancelled') is published seconds later by the
+            # supervisor, and hanging up here left the client stuck on "Cancelling…".
+            if message.get("type") == "status" and message.get("status") not in ACTIVE:
                 break
     except WebSocketDisconnect:
         pass

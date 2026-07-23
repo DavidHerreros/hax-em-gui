@@ -866,6 +866,19 @@ export function WorkflowsView() {
     drag = null;
   }
 
+  // Persist a step rename: save the graph, and let the server carry the new name onto
+  // the job that step has already run (it holds the authoritative node->job link, which
+  // the canvas cannot: during a run the client keeps its own copy of the graph, so a
+  // node's job_id here may be missing, or left over from an earlier run). A step that
+  // has never run has no job yet — its name reaches one when it launches.
+  async function commitNodeName(n, value) {
+    if (!wf) return;                       // unsaved canvas: goes with the first save
+    await save();
+    const saved = ((wf.graph && wf.graph.nodes) || []).find((x) => x.id === n.id);
+    const jid = (saved && saved.job_id) || (runState && runState[n.id] && runState[n.id].job_id);
+    if (jid) store.renameViewerForJob(jid, value.trim());
+  }
+
   // ── inspector (per-node args) ──
   function renderInspector() {
     clear(inspBody);
@@ -878,6 +891,11 @@ export function WorkflowsView() {
     inspBody.appendChild(h("div", { class: "wf-insp-head" }, h("strong", null, n.program)));
     const nameI = h("input", { class: "wf-field", placeholder: "step name (optional)", value: n.name || "" });
     nameI.addEventListener("input", () => { n.name = nameI.value; dirty = true; const t = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"] .wf-node-title`); if (t) t.textContent = n.name || n.program; });
+    // A step that has already run owns a job, and that job holds the name the Jobs
+    // view shows — and the one a project canvas reads back on every load. Renaming
+    // only the node would be undone by that re-sync unless the step were run again,
+    // so commit the new name to the job as well (same as the label chips below).
+    nameI.addEventListener("change", () => commitNodeName(n, nameI.value));
     const gpuI = h("input", { class: "wf-field", placeholder: "GPU (e.g. 0, empty = CPU)", value: n.gpu ?? "0" });
     gpuI.addEventListener("input", () => { n.gpu = gpuI.value; dirty = true; });
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "Name", nameI));

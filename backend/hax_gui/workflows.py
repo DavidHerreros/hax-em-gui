@@ -146,7 +146,7 @@ class WorkflowManager:
                 state[nid] = {"job_id": None, "status": "idle", "error": None}
                 continue
             st = job["status"]
-            if st in ACTIVE or st == "cancelling":
+            if st in ACTIVE:                  # incl. 'cancelling' — not final yet
                 st = "running"                # still in flight; the scheduler adopts it
             state[nid] = {
                 "job_id": jid, "status": st,
@@ -233,6 +233,7 @@ class WorkflowManager:
             for n in graph.get("nodes", []):
                 if not n.get("job_id") and prior.get(n["id"], {}).get("job_id"):
                     n["job_id"] = prior[n["id"]]["job_id"]
+            self._push_renames(wf, graph, prior)
             sets.append("graph=?"); params.append(json.dumps(graph))
         if not sets:
             return wf
@@ -241,6 +242,33 @@ class WorkflowManager:
         self._db.execute(f"UPDATE workflows SET {', '.join(sets)} WHERE id=?", params)
         self._db.commit()
         return self.get(wid)
+
+    @staticmethod
+    def _push_renames(wf: dict[str, Any], graph: dict[str, Any], prior: dict[str, Any]) -> None:
+        """Carry a renamed step's name onto the job it has already run.
+
+        A node's name only ever reached its job at launch (see :meth:`_run_node`), while a
+        project canvas refreshes node names *from* the job on every load — so renaming a
+        step that has already run, or is running right now, was quietly undone unless the
+        step was launched again.
+
+        Only names this save actually *changed* are pushed, and only while the job still
+        carries the name this canvas was built from — a compare-and-swap. The client holds
+        its own copy of the graph for the length of a run, so without that check a late
+        save could resurrect a stale name over one set meanwhile from the Jobs view. The
+        job is taken from the server's own link — node.job_id, filled in by the caller, or
+        the run's mapping for a standalone workflow — never from what the client believed.
+        """
+        state = wf.get("run_state") or {}
+        for n in graph.get("nodes", []):
+            was = prior.get(n.get("id"))
+            if was is None or (was.get("name") or "") == (n.get("name") or ""):
+                continue
+            jid = n.get("job_id") or (state.get(n["id"]) or {}).get("job_id")
+            job = jobs.get(jid) if jid else None
+            if job is None or (job.get("name") or "") != (was.get("name") or ""):
+                continue                      # no job yet, or renamed elsewhere since
+            jobs.rename(jid, n.get("name") or "")
 
     def get(self, wid: str) -> dict[str, Any] | None:
         row = self._db.execute("SELECT * FROM workflows WHERE id=?", (wid,)).fetchone()
@@ -617,7 +645,7 @@ class WorkflowManager:
                     job = jobs.get(s.get("job_id") or "")
                     if job is None:
                         s = {**s, "status": "idle"}            # never launched: a stale queue entry
-                    elif job["status"] in ACTIVE or job["status"] == "cancelling":
+                    elif job["status"] in ACTIVE:
                         s = {**s, "status": "running"}         # still training: adopt, don't relaunch
                     else:
                         s = {**s, "status": job["status"]}     # it did finish — keep its result
@@ -874,7 +902,7 @@ class WorkflowManager:
             job = jobs.get(job_id)
             if job is None:
                 return "failed"
-            if job["status"] not in ACTIVE and job["status"] != "cancelling":
+            if job["status"] not in ACTIVE:   # ACTIVE covers the transitional 'cancelling'
                 return job["status"]
             await asyncio.sleep(2.0)
 

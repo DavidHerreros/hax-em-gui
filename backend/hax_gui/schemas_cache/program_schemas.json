@@ -359,6 +359,28 @@
           "type": "integer"
         },
         {
+          "name": "lattice_stride",
+          "flags": [
+            "--lattice_stride"
+          ],
+          "flag": "--lattice_stride",
+          "required": false,
+          "help": "Sub-sample the fixed-point lattice by this factor along each axis, keeping 1 / lattice_stride^3 of the sample points. The fixed-point decoder places one point per masked voxel, so the point count grows with the CUBE of the box: a 600 px box is ~13x the points of a 256 px one, and every per-particle tensor in the decode and render chain scales with it. This is the knob that makes a large box affordable (--lattice_stride 2 is an 8x reduction).\nThis trades resolution for memory: the sample spacing bounds the finest density CHANGE the decoder can express, to roughly 2 x lattice_stride x sampling_rate Angstrom. The consensus map is not affected -- it is carried by the reference amplitudes at full box sampling -- so this limits the heterogeneity, not the map you started from. The render width is widened to match the spacing so the splats still tile the volume. Ignored when the points come from a Gaussian fit (see --num_gaussians), which sets the point count directly.",
+          "default": 1,
+          "type": "integer"
+        },
+        {
+          "name": "render_chunk_size",
+          "flags": [
+            "--render_chunk_size"
+          ],
+          "flag": "--render_chunk_size",
+          "required": false,
+          "help": "Render the point cloud in blocks of this many points, summing the partial images and recomputing each block in the backward pass instead of keeping it live. The projection intermediates are the largest per-particle tensors in the training step -- they scale with batch_size x n_points -- and this caps them at batch_size x render_chunk_size instead. The rendered image is identical either way; the scatter is a sum over points, so this is exact and not an approximation. Costs roughly one extra render per step.\nUse this to fit a large box on a smaller GPU (e.g. --render_chunk_size 262144). 0 (the default) renders the whole cloud at once, exactly as before. Smaller blocks save more memory and compile more slowly.",
+          "default": 0,
+          "type": "integer"
+        },
+        {
           "name": "local_reconstruction",
           "flags": [
             "--local_reconstruction"
@@ -466,6 +488,61 @@
           "path_kind": "directory"
         },
         {
+          "name": "log_images_every",
+          "flags": [
+            "--log_images_every"
+          ],
+          "flag": "--log_images_every",
+          "required": false,
+          "help": "How often (in epochs) to log the cheap intermediate results to Tensorboard: the predicted images and the central slices of the predicted volumes (set by default to 1, i.e. every epoch - set to 0 to disable)",
+          "default": 1,
+          "type": "integer"
+        },
+        {
+          "name": "log_landscape_every",
+          "flags": [
+            "--log_landscape_every"
+          ],
+          "flag": "--log_landscape_every",
+          "required": false,
+          "help": "How often (in epochs) to log the expensive intermediate results: the latent space embedding (Tensorboard projector), the intermediate volumes written to disk and the angular distribution plots (set by default to 5 - set to 0 to disable). NOTE: the embedding alone costs several seconds per call, so on small datasets it can easily dominate the training time - raise this value (or disable it) if logging is your bottleneck",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_checkpoint_every",
+          "flags": [
+            "--log_checkpoint_every"
+          ],
+          "flag": "--log_checkpoint_every",
+          "required": false,
+          "help": "How often (in epochs) to write the intermediate checkpoint used to resume an interrupted training (set by default to 5 - set to 0 to disable). This is deliberately independent from --log_landscape_every: how often you can resume should not be tied to how often you want pictures",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_time_budget",
+          "flags": [
+            "--log_time_budget"
+          ],
+          "flag": "--log_time_budget",
+          "required": false,
+          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "log_sync",
+          "flags": [
+            "--log_sync"
+          ],
+          "flag": "--log_sync",
+          "required": false,
+          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "reload",
           "flags": [
             "--reload"
@@ -507,8 +584,41 @@
           ],
           "flag": "--pose_refine_reg",
           "required": false,
-          "help": "Strength of the geodesic anchor that keeps the per-image rigid pose refinement close to the input poses (penalizes 1 - cos(theta) of the refinement rotation). Larger values keep the refinement smaller/more conservative; set to 0 to disable it. (NOTE: this is the only regularizer acting on the rigid pose refinement in the default M=1 sampling regime)",
+          "help": "Strength of the hinge that keeps the per-image rigid pose refinement within --pose_refine_max_angle of the input poses. It penalizes only the excess beyond that angle, so a genuinely-needed small correction is not pushed back to zero. Set to 0 to disable it.",
           "default": 0.1,
+          "type": "number"
+        },
+        {
+          "name": "pose_refine_max_angle",
+          "flags": [
+            "--pose_refine_max_angle"
+          ],
+          "flag": "--pose_refine_max_angle",
+          "required": false,
+          "help": "Deadzone (in degrees) of the pose-refinement hinge: rotations up to this angle are free, beyond it they are penalized with weight --pose_refine_reg. This is what 'stay a refinement' should mean -- do not wander further than a plausible alignment error. NOTE: setting it to 0 recovers the old one-sided pull towards the identity, which penalizes even the sub-degree corrections you want and biases the model into letting the decoder absorb the pose instead.",
+          "default": 8.0,
+          "type": "number"
+        },
+        {
+          "name": "shift_refine_reg",
+          "flags": [
+            "--shift_refine_reg"
+          ],
+          "flag": "--shift_refine_reg",
+          "required": false,
+          "help": "Strength of the hinge on the per-image in-plane shift refinement, the exact analogue of --pose_refine_reg for translations. Set to 0 to disable. (NOTE: the shift refinement previously had no prior at all, even though a 2D image shift is exactly a 3D translation of the decoded object and is therefore the most trivially absorbable part of the refinement)",
+          "default": 0.1,
+          "type": "number"
+        },
+        {
+          "name": "shift_refine_max",
+          "flags": [
+            "--shift_refine_max"
+          ],
+          "flag": "--shift_refine_max",
+          "required": false,
+          "help": "Deadzone (in pixels) of the shift-refinement hinge: shifts up to this magnitude are free, beyond it they are penalized with weight --shift_refine_reg.",
+          "default": 4.0,
           "type": "number"
         },
         {
@@ -518,9 +628,36 @@
           ],
           "flag": "--pose_refine_warmup_epochs",
           "required": false,
-          "help": "Number of initial epochs over which the rigid pose refinement is ramped in from the identity. During this warmup the input poses are kept (almost) untouched so the conformation latent and decoder can settle before poses start being refined. Set to 0 to refine from the first step.",
-          "default": 3.0,
+          "help": "Number of initial epochs over which the rigid pose refinement is ramped in from the identity. NOTE: the refinement heads are zero-initialized, so the model already starts at exactly the input poses -- the ramp buys nothing at initialization and only scales the pose head's gradient towards zero during precisely the window in which the decoder is learning to absorb the misalignment. It now defaults to 0 (refine from the first step); the decoder is instead held at a consensus early on, see --latent_warmup_epochs.",
+          "default": 0.0,
           "type": "number"
+        },
+        {
+          "name": "latent_warmup_epochs",
+          "flags": [
+            "--latent_warmup_epochs"
+          ],
+          "flag": "--latent_warmup_epochs",
+          "required": false,
+          "help": "Number of initial epochs over which the latent is ramped INTO the decoder (default: ~12%% of --epochs, so the schedule scales with the budget). For the first half of this window the decoder sees a zero latent, so it can only produce a single consensus volume -- and a consensus volume cannot absorb a per-particle pose error, so the whole misalignment has to be explained by the pose head. Over the second half the latent (and the KL term, which rides the same clock) ramps in linearly, against poses that have already been refined. This is the coarse-to-fine ordering a classical refinement uses -- consensus and poses first, heterogeneity after -- and it costs nothing. Set to 0 to feed the full latent from the first step.",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "rigid_gauge",
+          "flags": [
+            "--rigid_gauge"
+          ],
+          "flag": "--rigid_gauge",
+          "required": false,
+          "help": "Pins the decoder's per-particle output to a canonical frame, so a pose error cannot be absorbed by the decoder and has nowhere to go except the pose head (rotating the decoded object and refining the image pose produce the SAME projection, so without this the two are interchangeable -- and since every geometric prior here is rigid-invariant while the pose head is anchored to the identity, the decoder is the cheaper place for the model to put a misalignment). With --transport_mass the deformed cloud is rigidly superposed back onto the rest cloud (a weighted Kabsch, one 3x3 solve per particle); without it, the linearized rigid perturbations of the reference density are projected out instead. It does NOT remove motion: the correction is an isometry of the decoded object, so internal distances, hinge angles and relative domain motions are preserved exactly -- what it fixes is the FRAME the motion is reported in, and that frame is chosen by the weights: core (default) reweights against the residual so the frame is set by the least-moving part of the structure (the rigid core), which leaves domain motions entirely in the deformation field. mass uses the mass-weighted optimal superposition instead, in which a large domain motion makes the 'stationary' domain appear to counter-rotate and lets the pose head absorb a slice of the conformational change. off disables the correction but still reports the diagnostic, so a run can be checked for pose absorption without changing its behaviour. NOTE: without mass transport the gauge needs a reference density to differentiate, so it is unavailable (and silently a no-op) on fully ab-initio runs with no --vol.",
+          "default": "core",
+          "type": "enum",
+          "choices": [
+            "core",
+            "mass",
+            "off"
+          ]
         },
         {
           "name": "train_inverse",
@@ -621,7 +758,7 @@
           ],
           "flag": "--schedule_recon_split",
           "required": false,
-          "help": "Schedule the mass-transport reconstruction split instead of using the fixed 0.1 / 0.9 weighting. The reconstruction loss is a blend of an amplitude pathway (learned densities at frozen positions) and a mass-transport pathway (fixed reference densities at learned positions); the weight of the amplitude term ramps linearly from --recon_split_start to --recon_split_final over --recon_split_epochs (the motion term takes the complement). Starting near 0 makes early training explain the data almost purely by moving mass, so large-amplitude motions emerge and converge faster before the amplitude head is allowed to absorb residual density changes. Only meaningful with mass transport (--transport_mass). Default: off (fixed --recon_split_final throughout, i.e. the historical 0.1 / 0.9).",
+          "help": "Ramp the reconstruction split over training instead of holding it fixed. When set, the weight of the amplitude term ramps linearly from --recon_split_start to --recon_split_final over --recon_split_epochs (the motion term takes the complement). Starting near 0 makes early training explain the data almost purely by transport, so large motions organise before occupancy is allowed in. Only meaningful with mass transport (--transport_mass). Default: off (fixed --recon_split_final throughout).",
           "default": false,
           "type": "boolean"
         },
@@ -632,7 +769,7 @@
           ],
           "flag": "--recon_split_start",
           "required": false,
-          "help": "Amplitude-term weight at the START of training when --schedule_recon_split is on. 0.0 (default) means pure mass transport early (the reconstruction is explained entirely by motion). Ignored when scheduling is off.",
+          "help": "Amplitude-term weight at the START of training when --schedule_recon_split is on. 0.0 (default) means the data is explained purely by mass transport at the beginning.",
           "default": 0.0,
           "type": "number"
         },
@@ -643,7 +780,7 @@
           ],
           "flag": "--recon_split_final",
           "required": false,
-          "help": "Amplitude-term weight at the END of the ramp (and the fixed weight used throughout when --schedule_recon_split is off). 0.1 (default) reproduces the historical 0.1 / 0.9 split. The motion term always takes the complement (1 - this).",
+          "help": "Amplitude-term weight at the END of the ramp (and the fixed weight used throughout when --schedule_recon_split is off). The reconstruction loss is w x L(learned amplitudes, frozen coords) + (1-w) x L(reference amplitudes, learned coords). The second term can only be reduced by moving mass, so it is what forces motion to be modelled as transport; the first lets occupancy explain the residual transport cannot, without being able to leak gradient into the coordinate head. Default 0.1 (90%% transport). Raise it toward 0.5 if genuine compositional change is being forced into motion; lower it toward 0 for pure transport.",
           "default": 0.1,
           "type": "number"
         },
@@ -654,8 +791,52 @@
           ],
           "flag": "--recon_split_epochs",
           "required": false,
-          "help": "Number of initial epochs over which the amplitude-term weight ramps from --recon_split_start to --recon_split_final when --schedule_recon_split is on. If left at 0, it rides the coarse-to-fine clock and reuses --freq_anneal_epochs (amplitude is introduced as the resolution is refined); if both are 0 the weight jumps straight to --recon_split_final.",
+          "help": "Number of initial epochs over which the amplitude-term weight ramps from --recon_split_start to --recon_split_final. Only used with --schedule_recon_split; if left at 0 the ramp falls back to the --freq_anneal_epochs clock.",
           "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "occupancy_reg",
+          "flags": [
+            "--occupancy_reg"
+          ],
+          "flag": "--occupancy_reg",
+          "required": false,
+          "help": "Weight of the occupancy prior, which lets HetSIREN model compositional heterogeneity (a domain/ligand appearing or disappearing between particles) rather than forcing everything through the deformation field. Each Gaussian carries a per-particle amplitude change on top of the reference; this penalises it with a scale-normalised L1 (cost = fold change where the reference has density, so modulating existing density is cheap, while creating mass where the reference is empty costs |occ|/--occupancy_kappa -- possible but expensive). Set to 0 (default) to disable occupancy entirely (pure mass transport). Only meaningful with mass transport (--transport_mass) and a reference. NOTE: watch the occ_fraction diagnostic -- if it climbs while the pose/deformation goes quiet, lower this or --occupancy_kappa.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "occupancy_kappa",
+          "flags": [
+            "--occupancy_kappa"
+          ],
+          "flag": "--occupancy_kappa",
+          "required": false,
+          "help": "Creation threshold of the occupancy prior (as a density, in the reference's gray scale; default 0.05). It is added to the reference amplitude in the L1 denominator, so it sets how much evidence it takes to invent mass where the reference is (near) empty: smaller = harder to create mass, larger = easier. Where the reference already has substantial density it has little effect (the cost is a fold change). Only used when --occupancy_reg > 0.",
+          "default": 0.05,
+          "type": "number"
+        },
+        {
+          "name": "occupancy_tv",
+          "flags": [
+            "--occupancy_tv"
+          ],
+          "flag": "--occupancy_tv",
+          "required": false,
+          "help": "Relative weight of the spatial-coherence (graph total-variation) term of the occupancy prior (default 1.0). It penalises occupancy differences between neighbouring Gaussians, so a whole domain switching on together pays only at its boundary while scattered noise pays everywhere -- this is what separates a genuine compositional domain from amplitude noise. Raise it for blockier occupancy, lower it toward 0 to allow finer-grained occupancy. Only used when --occupancy_reg > 0.",
+          "default": 1.0,
+          "type": "number"
+        },
+        {
+          "name": "occupancy_warmup_epochs",
+          "flags": [
+            "--occupancy_warmup_epochs"
+          ],
+          "flag": "--occupancy_warmup_epochs",
+          "required": false,
+          "help": "Number of initial epochs over which occupancy is ramped in (default 3.0). While it ramps, the amplitudes stay at the reference so the data is explained purely by transport -- large motions organise first -- and occupancy is then released to explain only the residual that motion cannot (compositional change). Feeding occupancy from step 0 lets it short-circuit the motion (it is a strictly easier way to fit any image), so a non-zero warmup is recommended. Only used when --occupancy_reg > 0; set to 0 to use occupancy from the first step.",
+          "default": 3.0,
           "type": "number"
         },
         {
@@ -984,6 +1165,61 @@
           "path_kind": "directory"
         },
         {
+          "name": "log_images_every",
+          "flags": [
+            "--log_images_every"
+          ],
+          "flag": "--log_images_every",
+          "required": false,
+          "help": "How often (in epochs) to log the cheap intermediate results to Tensorboard: the predicted images and the central slices of the predicted volumes (set by default to 1, i.e. every epoch - set to 0 to disable)",
+          "default": 1,
+          "type": "integer"
+        },
+        {
+          "name": "log_landscape_every",
+          "flags": [
+            "--log_landscape_every"
+          ],
+          "flag": "--log_landscape_every",
+          "required": false,
+          "help": "How often (in epochs) to log the expensive intermediate results: the latent space embedding (Tensorboard projector), the intermediate volumes written to disk and the angular distribution plots (set by default to 5 - set to 0 to disable). NOTE: the embedding alone costs several seconds per call, so on small datasets it can easily dominate the training time - raise this value (or disable it) if logging is your bottleneck",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_checkpoint_every",
+          "flags": [
+            "--log_checkpoint_every"
+          ],
+          "flag": "--log_checkpoint_every",
+          "required": false,
+          "help": "How often (in epochs) to write the intermediate checkpoint used to resume an interrupted training (set by default to 5 - set to 0 to disable). This is deliberately independent from --log_landscape_every: how often you can resume should not be tied to how often you want pictures",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_time_budget",
+          "flags": [
+            "--log_time_budget"
+          ],
+          "flag": "--log_time_budget",
+          "required": false,
+          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "log_sync",
+          "flags": [
+            "--log_sync"
+          ],
+          "flag": "--log_sync",
+          "required": false,
+          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "reload",
           "flags": [
             "--reload"
@@ -1127,6 +1363,39 @@
           "type": "string",
           "widget": "path",
           "path_kind": "file"
+        },
+        {
+          "name": "log_landscape_every",
+          "flags": [
+            "--log_landscape_every"
+          ],
+          "flag": "--log_landscape_every",
+          "required": false,
+          "help": "How often (in epochs) to log the expensive intermediate results: the latent space embedding (Tensorboard projector), the intermediate volumes written to disk and the angular distribution plots (set by default to 5 - set to 0 to disable). NOTE: the embedding alone costs several seconds per call, so on small datasets it can easily dominate the training time - raise this value (or disable it) if logging is your bottleneck",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_time_budget",
+          "flags": [
+            "--log_time_budget"
+          ],
+          "flag": "--log_time_budget",
+          "required": false,
+          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "log_sync",
+          "flags": [
+            "--log_sync"
+          ],
+          "flag": "--log_sync",
+          "required": false,
+          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
+          "default": false,
+          "type": "boolean"
         },
         {
           "name": "config",
@@ -1520,6 +1789,39 @@
           "path_kind": "directory"
         },
         {
+          "name": "log_checkpoint_every",
+          "flags": [
+            "--log_checkpoint_every"
+          ],
+          "flag": "--log_checkpoint_every",
+          "required": false,
+          "help": "How often (in epochs) to write the intermediate checkpoint used to resume an interrupted training (set by default to 5 - set to 0 to disable). This is deliberately independent from --log_landscape_every: how often you can resume should not be tied to how often you want pictures",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_time_budget",
+          "flags": [
+            "--log_time_budget"
+          ],
+          "flag": "--log_time_budget",
+          "required": false,
+          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "log_sync",
+          "flags": [
+            "--log_sync"
+          ],
+          "flag": "--log_sync",
+          "required": false,
+          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "config",
           "flags": [
             "--config"
@@ -1744,6 +2046,39 @@
           "path_kind": "directory"
         },
         {
+          "name": "log_checkpoint_every",
+          "flags": [
+            "--log_checkpoint_every"
+          ],
+          "flag": "--log_checkpoint_every",
+          "required": false,
+          "help": "How often (in epochs) to write the intermediate checkpoint used to resume an interrupted training (set by default to 5 - set to 0 to disable). This is deliberately independent from --log_landscape_every: how often you can resume should not be tied to how often you want pictures",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_time_budget",
+          "flags": [
+            "--log_time_budget"
+          ],
+          "flag": "--log_time_budget",
+          "required": false,
+          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "log_sync",
+          "flags": [
+            "--log_sync"
+          ],
+          "flag": "--log_sync",
+          "required": false,
+          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "config",
           "flags": [
             "--config"
@@ -1895,6 +2230,42 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "decode_motion",
+          "flags": [
+            "--decode_motion",
+            "--no-decode_motion"
+          ],
+          "flag": "--no-decode_motion",
+          "required": false,
+          "help": "Include the deformation field (mass transport) when decoding. With --no-decode_motion the Gaussians are held at their consensus positions, so the decoded volume shows only what the occupancy pathway contributes. Combined with --decode_occupancy this gives the four ablations (both / motion only / occupancy only / consensus) needed to tell a genuine domain motion from an amplitude change: a real motion survives --no-decode_occupancy, real compositional change survives --no-decode_motion. Only meaningful for networks trained with mass transport.",
+          "default": true,
+          "type": "string"
+        },
+        {
+          "name": "decode_occupancy",
+          "flags": [
+            "--decode_occupancy",
+            "--no-decode_occupancy"
+          ],
+          "flag": "--no-decode_occupancy",
+          "required": false,
+          "help": "Include the per-Gaussian occupancy (amplitude) change when decoding. With --no-decode_occupancy the amplitudes are pinned to the consensus, so the decoded volume is the deformation field acting alone and is exactly mass-conserving -- any density that moves between two sites is genuine transport, not a fade-out/fade-in. See --decode_motion.",
+          "default": true,
+          "type": "string"
+        },
+        {
+          "name": "export_deformation",
+          "flags": [
+            "--export_deformation",
+            "--no-export_deformation"
+          ],
+          "flag": "--no-export_deformation",
+          "required": false,
+          "help": "Also export the decoder's per-state deformation field (the deformed point cloud + per-point occupancy relative to the consensus) under <output_path>/deformation/. This is the exact correspondence data downstream tools (e.g. the hax-em assistant's regional-motion analysis) use to characterise domain motions \u2014 hinges, rotations, coordinated motion and compositional/occupancy change \u2014 rigorously rather than guessing from the maps. Best-effort: skipped with a warning if the loaded network exposes no deformation field. Use --no-export_deformation to disable.",
+          "default": true,
+          "type": "string"
         },
         {
           "name": "config",
@@ -2353,6 +2724,61 @@
           "path_kind": "directory"
         },
         {
+          "name": "log_images_every",
+          "flags": [
+            "--log_images_every"
+          ],
+          "flag": "--log_images_every",
+          "required": false,
+          "help": "How often (in epochs) to log the cheap intermediate results to Tensorboard: the predicted images and the central slices of the predicted volumes (set by default to 1, i.e. every epoch - set to 0 to disable)",
+          "default": 1,
+          "type": "integer"
+        },
+        {
+          "name": "log_landscape_every",
+          "flags": [
+            "--log_landscape_every"
+          ],
+          "flag": "--log_landscape_every",
+          "required": false,
+          "help": "How often (in epochs) to log the expensive intermediate results: the latent space embedding (Tensorboard projector), the intermediate volumes written to disk and the angular distribution plots (set by default to 5 - set to 0 to disable). NOTE: the embedding alone costs several seconds per call, so on small datasets it can easily dominate the training time - raise this value (or disable it) if logging is your bottleneck",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_checkpoint_every",
+          "flags": [
+            "--log_checkpoint_every"
+          ],
+          "flag": "--log_checkpoint_every",
+          "required": false,
+          "help": "How often (in epochs) to write the intermediate checkpoint used to resume an interrupted training (set by default to 5 - set to 0 to disable). This is deliberately independent from --log_landscape_every: how often you can resume should not be tied to how often you want pictures",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_time_budget",
+          "flags": [
+            "--log_time_budget"
+          ],
+          "flag": "--log_time_budget",
+          "required": false,
+          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "log_sync",
+          "flags": [
+            "--log_sync"
+          ],
+          "flag": "--log_sync",
+          "required": false,
+          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "reload",
           "flags": [
             "--reload"
@@ -2610,6 +3036,61 @@
           "path_kind": "directory"
         },
         {
+          "name": "log_images_every",
+          "flags": [
+            "--log_images_every"
+          ],
+          "flag": "--log_images_every",
+          "required": false,
+          "help": "How often (in epochs) to log the cheap intermediate results to Tensorboard: the predicted images and the central slices of the predicted volumes (set by default to 1, i.e. every epoch - set to 0 to disable)",
+          "default": 1,
+          "type": "integer"
+        },
+        {
+          "name": "log_landscape_every",
+          "flags": [
+            "--log_landscape_every"
+          ],
+          "flag": "--log_landscape_every",
+          "required": false,
+          "help": "How often (in epochs) to log the expensive intermediate results: the latent space embedding (Tensorboard projector), the intermediate volumes written to disk and the angular distribution plots (set by default to 5 - set to 0 to disable). NOTE: the embedding alone costs several seconds per call, so on small datasets it can easily dominate the training time - raise this value (or disable it) if logging is your bottleneck",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_checkpoint_every",
+          "flags": [
+            "--log_checkpoint_every"
+          ],
+          "flag": "--log_checkpoint_every",
+          "required": false,
+          "help": "How often (in epochs) to write the intermediate checkpoint used to resume an interrupted training (set by default to 5 - set to 0 to disable). This is deliberately independent from --log_landscape_every: how often you can resume should not be tied to how often you want pictures",
+          "default": 5,
+          "type": "integer"
+        },
+        {
+          "name": "log_time_budget",
+          "flags": [
+            "--log_time_budget"
+          ],
+          "flag": "--log_time_budget",
+          "required": false,
+          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "log_sync",
+          "flags": [
+            "--log_sync"
+          ],
+          "flag": "--log_sync",
+          "required": false,
+          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "reload",
           "flags": [
             "--reload"
@@ -2763,7 +3244,7 @@
           ],
           "flag": "--reconstruct_halves",
           "required": false,
-          "help": "If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts.",
+          "help": "If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts, and report the half-map FSC. NOTE: without this there is no FSC and therefore no way to tell whether the reconstruction improved anything.",
           "default": false,
           "type": "boolean"
         },
@@ -2777,6 +3258,72 @@
           "help": "If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed.  NOTE : When providing this parameter, you MUST give the path to a trained  HetSIREN (with transport of mass)  or  Zernike3Deep  neural network.",
           "default": null,
           "type": "string"
+        },
+        {
+          "name": "epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "flag": "--epochs",
+          "required": false,
+          "help": "Number of reconstruction epochs (default 20). The learning-rate schedule is annealed over exactly this many, so the fit settles at the end instead of being cut off at full step size.",
+          "default": 20,
+          "type": "integer"
+        },
+        {
+          "name": "refine_positions",
+          "flags": [
+            "--refine_positions"
+          ],
+          "flag": "--refine_positions",
+          "required": false,
+          "help": "Let MoDART move the mass as well as re-weight it. Each voxel gets a displacement bounded to half a voxel and penalised by --coord_reg. NOTE: off by default. A free per-voxel displacement lets the model match any image by moving mass rather than by getting the density right, and sub-voxel jitter over every voxel is itself a blur kernel.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "l1_delta",
+          "flags": [
+            "--l1_delta"
+          ],
+          "flag": "--l1_delta",
+          "required": false,
+          "help": "Weight of the L1 sparsity prior on the amplitude CORRECTION (default 1e-3), normalised by the reference RMS. It penalises the departure from the reference map, not the map itself -- an L1 on the total density shrinks the reference and costs a flat slice of low-frequency contrast.",
+          "default": 0.001,
+          "type": "number"
+        },
+        {
+          "name": "tv_lambda",
+          "flags": [
+            "--tv_lambda"
+          ],
+          "flag": "--tv_lambda",
+          "required": false,
+          "help": "Weight of the total-variation (spatial smoothness) prior on the density (default 1e-3).",
+          "default": 0.001,
+          "type": "number"
+        },
+        {
+          "name": "coord_reg",
+          "flags": [
+            "--coord_reg"
+          ],
+          "flag": "--coord_reg",
+          "required": false,
+          "help": "Weight of the quadratic penalty on the per-voxel displacement (default 1e-2). Only used with --refine_positions.",
+          "default": 0.01,
+          "type": "number"
+        },
+        {
+          "name": "field_chunk",
+          "flags": [
+            "--field_chunk"
+          ],
+          "flag": "--field_chunk",
+          "required": false,
+          "help": "Number of reconstruction voxels evaluated per chunk when querying the motion field (default 131072). Lower it if the field query runs out of memory; it only trades speed for peak VRAM and does not change the result.",
+          "default": 131072,
+          "type": "integer"
         },
         {
           "name": "output_path",
@@ -2803,6 +3350,39 @@
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
+        },
+        {
+          "name": "log_images_every",
+          "flags": [
+            "--log_images_every"
+          ],
+          "flag": "--log_images_every",
+          "required": false,
+          "help": "How often (in epochs) to log the cheap intermediate results to Tensorboard: the predicted images and the central slices of the predicted volumes (set by default to 1, i.e. every epoch - set to 0 to disable)",
+          "default": 1,
+          "type": "integer"
+        },
+        {
+          "name": "log_time_budget",
+          "flags": [
+            "--log_time_budget"
+          ],
+          "flag": "--log_time_budget",
+          "required": false,
+          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "log_sync",
+          "flags": [
+            "--log_sync"
+          ],
+          "flag": "--log_sync",
+          "required": false,
+          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
+          "default": false,
+          "type": "boolean"
         },
         {
           "name": "config",
@@ -2973,6 +3553,261 @@
           "flag": "--ssd_scratch_folder",
           "required": false,
           "help": "Path to a folder on a fast (SSD/NVMe) disk. The reconstruction has to read every particle once, so on a slow disk the read is the run: 1M particles at box 320 is 410 GB, which an HDD needs roughly an hour to deliver, and the GPU spends that hour idle. Given this parameter, the images are cached as a local float16 copy (half the bytes) and streamed from there. NOTE: building the cache still costs one full read of the original stack, so it does not make a single cold run faster - it pays off because the copy is reused, both by later runs and by the other hax programs (HetSIREN, Zernike3Deep, MoDART...) pointed at the same scratch folder, which build and read exactly the same cache.",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "config",
+          "flags": [
+            "--config"
+          ],
+          "flag": "--config",
+          "required": false,
+          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
+          "default": null,
+          "type": "string"
+        }
+      ]
+    },
+    "reconstruct_motion_corrected": {
+      "name": "reconstruct_motion_corrected",
+      "module": "hax.programs.reconstruct_motion_corrected",
+      "description": "Motion-corrected volume reconstruction by Fourier gridding, given a trained HetSIREN (single pass, with half maps and FSC) - the non-iterative alternative to modart",
+      "summary": "",
+      "fields": [
+        {
+          "name": "md",
+          "flags": [
+            "--md"
+          ],
+          "flag": "--md",
+          "required": true,
+          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "file"
+        },
+        {
+          "name": "sr",
+          "flags": [
+            "--sr"
+          ],
+          "flag": "--sr",
+          "required": true,
+          "help": "Sampling rate of the images/volume",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "ctf_type",
+          "flags": [
+            "--ctf_type"
+          ],
+          "flag": "--ctf_type",
+          "required": true,
+          "help": "Whether the images carry a CTF. The reconstruction only needs to know if they do: apply, wiener and precorrect all mean they do, while None means they do not.",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "None",
+            "apply",
+            "wiener",
+            "precorrect"
+          ]
+        },
+        {
+          "name": "motion_correction",
+          "flags": [
+            "--motion_correction"
+          ],
+          "flag": "--motion_correction",
+          "required": true,
+          "help": "Path to a trained HetSIREN with mass transport (--transport_mass) checkpoint. Its encoder supplies each particle's latent and its decoder the displacement field that is removed from the image.",
+          "default": null,
+          "type": "string"
+        },
+        {
+          "name": "tau",
+          "flags": [
+            "--tau"
+          ],
+          "flag": "--tau",
+          "required": false,
+          "help": "Wiener floor of the reconstruction quotient (default 0.05). A numerical regularizer only -- the resolution is set by the data, not by this.",
+          "default": 0.05,
+          "type": "number"
+        },
+        {
+          "name": "correction",
+          "flags": [
+            "--correction"
+          ],
+          "flag": "--correction",
+          "required": false,
+          "help": "WHERE the modelled motion is removed (default image).\n  image warps each 2D image and then inserts it normally. Fast -- one pass, a couple of operations per pixel -- but a projection ray gets ONE displacement, the density-weighted mean of the motion along it, because a single-valued 2D field cannot carry more. On the ribosome the part of the field that varies ALONG a ray measured ~95% of the part that does not, so this is a real approximation, not a rounding error.\n  backprojection bends the backprojection rays in 3D instead: each canonical voxel reads the image where its own material landed, so two voxels at different depths on one ray read different pixels. This is what DynaMight does (Nat Methods 21, 1855-1862) and it is the geometrically correct version. It costs ~15-20x more (box x mask-fraction gathers per particle instead of one image warp).\n  Both modes share the CTF weighting, the parity halves and the gray scale, so their maps are directly comparable and the difference between them IS the depth-resolved part of the motion.",
+          "default": "image",
+          "type": "enum",
+          "choices": [
+            "image",
+            "backprojection"
+          ]
+        },
+        {
+          "name": "jacobian",
+          "flags": [
+            "--jacobian"
+          ],
+          "flag": "--jacobian",
+          "required": false,
+          "help": "Multiply the resampled density by the Jacobian determinant of the deformation, making the correction conserve mass rather than values. Resampling alone moves intensities around; where a deformation compresses a region the same material lands on fewer pixels and must be scaled up for the line integral to survive. Second order for the near-isometric deformations the elastic priors produce -- measured at 1.2% (median) and 30% (p99) on the ribosome -- but it grows in proportion to the size of the motion. DynaMight does not do this. Off by default so the two correction modes reproduce their published behaviour unless asked.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mask_radius",
+          "flags": [
+            "--mask_radius"
+          ],
+          "flag": "--mask_radius",
+          "required": false,
+          "help": "Voxels within this many voxels of a consensus point that carries mass take part in the deformed backprojection (default 5.0); only used with --correction backprojection. Cost is linear in the number of selected voxels, and the model has nothing to say outside its own point cloud. The selected fraction is printed at startup.",
+          "default": 5.0,
+          "type": "number"
+        },
+        {
+          "name": "mask_taper",
+          "flags": [
+            "--mask_taper"
+          ],
+          "flag": "--mask_taper",
+          "required": false,
+          "help": "Width, in voxels, over which the correction is faded out as it approaches the edge of that region (default 2.0, raised cosine). Do not set this to 0 unless you want to see why it exists: the correction is a difference, so ending it at a hard boundary leaves a step of its full size, and that step rings through the Fourier division. Measured with no taper, 71.6% of the entire difference between the corrected map and the consensus sat in a +-1.5 voxel shell at the mask edge -- 5.1% of the box by volume, where it was 1.43x the size of the density itself. The interpolated field does not fade on its own (its outermost band is the largest of any), so the window has to impose it. Full-strength correction therefore reaches to --mask_radius minus this.",
+          "default": 2.0,
+          "type": "number"
+        },
+        {
+          "name": "warp_sigma",
+          "flags": [
+            "--warp_sigma"
+          ],
+          "flag": "--warp_sigma",
+          "required": false,
+          "help": "Width, in pixels, of the smoothing applied when the scattered per-point displacements are turned into a dense image-plane warp (default 2.0). It should be comparable to the spacing between the model's points in projection; too small leaves gaps between them, too large washes out the boundary between a moving domain and a static one.",
+          "default": 2.0,
+          "type": "number"
+        },
+        {
+          "name": "min_coverage",
+          "flags": [
+            "--min_coverage"
+          ],
+          "flag": "--min_coverage",
+          "required": false,
+          "help": "Pixels whose splat coverage falls below this fraction of the mean are left UNWARPED rather than having a warp extrapolated into them (default 0.05). Doing nothing where the model has no support is the safe default; dividing by a near-zero coverage is how the previous 3D field transfer produced displacements thousands of Angstrom long.",
+          "default": 0.05,
+          "type": "number"
+        },
+        {
+          "name": "no_denoise",
+          "flags": [
+            "--no_denoise"
+          ],
+          "flag": "--no_denoise",
+          "required": false,
+          "help": "Skip the FSC-based denoising of the combined map. The FSC is still measured and reported.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "no_gray_scale_calibration",
+          "flags": [
+            "--no_gray_scale_calibration"
+          ],
+          "flag": "--no_gray_scale_calibration",
+          "required": false,
+          "help": "Skip the global gray-scale calibration against the input images.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "also_consensus",
+          "flags": [
+            "--also_consensus"
+          ],
+          "flag": "--also_consensus",
+          "required": false,
+          "help": "Also reconstruct the ordinary (uncorrected) consensus from the same particles and print both resolutions. Strongly recommended: it is the control that says whether the motion correction changed anything, and it is the only way to attribute a difference to the correction rather than to any other part of the pipeline.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "write_mask",
+          "flags": [
+            "--write_mask"
+          ],
+          "flag": "--write_mask",
+          "required": false,
+          "help": "Also write a binary mask of the protein region derived from the reconstructed map.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "batch_size",
+          "flags": [
+            "--batch_size"
+          ],
+          "flag": "--batch_size",
+          "required": false,
+          "help": "How many images are read per chunk (default 512). Peak RAM tracks this rather than the particle count.",
+          "default": 512,
+          "type": "integer"
+        },
+        {
+          "name": "field_batch",
+          "flags": [
+            "--field_batch"
+          ],
+          "flag": "--field_batch",
+          "required": false,
+          "help": "How many particles are pushed through the motion decoder at once (default 32). This is the VRAM-sensitive number -- the decoder holds (particles x points x hidden) activations -- so lower it if the field decode runs out of memory. It does not change the result.",
+          "default": 32,
+          "type": "integer"
+        },
+        {
+          "name": "threads",
+          "flags": [
+            "--threads"
+          ],
+          "flag": "--threads",
+          "required": false,
+          "help": "Number of reader threads feeding the GPU (default 8). On a spinning disk a lower value can be faster.",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "output_path",
+          "flags": [
+            "--output_path"
+          ],
+          "flag": "--output_path",
+          "required": true,
+          "help": "Path to save the results (trained neural network, new metadata...)",
+          "default": null,
+          "type": "string",
+          "widget": "path",
+          "path_kind": "directory"
+        },
+        {
+          "name": "ssd_scratch_folder",
+          "flags": [
+            "--ssd_scratch_folder"
+          ],
+          "flag": "--ssd_scratch_folder",
+          "required": false,
+          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
           "default": null,
           "type": "string",
           "widget": "path",

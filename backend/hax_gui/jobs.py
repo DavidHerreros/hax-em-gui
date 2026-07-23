@@ -49,7 +49,11 @@ from .config import settings
 # reconstruct progress lines exactly.
 LIVE_BUFFER_CHARS = 256_000
 
-ACTIVE = {"pending", "running"}
+# Statuses a job can still move out of on its own. 'cancelling' belongs here: the
+# process group has been signalled but nothing is final until the supervisor reaps it
+# and writes 'cancelled'. Leaving it out made the log WS treat a cancelling job as
+# finished and hang up, so the client never saw that final status.
+ACTIVE = {"pending", "running", "cancelling"}
 
 # The subprocess' output streams, kept separate so the UI can show one tab each.
 STREAMS = ("out", "err")
@@ -928,9 +932,12 @@ class JobManager:
         return [self._row(r) for r in rows]
 
     def count_active(self) -> int:
-        """Number of jobs currently pending or running (used to gate updates)."""
+        """Number of jobs still active — pending, running or being cancelled
+        (used to gate updates)."""
         row = self._exec(
-            "SELECT COUNT(*) AS n FROM jobs WHERE status IN ('pending','running')",
+            "SELECT COUNT(*) AS n FROM jobs WHERE status IN ({})".format(
+                ",".join("?" * len(ACTIVE))),
+            tuple(sorted(ACTIVE)),
             fetch="one",
         )
         return int(row["n"]) if row else 0
