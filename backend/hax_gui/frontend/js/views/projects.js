@@ -1,11 +1,11 @@
 // Projects section: tabs of open projects + a CryoSPARC-style project view
 // listing that project's runs (executions).
-import { h, mount, clear } from "../h.js";
+import { h, mount, clear, append } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { badge, jobsSignature, gpuLabel, jobDisplayName, jobMenuButton } from "./jobs.js";
-import { errorBox } from "./ui.js";
+import { errorBox, formatSize } from "./ui.js";
 import { ProjectManager } from "./projectManager.js";
 import { makeJobDraggable } from "./inputBinding.js";
 import { jobLabelChips, loadLabels } from "./labels.js";
@@ -79,6 +79,45 @@ function projectPanel(project) {
       project.path ? h("p", { class: "subtitle mono small" }, project.path) : null),
     h("div", { class: "ml-auto run-hint-inline" }, icon("arrowRight", 16), "Pick a program in the right menu to run it here")));
 
+  // Disk usage: the project folder's total, plus a size per run once measured. Walked
+  // on demand and cached server-side, so opening the project costs one measurement and
+  // revisiting it costs nothing; the refresh forces a fresh walk.
+  const usageEl = h("div", { class: "project-usage muted small" });
+  el.appendChild(usageEl);
+  let sizes = new Map();          // job id -> bytes, filled by the usage call
+
+  function renderUsage(u, state) {
+    clear(usageEl);
+    if (state) { append(usageEl, [icon("box", 13), h("span", null, state)]); return; }
+    const runs = u.jobs.length;
+    append(usageEl, [                       // h.js's append, which drops the null slots
+      icon("box", 13),
+      h("strong", { class: "mono" }, formatSize(u.bytes)),
+      h("span", null, ` across ${runs} run${runs === 1 ? "" : "s"}`),
+      u.other_bytes ? h("span", { title: "In the project folder but outside any run folder — project metadata, and anything a deleted run left behind" },
+        ` · ${formatSize(u.other_bytes)} outside runs`) : null,
+      // The SSD scratch is a rebuildable cache of the particle stack shared by the
+      // project's runs. It lives outside the project folder, so it is reported beside
+      // the total rather than inside it — and it is usually the biggest thing to reclaim.
+      u.scratch && u.scratch.exists ? h("span", { title: u.scratch.path },
+        ` · SSD scratch ${formatSize(u.scratch.bytes)}`) : null,
+      h("button", { class: "btn-icon", title: "Re-measure disk usage",
+        onclick: () => loadUsage(true) }, icon("refresh", 13))]);
+  }
+  async function loadUsage(refresh) {
+    renderUsage(null, "measuring disk usage…");
+    try {
+      const u = await api.projectUsage(project.id, refresh);
+      if (stop) return;
+      sizes = new Map(u.jobs.map((j) => [j.id, j.bytes]));
+      renderUsage(u);
+      lastSig = null;             // rebuild the run list so the per-run sizes show up
+      refreshJobs();
+    } catch (err) {
+      if (!stop) renderUsage(null, "disk usage unavailable: " + (err.detail || err.message));
+    }
+  }
+
   el.appendChild(h("h2", { class: "section", style: { marginTop: "8px" } }, "Executions"));
   const execWrap = h("div");
   el.appendChild(execWrap);
@@ -87,14 +126,14 @@ function projectPanel(project) {
   let lastSig = null;
   let animatedOnce = false;
   loadLabels().catch(() => {});
-  async function refresh() {
+  async function refreshJobs() {
     try {
       const jobs = await api.projectJobs(project.id);
       if (stop) return;
       const sig = jobsSignature(jobs);
       if (sig === lastSig) return; // unchanged -> skip rebuild (avoids flicker)
       lastSig = sig;
-      mount(execWrap, jobs.length ? execList(jobs) : h("p", { class: "muted" }, "No runs yet."));
+      mount(execWrap, jobs.length ? execList(jobs, sizes) : h("p", { class: "muted" }, "No runs yet."));
       // Animate rows only on first paint; later refreshes rebuild the list and
       // re-animating them (e.g. after adding a label) makes it visibly "jump".
       execWrap.classList.toggle("no-anim", animatedOnce);
@@ -103,13 +142,14 @@ function projectPanel(project) {
       if (!stop) mount(execWrap, errorBox(err));
     }
   }
-  refresh();
-  const timer = setInterval(refresh, 3000);
+  refreshJobs();
+  loadUsage(false);
+  const timer = setInterval(refreshJobs, 3000);
 
   return { el, cleanup: () => { stop = true; clearInterval(timer); } };
 }
 
-function execList(jobs) {
+function execList(jobs, sizes) {
   return h("div", null, ...jobs.map((j, i) => {
     const title = h("span", { class: "exec-name" }, jobDisplayName(j));
     const a = h(
@@ -119,6 +159,11 @@ function execList(jobs) {
       title,
       h("span", { class: "exec-prog mono" }, j.program),
       h("span", { class: "exec-folder mono" }, folderName(j.workdir)),
+      // Only once the project's usage has been measured — the job list refreshes every
+      // few seconds and must never trigger a folder walk of its own.
+      sizes && sizes.has(j.id)
+        ? h("span", { class: "exec-size mono", title: "Disk used by this run's folder" }, formatSize(sizes.get(j.id)))
+        : null,
       jobLabelChips(j, { editable: true }),
       gpuLabel(j.gpu) ? h("span", { class: "muted small" }, gpuLabel(j.gpu)) : null,
       h("span", { class: "exec-time" }, new Date(j.created_at).toLocaleString()),

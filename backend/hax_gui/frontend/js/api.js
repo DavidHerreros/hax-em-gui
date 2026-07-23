@@ -74,6 +74,11 @@ export const api = {
   // Recipe for copying a job into another project (program + params, inputs cleared).
   jobCopyPrefill: (id) => req(`/api/jobs/${id}/copy-prefill`),
   continueJob: (id) => req(`/api/jobs/${id}/continue`, { method: "POST" }),
+  // Disk usage. Measured on demand (a folder walk), cached server-side for a couple
+  // of minutes; `refresh` forces a re-measure.
+  jobUsage: (id, refresh) => req(`/api/jobs/${id}/usage${refresh ? "?refresh=true" : ""}`),
+  projectUsage: (id, refresh) => req(`/api/projects/${id}/usage${refresh ? "?refresh=true" : ""}`),
+  projectsUsage: (refresh) => req(`/api/projects/usage${refresh ? "?refresh=true" : ""}`),
   deleteJob: (id) => req(`/api/jobs/${id}`, { method: "DELETE" }),
   // labels (colored tags on jobs)
   labels: () => req("/api/labels"),

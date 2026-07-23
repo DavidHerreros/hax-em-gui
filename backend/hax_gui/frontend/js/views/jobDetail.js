@@ -5,7 +5,7 @@ import { icon } from "../icons.js";
 import { api, subscribeLog } from "../api.js";
 import { navigate, reload } from "../router.js";
 import { store } from "../store.js";
-import { errorBox } from "./ui.js";
+import { errorBox, formatSize } from "./ui.js";
 import { badge, jobDisplayName } from "./jobs.js";
 import { openContextMenu } from "./contextMenu.js";
 import { jobLabelChips } from "./labels.js";
@@ -22,7 +22,13 @@ export function JobDetailView(params) {
   const head = h("div", { class: "row", style: { marginBottom: "8px" } });
   const progress = h("div", { class: "progress" });
   const cmd = h("pre", { class: "cmdline" }, "…");
-  const wd = h("div", { class: "muted small", style: { margin: "-8px 0 16px" } });
+  const wdLine = h("div");
+  // How much this run has written. Measured on demand (it walks the run folder), not
+  // polled: a long training keeps growing, so there is a refresh rather than a number
+  // that silently ages. Re-measured for free when the run reaches a terminal status.
+  const diskVal = h("span", { class: "mono" }, "…");
+  const diskLine = h("div", { class: "row", style: { gap: "6px", marginTop: "2px" } });
+  const wd = h("div", { class: "muted small", style: { margin: "-8px 0 16px" } }, wdLine, diskLine);
   const inputs = h("div", { class: "job-maps" });
   const maps = h("div", { class: "job-maps" });
   const actionErr = h("div", { style: { marginBottom: "12px" } });
@@ -159,12 +165,32 @@ export function JobDetailView(params) {
     catch (err) { mount(actionErr, errorBox(err)); }
   }
 
-  // ── outputs this run produced: inspect maps (.mrc) and metadata (.xmd/.star/.cs) ──
-  function formatSize(bytes) {
-    const units = ["B", "KB", "MB", "GB", "TB"]; let n = bytes, i = 0;
-    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-    return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+  // ── how much disk this run occupies ──
+  function renderDiskLine() {
+    clear(diskLine);
+    if (!job || !job.workdir) return;
+    diskLine.append(
+      h("span", null, "Run folder: "),
+      // shrinkable so a long path ellipsises instead of pushing the size off the row
+      h("span", { class: "mono", title: job.workdir,
+        style: { minWidth: "0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, job.workdir),
+      h("span", null, " · "),
+      diskVal,
+      h("button", { class: "btn-icon", title: "Re-measure this run's disk usage",
+        onclick: () => loadUsage(true) }, icon("refresh", 12)));
   }
+  async function loadUsage(refresh) {
+    if (!job || !job.workdir) return;
+    if (refresh) diskVal.textContent = "measuring…";
+    try {
+      const u = await api.jobUsage(id, refresh);
+      diskVal.textContent = u.exists
+        ? `${formatSize(u.bytes)} in ${u.files} file${u.files === 1 ? "" : "s"}`
+        : "no run folder";
+    } catch { diskVal.textContent = "size unavailable"; }
+  }
+
+  // ── outputs this run produced: inspect maps (.mrc) and metadata (.xmd/.star/.cs) ──
   async function loadOutputs() {
     const [m, t] = await Promise.allSettled([api.jobMrcs(id), api.jobMetadata(id)]);
     const mapsF = m.status === "fulfilled" ? (m.value.files || []) : [];
@@ -256,6 +282,7 @@ export function JobDetailView(params) {
       termOut.reset(); termErr.reset();
       connectLog();      // re-open the stream now that the job is running
       renderHead();
+      renderDiskLine();
     } catch (err) { mount(actionErr, errorBox(err)); }
   }
 
@@ -298,8 +325,10 @@ export function JobDetailView(params) {
     .then((j) => {
       job = j; status = j.status;
       cmd.textContent = j.command.join(" ");
-      if (j.cwd) wd.textContent = "Working directory: " + j.cwd;
+      if (j.cwd) wdLine.textContent = "Working directory: " + j.cwd;
       renderHead();
+      renderDiskLine();
+      loadUsage(false);
       loadInputs();
       loadOutputs();
       updatePolling();
@@ -340,7 +369,8 @@ export function JobDetailView(params) {
       else if (m.type === "status") {
         status = m.status;
         updatePolling();
-        if (m.status !== "running") api.job(id).then((j) => { job = j; renderHead(); loadOutputs(); }).catch(() => renderHead());
+        // A finished run's folder has stopped growing — worth one fresh measurement.
+        if (m.status !== "running") api.job(id).then((j) => { job = j; renderHead(); loadOutputs(); if (!isActive()) loadUsage(true); }).catch(() => renderHead());
         else renderHead();
       }
     });

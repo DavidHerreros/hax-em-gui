@@ -5,7 +5,7 @@ import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
-import { errorBox } from "./ui.js";
+import { errorBox, formatSize } from "./ui.js";
 import { openContextMenu } from "./contextMenu.js";
 
 export function ProjectManager() {
@@ -21,9 +21,16 @@ export function ProjectManager() {
     onkeydown: (e) => { if (e.key === "Enter") create(); } });
   const addBtn = h("button", { class: "pm-add", title: "Create project", onclick: create }, icon("plus", 16));
   const cards = h("div", { class: "pm-cards" });
+  // Disk usage is opt-in: measuring means walking every project folder, which on
+  // shared storage is worth asking for rather than doing behind the user's back. Once
+  // measured the sizes stay on the cards (the server caches them for a couple of
+  // minutes, so a second click is instant).
+  const diskBtn = h("button", { class: "pm-collapse", title: "Show how much disk each project uses",
+    onclick: measureDisk }, icon("box", 16));
   const body = h("div", { class: "pm-body" },
     h("div", { class: "pm-head" },
       h("span", { class: "pm-title" }, "Projects"),
+      diskBtn,
       h("button", { class: "pm-collapse", title: "Collapse", onclick: () => store.togglePM() }, icon("chevronLeft", 16))),
     h("div", { class: "pm-new" }, nameInput, addBtn),
     cards);
@@ -34,6 +41,25 @@ export function ProjectManager() {
   let sig = null;
   let renamingId = null;
   let stop = false;
+  let diskById = new Map();      // project id -> bytes, once measured
+
+  async function measureDisk() {
+    diskBtn.disabled = true;
+    diskBtn.title = "Measuring…";
+    try {
+      // Re-measure on an explicit second click; the first one takes whatever is
+      // already cached so it comes straight back.
+      const rows = await api.projectsUsage(diskById.size > 0);
+      if (stop) return;
+      diskById = new Map(rows.map((r) => [r.id, r.bytes]));
+      renderCards();
+    } catch (err) {
+      if (!stop) mount(cards, errorBox(err));
+    } finally {
+      diskBtn.disabled = false;
+      diskBtn.title = "Re-measure how much disk each project uses";
+    }
+  }
 
   async function load() {
     try {
@@ -84,7 +110,9 @@ export function ProjectManager() {
       h("div", { class: "pm-meta" },
         h("span", null, `${runs} ${runs === 1 ? "run" : "runs"}`),
         p.created_at ? h("span", { class: "pm-sep" }, "·") : null,
-        p.created_at ? h("span", null, new Date(p.created_at).toLocaleDateString()) : null),
+        p.created_at ? h("span", null, new Date(p.created_at).toLocaleDateString()) : null,
+        diskById.has(p.id) ? h("span", { class: "pm-sep" }, "·") : null,
+        diskById.has(p.id) ? h("span", { class: "mono", title: "Disk used by this project folder" }, formatSize(diskById.get(p.id))) : null),
       p.path ? h("div", { class: "pm-path mono", title: p.path }, p.path) : null);
     return el;
   }

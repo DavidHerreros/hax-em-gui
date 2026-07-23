@@ -3,7 +3,7 @@ import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store } from "../store.js";
-import { errorBox } from "./ui.js";
+import { errorBox, formatSize } from "./ui.js";
 
 const MAP_RX = /\.(mrc|map|vol)$/i;
 const MD_RX = /\.(xmd|star|cs)$/i;
@@ -375,11 +375,4 @@ export function openFilePicker(kind, onSelect, startPath) {
   }
 
   load(startPath && String(startPath).trim() ? String(startPath).trim() : undefined, true);
-}
-
-function formatSize(bytes) {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let n = bytes, i = 0;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
 }

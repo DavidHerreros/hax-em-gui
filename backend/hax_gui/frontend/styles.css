@@ -576,6 +576,11 @@ body.vwin-dragging iframe { pointer-events: none; }
 .exec-prog { color: var(--accent); width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .exec-folder { color: var(--muted); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .exec-time { color: var(--faint); font-size: 12px; }
+/* disk used by one run — right-aligned so the column reads as a set of magnitudes */
+.exec-size { color: var(--muted); font-size: 12px; min-width: 72px; text-align: right; font-variant-numeric: tabular-nums; }
+/* the project's disk-usage line, under the header */
+.project-usage { display: flex; align-items: center; gap: 6px; margin: -10px 0 16px; }
+.project-usage strong { color: var(--text); }
 
 /* project chip on job rows */
 .proj-chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; background: var(--active-bg); color: var(--brand-300); font-size: 12px; }

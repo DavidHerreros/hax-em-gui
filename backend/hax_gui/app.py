@@ -28,7 +28,7 @@ from . import chats as chat_store
 from . import metrics as metrics_reader
 from . import ollama as ollama_manager_mod
 from . import files as filebrowser
-from . import branches, gpus, groups, projects, registry, settings_store, updates
+from . import branches, gpus, groups, projects, registry, settings_store, updates, usage
 from .branches import BranchError
 from .updater import UpdateBlocked, UpdateBusy, updater
 from .command import ValidationError
@@ -742,6 +742,31 @@ def create_project(body: ProjectCreate) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc))
 
 
+@app.get("/api/projects/usage", dependencies=[Depends(auth)])
+async def projects_usage(refresh: bool = False) -> list[dict[str, Any]]:
+    """Disk occupied by each project folder.
+
+    Declared before /api/projects/{project_id} so that path doesn't swallow it. The
+    walk is off the event loop and cached (see `usage`), so the repeat cost of the
+    rail showing these is nothing; `refresh=1` forces a re-measure.
+    """
+    try:
+        plist = projects.list_projects()
+    except ProjectsRootUnset:
+        return []
+
+    def _all() -> list[dict[str, Any]]:
+        out = []
+        for proj in plist:
+            measured = usage.measure(proj["path"], refresh) or {}
+            out.append({"id": proj["id"], "name": proj["name"], "path": proj["path"],
+                        "bytes": measured.get("bytes", 0), "files": measured.get("files", 0),
+                        "measured_at": measured.get("measured_at")})
+        return out
+
+    return await asyncio.to_thread(_all)
+
+
 @app.get("/api/projects/{project_id}", dependencies=[Depends(auth)])
 def get_project(project_id: str) -> dict[str, Any]:
     proj = _project_or_404(project_id)
@@ -774,6 +799,45 @@ def delete_project(project_id: str) -> dict[str, bool]:
 def project_jobs(project_id: str) -> list[dict[str, Any]]:
     _project_or_404(project_id)
     return _attach_labels(manager.list_for_project(project_id))
+
+
+@app.get("/api/projects/{project_id}/usage", dependencies=[Depends(auth)])
+async def project_usage(project_id: str, refresh: bool = False) -> dict[str, Any]:
+    """This project's disk use, broken down per run (largest first).
+
+    `other_bytes` is what sits in the project folder outside its runs' folders: the
+    project metadata, and anything a deleted job left behind. The SSD scratch is
+    reported *beside* the total rather than inside it — it lives under the configured
+    scratch root, not in the project, it can dwarf the project itself (it caches the
+    whole particle stack), and it is rebuildable, so it is the first thing to reclaim.
+    """
+    proj = _project_or_404(project_id)
+    project_jobs_list = manager.list_for_project(project_id)
+    scratch_root = settings_store.ssd_scratch_root()
+    scratch_dir = str(scratch_root / project_id) if scratch_root is not None else None
+
+    def _measure() -> dict[str, Any]:
+        total = usage.measure(proj["path"], refresh) or {}
+        per_job, counted = [], 0
+        for job in project_jobs_list:
+            measured = usage.measure(job.get("workdir"), refresh)
+            if measured is None:
+                continue                        # saved job that never got a run folder
+            counted += measured["bytes"]
+            per_job.append({"id": job["id"], "name": job.get("name"), "program": job["program"],
+                            "status": job["status"], "workdir": job.get("workdir"),
+                            "bytes": measured["bytes"], "files": measured["files"]})
+        per_job.sort(key=lambda j: j["bytes"], reverse=True)
+        return {
+            "id": proj["id"], "name": proj["name"], "path": proj["path"],
+            "bytes": total.get("bytes", 0), "files": total.get("files", 0),
+            "measured_at": total.get("measured_at"),
+            "jobs": per_job,
+            "other_bytes": max(0, total.get("bytes", 0) - counted),
+            "scratch": usage.measure(scratch_dir, refresh),
+        }
+
+    return await asyncio.to_thread(_measure)
 
 
 @app.get("/api/projects/{project_id}/sources", dependencies=[Depends(auth)])
@@ -1715,6 +1779,20 @@ def job_mrcs(job_id: str) -> dict[str, Any]:
     """List the volume files (.mrc/.map/.vol) inside a job's run folder, so any map
     it produced can be inspected (works while running and after it finishes)."""
     return _list_job_files(job_id, _MAP_SUFFIXES)
+
+
+@app.get("/api/jobs/{job_id}/usage", dependencies=[Depends(auth)])
+async def job_usage(job_id: str, refresh: bool = False) -> dict[str, Any]:
+    """Disk occupied by this run's folder (outputs, checkpoints and logs).
+
+    Measured on demand rather than carried on every job listing: it means walking the
+    folder, and a job list refreshes every few seconds.
+    """
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    measured = await asyncio.to_thread(usage.measure, job.get("workdir"), refresh)
+    return measured or {"path": None, "bytes": 0, "files": 0, "exists": False, "measured_at": None}
 
 
 @app.get("/api/jobs/{job_id}/inputs", dependencies=[Depends(auth)])
