@@ -179,6 +179,9 @@ export const api = {
   deleteProject: (id) => req(`/api/projects/${id}`, { method: "DELETE" }),
   project: (id) => req(`/api/projects/${id}`),
   projectJobs: (id) => req(`/api/projects/${id}/jobs`),
+  // Recover input bindings an edit-and-rerun flattened to literal paths, so the
+  // workflow edges they back reappear. Returns { relinked: [...], count }.
+  relinkProject: (id) => req(`/api/projects/${id}/relink`, { method: "POST" }),
   projectSources: (id, kind) => req(`/api/projects/${id}/sources?kind=${encodeURIComponent(kind)}`),
   createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true, recreateSsd = false, replaceJobId = null, resume = false) =>
     req(`/api/projects/${projectId}/jobs`, {

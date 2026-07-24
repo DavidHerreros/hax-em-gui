@@ -122,24 +122,19 @@ export function createVolume(canvas) {
   let threshold = 0.45, gamma = 1.4, bright = 1.2, mode = 0, steps = 160;
   let hasTex = false;
   let boxLo = [-1, -1, -1], boxHi = [1, 1, 1];   // model-space cube the grid fills; set per volume so it coincides with the surface mesh
-  let grid = null;   // { nx, ny, nz, data } kept on the CPU so the ray-march can be repeated here
+  let grid = null;   // { nx, ny, nz } of the uploaded map; null until one is, which is what the camera tests
   let gridB = null;  // the morph's far end, same shape; null when not morphing
   let mix = 0;       // blend weight in [0,1]; 0 = `grid` alone
 
-  // Reads the density the *shader* is drawing, so the centre of rotation and the
-  // displayed bounds follow a morph instead of describing whichever map happens to be
-  // at the near end. Returns a plain indexed read when nothing is blending, so the
-  // common case pays nothing for the morph case.
-  function sampler() {
-    if (!gridB || mix <= 0) { const d = grid.data; return (i) => d[i]; }
-    const a = grid.data, b = gridB.data, w = mix;
-    return (i) => a[i] + (b[i] - a[i]) * w;
-  }
-
-  // Distance from the eye to the first voxel at or above the display threshold along
-  // the view axis — the surface you see at the centre of the window. There is no
-  // geometry to read back here, so re-walk the ray the shader walks, on the coarse
-  // grid it is drawing. The camera turns this into a ChimeraX-style centre of rotation.
+  // Where the sight line through the centre of the window meets the map, as ChimeraX
+  // reports it for a map drawn as an image: the *midpoint* of the segment the line spends
+  // inside the data box — Volume.first_intercept's `image_shown` branch returns
+  // 0.5*(xyz_in + xyz_out), not the first voxel above the contour. A ray-march has no
+  // surface to hit, so ChimeraX does not pretend it has one, and the camera turns this into
+  // its centre of rotation when you have zoomed in past the box.
+  //
+  // Returned as a distance from the eye, which the axis ray measures in the same model
+  // units the box is in (the camera is not scaled, only rotated and translated).
   function centreDepth() {
     if (!grid) return null;
     const { origin, dir } = orbit.axisRay();   // model space, where the volume fills [boxLo, boxHi]
@@ -151,56 +146,19 @@ export function createVolume(canvas) {
       tn = Math.max(tn, t0); tf = Math.min(tf, t1);
     }
     if (tf <= tn) return null;                 // the box is behind us, or we missed it
-
-    const { nx, ny, nz } = grid;              // data is C-order (numpy axis0=nz slowest, axis2=nx fastest)
-    const sample = sampler();
-    const cut = threshold * 255;               // the shader compares the sample in [0,1] against uThreshold
-    const steps3 = 2 * Math.max(nx, ny, nz);   // Nyquist-ish along the ray
-    const texel = (v, lo, hi, n) => Math.min(n - 1, Math.max(0, Math.round(((v - lo) / (hi - lo)) * n - 0.5)));
-    for (let i = 0; i <= steps3; i++) {
-      const t = tn + ((tf - tn) * i) / steps3;
-      // box/model axes are in numpy-axis order: model X -> axis0 (nz), Y -> axis1 (ny), Z -> axis2 (nx).
-      const i0 = texel(origin[0] + dir[0] * t, boxLo[0], boxHi[0], nz);
-      const i1 = texel(origin[1] + dir[1] * t, boxLo[1], boxHi[1], ny);
-      const i2 = texel(origin[2] + dir[2] * t, boxLo[2], boxHi[2], nx);
-      if (sample((i0 * ny + i1) * nx + i2) >= cut) return t;
-    }
-    return null;                               // the ray passed through empty space
+    return 0.5 * (tn + tf);
   }
 
-  // Model-space box enclosing the voxels at or above the display threshold — what the
-  // ray-march actually paints, as opposed to the grid box, most of which is empty
-  // padding. The camera uses it to decide whether the map is fully framed. One pass over
-  // a ~96³ grid, recomputed only when the volume or the threshold changes.
-  let boundsCache = null;
+  // The model-space box the grid occupies — ChimeraX's bounds for an image-rendered map,
+  // which are the data box (the image drawing is the box; there is no contour to bound).
+  // The camera uses it to decide whether the map is still framed.
+  //
+  // Tempting to return the box of the voxels above the display threshold instead, and this
+  // did: it is the tighter, truer description of what you can see. But it is not what
+  // ChimeraX measures, so the view stops switching to a front-centre pivot at the same
+  // moment ChimeraX does — and past that moment rotation is about a different point.
   function displayedBounds() {
-    if (!grid) return null;
-    if (boundsCache) return boundsCache;
-    const { nx, ny, nz } = grid;
-    const sample = sampler();
-    const cut = threshold * 255;
-    let a0 = nz, b0 = -1, a1 = ny, b1 = -1, a2 = nx, b2 = -1;
-    for (let i0 = 0; i0 < nz; i0++) {
-      for (let i1 = 0; i1 < ny; i1++) {
-        const row = (i0 * ny + i1) * nx;
-        for (let i2 = 0; i2 < nx; i2++) {
-          if (sample(row + i2) < cut) continue;
-          if (i0 < a0) a0 = i0; if (i0 > b0) b0 = i0;
-          if (i1 < a1) a1 = i1; if (i1 > b1) b1 = i1;
-          if (i2 < a2) a2 = i2; if (i2 > b2) b2 = i2;
-        }
-      }
-    }
-    if (b0 < 0) return null;   // nothing is above the threshold
-    // Voxel index -> model coordinate, taking the outer face of the extreme voxels so
-    // the box encloses them rather than passing through their centres. Model axes are in
-    // numpy-axis order (X -> axis0 = nz, Y -> axis1 = ny, Z -> axis2 = nx), as in centreDepth.
-    const at = (a, idx, n) => boxLo[a] + (idx / n) * (boxHi[a] - boxLo[a]);
-    boundsCache = {
-      lo: [at(0, a0, nz), at(1, a1, ny), at(2, a2, nx)],
-      hi: [at(0, b0 + 1, nz), at(1, b1 + 1, ny), at(2, b2 + 1, nx)],
-    };
-    return boundsCache;
+    return grid ? { lo: boxLo, hi: boxHi } : null;
   }
 
   // 1.41 = the height this view has always shown (old camera: 3.4·tan(22.5°)), so the map
@@ -250,30 +208,32 @@ export function createVolume(canvas) {
 
   function setVolume(nx, ny, nz, u8, lo, hi) {
     upload(tex, nx, ny, nz, u8);
-    grid = { nx, ny, nz, data: u8 };
+    grid = { nx, ny, nz };
     if (lo && hi) { boxLo = lo.slice(); boxHi = hi.slice(); }   // the cube the surface mesh uses, so the two modes coincide
-    hasTex = true; boundsCache = null; orbit.invalidatePivot(); render();
+    hasTex = true; orbit.invalidatePivot(); render();           // a new map is a new box to pivot on
   }
 
   window.addEventListener("resize", render);
 
   return {
     setVolume, render,
-    // The far end of a morph. Pass null to stop morphing and go back to one volume.
+    // The far end of a morph. Pass null to stop morphing and go back to one volume. The
+    // camera is untouched either way: the two ends share a grid, so they share the box the
+    // pivot is derived from.
     setVolumeB(nx, ny, nz, u8) {
-      if (!u8) { gridB = null; mix = 0; boundsCache = null; orbit.invalidatePivot(); render(); return; }
+      if (!u8) { gridB = null; mix = 0; render(); return; }
       upload(texB, nx, ny, nz, u8);
-      gridB = { nx, ny, nz, data: u8 };
-      boundsCache = null; orbit.invalidatePivot(); render();
+      gridB = { nx, ny, nz };
+      render();
     },
     // Blend weight, 0 = the near map, 1 = the far one. Called every animation frame, so
-    // it must stay cheap: no pivot invalidation and no bounds rescan here — those are
-    // gesture-time concerns, and re-deriving them 60 times a second would cost more
-    // than the render.
+    // it must stay cheap — which it is, being two uniform writes and a draw.
     setMix(t) { mix = Math.max(0, Math.min(1, t)); render(); },
     setMode(m) { mode = m === "emission" ? 1 : 0; render(); },
-    // A new contour is a new front surface — and a different set of voxels on screen.
-    setThreshold(v) { threshold = Math.max(0, Math.min(1, v)); boundsCache = null; orbit.invalidatePivot(); render(); },
+    // No pivot invalidation: an image-rendered map pivots on its box, and the contour does
+    // not move the box. Same in ChimeraX, where changing the level of a map shown as an
+    // image leaves its bounds — and so its centre of rotation — where they were.
+    setThreshold(v) { threshold = Math.max(0, Math.min(1, v)); render(); },
     setGamma(g) { gamma = Math.max(0.2, g); render(); },
     setBrightness(b) { bright = Math.max(0.1, b); render(); },
     setColor(rgb) { color = rgb; render(); },

@@ -22,6 +22,16 @@ export function halfFovY(aspect) {
   return Math.atan(Math.tan(FOV_X_2) / Math.max(1e-6, aspect));
 }
 
+// How wide the field is, in world units, at the given distance from the eye — ChimeraX's
+// Camera.view_width(). It uses the small-angle form d·fov, *not* the exact 2·d·tan(fov/2)
+// (perspective_view_width() in chimerax/graphics/camera.py). The two differ by 2.3% at
+// 30°, and this one number scales nearly every gesture ChimeraX has: the pixel size that
+// sets the pan step, and the "is the model fully framed?" test that decides where the
+// centre of rotation goes. Reproducing the approximation is what makes those match, so
+// the discrepancy with projection() above is deliberate — do not "fix" it.
+const FOV_X_RAD = (FOV_X_DEG * Math.PI) / 180;
+export function viewWidth(distance) { return distance * FOV_X_RAD; }
+
 // The projection matrix for that camera. aspect = width / height.
 export function projection(aspect, near, far) {
   const f = 1 / Math.tan(FOV_X_2);   // horizontal, not vertical: m[0] carries it, m[5] scales by aspect

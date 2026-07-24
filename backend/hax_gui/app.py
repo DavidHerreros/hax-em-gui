@@ -840,6 +840,15 @@ async def project_usage(project_id: str, refresh: bool = False) -> dict[str, Any
     return await asyncio.to_thread(_measure)
 
 
+@app.post("/api/projects/{project_id}/relink", dependencies=[Depends(auth)])
+def relink_project(project_id: str) -> dict[str, Any]:
+    """Recover input bindings that an edit-and-rerun flattened into literal paths, so
+    the workflow edges they back reappear. Returns what was reconnected."""
+    _project_or_404(project_id)
+    restored = manager.relink_project(project_id)
+    return {"relinked": restored, "count": len(restored)}
+
+
 @app.get("/api/projects/{project_id}/sources", dependencies=[Depends(auth)])
 def project_sources(project_id: str, kind: str) -> list[dict[str, Any]]:
     """Jobs in this project whose output can feed a `kind` input (for chaining)."""
@@ -1010,6 +1019,9 @@ def delete_job(job_id: str) -> dict[str, bool]:
         raise HTTPException(status_code=409, detail="cancel the job before deleting it")
     except JobNotFound:
         raise HTTPException(status_code=404, detail="job not found")
+    # Drop the step the job backed from any workflow graph right away, so a canvas
+    # reloaded (or polled) before the next full reconcile doesn't show it again.
+    wf_manager.forget_job(job_id)
     return {"deleted": True}
 
 

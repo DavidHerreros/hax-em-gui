@@ -124,7 +124,12 @@ export const store = {
   // the edited args. Plain edit (no opts) replaces the run for a fresh start.
   editFrom(job, opts = {}) {
     state.prefill = { program: job.program, values: { ...(job.args || {}) }, gpu: job.gpu || "",
-                      jobId: job.id, resume: !!opts.resume };
+                      jobId: job.id, resume: !!opts.resume,
+                      // Carry the input bindings so an edit-and-rerun keeps a field that
+                      // was fed by another run *bound* (the launcher re-hydrates them),
+                      // instead of freezing that run's resolved output path into the args
+                      // and dropping the link. bindings: { field: { job_id, kind } }.
+                      bindings: job.bindings || null };
     state.selectedProgram = job.program;
     state.rightOpen = true;
     state.formNonce++;

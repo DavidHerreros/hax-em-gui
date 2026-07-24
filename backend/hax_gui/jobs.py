@@ -454,6 +454,60 @@ class JobManager:
         await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"))
         return self.get(job_id)
 
+    def relink_project(self, project_id: str) -> list[dict[str, Any]]:
+        """Recover input bindings that were flattened to literal paths.
+
+        Editing a run and re-launching it (the launcher form) submits a *literal* value
+        for every field, including one that used to be fed by another run's output: the
+        job's stored args already held that run's resolved output path, so the edit
+        froze it in and dropped the binding. The workflow edge, which is derived from the
+        binding, then vanished and the input read as hardcoded.
+
+        This walks the project's jobs and, for each bindable field still holding a plain
+        path, looks for the one other job whose output *is* that exact path (see
+        :func:`adapters.reference_path`). A unique match restores the binding; the
+        workflow edge reappears on the next reconcile. Ambiguous matches (two runs at the
+        same path) and copied inputs (latents, whose path points into the consumer's own
+        folder) are left alone rather than guessed. Idempotent: an already-bound field is
+        skipped, so it is safe to run repeatedly.
+        """
+        job_list = self.list_for_project(project_id)
+        # Each producer's in-place output path per kind, computed once.
+        produced: list[tuple[str, str, str]] = []       # (abspath, kind, producer_id)
+        kinds = {k for j in job_list for k in adapters.bindable_fields(j["program"]).values()}
+        for producer in job_list:
+            for kind in kinds:
+                ref = adapters.reference_path(kind, producer)
+                if ref:
+                    produced.append((os.path.abspath(ref), kind, producer["id"]))
+
+        restored: list[dict[str, Any]] = []
+        for consumer in job_list:
+            fields = adapters.bindable_fields(consumer["program"])
+            if not fields:
+                continue
+            bindings = dict(consumer.get("bindings") or {})
+            args = consumer.get("args") or {}
+            changed = False
+            for field, kind in fields.items():
+                if field in bindings:
+                    continue                             # already fed by a run
+                val = args.get(field)
+                if not isinstance(val, str) or not val:
+                    continue                             # unset, or a multi-valued list
+                target = os.path.abspath(val)
+                srcs = {pid for path, k, pid in produced
+                        if k == kind and path == target and pid != consumer["id"]}
+                if len(srcs) == 1:
+                    bindings[field] = {"job_id": next(iter(srcs)), "kind": kind}
+                    changed = True
+                    restored.append({"job": consumer["id"], "field": field,
+                                     "kind": kind, "source": bindings[field]["job_id"]})
+            if changed:
+                self._exec("UPDATE jobs SET bindings=? WHERE id=?",
+                           (json.dumps(bindings), consumer["id"]))
+        return restored
+
     def _resolve_bindings(
         self, values: dict[str, Any], bindings: dict[str, dict[str, Any]] | None, workdir: Path
     ) -> dict[str, Any]:

@@ -76,12 +76,20 @@ export function buildLauncher() {
     content.appendChild(body);
     mount(body, h("p", { class: "muted", style: { padding: "12px" } }, "Loading…"));
 
-    Promise.all([api.program(name), api.gpus().catch(() => [])])
-      .then(([schema, gpus]) => buildForm(body, schema, gpus))
+    // When editing a job that had bound inputs, also fetch the project's jobs so the
+    // rehydrated binding chips can show the source run's name (the stored binding
+    // carries only its id + kind).
+    const pf = getState().prefill;
+    const wantNames = pf && pf.program === name && pf.bindings && Object.keys(pf.bindings).length;
+    const jobsP = wantNames && getState().activeProjectId
+      ? api.projectJobs(getState().activeProjectId).catch(() => [])
+      : Promise.resolve([]);
+    Promise.all([api.program(name), api.gpus().catch(() => []), jobsP])
+      .then(([schema, gpus, projJobs]) => buildForm(body, schema, gpus, projJobs))
       .catch((err) => mount(body, errorBox(err)));
   }
 
-  function buildForm(body, schema, gpus) {
+  function buildForm(body, schema, gpus, projJobs = []) {
     clear(body);
     const values = initialValues(schema);
     const bindings = {};       // { field: { job_id, kind, label } } — inputs fed from a job
@@ -107,6 +115,17 @@ export function buildLauncher() {
       if (prefill.gpu) gpu = String(prefill.gpu);
       if (prefill.jobId) targetJobId = prefill.jobId;
       resume = !!prefill.resume;
+      // Re-hydrate inputs that were fed by another run, so editing keeps them *bound*
+      // rather than freezing that run's resolved output path into the args (which is
+      // what silently turned a wired input into a hardcoded one and dropped the edge).
+      // The literal value is cleared so the disabled input stays empty and the binding,
+      // not the stale path, is what gets submitted.
+      const nameById = new Map((projJobs || []).map((j) => [j.id, j.name || j.program]));
+      for (const [field, b] of Object.entries(prefill.bindings || {})) {
+        if (!b || !b.job_id) continue;
+        bindings[field] = { job_id: b.job_id, kind: b.kind, label: nameById.get(b.job_id) || b.job_id };
+        delete values[field];
+      }
       store.clearPrefill();
     }
 

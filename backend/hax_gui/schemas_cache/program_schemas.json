@@ -365,7 +365,7 @@
           ],
           "flag": "--lattice_stride",
           "required": false,
-          "help": "Sub-sample the fixed-point lattice by this factor along each axis, keeping 1 / lattice_stride^3 of the sample points. The fixed-point decoder places one point per masked voxel, so the point count grows with the CUBE of the box: a 600 px box is ~13x the points of a 256 px one, and every per-particle tensor in the decode and render chain scales with it. This is the knob that makes a large box affordable (--lattice_stride 2 is an 8x reduction).\nThis trades resolution for memory: the sample spacing bounds the finest density CHANGE the decoder can express, to roughly 2 x lattice_stride x sampling_rate Angstrom. The consensus map is not affected -- it is carried by the reference amplitudes at full box sampling -- so this limits the heterogeneity, not the map you started from. The render width is widened to match the spacing so the splats still tile the volume. Ignored when the points come from a Gaussian fit (see --num_gaussians), which sets the point count directly.",
+          "help": "Sub-sample the fixed-point lattice by this factor along each axis, keeping 1 / lattice_stride^3 of the sample points. The fixed-point decoder places one point per masked voxel, so the point count grows with the CUBE of the box: a 600 px box is ~13x the points of a 256 px one, and every per-particle tensor in the decode and render chain scales with it. This is the knob that makes a large box affordable (--lattice_stride 2 is an 8x reduction).\nThis trades resolution for memory: the sample spacing bounds the finest density CHANGE the decoder can express, to roughly 2 x lattice_stride x sampling_rate Angstrom. The consensus map is not affected -- it is carried by the reference amplitudes at full box sampling -- so this limits the heterogeneity, not the map you started from. The render width grows with HALF the spacing, which is what tiling costs; strides 1 and 2 therefore render exactly as before. Ignored when the points come from a Gaussian fit (see --num_gaussians), which sets the point count directly.",
           "default": 1,
           "type": "integer"
         },
@@ -576,6 +576,22 @@
           "help": "When set, HetSIREN will use an implicit neural network approach to recover conformational states. Implicit neural networks are more memory consuming, but they are also more accurate in the detection of very local motions. If this architecture is selected, we strongly recommend to set as well the parameter total_mass to limit the memory consumption of the network and increase its performance.",
           "default": false,
           "type": "boolean"
+        },
+        {
+          "name": "encoder_arch",
+          "flags": [
+            "--encoder_arch"
+          ],
+          "flag": "--encoder_arch",
+          "required": false,
+          "help": "Encoder that maps each image to its latent (set by default to convnn).\nconvnn / mlpnn both begin with a single dense layer over the FLATTENED image, Linear(box^2, ...), whose parameter count grows with the SQUARE of the box: at 320 px that one layer is ~105M parameters per encoder (~4.8 GiB once the two encoders, Adam and the EMA copy are counted), independent of batch size. This is what makes a large box run out of memory during training even when the batch is small.\nconvstem replaces that dense projection with a stack of strided convolutions that downsample the image to the same internal grid. Its parameter count is independent of the box (a few thousand), so training a 320 px box costs about what a 160 px box costs with convnn -- and it is translation-equivariant, which the dense projection is not. Recommended for large boxes on limited VRAM. NOTE: the three encoders are different architectures, so a checkpoint trained with one cannot be reloaded with another.",
+          "default": "convnn",
+          "type": "enum",
+          "choices": [
+            "convnn",
+            "convstem",
+            "mlpnn"
+          ]
         },
         {
           "name": "pose_refine_reg",
@@ -3517,9 +3533,11 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "How many images are read and inserted at once (set by default to 1024). The images are read on a thread pool while the GPU accumulates, so peak RAM tracks this value rather than the number of particles - lower it if you run out of memory, raise it to read fewer, larger chunks.",
-          "default": 1024,
-          "type": "integer"
+          "help": "How many images are read and inserted at once. The images are read on a thread pool while the GPU accumulates, so peak RAM tracks this value rather than the number of particles.\nLeft at auto (the default) the largest memory-safe batch is measured for your box and GPU before the pass starts - the measurement only compiles the kernel, so it allocates nothing and cannot itself run you out of memory. This matters because the cost per particle grows with the square of the box: a batch that is comfortable at 128 px needs ~7x the memory at 320 px. Pass an integer to pin it instead.",
+          "default": "auto",
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
         },
         {
           "name": "threads",

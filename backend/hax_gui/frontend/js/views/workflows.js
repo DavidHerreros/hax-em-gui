@@ -142,9 +142,23 @@ export function WorkflowsView() {
       { label: "Open project as workflow", icon: icon("box", 15), onClick: openProject },
     ];
     if (!(wf && wf.project_id)) items.push({ label: "Save as project", icon: icon("save", 15), onClick: saveAsProject });
+    if (wf && wf.project_id) items.push({ label: "Reconnect step inputs", icon: icon("link", 15), onClick: relinkInputs });
     if (wf) items.push({ label: "Duplicate to project…", icon: icon("copy", 15), onClick: duplicateToProject });
     if (wf) items.push({ label: "Delete workflow", icon: icon("trash", 15), danger: true, onClick: removeWorkflow });
     return items;
+  }
+
+  // Repair links dropped by an edit-and-rerun: the backend re-derives a step's input
+  // bindings from the literal paths its args froze in, then we reload so the recovered
+  // edges show. Only reconnects unambiguous matches; a hand-typed path is left alone.
+  async function relinkInputs() {
+    if (!(wf && wf.project_id)) { flash("Open a project workflow first.", "warn"); return; }
+    flash("Reconnecting step inputs…", "busy");
+    try {
+      const r = await api.relinkProject(wf.project_id);
+      if (r.count) { await openWorkflow(wf.id); flash(`Reconnected ${r.count} input${r.count === 1 ? "" : "s"}.`, "muted"); }
+      else flash("No inputs to reconnect — every wired input is already linked.", "muted");
+    } catch (err) { flash("Reconnect failed: " + (err.detail || err.message), "err"); }
   }
 
   // Clone this whole pipeline into another project (a fresh, standalone copy). Internal
@@ -482,18 +496,28 @@ export function WorkflowsView() {
   const jobIdOf = (id) => nodeById(id)?.job_id || (runState && runState[id] && runState[id].job_id) || null;
 
   // Remove every step in `ids` (and any edges touching them) at once, and delete
-  // the jobs those steps produced (DB record + output/log folder). Deleting the
-  // job is also what makes removal *stick* on a project canvas, whose nodes are
-  // reconciled back from the project's jobs on every load. Confirms first — this
-  // permanently discards outputs and can't be undone.
+  // the jobs those steps produced (DB record + output/log folder). Confirms first —
+  // this permanently discards outputs and can't be undone.
+  //
+  // The removal is saved for you: leaving it as an unsaved canvas edit meant a step
+  // whose job was already deleted came back the next time the page was opened.
+  // A step whose job *couldn't* be deleted (it is still running) is put back instead,
+  // so the canvas keeps matching what actually exists.
   async function removeNodes(ids) {
     const set = new Set((ids || []).filter(Boolean));
     if (!set.size) { flash("Select step(s) to remove.", "muted"); return; }
-    const jobIds = [...set].map(jobIdOf).filter(Boolean);
+    const withJob = [...set].map((id) => [id, jobIdOf(id)]).filter(([, jid]) => jid);
+    const jobIds = withJob.map(([, jid]) => jid);
     const n = set.size;
     let msg = n > 1 ? `Remove ${n} selected steps from the canvas?` : "Remove this step from the canvas?";
     if (jobIds.length) msg += `\n\nThis also permanently deletes ${jobIds.length} associated job${jobIds.length > 1 ? "s" : ""} — their output folders and logs — and cannot be undone.`;
     if ((n > 1 || jobIds.length) && !confirm(msg)) return;
+
+    // keep what we drop, so a step whose job survives can be restored below
+    const cutNodes = graph.nodes.filter((nd) => set.has(nd.id));
+    const cutEdges = graph.edges.filter((e) => set.has(e.from) || set.has(e.to));
+    const cutState = {};
+    for (const id of set) if (runState && runState[id]) cutState[id] = runState[id];
 
     // drop the boxes + their wiring from the canvas
     graph.nodes = graph.nodes.filter((nd) => !set.has(nd.id));
@@ -502,14 +526,31 @@ export function WorkflowsView() {
     if (set.has(selected)) selected = selectedSet.size ? [...selectedSet][0] : null;
     dirty = true; renderNodes(); renderInspector();
 
-    if (!jobIds.length) { flash(n === 1 ? "Step removed — Save to persist." : `${n} steps removed — Save to persist.`, "muted"); return; }
     // delete the backing jobs (best-effort: an active job can't be deleted, so it
     // is reported rather than silently skipped)
-    const results = await Promise.allSettled(jobIds.map((jid) => api.deleteJob(jid)));
-    const failed = results.filter((r) => r.status === "rejected").length;
-    const okJobs = jobIds.length - failed;
-    if (failed) flash(`Removed ${n === 1 ? "step" : n + " steps"}; deleted ${okJobs} job(s), but ${failed} could not be deleted (still running? cancel them first).`, "warn");
-    else flash(`Removed ${n === 1 ? "step" : n + " steps"} and deleted ${okJobs} job(s).`, "muted");
+    let failed = 0;
+    if (jobIds.length) {
+      const results = await Promise.allSettled(withJob.map(([, jid]) => api.deleteJob(jid)));
+      const kept = new Set(withJob.filter((_, i) => results[i].status === "rejected").map(([id]) => id));
+      failed = kept.size;
+      if (kept.size) {                       // put the un-deletable steps back
+        for (const nd of cutNodes) if (kept.has(nd.id)) graph.nodes.push(nd);
+        const present = new Set(graph.nodes.map((nd) => nd.id));
+        for (const e of cutEdges) {
+          if (present.has(e.from) && present.has(e.to) && !graph.edges.some((x) => x.id === e.id)) graph.edges.push(e);
+        }
+        if (runState) for (const id of kept) if (cutState[id]) runState[id] = cutState[id];
+        renderNodes(); renderInspector();
+      }
+    }
+
+    const removed = n - failed;
+    if (wf && removed) await save();          // make the removal outlive this page visit
+    const noun = removed === 1 ? "step" : "steps";
+    if (!removed) flash(`Nothing removed — ${failed === 1 ? "that step's job is" : "those steps' jobs are"} still running (cancel first).`, "warn");
+    else if (failed) flash(`Removed ${removed} ${noun}; ${failed} could not be removed — their job is still running (cancel it first).`, "warn");
+    else if (jobIds.length) flash(`Removed ${removed} ${noun} and deleted ${jobIds.length - failed} job(s).`, "muted");
+    else flash(wf ? `Removed ${removed} ${noun}.` : `Removed ${removed} ${noun} — Save to persist.`, "muted");
   }
 
   // Duplicate node(s) as fresh, un-run steps: copy program/args/gpu/name/labels at

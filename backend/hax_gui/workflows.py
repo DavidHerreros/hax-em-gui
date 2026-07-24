@@ -372,12 +372,80 @@ class WorkflowManager:
         wf = self.save(project_id, name or "Project workflow", graph, kind="project")
         return self.seed_state(wf["id"], state)
 
+    def forget_job(self, job_id: str) -> None:
+        """Drop every reference to a job that has just been deleted, from all workflows.
+
+        Called by the delete-job endpoint. Without it, removing a step from the canvas
+        only *looked* permanent: the job went, but the node stayed in the stored graph
+        and came back on the next visit — the full reconcile that would have dropped it
+        never runs for a standalone workflow, and is skipped while a run is live.
+        """
+        for wf in self.list():
+            self._prune_deleted_jobs(wf["id"], {job_id})
+
+    def _prune_deleted_jobs(self, wid: str, only: set[str] | None = None) -> bool:
+        """Forget nodes/run_state entries pointing at jobs that no longer exist.
+
+        Runs for *every* workflow on load, including standalone ones and while a run is
+        in progress — unlike :meth:`_synced_graph` it only ever removes, never re-derives
+        the graph from the jobs, so it is safe on a live run (the scheduler re-reads the
+        graph each tick and ``_sync_state`` follows) and on a parked resumable one (steps
+        that never launched have no job id and are left alone).
+
+        A *project* canvas is a view of its jobs, so a node whose job is gone goes with
+        it. A *standalone* workflow's node is a step definition that outlives any one
+        run, so it is kept and only its dangling run link is cleared. ``only`` limits the
+        purge to specific job ids (used when a single job is deleted); by default any
+        dangling reference is cleaned. Returns True if anything changed.
+        """
+        wf = self.get(wid)
+        if wf is None:
+            return False
+        graph = wf["graph"] or {"nodes": [], "edges": []}
+        state = dict(wf.get("run_state") or {})
+        nodes = graph.get("nodes", [])
+
+        def gone(jid: str | None) -> bool:
+            if not jid or (only is not None and jid not in only):
+                return False
+            return jobs.get(jid) is None
+
+        is_project = wf.get("kind") == "project"
+        drop = {n["id"] for n in nodes if is_project and gone(n.get("job_id"))}
+        if drop:
+            graph["nodes"] = [n for n in nodes if n["id"] not in drop]
+            graph["edges"] = [e for e in graph.get("edges", [])
+                              if e.get("from") not in drop and e.get("to") not in drop]
+        # Stale links on the nodes that stay: a standalone node keeps its place but goes
+        # back to un-run, so it does not advertise a status for a job that is gone.
+        cleared = False
+        for nid in list(state):
+            if nid in drop:
+                del state[nid]; cleared = True
+            elif gone(state[nid].get("job_id")):
+                state[nid] = {"job_id": None, "status": "idle", "error": None}; cleared = True
+        for n in graph.get("nodes", []):
+            if gone(n.get("job_id")):
+                n.pop("job_id", None); cleared = True
+        if not (drop or cleared):
+            return False
+        self._db.execute(
+            "UPDATE workflows SET graph=?, run_state=?, updated_at=? WHERE id=?",
+            (json.dumps(graph), json.dumps(state), _now(), wid),
+        )
+        self._db.commit()
+        return True
+
     def reconcile(self, wid: str) -> dict[str, Any] | None:
         """Refresh a *project* workflow from its jobs' current statuses, so the
         canvas is a true live view (a job that finished/cancelled outside a
         workflow run no longer shows a stale node status, and downstream nodes
         un-block once their inputs actually succeed). No-op for standalone
         workflows and while a run is in progress."""
+        # Dropping deleted jobs is *not* part of that no-op: it has to happen on every
+        # load, or a step removed from a standalone canvas — or from a project canvas
+        # while a run is live — reappears the next time the page is opened.
+        self._prune_deleted_jobs(wid)
         wf = self.get(wid)
         if wf is None:
             return None

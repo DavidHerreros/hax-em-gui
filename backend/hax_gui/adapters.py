@@ -374,6 +374,29 @@ def source_file_for(kind: str, job: dict[str, Any]) -> Path | None:
     return _find_artifact(Path(workdir), spec, program)
 
 
+def reference_path(kind: str, source_job: dict[str, Any]) -> str | None:
+    """The path a binding to `kind` from `source_job` resolves to **in place**.
+
+    Mirrors :func:`produce` for the styles that reference their source without copying
+    (particles/volumes/checkpoints), so a job's stored *literal* argument can be matched
+    back to the run that produced it -- which is how a binding lost to an edit-and-rerun
+    (the resolved path was frozen into the args, the binding dropped) is recovered.
+
+    None for kinds materialised by copying into the *consumer's* own folder (latents):
+    their stored path points inside the consumer, not the producer, so value-matching
+    cannot identify the source. None too if the source hasn't produced the artifact.
+    """
+    spec = _match_producer(kind, source_job.get("program", ""))
+    if spec is None or spec["style"] not in ("path", "unique_glob", "dir"):
+        return None
+    src = source_file_for(kind, source_job)
+    if src is None:
+        return None
+    if spec["style"] == "dir":
+        return str(src.parent if spec.get("form") == "parent" else src)
+    return str(src)
+
+
 def checkpoint_dir(program: str, reload_path: str) -> Path:
     """Resolve a directly-loadable checkpoint dir from a job's reload/pickled_nn
     value, which may already be the checkpoint or the run folder that holds it.
