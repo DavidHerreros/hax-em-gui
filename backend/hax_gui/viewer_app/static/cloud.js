@@ -561,7 +561,7 @@ export function createCloud(canvas, onSelect) {
     onRender(cb) { onRenderCb = cb; },   // called after every render (overlay re-syncs to the camera)
     orbitRotate(dx, dy) { orbit.drag(dx, dy); },   // rotate the camera from an external drag (overlay edit mode)
     orbitPan(dx, dy) { orbit.pan(dx, dy); },       // pan the camera from an external drag (overlay / middle-mouse)
-    orbitZoom(deltaY) { orbit.zoom(deltaY); },     // wheel-zoom forwarded from the overlay
+    orbitZoom(e) { orbit.wheel(e); },              // wheel-zoom forwarded from the overlay
     resetView() { orbit.reset(); },
     render,
     get selected() { return selected; },

@@ -1867,7 +1867,7 @@ function setupLasso() {
   // active landscape so the wheel zooms even mid-lasso / mid-edit.
   lc.addEventListener("wheel", (e) => {
     e.preventDefault();
-    if (is3d() && cloud) cloud.orbitZoom(e.deltaY);
+    if (is3d() && cloud) cloud.orbitZoom(e);
     else scatter.zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * 0.0015));
   }, { passive: false });
   lc.addEventListener("pointerdown", (e) => {

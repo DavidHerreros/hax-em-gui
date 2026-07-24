@@ -35,6 +35,25 @@ import { identity, axisAngle, multiply, mulVec4, fitDistance, viewWidth } from "
 // logical pixels — device-independent, like CSS pixels — so the number carries over as is.
 const RAD_PER_PX = (0.5 * Math.PI) / 180;
 
+// One wheel notch, in each of the three units a DOM wheel event can report deltas in
+// (pixel, line, page — deltaMode 0, 1, 2). Reading deltaY without consulting deltaMode is
+// why the zoom used to run at wildly different speeds per browser: the notch Chrome reports
+// as 100 pixels, Firefox on Windows and Linux reports as 3 lines. Trackpads emit small
+// continuous pixel deltas, which arrive here as fractions of a notch and accumulate
+// smoothly — which is the behaviour you want from them anyway.
+const WHEEL_NOTCH = [100, 3, 1];
+// ZoomMouseMode.speed, which ChimeraX multiplies into the wheel step and exposes as
+// `mousemode setting zoom speed <n>`. Stock ChimeraX ships 1.0; 1.75 is the one place this
+// viewer deliberately runs faster than it, because at 1.0 the wheel felt sluggish here. It
+// also lands within a few percent of the step this viewer had before the wheel was fixed
+// (10.2% vs 10.5% of the distance per notch on a 900px-wide window), so it should feel like
+// the zoom you are used to rather than a new one. Turn it down to 1 for stock behaviour.
+const ZOOM_SPEED = 1.75;
+// DOM deltaY grows downwards, towards the user. Qt's angleDelta — which ChimeraX divides by
+// 120 to get the click count — grows the other way, hence the sign. Positive clicks are a
+// scroll away from you, which zooms in.
+const wheelClicks = (e) => -e.deltaY / (WHEEL_NOTCH[e.deltaMode] || WHEEL_NOTCH[0]);
+
 export function createOrbit(canvas, onChange, onClick, opts = {}) {
   // Radius of the sphere the camera frames on open (and on reset) — see fitDistance().
   // The eye distance is no longer a constant: the field is pinned horizontally
@@ -182,11 +201,31 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
     // width of the window. So whatever sits at the pivot tracks the cursor, and pixels stay
     // square because the horizontal field is the pinned one.
     const wpp = viewWidth(Math.max(minDist, eyeRange(pivot))) / Math.max(1, canvas.clientWidth);
-    offset = [offset[0] + dxCss * wpp, offset[1] - dyCss * wpp, offset[2]];   // screen y-down -> world y-up
+    const dx = dxCss * wpp, dy = -dyCss * wpp;                                // screen y-down -> world y-up
+    offset = [offset[0] + dx, offset[1] + dy, offset[2]];
+    // The pivot rides along with the model. ChimeraX's centre of rotation is a point in the
+    // *scene*, and a pan moves its camera, not its models — so the pivot stays glued to the
+    // geometry while the view slides past. Here it is the model that moves, so staying glued
+    // means moving with it. Leaving it behind is not visible in the pan itself, but the pivot
+    // survives the gesture as a stale value that the wheel then measures its step against.
+    pivot = [pivot[0] + dx, pivot[1] + dy, pivot[2]];
     pivotStale = true;   // a translation changed what sits at the centre of the window
   }
-  function zoomBy(deltaY) {
-    dist = clampDist(eyeDist() * Math.exp(deltaY * 0.001));
+  // ChimeraX's ZoomMouseMode.wheel: the camera steps `100 · clicks · pixel_size · speed`
+  // along the view axis. pixel_size grows with the distance to the centre of rotation, so the
+  // step is a fixed *fraction* of that distance — 100·radians(30)/width of it per click,
+  // which makes the zoom slower on a wider window. That is ChimeraX's, odd as it looks, not
+  // a slip here; only ZOOM_SPEED departs from stock.
+  //
+  // The pivot is read raw, without refreshing a stale one, because View.pixel_size goes out
+  // of its way to do the same ("Don't recompute center of rotation as that can be slow").
+  // It gives the gesture a nice property worth keeping: zoomed in on a surface, each notch
+  // covers a fraction of the remaining gap, so the wheel alone eases up to the surface
+  // instead of punching through it.
+  function zoomBy(clicks) {
+    const step = (100 * clicks * ZOOM_SPEED * viewWidth(Math.max(minDist, eyeRange(pivot)))) /
+      Math.max(1, canvas.clientWidth);
+    dist = clampDist(eyeDist() - step);   // camera forward on a positive click
     pivotStale = true;
   }
 
@@ -235,7 +274,7 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
   canvas.addEventListener("auxclick", (e) => { if (e.button === 1) e.preventDefault(); });
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
-    zoomBy(e.deltaY);
+    zoomBy(wheelClicks(e));
     onChange();
   }, { passive: false });
 
@@ -258,7 +297,9 @@ export function createOrbit(canvas, onChange, onClick, opts = {}) {
     },
     drag(dx, dy) { rotateBy(dx, dy); onChange(); },   // externally driven rotation (e.g. an overlay)
     pan(dx, dy) { panBy(dx, dy); onChange(); },       // externally driven pan (CSS px)
-    zoom(deltaY) { zoomBy(deltaY); onChange(); },
+    // Takes the wheel event, not its deltaY: the unit that delta is in travels with the
+    // event, and normalising it is this module's job, not every forwarder's.
+    wheel(e) { zoomBy(wheelClicks(e)); onChange(); },
     invalidatePivot() { pivotStale = true; },         // the geometry changed under the camera
     // null, not a stored constant: re-fit to whatever shape the window is now — this is
     // ChimeraX's `view`, which reframes the model rather than restoring an old distance.
