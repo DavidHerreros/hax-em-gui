@@ -9,6 +9,7 @@
 import { h, clear, mount } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
+import { navigate } from "../router.js";
 import { store, getState } from "../store.js";
 import { errorBox } from "./ui.js";
 import { visibleFields } from "./formFields.js";
@@ -21,6 +22,31 @@ import { loadProgramGroups, isModed } from "../programGroups.js";
 import { layeredLayout } from "./wfLayout.js";
 
 const LAST_WF_KEY = "hax_gui_last_workflow";   // reopen this workflow on next visit
+const ORIENT_KEY = "hax_gui_wf_orientation";   // the orientation last chosen by the user
+
+// A workflow stores its own orientation, so this is only the default for a canvas that
+// carries none: a brand-new one, or a graph imported from elsewhere.
+function rememberedOrientation() {
+  try { return localStorage.getItem(ORIENT_KEY) === "vertical" ? "vertical" : "horizontal"; }
+  catch { return "horizontal"; }
+}
+function rememberOrientation(v) {
+  try { localStorage.setItem(ORIENT_KEY, v); } catch { /* storage unavailable — non-fatal */ }
+}
+
+const FOCUS_KEY = "hax_gui_wf_focus";          // focus mode on? (a view preference, off by default)
+function rememberedFocus() {
+  try { return localStorage.getItem(FOCUS_KEY) === "1"; } catch { return false; }
+}
+function rememberFocus(on) {
+  try { localStorage.setItem(FOCUS_KEY, on ? "1" : "0"); } catch { /* storage unavailable — non-fatal */ }
+}
+
+// Where the canvas was left, per workflow id ("" = the unsaved canvas): {sl, st, zoom}.
+// Module scope, not view scope — the router builds a fresh view on every visit, so
+// anything held on the instance dies with it. Deliberately in memory only: it is
+// ephemeral view state, so a full page reload starts centred again.
+const VIEWPORTS = new Map();
 
 // Point the *next* visit to this page at `id`. Used by callers that create a
 // workflow elsewhere (the getting-started recipe) and then navigate here: the view
@@ -80,7 +106,7 @@ function roundRectPath(ctx, x, y, w, h, r) {
 export function WorkflowsView() {
   let catalog = [];
   let byName = {};
-  let graph = { nodes: [], edges: [], orientation: "horizontal" };
+  let graph = { nodes: [], edges: [], orientation: rememberedOrientation() };
   let wf = null;            // saved workflow record
   let selected = null;      // primary selected node id (drives the inspector)
   const selectedSet = new Set();   // multi-selection (run / move together)
@@ -90,6 +116,7 @@ export function WorkflowsView() {
   const schemaCache = {};
   let drag = null;          // active node drag / wiring / pan gesture
   let nodeSeq = 1, edgeSeq = 1;
+  let focusMode = rememberedFocus();   // dim everything not wired to the selection?
   let minimapOn = true;     // overview window visible?
   let mmCollapsed = false;  // overview shrunk to its title pill?
   let mmXform = null;       // last minimap transform (for click-to-navigate)
@@ -186,6 +213,7 @@ export function WorkflowsView() {
       { label: horiz() ? "Switch to vertical" : "Switch to horizontal", icon: icon(horiz() ? "chevronRight" : "arrowRight", 15), onClick: toggleOrientation },
       { label: "Center in view", icon: icon("orbit", 15), onClick: centerView },
       { label: minimapOn ? "Hide overview map" : "Show overview map", icon: icon("grid", 15), onClick: toggleMinimap },
+      { label: focusMode ? "Focus mode: on" : "Focus mode: off", icon: icon(focusMode ? "eye" : "eyeOff", 15), onClick: toggleFocusMode },
       { label: "Pin this layout", icon: icon("bookmark", 15), onClick: saveLayout },
     ];
     if (graph.savedLayout && graph.savedLayout.pos) {
@@ -302,6 +330,7 @@ export function WorkflowsView() {
     canvas.scrollLeft = cx * zoom - mx;
     canvas.scrollTop = cy * zoom - my;
     drawMinimap();
+    rememberViewport();   // a zoom at the scroll extremes moves no scrollbar, so record it here too
   }
   function resetZoom() { zoomTo(1, canvas.clientWidth / 2, canvas.clientHeight / 2); }
   applyZoom();
@@ -377,7 +406,19 @@ export function WorkflowsView() {
       window.addEventListener("pointerup", onUp);
     }
   });
-  canvas.addEventListener("scroll", drawMinimap);
+  canvas.addEventListener("scroll", () => { drawMinimap(); rememberViewport(); });
+  // Double-click a step -> open the job it ran. Delegated to the canvas and resolved by
+  // hit-testing rather than bound per node: pressing a node re-renders the nodes layer,
+  // so the two clicks land on different elements and the dblclick is dispatched to
+  // their common ancestor (this canvas), never to the node itself.
+  canvas.addEventListener("dblclick", (e) => {
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    if (under && under.closest(".wf-node-x, .wf-node-run, .wf-port")) return;   // own gestures
+    const id = elementNodeAt(e.clientX, e.clientY);
+    if (!id) return;
+    e.preventDefault();               // suppress the double-click text selection
+    openJobFor(id);
+  });
   // The panel is sized in CSS (and shrinks with the canvas on narrow screens), so the
   // backing store has to follow it rather than be set once.
   if (window.ResizeObserver) new ResizeObserver(() => drawMinimap()).observe(mmCanvas);
@@ -494,6 +535,17 @@ export function WorkflowsView() {
   // The job backing a node, if any: project-canvas nodes carry `job_id`; a
   // standalone workflow that has run maps its nodes to jobs via runState.
   const jobIdOf = (id) => nodeById(id)?.job_id || (runState && runState[id] && runState[id].job_id) || null;
+
+  // Double-clicking a step opens the job page for the job it ran — live stdout/stderr,
+  // progress, outputs. A step that has never run has no job to open yet. The canvas is
+  // saved on the way out: leaving the view discards unsaved edits, and the job page is
+  // a navigation away, not a panel.
+  async function openJobFor(id) {
+    const jid = jobIdOf(id);
+    if (!jid) { flash("That step hasn't run yet — no job to open.", "warn"); return; }
+    if (dirty && wf) await save();
+    navigate("/jobs/" + jid);
+  }
 
   // Remove every step in `ids` (and any edges touching them) at once, and delete
   // the jobs those steps produced (DB record + output/log folder). Confirms first —
@@ -690,11 +742,40 @@ export function WorkflowsView() {
   function selectOnly(id) { selectedSet.clear(); if (id) selectedSet.add(id); selected = id; }
   function toggleSel(id) { if (selectedSet.has(id)) selectedSet.delete(id); else selectedSet.add(id); selected = selectedSet.has(id) ? id : ([...selectedSet][0] || null); }
 
+  // ── focus mode ──
+  // What the selection is wired to: the selected steps, everything one hop up- or
+  // downstream, and the edges between them. Null when focus mode is off or nothing is
+  // selected — i.e. nothing to pick out, so the canvas renders normally.
+  function focusSets() {
+    if (!focusMode || !selectedSet.size) return null;
+    const nodes = new Set(selectedSet), edges = new Set();
+    for (const e of graph.edges) {
+      if (!selectedSet.has(e.from) && !selectedSet.has(e.to)) continue;
+      edges.add(e.id); nodes.add(e.from); nodes.add(e.to);
+    }
+    return { nodes, edges };
+  }
+  function toggleFocusMode() {
+    focusMode = !focusMode;
+    rememberFocus(focusMode);
+    renderNodes();
+    flash(focusMode
+      ? "Focus mode on — selecting a step dims everything it isn't wired to."
+      : "Focus mode off.", "muted");
+  }
+
   // ── rendering ──
   function renderNodes() {
     clear(nodesLayer);
-    for (const n of graph.nodes) nodesLayer.appendChild(nodeEl(n));
-    redrawWires();
+    const focus = focusSets();
+    for (const n of graph.nodes) {
+      const el = nodeEl(n);
+      // three tiers: the selection (already ringed by .sel/.primary), the steps it is
+      // wired to, and everything else.
+      if (focus) el.classList.add(!focus.nodes.has(n.id) ? "dim" : (selectedSet.has(n.id) ? "focused" : "near"));
+      nodesLayer.appendChild(el);
+    }
+    redrawWires(null, focus);
     drawMinimap();
     syncActions();   // the action cluster follows the selection and the run state
   }
@@ -714,6 +795,8 @@ export function WorkflowsView() {
     });
     el.dataset.node = n.id;
     if (st) el.style.borderColor = STATUS_COLOR[st] || "var(--border)";
+    // the dblclick that opens this step's job is delegated to the canvas
+    if (jobIdOf(n.id)) el.title = "Double-click to open this step's job (log, outputs)";
     // header (drag handle + select + run + remove)
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
@@ -749,7 +832,9 @@ export function WorkflowsView() {
     return el;
   }
 
-  function wirePath(p1, p2, edge, temp = false) {
+  // `fs` is the focus state of this wire: "hot" (wired to the selection), "dim" (not),
+  // or null (focus mode idle).
+  function wirePath(p1, p2, edge, temp = false, fs = null) {
     let d;
     if (horiz()) {
       const dx = Math.max(40, Math.abs(p2.x - p1.x) * 0.5);
@@ -759,11 +844,21 @@ export function WorkflowsView() {
       d = `M ${p1.x} ${p1.y} C ${p1.x} ${p1.y + dy}, ${p2.x} ${p2.y - dy}, ${p2.x} ${p2.y}`;
     }
     const st = edge && runState && runState[edge.from] ? runState[edge.from].status : null;
+    const color = temp ? "var(--accent)" : statusColor(st);
     const path = svgEl("path", {
-      d, fill: "none", "stroke-width": temp ? 2 : 2.5,
-      stroke: temp ? "var(--accent)" : statusColor(st),
+      d, fill: "none", "stroke-width": temp ? 2 : (fs === "hot" ? 4 : 2.5),
+      stroke: color,
       "stroke-dasharray": temp ? "5 4" : "",
+      // A focused wire keeps its status color and thickens; the rest fade back far
+      // enough to read as background without disappearing.
+      "stroke-opacity": fs === "dim" ? 0.15 : 1,
     });
+    if (fs === "hot") {
+      // the glow is drawn in the wire's own status color: `currentColor` in the
+      // stylesheet resolves against this, which the stroke attribute can't provide
+      path.setAttribute("class", "wf-wire-hot");
+      path.style.color = color;
+    }
     if (edge && !temp) {
       path.style.cursor = "pointer"; path.style.pointerEvents = "stroke";
       path.addEventListener("click", () => { if (confirm("Remove this connection?")) removeEdge(edge.id); });
@@ -771,14 +866,20 @@ export function WorkflowsView() {
     return path;
   }
 
-  function redrawWires(tempTo) {
+  function redrawWires(tempTo, focus = focusSets()) {
     clear(svg);
-    for (const e of graph.edges) {
+    // With focus on, draw the dimmed wires first so the focused ones sit on top of them
+    // (SVG has no z-index — paint order is document order).
+    const edges = focus
+      ? [...graph.edges].sort((a, b) => (focus.edges.has(a.id) ? 1 : 0) - (focus.edges.has(b.id) ? 1 : 0))
+      : graph.edges;
+    for (const e of edges) {
       const s = nodeById(e.from), d = nodeById(e.to);
       if (!s || !d) continue;
       const ins = inputsOf(d.program);
       const idx = Math.max(0, ins.findIndex(([f]) => f === e.field));
-      svg.appendChild(wirePath(outPort(s), inPort(d, idx, ins.length), e));
+      svg.appendChild(wirePath(outPort(s), inPort(d, idx, ins.length), e, false,
+        focus ? (focus.edges.has(e.id) ? "hot" : "dim") : null));
     }
     if (drag && drag.kind === "wire" && tempTo) svg.appendChild(wirePath(outPort(nodeById(drag.from)), tempTo, null, true));
   }
@@ -926,7 +1027,7 @@ export function WorkflowsView() {
     const n = selected && nodeById(selected);
     if (!n) {
       inspBody.appendChild(h("div", { class: "wf-insp-empty muted" },
-        "Select a step to edit its parameters. Wire a step's output port into another step's input port to pass data. Shift-click to multi-select."));
+        "Select a step to edit its parameters. Wire a step's output port into another step's input port to pass data. Shift-click to multi-select. Double-click a step that has run to open its job log."));
       return;
     }
     inspBody.appendChild(h("div", { class: "wf-insp-head" }, h("strong", null, n.program)));
@@ -992,9 +1093,18 @@ export function WorkflowsView() {
   }
 
   // ── layout ──
-  function toggleOrientation() {
+  // The orientation belongs to the graph, so it only outlives this page visit if it is
+  // written back — leaving the view and returning reloads the workflow from the server.
+  // Save it right away rather than waiting for an explicit Save: the toggle re-lays out
+  // every node anyway, and an unsaved canvas loses its edits on navigation regardless,
+  // so saving here only ever preserves work. The choice is also remembered locally, to
+  // seed canvases that have no orientation of their own (including unsaved ones, which
+  // have no record to save into).
+  async function toggleOrientation() {
     graph.orientation = horiz() ? "vertical" : "horizontal";
+    rememberOrientation(graph.orientation);
     autoLayout(); dirty = true;
+    if (wf) await save();
   }
 
   // Arrange nodes into dependency tiers, one independent subworkflow at a time, with
@@ -1037,6 +1147,25 @@ export function WorkflowsView() {
     }
     return { x0, y0, x1, y1, cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0 };
   }
+  // ── viewport memory (pan + zoom, across visits to this page) ──
+  // Recorded continuously while the canvas is scrolled/zoomed, and once more on the way
+  // out, so returning to the page resumes the exact view instead of re-centring.
+  function rememberViewport() {
+    if (!canvas.clientWidth) return;              // not laid out yet — nothing to record
+    VIEWPORTS.set(wf ? wf.id : "", { sl: canvas.scrollLeft, st: canvas.scrollTop, zoom });
+  }
+  // Restore the view remembered for `id`; false if there is none (caller centres instead).
+  // Zoom is applied first: it resizes the scroll content, which is what the scroll
+  // offsets are clamped against.
+  function restoreViewport(id) {
+    const v = VIEWPORTS.get(id || "");
+    if (!v || !canvas.clientWidth) return false;
+    zoom = v.zoom; applyZoom();
+    canvas.scrollLeft = v.sl; canvas.scrollTop = v.st;
+    drawMinimap();
+    return true;
+  }
+
   // Scroll so the graph's bounding box sits in the middle of the viewport (the
   // content is scaled by `zoom`, so content coords map to scroll via *zoom).
   function centerView() {
@@ -1336,7 +1465,7 @@ export function WorkflowsView() {
 
   // Adopt a server graph into local state (keeping the id counters ahead).
   function adoptGraph(g) {
-    graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || graph.orientation || "horizontal", savedLayout: g.savedLayout || null };
+    graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || graph.orientation || rememberedOrientation(), savedLayout: g.savedLayout || null };
     nodeSeq = Math.max(1, ...graph.nodes.map((n) => +(n.id.replace(/\D/g, "")) || 0)) + 1;
     edgeSeq = Math.max(1, ...graph.edges.map((e) => +((e.id || "").replace(/\D/g, "")) || 0)) + 1;
   }
@@ -1368,11 +1497,15 @@ export function WorkflowsView() {
 
   async function openWorkflow(id) {
     stopPolling();
+    // Park the outgoing workflow's view before `wf` changes. Skipped for an empty
+    // canvas, so the first open of a freshly built view doesn't record its 0,0 start.
+    if (graph.nodes.length) rememberViewport();
     selectedSet.clear();
     if (!id) {
-      wf = null; graph = { nodes: [], edges: [], orientation: "horizontal" }; runState = null; selected = null; nameInput.value = "";
+      wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; nameInput.value = "";
       wfSelect.value = ""; rememberWorkflow(null);
-      renderNodes(); renderInspector(); syncActions(); flash("New workflow.", "muted"); return;
+      renderNodes(); restoreViewport("");
+      renderInspector(); syncActions(); flash("New workflow.", "muted"); return;
     }
     try {
       wf = await api.workflow(id);
@@ -1381,7 +1514,7 @@ export function WorkflowsView() {
       rememberWorkflow(wf.id);
       // freshly imported / never-laid-out graphs have all-zero coords — tidy once
       if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
-      else { renderNodes(); centerView(); }
+      else { renderNodes(); if (!restoreViewport(wf.id)) centerView(); }
       renderInspector();
       syncActions();          // the run controls and the per-device cap follow the workflow
       flash(wf.status && wf.status !== "idle" ? `${wf.status} — ${countStatuses()}` : "Loaded.", "muted");
@@ -1400,7 +1533,7 @@ export function WorkflowsView() {
   async function removeWorkflow() {
     if (!wf) return openWorkflow(null);
     if (!confirm(`Delete workflow "${wf.name}"?`)) return;
-    try { await api.deleteWorkflow(wf.id); await refreshList(); openWorkflow(null); }
+    try { const id = wf.id; await api.deleteWorkflow(id); VIEWPORTS.delete(id); await refreshList(); openWorkflow(null); }
     catch (err) { flash("Delete failed: " + (err.detail || err.message), "err"); }
   }
 
@@ -1420,5 +1553,7 @@ export function WorkflowsView() {
   document.addEventListener("keydown", onKey);
 
   boot();
-  return { el: root, cleanup: () => { stopPolling(); document.removeEventListener("keydown", onKey); } };
+  // cleanup runs before the view is detached, so the canvas is still laid out here and
+  // its final scroll/zoom can be recorded.
+  return { el: root, cleanup: () => { rememberViewport(); stopPolling(); document.removeEventListener("keydown", onKey); } };
 }

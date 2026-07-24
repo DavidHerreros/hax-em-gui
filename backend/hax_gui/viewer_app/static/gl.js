@@ -1,22 +1,90 @@
-// WebGL2 isosurface renderer with screen-space ambient occlusion (SSAO).
+// WebGL2 isosurface renderer, shaded as ChimeraX shades a map surface.
 //
-// Pipeline (when EXT_color_buffer_float is available):
-//   1. geometry prepass  -> offscreen MRT: view-space position + normal (RGBA16F)
-//   2. SSAO pass          -> hemisphere-kernel occlusion into an AO texture
-//   3. blur pass          -> 4x4 box blur to denoise the AO
-//   4. beauty pass        -> re-render the mesh to the default (MSAA) framebuffer
-//                            with Blinn-Phong key+fill+headlight + specular, the
-//                            blurred AO multiplied in, and depth cueing.
-// Re-rendering the geometry for the beauty pass keeps the default framebuffer's
-// multisampling, so silhouettes stay smooth (deferred shading would alias them).
-// Falls back to a single forward pass (derivative AO) when float targets are
-// unsupported. Hand-written, no dependencies.
-import { projection, lookAt } from "./mat4.js";
+// The lighting here is not "ChimeraX-like": it is a transcription of ChimeraX 1.8's
+// fragment shader (chimerax/graphics/fragmentShader.txt) driven by the constants its
+// `lighting` presets set (chimerax/std_commands/lighting.py) and its Material defaults
+// (chimerax/graphics/opengl.py, class Material). The three modes this viewer offers map
+// onto three ChimeraX presets:
+//
+//     standard  -> lighting simple   (the ChimeraX default: key + fill + ambient, no shadows)
+//     smooth    -> lighting soft     (no directional light at all; ambient occlusion only)
+//     ray traced-> lighting full     (key + fill + ambient, key casts a shadow, plus AO)
+//
+// The ambient occlusion in the latter two is ChimeraX's "multishadow": 64 real shadow maps
+// cast from uniformly distributed directions, tiled into one depth texture, and summed per
+// fragment with a cosine weight. It is not screen-space AO — this used to use SSAO, and the
+// difference is not subtle, because SSAO can only see occluders that are on screen and
+// within a small radius, so it draws thin creases where ChimeraX draws a whole domain
+// shadowing its neighbour.
+//
+// Pipeline:
+//   1. multishadow atlas  -> 8x8 tiles of 128x128 depth, in MODEL space (see below), rebuilt
+//                            only when the geometry changes. Skipped in `standard`.
+//   2. key shadow map     -> one 2048x2048 depth map, rebuilt every frame (the key light is
+//                            fixed to the camera, so it moves over the model). `raytraced` only.
+//   3. beauty pass        -> ChimeraX's lighting equation into the default (MSAA) framebuffer.
+//
+// Why model space: ChimeraX orbits a camera around a still scene, so its ambient shadows are
+// computed once in scene coordinates and survive any camera move. Here the camera is still
+// and the model carries the rotation (see orbit.js), so the coordinates that stay put under a
+// drag are the mesh's own — compute the atlas there and it is equally view-invariant, and the
+// occlusion stays welded to the surface exactly as it does in ChimeraX.
+//
+// Hand-written, no dependencies.
+import { projection, lookAt, multiply, invert, mulVec4, normalize, cross } from "./mat4.js";
 import { createOrbit } from "./orbit.js";
 
-const KSIZE = 24;   // SSAO hemisphere samples
+// ---------------------------------------------------------------------------
+// ChimeraX constants
+// ---------------------------------------------------------------------------
 
-// Shared mesh vertex shader: view-space position + normal to the fragment stage.
+// class Material, set_default_parameters(). These multiply the light intensities to give
+// the colours the shader actually receives — see Render._light_shader_parameter_values().
+const MATERIAL = { ambient: 0.8, diffuse: 0.8, specular: 0.3, exponent: 30 };
+
+// class Lighting, set_default_parameters(). Unit vectors in camera coordinates (x right,
+// y up, z towards the viewer) pointing in the direction each light *shines*, so the key
+// light comes from the upper left and slightly in front, and the fill is nearly a headlight.
+// `move_lights_with_camera` is true by default, which is why these are camera-space
+// constants and not model-space ones.
+const KEY_DIR = normalize([0.577, -0.577, -0.577]);
+const FILL_DIR = normalize([-0.2, -0.2, -0.959]);
+
+// The presets, as `lighting.py` writes them. Everything else (directions, depth cue,
+// material) stays at the defaults above, which is also what ChimeraX does: a preset only
+// touches the intensities and the shadow switches.
+const LIGHTING = {
+  standard:  { key: 1.0, fill: 0.5, ambient: 0.4, shadows: false, multishadow: 0  },  // "simple"
+  smooth:    { key: 0.0, fill: 0.0, ambient: 1.5, shadows: false, multishadow: 64 },  // "soft"
+  raytraced: { key: 0.7, fill: 0.3, ambient: 0.8, shadows: true,  multishadow: 64 },  // "full"
+};
+
+// Lighting.depth_cue_{start,end}: fractions of the near-to-far clip range. depth_cue_color
+// tracks the background (View.background_color keeps the two in step), so distant geometry
+// fades *into the background* rather than darkening towards black.
+const DEPTH_CUE_START = 0.5, DEPTH_CUE_END = 1.0;
+// View._near_far_pad and View._min_near_fraction.
+const NEAR_FAR_PAD = 0.01, MIN_NEAR_FRACTION = 0.001;
+
+// Lighting.multishadow_map_size / multishadow_depth_bias, and the same pair for the key
+// light's shadow (shadow_map_size / shadow_depth_bias). The biases are fractions of the
+// scene diameter, which is the unit the shadow texture's depth axis is scaled into.
+const MS_COUNT = 64, MS_MAP_SIZE = 1024, MS_DEPTH_BIAS = 0.01;
+const SHADOW_MAP_SIZE = 2048, SHADOW_DEPTH_BIAS = 0.005;
+
+// The 64 shadow transforms travel as a uniform block rather than a plain array: 64 mat4 is
+// 256 uniform vectors, well past the 224 GLSL ES 3.0 guarantees, but exactly the 16 KB a
+// uniform block is guaranteed to hold. ChimeraX makes the same trade for the same reason.
+const MS_BLOCK_BINDING = 0;
+
+// ---------------------------------------------------------------------------
+// Shaders
+// ---------------------------------------------------------------------------
+
+// Mesh vertex shader. `vViewPos`/`vNormal` are ChimeraX's `v` and `N` — camera-space
+// position and normal, straight out of its vertexShader.txt. The model-space pair is the
+// extra this renderer needs, because its shadow transforms are model->texture (see the
+// header note on coordinate spaces) rather than ChimeraX's camera->texture.
 const VERT = `#version 300 es
 precision highp float;
 layout(location=0) in vec3 aPos;
@@ -26,161 +94,155 @@ uniform mat4 uView;
 uniform mat4 uModel;
 out vec3 vNormal;
 out vec3 vViewPos;
+out vec3 vModelPos;
+out vec3 vModelNormal;
 void main() {
   vec4 vp = uView * uModel * vec4(aPos, 1.0);
   vViewPos = vp.xyz;
-  vNormal = mat3(uView * uModel) * aNormal;
+  // The model transform is rigid (rotation + translation), as ChimeraX's always is, so the
+  // plain matrix transforms normals correctly and no inverse-transpose is needed.
+  vNormal = normalize(mat3(uView * uModel) * aNormal);
+  vModelPos = aPos;
+  vModelNormal = aNormal;
   gl_Position = uProj * vp;
 }`;
 
-// Geometry prepass: write view position (w=1 marks geometry) + view normal.
+// Depth-only pass, used for both shadow maps. No colour attachment is bound, so the
+// fragment stage exists only to satisfy the linker.
+const VERT_DEPTH = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uProj;
+uniform mat4 uView;
+void main() { gl_Position = uProj * uView * vec4(aPos, 1.0); }`;
+const FRAG_EMPTY = `#version 300 es
+precision highp float;
+void main() {}`;
+
+// Camera-space position prepass, read back a few pixels at a time to find what is under
+// the centre of the window. That is the only thing the camera needs from the renderer
+// (orbit.js turns it into a ChimeraX `cofr frontCenter` pivot), so it runs on demand —
+// once per gesture — rather than every frame.
 const FRAG_GEOM = `#version 300 es
 precision highp float;
-in vec3 vNormal;
 in vec3 vViewPos;
-layout(location=0) out vec4 outPos;
-layout(location=1) out vec4 outNrm;
-void main() {
-  vec3 n = normalize(vNormal);
-  if (!gl_FrontFacing) n = -n;
-  outPos = vec4(vViewPos, 1.0);
-  outNrm = vec4(n, 0.0);
-}`;
+out vec4 outPos;
+void main() { outPos = vec4(vViewPos, 1.0); }`;
 
-// Fullscreen-triangle vertex shader (no buffers; derived from gl_VertexID).
-const VERT_FS = `#version 300 es
-precision highp float;
-out vec2 vUv;
-void main() {
-  vec2 p = vec2(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0);
-  vUv = p * 0.5 + 0.5;
-  gl_Position = vec4(p, 0.0, 1.0);
-}`;
-
-// SSAO: for each fragment, sample a normal-oriented hemisphere of points around
-// the view-space position, project them to screen, and count how many are hidden
-// behind nearer geometry. Range check fades occlusion when the occluder is far.
-const FRAG_SSAO = `#version 300 es
-precision highp float;
-in vec2 vUv;
-uniform sampler2D uPos;
-uniform sampler2D uNrm;
-uniform sampler2D uNoise;
-uniform mat4 uProj;
-uniform vec2 uNoiseScale;
-uniform vec3 uKernel[${KSIZE}];
-uniform float uRadius;
-uniform float uBias;
-out vec4 outColor;
-void main() {
-  vec4 pw = texture(uPos, vUv);
-  if (pw.w < 0.5) { outColor = vec4(1.0); return; }   // background: unoccluded
-  vec3 p = pw.xyz;
-  vec3 n = normalize(texture(uNrm, vUv).xyz);
-  vec3 rnd = texture(uNoise, vUv * uNoiseScale).xyz * 2.0 - 1.0;
-  vec3 t = normalize(rnd - n * dot(rnd, n));
-  vec3 b = cross(n, t);
-  mat3 tbn = mat3(t, b, n);
-  float occ = 0.0;
-  for (int i = 0; i < ${KSIZE}; i++) {
-    vec3 sp = p + tbn * uKernel[i] * uRadius;          // view-space sample point
-    vec4 off = uProj * vec4(sp, 1.0);
-    off.xyz /= off.w;
-    off.xyz = off.xyz * 0.5 + 0.5;                     // -> [0,1] screen
-    if (off.x < 0.0 || off.x > 1.0 || off.y < 0.0 || off.y > 1.0) continue;
-    vec4 sd = texture(uPos, off.xy);
-    if (sd.w < 0.5) continue;
-    float sampleZ = sd.z;                              // stored geometry depth (view z, -forward)
-    float rangeCheck = smoothstep(0.0, 1.0, uRadius / max(abs(p.z - sampleZ), 1e-4));
-    occ += (sampleZ >= sp.z + uBias ? 1.0 : 0.0) * rangeCheck;
-  }
-  outColor = vec4(vec3(1.0 - occ / float(${KSIZE})), 1.0);
-}`;
-
-// Separable-ish 4x4 box blur over the noisy AO (matches the 4x4 noise tile).
-const FRAG_BLUR = `#version 300 es
-precision highp float;
-in vec2 vUv;
-uniform sampler2D uAO;
-uniform vec2 uTexel;
-out vec4 outColor;
-void main() {
-  float sum = 0.0;
-  for (int x = -2; x < 2; x++)
-    for (int y = -2; y < 2; y++)
-      sum += texture(uAO, vUv + vec2(float(x), float(y)) * uTexel).r;
-  outColor = vec4(vec3(sum / 16.0), 1.0);
-}`;
-
-// Beauty/lighting pass. uUseSSAO=1 samples the blurred AO texture by screen
-// position; uUseSSAO=0 falls back to a cheap derivative AO (no float targets).
+// The beauty pass: ChimeraX's fragmentShader.txt, USE_LIGHTING branch, with
+// USE_LIGHTING_NORMALS, USE_SHADOW, USE_MULTISHADOW and USE_DEPTH_CUE all enabled and
+// selected at run time by uniforms instead of by #define.
 const FRAG_BEAUTY = `#version 300 es
 precision highp float;
+precision highp sampler2DShadow;
 in vec3 vNormal;
 in vec3 vViewPos;
+in vec3 vModelPos;
+in vec3 vModelNormal;
+
 uniform vec3 uColor;
-uniform float uAmbient;   // base fill
-uniform float uFill;      // upper-left key weight
-uniform float uSpec;      // specular strength
-uniform float uShine;     // specular exponent
-uniform float uAO;        // derivative-AO strength (fallback)
-uniform float uSSAO;      // SSAO strength (0..1)
-uniform float uDepthCue;  // distance darkening
-uniform float uCamDist;   // camera distance (depth-cue range)
-uniform sampler2D uAOTex; // blurred SSAO
-uniform vec2 uResolution;
-uniform int uUseSSAO;
-out vec4 outColor;
-const vec3 KEY = vec3(-0.355, 0.450, 0.819);   // upper-left key (normalized below)
+
+// The lighting_block uniforms, already multiplied by the material reflectivities.
+uniform vec3 uKeyDir;             // camera space, direction the key light shines
+uniform vec3 uFillDir;
+uniform vec3 uKeyDiffuse;
+uniform vec3 uKeySpecular;
+uniform float uSpecExponent;
+uniform vec3 uFillDiffuse;
+uniform vec3 uAmbient;
+
+// Key-light shadow map. uShadowXf maps model space to its texture coordinates.
+uniform int uUseShadow;
+uniform mat4 uShadowXf;
+uniform sampler2DShadow uShadowMap;
+
+// Ambient ("multi") shadows. uMSCount is 0 or 64; uMSDepth is the scene diameter, which
+// recovers each light's direction from the third row of its transform exactly as ChimeraX
+// does, so the two never drift apart.
+uniform int uMSCount;
+uniform float uMSDepth;
+uniform sampler2DShadow uMSMap;
+layout(std140) uniform shadow_matrix_block { mat4 uMSXf[${MS_COUNT}]; };
+
+// Depth cue: fade towards uDepthCueColor between the two camera-space distances in
+// uDepthCueRange.
+uniform vec3 uDepthCueColor;
+uniform vec2 uDepthCueRange;
+
+out vec4 frag_color;
+
 void main() {
-  vec3 n = normalize(vNormal);
-  if (!gl_FrontFacing) n = -n;
-  vec3 v = normalize(-vViewPos);
-  vec3 k = normalize(KEY);
-  // bright, even base: half-Lambert camera headlight (never below 0.5).
-  float nl = max(dot(n, v), 0.0);
-  float wrap = nl * 0.5 + 0.5;
-  float kd = max(dot(n, k), 0.0) * uFill;     // upper-left key adds gentle form shading
-  float diff = uAmbient + (1.0 - uAmbient) * min(wrap + kd, 1.35);
-  vec3 hh = normalize(k + v);
-  float spec = pow(max(dot(n, hh), 0.0), uShine) * uSpec;
-  float ao;
-  if (uUseSSAO == 1) {
-    float a = texture(uAOTex, gl_FragCoord.xy / uResolution).r;
-    ao = mix(1.0, a, uSSAO);
+  vec4 fcolor = vec4(uColor, 1.0);
+
+  // Unit normal, with two-sided lighting.
+  float side = gl_FrontFacing ? 1.0 : -1.0;
+  vec3 N1 = normalize(vNormal) * side;
+  // Unit vector from camera to surface point.
+  vec3 v1 = normalize(vViewPos);
+
+  float key_factor = max(-dot(N1, uKeyDir), 0.0);
+  float fill_factor = max(-dot(N1, uFillDir), 0.0);
+  // Phong, not Blinn-Phong: ChimeraX reflects the light about the normal and dots that
+  // against the view vector. Swapping in a halfway vector would need roughly 4x the
+  // exponent to put the highlight at the same size, and would still fall off differently.
+  vec3 R = normalize(reflect(uKeyDir, N1));
+  float specular_factor = pow(max(-dot(R, v1), 0.0), uSpecExponent);
+
+  float shadow = 1.0;
+  if (uUseShadow == 1) shadow = texture(uShadowMap, (uShadowXf * vec4(vModelPos, 1.0)).stp);
+
+  // Diffuse: radiated equally in all directions, strength from the light direction and the
+  // surface normal. Specular: the key light reflected towards the camera. Both are killed
+  // by the key light's shadow; only the ambient term survives it.
+  vec3 Idiff = fcolor.rgb * (uKeyDiffuse * key_factor * shadow + uFillDiffuse * fill_factor);
+  vec3 Ispec = uKeySpecular * specular_factor * shadow;
+
+  vec3 Iamb;
+  if (uMSCount > 0) {
+    // Cosine-weighted fraction of the sphere of directions from which this point can see
+    // out. The 0.25 in the normalisation is the mean of max(cos,0) over a uniformly
+    // sampled sphere, so an unoccluded point comes out at 1 and the ambient term is
+    // untouched there.
+    vec3 Nm = normalize(vModelNormal) * side;
+    float mshadow = 0.0;
+    for (int i = 0; i < ${MS_COUNT}; i++) {
+      if (i >= uMSCount) break;
+      mat4 stf = uMSXf[i];
+      vec3 light_direction = uMSDepth * vec3(stf[0][2], stf[1][2], stf[2][2]);
+      float diffuse = max(-dot(Nm, light_direction), 0.0);
+      mshadow += diffuse * texture(uMSMap, (stf * vec4(vModelPos, 1.0)).stp);
+    }
+    mshadow /= 0.25 * float(uMSCount);
+    Iamb = fcolor.rgb * uAmbient * mshadow;
   } else {
-    // fallback: screen-space normal variation (no float render targets).
-    ao = 1.0 - clamp(length(fwidth(n)) * 1.4 * uAO, 0.0, 0.16);
+    Iamb = fcolor.rgb * uAmbient;
   }
-  float far = (-vViewPos.z) - (uCamDist - 1.2);
-  float dc = 1.0 - clamp(far * 0.26 * uDepthCue, 0.0, 0.32);
-  vec3 col = uColor * diff * ao * dc + vec3(spec);
-  outColor = vec4(col, 1.0);
+
+  // Total colour. Deliberately not tone-mapped or normalised: with the "soft" preset the
+  // ambient intensity is 1.5, so a bright unoccluded face lands above 1 and clips against
+  // the framebuffer. That clipping is what the preset looks like in ChimeraX.
+  vec3 Ifrag = Iamb + Idiff + Ispec;
+
+  float d = -vViewPos.z;   // distance from eye to fragment
+  float dim = (uDepthCueRange.y - d) / (uDepthCueRange.y - uDepthCueRange.x);
+  Ifrag = mix(uDepthCueColor, Ifrag, clamp(dim, 0.0, 1.0));
+
+  frag_color = vec4(Ifrag, 1.0);
 }`;
-
-// `radius` is the SSAO sampling scale (view-space units; the map is ~unit-sized).
-// A tight radius darkens only deep contacts (crisp, for standard); a broad radius
-// gives the soft, voluminous recess-shadowing ChimeraX shows in smooth mode.
-const LIGHTING = {
-  standard:  { ambient: 0.46, fill: 0.50, spec: 0.18, shine: 24.0, ao: 0.35, ssao: 0.55, radius: 0.12, depthCue: 0.14 },
-  smooth:    { ambient: 0.47, fill: 0.30, spec: 0.08, shine: 16.0, ao: 0.15, ssao: 0.95, radius: 0.32, depthCue: 0.18 },
-  raytraced: { ambient: 0.40, fill: 0.40, spec: 0.42, shine: 50.0, ao: 0.60, ssao: 0.80, radius: 0.18, depthCue: 0.22 },
-};
-
-const SSAO_RADIUS = 0.12, SSAO_BIAS = 0.018;   // defaults / fallback
 
 export function createRenderer(canvas) {
   // preserveDrawingBuffer lets us read the canvas back for snapshots/recording.
   const gl = canvas.getContext("webgl2", { antialias: true, depth: true, preserveDrawingBuffer: true, premultipliedAlpha: false });
   if (!gl) throw new Error("WebGL2 is not available in this browser.");
 
-  // SSAO needs to render into float color targets.
-  let ssaoOK = !!gl.getExtension("EXT_color_buffer_float");
+  // The pivot probe writes camera-space positions into a float target; shadows do not need
+  // one. So a driver without float colour buffers loses the front-centre centre of
+  // rotation and nothing else.
+  const floatTargets = !!gl.getExtension("EXT_color_buffer_float");
 
   const beauty = makeProg(gl, VERT, FRAG_BEAUTY);
-  const geomP = ssaoOK ? makeProg(gl, VERT, FRAG_GEOM) : null;
-  const ssaoP = ssaoOK ? makeProg(gl, VERT_FS, FRAG_SSAO) : null;
-  const blurP = ssaoOK ? makeProg(gl, VERT_FS, FRAG_BLUR) : null;
+  const depthP = makeProg(gl, VERT_DEPTH, FRAG_EMPTY);
+  const geomP = floatTargets ? makeProg(gl, VERT, FRAG_GEOM) : null;
 
   // Mesh geometry, one entry per model in the scene. A lone map is just the case where
   // there is one of them, so the single-map path is not a separate code path.
@@ -200,59 +262,293 @@ export function createRenderer(canvas) {
     return m;
   }
   const drawable = () => [...models.values()].filter((m) => m.visible && m.count);
-  // Whether *anything* is on screen. SSAO and the snapshot path both key off this.
+  // Whether *anything* is on screen. The shadow passes and the snapshot path key off this.
   const anyGeometry = () => drawable().length > 0;
-  const quadVao = gl.createVertexArray();   // empty VAO for fullscreen passes
   gl.enable(gl.DEPTH_TEST);
-
-  // 1x1 white texture (bound to the AO sampler on the forward-fallback path).
-  const whiteTex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, whiteTex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-
-  // SSAO hemisphere kernel + tiling rotation-noise texture.
-  let kernel = null, noiseTex = null;
-  if (ssaoOK) {
-    kernel = makeKernel(KSIZE);
-    noiseTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, noiseTex);
-    const noise = new Uint8Array(16 * 4);
-    for (let i = 0; i < 16; i++) {
-      noise[i * 4] = (Math.random() * 256) | 0;
-      noise[i * 4 + 1] = (Math.random() * 256) | 0;
-      noise[i * 4 + 2] = 128;   // z=0 after *2-1: rotation stays in the tangent plane
-      noise[i * 4 + 3] = 255;
-    }
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 4, 4, 0, gl.RGBA, gl.UNSIGNED_BYTE, noise);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  // The shadow-transform block is bound for the life of the renderer, zero-filled until an
+  // atlas is built. Drawing with an active uniform block that has no buffer bound to its
+  // binding point is an INVALID_OPERATION, even in `standard`, where the shader's loop over
+  // the block never executes — the block is still active because the compiler cannot prove
+  // uMSCount is zero.
+  const msUbo = gl.createBuffer();
+  {
+    gl.bindBuffer(gl.UNIFORM_BUFFER, msUbo);
+    gl.bufferData(gl.UNIFORM_BUFFER, MS_COUNT * 64, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.UNIFORM_BUFFER, null);
+    const bi = gl.getUniformBlockIndex(beauty.prog, "shadow_matrix_block");
+    if (bi !== gl.INVALID_INDEX) gl.uniformBlockBinding(beauty.prog, bi, MS_BLOCK_BINDING);
+    gl.bindBufferBase(gl.UNIFORM_BUFFER, MS_BLOCK_BINDING, msUbo);
   }
-
-  // offscreen targets (allocated lazily, resized to match the canvas)
-  let aw = 0, ah = 0;
-  let posTex = null, nrmTex = null, depthRbo = null, gFbo = null;
-  let aoTex = null, aoFbo = null, blurTex = null, blurFbo = null;
 
   let color = [0.863, 0.863, 0.863];   // ChimeraX-style near-white neutral gray
   let bg = [0.016, 0.024, 0.06];
   let light = { ...LIGHTING.standard };
-  // Distance from the eye to the front-most surface at the centre of the window, which
-  // is what the camera turns into a ChimeraX-style centre of rotation. The SSAO
-  // geometry prepass already parks view-space positions in `posTex` (w=1 marks
-  // geometry) for exactly the camera we are looking at, so this costs a small readback
-  // rather than another pass. Null on the forward fallback (no G-buffer) or over
-  // background, which leaves the camera on the pivot it already had.
+
+  // ---------------------------------------------------------------------------
+  // Shadow maps
+  // ---------------------------------------------------------------------------
+
+  // A depth texture set up the way ChimeraX's Texture.initialize_depth does: 24-bit depth
+  // with comparison filtering, so a sampler2DShadow lookup returns "is this point lit"
+  // rather than a raw depth, with the hardware doing the 2x2 PCF for free.
+  function makeDepthTex(size) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, size, size, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+    return t;
+  }
+  // Depth-only framebuffer: legal in WebGL2 with no colour attachment at all.
+  function makeDepthFbo(tex) {
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, tex, 0);
+    gl.drawBuffers([gl.NONE]);
+    gl.readBuffer(gl.NONE);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return ok ? f : null;
+  }
+
+  // Bound to every shadow sampler that is not in use this frame. Sampling an unbound
+  // sampler2DShadow is undefined behaviour on some drivers even where the branch guarding
+  // it never runs.
+  const dummyDepthTex = makeDepthTex(1);
+
+  let msTex = null, msFbo = null;
+  let msReady = false;          // atlas matches the current geometry
+  let msDepth = 1;              // scene diameter, the unit the transforms' depth axis uses
+  const msXf = new Float32Array(MS_COUNT * 16);
+  let shadowTex = null, shadowFbo = null;
+  let shadowXf = null;          // model -> key-light shadow texture
+  let shadowKey = null;         // the (geometry, light direction) the map above was built for
+  let geomGen = 0;              // bumped whenever the set of drawn triangles changes
+
+  // ChimeraX's geometry.sphere.sphere_points(n) — the Bauer spiral. The exact point set
+  // matters: 64 directions is few enough that a different distribution puts the soft
+  // shadows in visibly different places.
+  const MS_DIRS = (() => {
+    const p = [], snp = Math.sqrt(MS_COUNT * Math.PI);
+    for (let i = 0; i < MS_COUNT; i++) {
+      const phi = Math.acos(-1 + (2 * i + 1) / MS_COUNT);
+      const theta = snp * phi, s = Math.sin(phi);
+      p.push([s * Math.cos(theta), s * Math.sin(theta), Math.cos(phi)]);
+    }
+    return p;
+  })();
+
+  // A rotation with the given z axis; the rotation about that axis is free (ChimeraX's
+  // geometry.orthonormal_frame says so, and the shadow map only cares which way it looks).
+  function orthoFrame(z) {
+    const zz = normalize(z);
+    const a = Math.abs(zz[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+    const x = normalize(cross(a, zz));
+    const y = cross(zz, x);
+    return new Float32Array([x[0], x[1], x[2], 0, y[0], y[1], y[2], 0, zz[0], zz[1], zz[2], 0, 0, 0, 0, 1]);
+  }
+
+  // ChimeraX Shadow._shadow_transforms: the view matrix the depth pass renders with, and
+  // the model->texture-coordinate matrix the beauty pass looks the result up with.
+  //
+  //   lv    = translation(center - radius*ld) * orthonormal_frame(-ld)
+  //   lvinv = lv^-1
+  //   stf   = translation(0.5, 0.5, -bias) * scale(0.5/r, 0.5/r, -0.5/r) * lvinv
+  //
+  // The light sits a radius back along its own direction, the scene spans light-space z in
+  // [-2r, 0], and the scale maps that onto the [0,1] the depth buffer stores. `bias` is
+  // subtracted in those same units, i.e. as a fraction of the scene diameter.
+  function shadowTransforms(ld, center, radius, bias) {
+    const d = normalize(ld);
+    const lv = orthoFrame([-d[0], -d[1], -d[2]]);
+    lv[12] = center[0] - radius * d[0];
+    lv[13] = center[1] - radius * d[1];
+    lv[14] = center[2] - radius * d[2];
+    const lvinv = invert(lv);
+    if (!lvinv) return null;
+    const S = [0.5 / radius, 0.5 / radius, -0.5 / radius], T = [0.5, 0.5, -bias];
+    const stf = lvinv.slice();
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 3; r++)
+        stf[c * 4 + r] = lvinv[c * 4 + r] * S[r] + (c === 3 ? T[r] : 0);
+    return { lvinv, stf };
+  }
+
+  // ChimeraX Render.start_depth_render's projection: orthographic along z, spanning
+  // +-radius across and the full [0, -2r] depth. Written out in the column-major order
+  // WebGL wants.
+  const shadowProjection = (r) =>
+    new Float32Array([1 / r, 0, 0, 0, 0, 1 / r, 0, 0, 0, 0, -1 / r, 0, 0, 0, -1, 1]);
+
+  // Bounding sphere of the scene, in model space. `radius` is ChimeraX's Bounds.radius:
+  // the sphere around the bounding *box*, i.e. half its diagonal — not the tightest sphere
+  // around the vertices. Both shadow volumes and the depth-cue range are sized from it, so
+  // using anything tighter would shift the fade and clip the shadows.
+  function boundingSphere() {
+    const b = sceneBounds();
+    if (!b) return null;
+    const c = [0, 0, 0], s = [0, 0, 0];
+    for (let a = 0; a < 3; a++) { c[a] = (b.lo[a] + b.hi[a]) / 2; s[a] = b.hi[a] - b.lo[a]; }
+    return { center: c, radius: 0.5 * Math.hypot(s[0], s[1], s[2]) };
+  }
+
+  function drawDepth(proj, view) {
+    gl.useProgram(depthP.prog);
+    gl.uniformMatrix4fv(depthP.u("uProj"), false, proj);
+    gl.uniformMatrix4fv(depthP.u("uView"), false, view);
+    for (const m of drawable()) {
+      gl.bindVertexArray(m.vao);
+      gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+    }
+    gl.bindVertexArray(null);
+  }
+
+  // The 64-direction ambient shadow atlas. Model space, so it is valid until the geometry
+  // itself changes — which is what makes 64 depth passes affordable: they do not run again
+  // when you rotate, pan or zoom.
+  function ensureMultishadow() {
+    if (msReady) return true;
+    const bs = boundingSphere();
+    if (!bs || bs.radius === 0) return false;
+    if (!msTex) {
+      msTex = makeDepthTex(MS_MAP_SIZE);
+      msFbo = makeDepthFbo(msTex);
+      if (!msFbo) return false;
+    }
+    const d = Math.ceil(Math.sqrt(MS_COUNT));   // tiles per axis: 8
+    const s = Math.floor(MS_MAP_SIZE / d);      // tile size: 128
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msFbo);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.viewport(0, 0, MS_MAP_SIZE, MS_MAP_SIZE);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+    const proj = shadowProjection(bs.radius);
+    for (let l = 0; l < MS_COUNT; l++) {
+      const x = (l % d) * s, y = Math.floor(l / d) * s;
+      gl.viewport(x, y, s, s);
+      const t = shadowTransforms(MS_DIRS[l], bs.center, bs.radius, MS_DEPTH_BIAS);
+      if (!t) continue;
+      drawDepth(proj, t.lvinv);
+      // Fold the sub-viewport into the transform, so the lookup lands in this tile:
+      // translation(x/w, y/w, 0) * scale(vw/w, vh/h, 1) * stf. Only the x and y rows move,
+      // which is what lets the fragment shader keep reading the light direction off the
+      // untouched z row.
+      const stf = t.stf;
+      for (let c = 0; c < 4; c++) {
+        stf[c * 4 + 0] = stf[c * 4 + 0] * (s / MS_MAP_SIZE) + (c === 3 ? x / MS_MAP_SIZE : 0);
+        stf[c * 4 + 1] = stf[c * 4 + 1] * (s / MS_MAP_SIZE) + (c === 3 ? y / MS_MAP_SIZE : 0);
+      }
+      msXf.set(stf, l * 16);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindBuffer(gl.UNIFORM_BUFFER, msUbo);
+    gl.bufferSubData(gl.UNIFORM_BUFFER, 0, msXf);
+    gl.bindBuffer(gl.UNIFORM_BUFFER, null);
+    msDepth = 2 * bs.radius;
+    msReady = true;
+    return true;
+  }
+
+  // The key light's shadow. Unlike the ambient atlas this cannot be cached: the key light
+  // is fixed to the camera (Lighting.move_lights_with_camera), so every rotation swings it
+  // over the model. Its model-space direction is the camera-space constant carried back
+  // through the rotation part of view*model.
+  function buildKeyShadow(view, model) {
+    const bs = boundingSphere();
+    if (!bs || bs.radius === 0) { shadowXf = null; shadowKey = null; return; }
+    if (!shadowTex) {
+      shadowTex = makeDepthTex(SHADOW_MAP_SIZE);
+      shadowFbo = makeDepthFbo(shadowTex);
+      if (!shadowFbo) { shadowTex = null; shadowXf = null; return; }
+    }
+    const mv = multiply(view, model);
+    // Rigid transform, so the inverse rotation is the transpose: pull the camera-space
+    // direction back into model space by multiplying by the 3x3 from the left.
+    const ld = [
+      mv[0] * KEY_DIR[0] + mv[1] * KEY_DIR[1] + mv[2] * KEY_DIR[2],
+      mv[4] * KEY_DIR[0] + mv[5] * KEY_DIR[1] + mv[6] * KEY_DIR[2],
+      mv[8] * KEY_DIR[0] + mv[9] * KEY_DIR[1] + mv[10] * KEY_DIR[2],
+    ];
+    // Only the model-space light direction and the geometry can change what this map
+    // holds, so a redraw that changed neither (a recolour, a resize, a zoom, a pan — the
+    // last two move the camera without turning the model) reuses it. Rotation does change
+    // it, which is inherent: a camera-fixed light sweeps over the model as it turns.
+    const key = `${geomGen}|${ld[0].toFixed(6)},${ld[1].toFixed(6)},${ld[2].toFixed(6)}`;
+    if (key === shadowKey && shadowXf) return;
+
+    const t = shadowTransforms(ld, bs.center, bs.radius, SHADOW_DEPTH_BIAS);
+    if (!t) { shadowXf = null; shadowKey = null; return; }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFbo);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.viewport(0, 0, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+    drawDepth(shadowProjection(bs.radius), t.lvinv);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    shadowXf = t.stf;
+    shadowKey = key;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Camera pivot probe
+  // ---------------------------------------------------------------------------
+
+  let posTex = null, posRbo = null, posFbo = null, pw = 0, ph = 0;
+
+  // Distance from the eye to the front-most surface at the centre of the window, which is
+  // what the camera turns into a ChimeraX-style centre of rotation. Renders a camera-space
+  // position pass and reads back a few pixels; called from orbit.js at most once per
+  // gesture, never per frame. Null on a driver without float targets, or over background,
+  // which leaves the camera on the pivot it already had.
   function centreDepth() {
     const W = canvas.width, H = canvas.height, N = 5;   // a few px wide, so a 1px gap doesn't read as "empty"
-    if (!ssaoOK || !anyGeometry() || !gFbo || W < N || H < N) return null;
+    if (!floatTargets || !anyGeometry() || W < N || H < N) return null;
+    if (pw !== W || ph !== H || !posFbo) {
+      if (posTex) gl.deleteTexture(posTex);
+      if (posRbo) gl.deleteRenderbuffer(posRbo);
+      if (posFbo) gl.deleteFramebuffer(posFbo);
+      pw = W; ph = H;
+      posTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, posTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, W, H, 0, gl.RGBA, gl.HALF_FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      posRbo = gl.createRenderbuffer();
+      gl.bindRenderbuffer(gl.RENDERBUFFER, posRbo);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, W, H);
+      posFbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, posFbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, posTex, 0);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, posRbo);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null); posFbo = null; return null;
+      }
+    }
+    const { proj, view, model } = camera();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, posFbo);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    gl.viewport(0, 0, W, H);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.clearColor(0, 0, 0, 0);   // pos.w = 0 => background
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.useProgram(geomP.prog);
+    gl.uniformMatrix4fv(geomP.u("uProj"), false, proj);
+    gl.uniformMatrix4fv(geomP.u("uView"), false, view);
+    gl.uniformMatrix4fv(geomP.u("uModel"), false, model);
+    for (const m of drawable()) {
+      gl.bindVertexArray(m.vao);
+      gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+    }
+    gl.bindVertexArray(null);
+
     const x = (W >> 1) - (N >> 1), y = (H >> 1) - (N >> 1);
     let px;
     try {
-      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, gFbo);
       gl.readBuffer(gl.COLOR_ATTACHMENT0);
       // An RGBA16F attachment is only readable through the pair the driver advertises.
       if (gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT) !== gl.RGBA) return null;
@@ -268,7 +564,7 @@ export function createRenderer(canvas) {
     } catch {
       return null;
     } finally {
-      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     }
     let best = null;
     for (let i = 0; i < N * N; i++) {
@@ -291,164 +587,92 @@ export function createRenderer(canvas) {
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   }
 
-  function mkTex(w, h, internal, format, type, filter) {
-    const t = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, t);
-    gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    return t;
-  }
-  function fboWith(attachments, depth) {
-    const f = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
-    attachments.forEach((tex, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, tex, 0));
-    if (depth) gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
-    return f;
-  }
-
-  function ensureTargets() {
-    if (!ssaoOK) return;
-    const W = canvas.width, H = canvas.height;
-    if (W === aw && H === ah && gFbo) return;
-    aw = W; ah = H;
-    [posTex, nrmTex, aoTex, blurTex].forEach((t) => t && gl.deleteTexture(t));
-    [gFbo, aoFbo, blurFbo].forEach((f) => f && gl.deleteFramebuffer(f));
-    if (depthRbo) gl.deleteRenderbuffer(depthRbo);
-
-    posTex = mkTex(W, H, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.NEAREST);
-    nrmTex = mkTex(W, H, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.NEAREST);
-    depthRbo = gl.createRenderbuffer();
-    gl.bindRenderbuffer(gl.RENDERBUFFER, depthRbo);
-    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, W, H);
-    gFbo = fboWith([posTex, nrmTex], depthRbo);
-    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { ssaoOK = false; gl.bindFramebuffer(gl.FRAMEBUFFER, null); return; }
-
-    aoTex = mkTex(W, H, gl.R8, gl.RED, gl.UNSIGNED_BYTE, gl.LINEAR);
-    aoFbo = fboWith([aoTex], null);
-    blurTex = mkTex(W, H, gl.R8, gl.RED, gl.UNSIGNED_BYTE, gl.LINEAR);
-    blurFbo = fboWith([blurTex], null);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  }
-
   function camera() {
     const aspect = canvas.width / Math.max(1, canvas.height);
     const proj = projection(aspect, 0.01, 100);
     const view = lookAt(orbit.eye, [0, 0, 0], [0, 1, 0]);   // camera fixed; model carries the trackball rotation + pan
     return { proj, view, model: orbit.model };
   }
-  // Draw every visible model. `colorLoc` is the beauty shader's uColor — passed so the
-  // colour is set per model rather than once per pass; the geometry prepass has no
-  // colour and passes null.
-  function drawModels(colorLoc) {
+
+  // ChimeraX View.near_far_distances: the scene's bounding sphere projected onto the view
+  // axis, padded by 1%, then clamped so the near plane stays in front of the eye. The
+  // depth cue fades between fixed fractions of that range, which is why the fade tracks the
+  // model as you zoom instead of being pinned to the GL frustum (fixed here at 0.01..100).
+  function depthCueRange(view, model) {
+    const bs = boundingSphere();
+    if (!bs) return [1, 2];
+    const c = mulVec4(multiply(view, model), [bs.center[0], bs.center[1], bs.center[2], 1]);
+    const d = -c[2];                       // camera looks down -z, so this is the axial distance
+    const r = (1 + NEAR_FAR_PAD) * bs.radius;
+    let near = d - r, far = d + r;
+    const nearMin = far > near ? MIN_NEAR_FRACTION * (far - near) : 1;
+    near = Math.max(near, nearMin);
+    if (far <= near) far = 2 * near;
+    return [near + (far - near) * DEPTH_CUE_START, near + (far - near) * DEPTH_CUE_END];
+  }
+
+  function bindDepthTex(unit, tex) {
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, tex || dummyDepthTex);
+  }
+
+  function paint(alpha) {
+    const { proj, view, model } = camera();
+    const useMS = light.multishadow > 0 && anyGeometry() && ensureMultishadow();
+    if (light.shadows && anyGeometry()) buildKeyShadow(view, model); else shadowXf = null;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.clearColor(bg[0], bg[1], bg[2], alpha);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (!anyGeometry()) return;
+
+    gl.useProgram(beauty.prog);
+    gl.uniformMatrix4fv(beauty.u("uProj"), false, proj);
+    gl.uniformMatrix4fv(beauty.u("uView"), false, view);
+    gl.uniformMatrix4fv(beauty.u("uModel"), false, model);
+
+    // Render._light_shader_parameter_values(): the intensities meet the material's
+    // reflectivities here, and the shader only ever sees the product.
+    const kd = MATERIAL.diffuse * light.key, ks = MATERIAL.specular * light.key;
+    const fd = MATERIAL.diffuse * light.fill, am = MATERIAL.ambient * light.ambient;
+    gl.uniform3fv(beauty.u("uKeyDir"), KEY_DIR);
+    gl.uniform3fv(beauty.u("uFillDir"), FILL_DIR);
+    gl.uniform3f(beauty.u("uKeyDiffuse"), kd, kd, kd);
+    gl.uniform3f(beauty.u("uKeySpecular"), ks, ks, ks);
+    gl.uniform1f(beauty.u("uSpecExponent"), MATERIAL.exponent);
+    gl.uniform3f(beauty.u("uFillDiffuse"), fd, fd, fd);
+    gl.uniform3f(beauty.u("uAmbient"), am, am, am);
+
+    gl.uniform1i(beauty.u("uUseShadow"), shadowXf ? 1 : 0);
+    if (shadowXf) gl.uniformMatrix4fv(beauty.u("uShadowXf"), false, shadowXf);
+    gl.uniform1i(beauty.u("uMSCount"), useMS ? MS_COUNT : 0);
+    gl.uniform1f(beauty.u("uMSDepth"), msDepth);
+    bindDepthTex(0, useMS ? msTex : null); gl.uniform1i(beauty.u("uMSMap"), 0);
+    bindDepthTex(1, shadowXf ? shadowTex : null); gl.uniform1i(beauty.u("uShadowMap"), 1);
+
+    // Depth cue fades towards the background, as ChimeraX's does: View.background_color
+    // keeps Lighting.depth_cue_color in step with it.
+    gl.uniform3fv(beauty.u("uDepthCueColor"), bg);
+    gl.uniform2fv(beauty.u("uDepthCueRange"), depthCueRange(view, model));
+
+    const cLoc = beauty.u("uColor");
     for (const m of drawable()) {
-      if (colorLoc) gl.uniform3fv(colorLoc, m.color || color);
+      gl.uniform3fv(cLoc, m.color || color);
       gl.bindVertexArray(m.vao);
       gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
     }
     gl.bindVertexArray(null);
   }
-  function drawQuad() { gl.bindVertexArray(quadVao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null); }
 
-  function setMatrices(p) {
-    const { proj, view, model } = camera();
-    gl.uniformMatrix4fv(p.u("uProj"), false, proj);
-    gl.uniformMatrix4fv(p.u("uView"), false, view);
-    gl.uniformMatrix4fv(p.u("uModel"), false, model);
-  }
-  function setLighting(useSSAO) {
-    gl.uniform1f(beauty.u("uAmbient"), light.ambient);
-    gl.uniform1f(beauty.u("uFill"), light.fill);
-    gl.uniform1f(beauty.u("uSpec"), light.spec);
-    gl.uniform1f(beauty.u("uShine"), light.shine);
-    gl.uniform1f(beauty.u("uAO"), light.ao);
-    gl.uniform1f(beauty.u("uSSAO"), light.ssao);
-    gl.uniform1f(beauty.u("uDepthCue"), light.depthCue);
-    gl.uniform1f(beauty.u("uCamDist"), orbit.dist);
-    gl.uniform2f(beauty.u("uResolution"), canvas.width, canvas.height);
-    gl.uniform1i(beauty.u("uUseSSAO"), useSSAO ? 1 : 0);
-    gl.uniform1i(beauty.u("uAOTex"), 3);
-  }
-
-  function drawSSAO(alpha) {
-    const W = canvas.width, H = canvas.height;
-    // 1. geometry prepass -> position + normal G-buffer
-    gl.bindFramebuffer(gl.FRAMEBUFFER, gFbo);
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
-    gl.viewport(0, 0, W, H);
-    gl.enable(gl.DEPTH_TEST);
-    gl.clearColor(0, 0, 0, 0);   // pos.w=0 => background
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.useProgram(geomP.prog);
-    setMatrices(geomP);
-    drawModels(null);
-
-    // 2. SSAO
-    gl.bindFramebuffer(gl.FRAMEBUFFER, aoFbo);
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
-    gl.viewport(0, 0, W, H);
-    gl.disable(gl.DEPTH_TEST);
-    gl.useProgram(ssaoP.prog);
-    bindTex(0, posTex); bindTex(1, nrmTex); bindTex(2, noiseTex);
-    gl.uniform1i(ssaoP.u("uPos"), 0); gl.uniform1i(ssaoP.u("uNrm"), 1); gl.uniform1i(ssaoP.u("uNoise"), 2);
-    gl.uniformMatrix4fv(ssaoP.u("uProj"), false, camera().proj);
-    gl.uniform3fv(ssaoP.u("uKernel"), kernel);
-    gl.uniform1f(ssaoP.u("uRadius"), light.radius || SSAO_RADIUS);
-    gl.uniform1f(ssaoP.u("uBias"), SSAO_BIAS);
-    gl.uniform2f(ssaoP.u("uNoiseScale"), W / 4, H / 4);
-    drawQuad();
-
-    // 3. blur
-    gl.bindFramebuffer(gl.FRAMEBUFFER, blurFbo);
-    gl.viewport(0, 0, W, H);
-    gl.useProgram(blurP.prog);
-    bindTex(0, aoTex);
-    gl.uniform1i(blurP.u("uAO"), 0);
-    gl.uniform2f(blurP.u("uTexel"), 1 / W, 1 / H);
-    drawQuad();
-
-    // 4. beauty pass into the default (MSAA) framebuffer
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, W, H);
-    gl.enable(gl.DEPTH_TEST);
-    gl.clearColor(bg[0], bg[1], bg[2], alpha);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.useProgram(beauty.prog);
-    setMatrices(beauty);
-    setLighting(true);
-    bindTex(3, blurTex);
-    drawModels(beauty.u("uColor"));
-  }
-
-  function drawForward(alpha) {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.enable(gl.DEPTH_TEST);
-    gl.clearColor(bg[0], bg[1], bg[2], alpha);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (!anyGeometry()) return;
-    gl.useProgram(beauty.prog);
-    setMatrices(beauty);
-    setLighting(false);
-    bindTex(3, whiteTex);
-    drawModels(beauty.u("uColor"));
-  }
-
-  function bindTex(unit, tex) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); }
-
-  function paint(alpha) {
-    if (ssaoOK && anyGeometry()) { ensureTargets(); }
-    if (ssaoOK && anyGeometry()) drawSSAO(alpha);
-    else drawForward(alpha);
-  }
-
+  // The multishadow atlas lives in model space, so a canvas resize does not touch it; only
+  // the pivot probe's targets follow the canvas, and those rebuild themselves on demand.
   function render() { resize(); paint(1); }
 
-  // Axis-aligned box enclosing the vertices, for the camera's centre-of-rotation rule.
-  // A single pass over the positions, once per contour — the surface is what the box is
-  // meant to describe, and it is the only thing here that knows where the surface is.
+  // Axis-aligned box enclosing the vertices, for the camera's centre-of-rotation rule and
+  // for sizing the shadow volumes. A single pass over the positions, once per contour.
   function aabb(positions) {
     if (!positions.length) return null;
     const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
@@ -462,8 +686,8 @@ export function createRenderer(canvas) {
     return isFinite(lo[0]) ? { lo, hi } : null;
   }
 
-  // Union of what is on screen — the camera frames and pivots on the whole scene, not
-  // on whichever model happens to be first.
+  // Union of what is on screen — the camera frames and pivots on the whole scene, not on
+  // whichever model happens to be first, and the shadows are cast over all of it.
   function sceneBounds() {
     let lo = null, hi = null;
     for (const m of drawable()) {
@@ -486,6 +710,7 @@ export function createRenderer(canvas) {
     m.count = indices.length;
     m.bounds = indices.length ? aabb(positions) : null;
     orbit.invalidatePivot();   // a new contour is a new front surface
+    msReady = false; geomGen++;   // ...and a new set of occluders
     render();
   }
 
@@ -496,6 +721,7 @@ export function createRenderer(canvas) {
     gl.deleteBuffer(m.posBuf); gl.deleteBuffer(m.normBuf); gl.deleteBuffer(m.idxBuf);
     models.delete(id);
     orbit.invalidatePivot();
+    msReady = false; geomGen++;
     render();
   }
 
@@ -512,12 +738,15 @@ export function createRenderer(canvas) {
       if (!m || m.visible === !!on) return;
       m.visible = !!on;
       orbit.invalidatePivot();   // hiding the front map exposes a different front surface
+      msReady = false; geomGen++;   // and removes an occluder from the ambient shadows
       render();
     },
     clear() { for (const id of [...models.keys()]) dropModel(id); render(); },
     setColor(rgb) { color = rgb; render(); },
+    // The background is also what the depth cue fades towards, so changing it changes the
+    // shading of the far side of the map — as it does in ChimeraX.
     setBackground(rgb) { bg = rgb; render(); },
-    setLighting(mode) { light = { ...(LIGHTING[mode] || LIGHTING.standard) }; render(); },
+    setLighting(m) { light = { ...(LIGHTING[m] || LIGHTING.standard) }; render(); },
     resetView() { orbit.reset(); },
     getCamera() { return orbit.getState(); },   // handed to the other renderer on a render-mode switch
     setCamera(cam) { orbit.setState(cam); },
@@ -526,7 +755,6 @@ export function createRenderer(canvas) {
       const ow = canvas.width, oh = canvas.height;
       canvas.width = Math.floor(canvas.clientWidth * scale);
       canvas.height = Math.floor(canvas.clientHeight * scale);
-      if (ssaoOK && anyGeometry()) ensureTargets();
       paint(transparent ? 0 : 1);
       const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
       canvas.width = ow; canvas.height = oh; render();
@@ -542,19 +770,6 @@ function fromHalf(h) {
   if (exp === 0) return sign * 2 ** -14 * (frac / 1024);
   if (exp === 31) return frac ? NaN : sign * Infinity;
   return sign * 2 ** (exp - 15) * (1 + frac / 1024);
-}
-
-// Hemisphere kernel: points in the +z half, packed toward the origin so nearby
-// occluders dominate (the usual accelerating distribution).
-function makeKernel(n) {
-  const k = new Float32Array(n * 3);
-  for (let i = 0; i < n; i++) {
-    let x = Math.random() * 2 - 1, y = Math.random() * 2 - 1, z = Math.random();
-    const len = Math.hypot(x, y, z) || 1;
-    let s = i / n; s = 0.1 + 0.9 * s * s;
-    k[i * 3] = (x / len) * s; k[i * 3 + 1] = (y / len) * s; k[i * 3 + 2] = (z / len) * s;
-  }
-  return k;
 }
 
 function makeProg(gl, vs, fs) {

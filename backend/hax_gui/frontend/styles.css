@@ -948,6 +948,17 @@ body.vwin-dragging iframe { pointer-events: none; }
 .wf-node.primary { box-shadow: 0 0 0 2px var(--brand, #2dd4bf), 0 2px 12px rgba(0,0,0,.3); }
 .wf-node.sel:not(.primary) { box-shadow: 0 0 0 1.5px var(--brand, #2dd4bf); }
 
+/* Focus mode: the selection keeps full contrast, the steps it is wired to are outlined,
+   everything else recedes. Only the *contents* of a dimmed step fade — its background
+   stays opaque, so it doesn't turn into a window onto the wires running underneath. */
+.wf-node.dim { box-shadow: none; border-color: color-mix(in srgb, var(--border) 55%, transparent); }
+.wf-node.dim > * { opacity: .28; }
+.wf-node.near { border-color: var(--brand, #2dd4bf);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--brand, #2dd4bf) 45%, transparent), 0 2px 10px rgba(0,0,0,.22); }
+.wf-node.focused { z-index: 1; }   /* lift the selection above any step it overlaps */
+/* the focused wires: thickened from JS, glowing in their own status color from here */
+.wf-wire-hot { filter: drop-shadow(0 0 3px currentColor); }
+
 /* drag-and-drop a program onto the canvas */
 .wf-canvas.wf-drop { outline: 2px dashed var(--brand, #2dd4bf); outline-offset: -6px; }
 
