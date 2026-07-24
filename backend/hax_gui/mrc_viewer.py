@@ -12,6 +12,7 @@ token (the iframe can't send the bearer header).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
 import socket
 import subprocess
@@ -20,6 +21,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+from . import viewer_logs
 
 # The viewer backend ships inside the package: hax_gui/viewer_app/mrc_server.py
 _SERVER = Path(__file__).resolve().parent / "viewer_app" / "mrc_server.py"
@@ -80,21 +83,32 @@ class MrcViewerManager:
             "--host", "127.0.0.1",
             "--port", str(port),
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        viewer_logs.prune("mrcviewer")
+        log = viewer_logs.log_path("mrcviewer", vid)
+        with viewer_logs.spawn_log(log) as log_fh:
+            proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
         instance = {"id": vid, "port": port, "mrcs": [str(p) for p in paths],
-                    "key": key, "title": title, "proc": proc}
-        await self._wait_ready(instance)
+                    "key": key, "title": title, "proc": proc, "log": str(log)}
+        try:
+            await self._wait_ready(instance)
+        except BaseException:
+            # Untracked once we raise, so nothing else would reap it.
+            with contextlib.suppress(OSError):
+                proc.terminate()
+            raise
         self._by_path[key] = instance
         self._by_id[vid] = instance
         return self._public(instance)
 
     async def _wait_ready(self, instance: dict[str, Any], timeout: float = 40.0) -> None:
         url = f"http://127.0.0.1:{instance['port']}/api/health"
+        log = Path(instance["log"])
         deadline = asyncio.get_event_loop().time() + timeout
         async with httpx.AsyncClient(timeout=3.0) as client:
             while asyncio.get_event_loop().time() < deadline:
                 if instance["proc"].poll() is not None:
-                    raise RuntimeError("map-viewer backend exited during startup")
+                    raise RuntimeError(viewer_logs.startup_error(
+                        "map-viewer backend exited during startup", log))
                 try:
                     r = await client.get(url)
                     if r.status_code < 500:
@@ -102,7 +116,8 @@ class MrcViewerManager:
                 except httpx.HTTPError:
                     pass
                 await asyncio.sleep(0.4)
-        raise TimeoutError("map-viewer backend did not become ready in time")
+        raise TimeoutError(viewer_logs.startup_error(
+            "map-viewer backend did not become ready in time", log))
 
     def stop(self, vid: str) -> bool:
         inst = self._by_id.pop(vid, None)
@@ -131,6 +146,7 @@ class MrcViewerManager:
             "mrc": instance["mrcs"][0],
             "mrcs": instance["mrcs"],
             "url": f"/mrcviewer/{instance['id']}/",
+            "log": instance["log"],   # this session's stdout+stderr, for diagnosis
             "kind": "mrc",
             "running": instance["proc"].poll() is None,
         }

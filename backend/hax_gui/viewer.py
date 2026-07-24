@@ -11,6 +11,7 @@ bearer header).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
 import socket
 import subprocess
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+from . import viewer_logs
 
 # The viewer backend ships inside the package: hax_gui/viewer_app/server.py
 _SERVER = Path(__file__).resolve().parent / "viewer_app" / "server.py"
@@ -89,21 +92,33 @@ class ViewerManager:
             cmd += ["--metadata", str(metadata)]
         if gpu:
             cmd += ["--gpu", str(gpu)]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        viewer_logs.prune("viewer")
+        log = viewer_logs.log_path("viewer", vid)
+        with viewer_logs.spawn_log(log) as log_fh:
+            proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
         instance = {"id": vid, "port": port, "latents": str(lat), "reload": str(ckpt),
-                    "title": title, "gpu": gpu or "", "key": key, "proc": proc}
-        await self._wait_ready(instance)
+                    "title": title, "gpu": gpu or "", "key": key, "proc": proc, "log": str(log)}
+        try:
+            await self._wait_ready(instance)
+        except BaseException:
+            # A backend that never came up is not tracked anywhere, so nothing else
+            # would ever reap it: kill it here rather than leave it holding a GPU.
+            with contextlib.suppress(OSError):
+                proc.terminate()
+            raise
         self._by_key[key] = instance
         self._by_id[vid] = instance
         return self._public(instance)
 
     async def _wait_ready(self, instance: dict[str, Any], timeout: float = 40.0) -> None:
         url = f"http://127.0.0.1:{instance['port']}/api/health"
+        log = Path(instance["log"])
         deadline = asyncio.get_event_loop().time() + timeout
         async with httpx.AsyncClient(timeout=3.0) as client:
             while asyncio.get_event_loop().time() < deadline:
                 if instance["proc"].poll() is not None:
-                    raise RuntimeError("viewer backend exited during startup")
+                    raise RuntimeError(viewer_logs.startup_error(
+                        "viewer backend exited during startup", log))
                 try:
                     r = await client.get(url)
                     if r.status_code < 500:
@@ -111,7 +126,8 @@ class ViewerManager:
                 except httpx.HTTPError:
                     pass
                 await asyncio.sleep(0.4)
-        raise TimeoutError("viewer backend did not become ready in time")
+        raise TimeoutError(viewer_logs.startup_error(
+            "viewer backend did not become ready in time", log))
 
     def stop(self, vid: str) -> bool:
         inst = self._by_id.pop(vid, None)
@@ -140,6 +156,7 @@ class ViewerManager:
             "reload": instance["reload"],
             "gpu": instance["gpu"],   # "" = unpinned (JAX chose); "cpu" = no device
             "url": f"/viewer/{instance['id']}/",
+            "log": instance["log"],   # this session's stdout+stderr, for diagnosis
             "running": instance["proc"].poll() is None,
         }
 

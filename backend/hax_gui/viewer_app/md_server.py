@@ -19,6 +19,7 @@ import io
 import math
 import os
 import sys
+import traceback
 from pathlib import Path
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -220,6 +221,11 @@ def build_app(meta: Meta, title: str = "Metadata") -> FastAPI:
         try:
             img = meta.image(row)
         except Exception as exc:  # noqa: BLE001
+            # The traceback would otherwise be lost in the HTTPException; the
+            # spawning manager captures this backend's stderr per session
+            # (hax_gui/viewer_logs.py).
+            print(f"[mdviewer] image read failed (row {row}):", file=sys.stderr, flush=True)
+            traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"image read failed: {exc}")
         png = _png_from_image(img, int(max(16, min(512, size))))
         return Response(content=png, media_type="image/png",

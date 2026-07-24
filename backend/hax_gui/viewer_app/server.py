@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 # Be a good GPU citizen: don't preallocate the whole device.
@@ -45,6 +47,20 @@ def _timing(stage: str, **parts: float) -> None:
         return
     body = " | ".join(f"{k} {v * 1e3:8.1f} ms" for k, v in parts.items())
     print(f"[viewer:timing] {stage:12s} {body}", flush=True)
+
+
+def _log_exc(context: str) -> None:
+    """Print the current exception's traceback to this backend's log.
+
+    The request handlers below convert exceptions into ``HTTPException`` so the
+    browser gets a readable ``detail``, which discards the traceback — and a
+    one-line ``detail`` is rarely enough to explain a decode failure. The manager
+    that spawned us captures stdout+stderr per session (hax_gui/viewer_logs.py),
+    so writing it here is what makes the full stack recoverable afterwards.
+    """
+    print(f"[viewer] {context}:", file=sys.stderr, flush=True)
+    traceback.print_exc()
+    sys.stderr.flush()
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -987,6 +1003,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             except HTTPException:
                 raise
             except Exception as exc:  # noqa: BLE001
+                _log_exc("decode failed")
                 raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
 
             t_level = time.perf_counter()
@@ -1028,6 +1045,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             except HTTPException:
                 raise
             except Exception as exc:  # noqa: BLE001
+                _log_exc("decode failed")
                 raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
         vmin, vmax = float(ds.min()), float(ds.max())
         u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)
@@ -1086,6 +1104,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             except HTTPException:
                 raise
             except Exception as exc:  # noqa: BLE001
+                _log_exc("decode failed")
                 raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
             level = level_for_sigma(grid, sigma)
             # Scale back up by the stride so a draft's mass is comparable to a full one —
@@ -1142,6 +1161,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:  # noqa: BLE001
+            _log_exc("save_layer failed")
             raise HTTPException(status_code=500, detail=f"save failed: {exc}")
 
     @app.get("/")

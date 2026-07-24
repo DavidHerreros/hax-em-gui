@@ -70,6 +70,15 @@ class Settings:
         return self.data_dir / "runs"
 
     @property
+    def viewer_logs_dir(self) -> Path:
+        """Per-session stdout/stderr of the viewer subprocesses (see viewer_logs.py).
+
+        Kept out of :attr:`runs_dir`, which is per-*job*: a viewer session is not a
+        job, outlives none of them, and is pruned on its own schedule.
+        """
+        return self.data_dir / "viewer_logs"
+
+    @property
     def schema_cache(self) -> Path:
         """Writable program-schema cache. Defaults under the data dir (never the
         installed package, which may be read-only); falls back to the shipped seed
@@ -94,6 +103,7 @@ class Settings:
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.viewer_logs_dir.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

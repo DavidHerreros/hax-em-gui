@@ -9,6 +9,7 @@ reverse-proxied at ``/mdviewer/<id>/``. The id is an unguessable capability toke
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
 import socket
 import subprocess
@@ -18,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from . import mdpaths
+from . import mdpaths, viewer_logs
 
 _SERVER = Path(__file__).resolve().parent / "viewer_app" / "md_server.py"
 
@@ -69,20 +70,32 @@ class MdViewerManager:
         # Run from wherever the file's relative image refs resolve — its own
         # folder by the Xmipp/Relion convention, an ancestor under Scipion.
         cwd = mdpaths.image_base_dir(path) or path.parent
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, cwd=str(cwd))
-        instance = {"id": vid, "port": port, "md": str(path), "title": title, "proc": proc}
-        await self._wait_ready(instance)
+        viewer_logs.prune("mdviewer")
+        log = viewer_logs.log_path("mdviewer", vid)
+        with viewer_logs.spawn_log(log) as log_fh:
+            proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, cwd=str(cwd))
+        instance = {"id": vid, "port": port, "md": str(path), "title": title,
+                    "proc": proc, "log": str(log)}
+        try:
+            await self._wait_ready(instance)
+        except BaseException:
+            # Untracked once we raise, so nothing else would reap it.
+            with contextlib.suppress(OSError):
+                proc.terminate()
+            raise
         self._by_path[key] = instance
         self._by_id[vid] = instance
         return self._public(instance)
 
     async def _wait_ready(self, instance: dict[str, Any], timeout: float = 40.0) -> None:
         url = f"http://127.0.0.1:{instance['port']}/api/health"
+        log = Path(instance["log"])
         deadline = asyncio.get_event_loop().time() + timeout
         async with httpx.AsyncClient(timeout=3.0) as client:
             while asyncio.get_event_loop().time() < deadline:
                 if instance["proc"].poll() is not None:
-                    raise RuntimeError("metadata-viewer backend exited during startup")
+                    raise RuntimeError(viewer_logs.startup_error(
+                        "metadata-viewer backend exited during startup", log))
                 try:
                     r = await client.get(url)
                     if r.status_code < 500:
@@ -90,7 +103,8 @@ class MdViewerManager:
                 except httpx.HTTPError:
                     pass
                 await asyncio.sleep(0.4)
-        raise TimeoutError("metadata-viewer backend did not become ready in time")
+        raise TimeoutError(viewer_logs.startup_error(
+            "metadata-viewer backend did not become ready in time", log))
 
     def stop(self, vid: str) -> bool:
         inst = self._by_id.pop(vid, None)
@@ -117,6 +131,7 @@ class MdViewerManager:
             "title": instance["title"],
             "md": instance["md"],
             "url": f"/mdviewer/{instance['id']}/",
+            "log": instance["log"],   # this session's stdout+stderr, for diagnosis
             "kind": "md",
             "running": instance["proc"].poll() is None,
         }

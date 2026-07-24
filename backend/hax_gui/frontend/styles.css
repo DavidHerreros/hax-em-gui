@@ -949,9 +949,10 @@ body.vwin-dragging iframe { pointer-events: none; }
 .wf-node.sel:not(.primary) { box-shadow: 0 0 0 1.5px var(--brand, #2dd4bf); }
 
 /* Focus mode: the selection keeps full contrast, the steps it is wired to are outlined,
-   everything else recedes. Only the *contents* of a dimmed step fade — its background
-   stays opaque, so it doesn't turn into a window onto the wires running underneath. */
-.wf-node.dim { box-shadow: none; border-color: color-mix(in srgb, var(--border) 55%, transparent); }
+   everything else recedes. A dimmed step also goes translucent so a focused wire passing
+   behind it stays readable instead of being cut in two. */
+.wf-node.dim { box-shadow: none; border-color: color-mix(in srgb, var(--border) 55%, transparent);
+  background: color-mix(in srgb, var(--surface) 45%, transparent); }
 .wf-node.dim > * { opacity: .28; }
 .wf-node.near { border-color: var(--brand, #2dd4bf);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--brand, #2dd4bf) 45%, transparent), 0 2px 10px rgba(0,0,0,.22); }
