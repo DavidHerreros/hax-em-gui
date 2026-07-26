@@ -111,10 +111,14 @@ export function openSourcePicker(kind, onPick) {
           `No compatible runs in this project yet (need a finished run that produces ${prettyKind(kind)}).`));
         return;
       }
+      // A stale run is still offered — its output file is right there and may be exactly
+      // what you want — but never silently: it was computed from an input that has since
+      // been re-made, so chaining off it carries that staleness forward.
       mount(list, h("div", null, ...sources.map((s) => h(
         "button", { class: "entry", onclick: () => { onPick(s); close(); } },
         icon("box", 16),
         h("span", { class: "nm" }, s.name || s.program),
+        s.stale ? h("span", { class: "badge stale", title: "This run's own input was re-run after it finished — its output is out of date." }, "stale") : null,
         h("span", { class: "sz mono" }, s.program)))));
     })
     .catch((err) => mount(list, errorBox(err)));

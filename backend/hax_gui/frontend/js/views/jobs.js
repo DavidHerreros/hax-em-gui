@@ -15,6 +15,74 @@ export function badge(status) {
   return h("span", { class: "badge " + status }, animated ? h("span", { class: "dot" }) : null, status);
 }
 
+// Sits next to the status badge on a run whose inputs were re-made after it finished:
+// its outputs are real, they just no longer correspond to anything that exists. Returns
+// null for a healthy run so callers can drop it straight into a child list.
+export function staleBadge(job) {
+  if (!job || !job.stale) return null;
+  return h("span", { class: "badge stale", title: "A run this one depends on has been re-run since. These outputs came from the previous version of that input — re-run this step to bring them up to date." },
+    icon("refresh", 11), "stale");
+}
+
+// ── when a run happened ──
+// `created_at` is set once, when the row is first inserted, and a rerun deliberately
+// keeps it (jobs.py: that is what holds the row's place in these lists). So on anything
+// that has been re-run it names a run that no longer exists — which is why these lists
+// used to claim a job "ran" days before the outputs sitting in its folder were written.
+// The run's own clock is started_at / finished_at, reset by every launch path.
+//
+// Returns { label, stamp } naming the timestamp that actually describes what you are
+// looking at, or nulls when there is nothing to show.
+export function jobTime(job) {
+  if (!job) return { label: null, stamp: null };
+  if (job.active) return job.started_at ? { label: "started", stamp: job.started_at } : { label: "queued", stamp: job.created_at };
+  if (job.finished_at) return { label: "finished", stamp: job.finished_at };
+  // Started but no end recorded: the machine went down under it, or it is a saved row
+  // that has never run at all (both timestamps cleared on replace).
+  if (job.started_at) return { label: "started", stamp: job.started_at };
+  return { label: "created", stamp: job.created_at };
+}
+
+// How long the run took, once it has both ends. Null while it is still going: these
+// lists only rebuild when something changes, so a "2h 14m so far" would sit there
+// frozen and quietly lie.
+export function jobDuration(job) {
+  if (!job || job.active || !job.started_at || !job.finished_at) return null;
+  const ms = new Date(job.finished_at) - new Date(job.started_at);
+  if (!(ms >= 0)) return null;                       // clock skew, or a malformed stamp
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const hrs = Math.floor(m / 60);
+  if (hrs < 24) return `${hrs}h ${m % 60}m`;
+  return `${Math.floor(hrs / 24)}d ${hrs % 24}h`;
+}
+
+// The row shows one time; the tooltip shows the whole life of the run, so "why does this
+// say finished 10:04 when I launched it yesterday" is answerable without leaving the list.
+export function jobTimeTitle(job) {
+  if (!job) return "";
+  const at = (t) => (t ? new Date(t).toLocaleString() : "—");
+  const lines = [`Created: ${at(job.created_at)}`, `Started: ${at(job.started_at)}`];
+  if (!job.active) lines.push(`Finished: ${at(job.finished_at)}`);
+  const dur = jobDuration(job);
+  if (dur) lines.push(`Duration: ${dur}`);
+  if (job.created_at && job.started_at && job.created_at !== job.started_at) {
+    lines.push("", "Created is when this step was first added; a rerun keeps it so the row stays put.");
+  }
+  return lines.join("\n");
+}
+
+// The one-line form used in every run list: "finished 25/07/2026, 14:32:10 · 2h 14m".
+export function jobTimeEl(job, cls = "time") {
+  const { label, stamp } = jobTime(job);
+  const dur = jobDuration(job);
+  return h("span", { class: cls, title: jobTimeTitle(job) },
+    stamp ? `${label} ${new Date(stamp).toLocaleString()}` : "—",
+    dur ? h("span", { class: "time-dur" }, " · " + dur) : null);
+}
+
 export function JobsView() {
   const root = h("div", { class: "view" }, h("h1", { style: { marginBottom: "16px" } }, "Jobs"));
   const filterBar = h("div", { class: "jobs-filters" });
@@ -161,7 +229,10 @@ function groupedList(jobs, hooks) {
 // object locally (the chip updates immediately), so a label change shouldn't force
 // a full list rebuild — which otherwise causes a visible ~refresh-tick "jump".
 export function jobsSignature(jobs) {
-  return jobs.map((j) => `${j.id}:${j.status}:${j.name || ""}`).join("|");
+  // `stale` is in here because it changes with no status change of its own: a run goes
+  // stale when a *different* run is re-made, and without it the badge would only appear
+  // the next time something else about the list moved.
+  return jobs.map((j) => `${j.id}:${j.status}:${j.stale ? "s" : ""}:${j.name || ""}`).join("|");
 }
 
 // What to show as a run's title: its custom name, falling back to the program.
@@ -235,11 +306,12 @@ function row(job, i, hooks) {
     "a",
     { class: "job-row", href: "#/jobs/" + job.id, style: { animationDelay: `${i * 0.02}s` } },
     badge(job.status),
+    staleBadge(job),
     title,
     job.name ? h("span", { class: "prog-sub mono" }, job.program) : null,
     jobLabelChips(job, { editable: true }),
     gpuLabel(job.gpu) ? h("span", { class: "muted", style: { fontSize: "12px" } }, gpuLabel(job.gpu)) : null,
-    h("span", { class: "time" }, new Date(job.created_at).toLocaleString()),
+    jobTimeEl(job),
     jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); hooks?.afterLocalRename?.(); }, onDeleted: () => a.remove() })
   );
   return a;

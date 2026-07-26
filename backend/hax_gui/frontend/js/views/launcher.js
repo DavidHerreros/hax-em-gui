@@ -9,6 +9,7 @@ import { errorBox } from "./ui.js";
 import { initialValues, visibleFields } from "./formFields.js";
 import { paramForm } from "./paramForm.js";
 import { bindingControl } from "./inputBinding.js";
+import { confirmJobCascade } from "./cascadeModal.js";
 
 const CATEGORY_ORDER = ["Preprocessing", "Networks", "Post-processing", "Metrics", "Viewers", "Other"];
 
@@ -217,6 +218,23 @@ export function buildLauncher() {
     async function submit(launch) {
       const proj = store.activeProject();
       if (!proj) return;
+      // Reusing an existing job rebuilds its run folder (even on Save — the old folder
+      // goes either way), so everything downstream of it is invalidated. Ask first. No
+      // dialog appears when nothing depends on it, which includes the common case of a
+      // job this same form just created.
+      let cascade = null;
+      if (targetJobId) {
+        cascade = await confirmJobCascade(targetJobId, resume ? {
+          title: "Continue this run with the edited settings?",
+          verb: "Continue",
+          lead: "It resumes from its last checkpoint and keeps writing into the same run folder, replacing its current outputs.",
+        } : {
+          title: launch ? "Re-run this step with the edited settings?" : "Save over this step?",
+          verb: launch ? "Re-run" : "Save",
+          lead: "Its run folder is rebuilt from scratch — the current outputs and log are replaced.",
+        });
+        if (!cascade) return;
+      }
       clear(formErr);
       form.clearErrors();
       runBtn.disabled = true;
@@ -230,7 +248,7 @@ export function buildLauncher() {
         for (const f of Object.keys(bindings)) delete payload[f];
         // Reuse the edited / just-saved job in place (no duplicate). The server
         // ignores a stale target (deleted / already running) and creates fresh.
-        const created = await api.createProjectJob(proj.id, schema.name, payload, gpu || null, runName, bindings, launch, recreateSsd, targetJobId, resume);
+        const created = await api.createProjectJob(proj.id, schema.name, payload, gpu || null, runName, bindings, launch, recreateSsd, targetJobId, resume, cascade);
         // Remember the id so a subsequent Run/Save in this same form keeps reusing
         // it (e.g. Save job → Run launches that saved job rather than a new one).
         if (created && created.id) targetJobId = created.id;

@@ -10,6 +10,7 @@ import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
 import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
 import { runBrowser, folderName } from "./runBrowser.js";
+import { jobTimeEl } from "./jobs.js";
 
 // A job is viewable if it has a network checkpoint plus latents — either a
 // latents input, or a finished predict run whose output provides them (which
@@ -40,7 +41,7 @@ export function ViewerView() {
         j.name ? h("span", { class: "run-sub mono" }, j.program) : null,
         h("span", { class: "run-folder mono" }, folderName(j.workdir)),
         (j.labels && j.labels.length) ? jobLabelChips(j) : null,
-        h("span", { class: "run-time" }, new Date(j.created_at).toLocaleString()),
+        jobTimeEl(j, "run-time"),
         h("span", { class: "run-open" }, icon("box", 14), "Open viewer"));
       btn.onclick = () => launch(j, btn);
       return btn;

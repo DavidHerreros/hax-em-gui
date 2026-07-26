@@ -4,7 +4,7 @@ import { h, mount, clear, append } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
-import { badge, jobsSignature, gpuLabel, jobDisplayName, jobMenuButton } from "./jobs.js";
+import { badge, staleBadge, jobsSignature, gpuLabel, jobDisplayName, jobMenuButton, jobTimeEl } from "./jobs.js";
 import { errorBox, formatSize } from "./ui.js";
 import { ProjectManager } from "./projectManager.js";
 import { makeJobDraggable } from "./inputBinding.js";
@@ -156,6 +156,7 @@ function execList(jobs, sizes) {
       "a", { class: "exec-row", href: "#/jobs/" + j.id, title: "Drag onto a compatible input to chain it", style: { animationDelay: `${i * 0.02}s` } },
       h("span", { class: "exec-grip", title: "Drag as input" }, icon("more", 14)),
       badge(j.status),
+      staleBadge(j),
       title,
       h("span", { class: "exec-prog mono" }, j.program),
       h("span", { class: "exec-folder mono" }, folderName(j.workdir)),
@@ -166,7 +167,7 @@ function execList(jobs, sizes) {
         : null,
       jobLabelChips(j, { editable: true }),
       gpuLabel(j.gpu) ? h("span", { class: "muted small" }, gpuLabel(j.gpu)) : null,
-      h("span", { class: "exec-time" }, new Date(j.created_at).toLocaleString()),
+      jobTimeEl(j, "exec-time"),
       jobMenuButton(j, { onRenamed: (u) => { title.textContent = jobDisplayName(u); }, onDeleted: () => a.remove() }));
     makeJobDraggable(a, j);
     return a;

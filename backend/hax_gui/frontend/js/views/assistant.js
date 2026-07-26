@@ -15,6 +15,7 @@ import { store } from "../store.js";
 import { createTerminal } from "./terminal.js";
 import { runBrowser, folderName } from "./runBrowser.js";
 import { jobLabelChips } from "./labels.js";
+import { jobTimeEl } from "./jobs.js";
 
 const GREETING =
   "Hi! I can help you pick programs and parameters, explain options from the docs, "
@@ -202,7 +203,7 @@ export function AssistantView() {
       h("span", { class: "run-folder mono" }, folderName(j.workdir)),
       (j.status && j.status !== "succeeded") ? h("span", { class: "run-status" }, j.status) : null,
       (j.labels && j.labels.length) ? jobLabelChips(j) : null,
-      h("span", { class: "run-time" }, new Date(j.created_at).toLocaleString()),
+      jobTimeEl(j, "run-time"),
       h("span", { class: "run-open" }, icon("paperclip", 14), "Attach"));
   }
   function openRunPicker() {

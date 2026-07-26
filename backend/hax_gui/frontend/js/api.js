@@ -70,10 +70,16 @@ export const api = {
   renameJob: (id, name) => req(`/api/jobs/${id}`, { method: "PUT", body: JSON.stringify({ name }) }),
   startJob: (id) => req(`/api/jobs/${id}/start`, { method: "POST" }),
   cancelJob: (id) => req(`/api/jobs/${id}/cancel`, { method: "POST" }),
-  rerunJob: (id) => req(`/api/jobs/${id}/rerun`, { method: "POST" }),
+  // Re-running rebuilds this job's run folder, which is where everything downstream
+  // reads its inputs — so `cascade` says what happens to those: "stale" flags them,
+  // "queue" also re-runs them in order. `cancel_running` is the user's explicit yes to
+  // stopping downstream runs still executing (without it the server answers 409).
+  rerunJob: (id, cascade) => req(`/api/jobs/${id}/rerun`, { method: "POST", body: JSON.stringify(cascade || {}) }),
+  // The runs this one feeds, transitively — what a rerun would invalidate.
+  jobDependents: (id) => req(`/api/jobs/${id}/dependents`),
   // Recipe for copying a job into another project (program + params, inputs cleared).
   jobCopyPrefill: (id) => req(`/api/jobs/${id}/copy-prefill`),
-  continueJob: (id) => req(`/api/jobs/${id}/continue`, { method: "POST" }),
+  continueJob: (id, cascade) => req(`/api/jobs/${id}/continue`, { method: "POST", body: JSON.stringify(cascade || {}) }),
   // Disk usage. Measured on demand (a folder walk), cached server-side for a couple
   // of minutes; `refresh` forces a re-measure.
   jobUsage: (id, refresh) => req(`/api/jobs/${id}/usage${refresh ? "?refresh=true" : ""}`),
@@ -127,7 +133,10 @@ export const api = {
   // runWorkflow with no `nodes` runs the whole graph; pass an array of node ids
   // to run just that subset (a single node or a selection). If a run is already in
   // flight the steps are appended to its queue rather than rejected.
-  runWorkflow: (id, nodes) => req(`/api/workflows/${id}/run`, { method: "POST", body: JSON.stringify(nodes ? { nodes } : {}) }),
+  // `cascade` carries the same rerun choice as rerunJob, for the steps this subset
+  // feeds; ignored when the whole graph runs.
+  runWorkflow: (id, nodes, cascade) =>
+    req(`/api/workflows/${id}/run`, { method: "POST", body: JSON.stringify({ ...(nodes ? { nodes } : {}), ...(cascade || {}) }) }),
   stopWorkflow: (id) => req(`/api/workflows/${id}/stop`, { method: "POST" }),
   // Runs the server was restarted out from under, whose next step never started.
   resumableWorkflows: () => req("/api/workflows/resumable"),
@@ -183,10 +192,12 @@ export const api = {
   // workflow edges they back reappear. Returns { relinked: [...], count }.
   relinkProject: (id) => req(`/api/projects/${id}/relink`, { method: "POST" }),
   projectSources: (id, kind) => req(`/api/projects/${id}/sources?kind=${encodeURIComponent(kind)}`),
-  createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true, recreateSsd = false, replaceJobId = null, resume = false) =>
+  // `cascade` ({cascade, cancel_running}) only bites alongside replaceJobId: editing a
+  // run in place re-makes its outputs, so it invalidates what it feeds just as a rerun does.
+  createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true, recreateSsd = false, replaceJobId = null, resume = false, cascade = null) =>
     req(`/api/projects/${projectId}/jobs`, {
       method: "POST",
-      body: JSON.stringify({ program, args, gpu, name: name || null, bindings: bindings || {}, launch, recreate_ssd: recreateSsd, replace_job_id: replaceJobId, resume }),
+      body: JSON.stringify({ program, args, gpu, name: name || null, bindings: bindings || {}, launch, recreate_ssd: recreateSsd, replace_job_id: replaceJobId, resume, ...(cascade || {}) }),
     }),
 };
 

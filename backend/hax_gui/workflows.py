@@ -149,7 +149,7 @@ class WorkflowManager:
             if st in ACTIVE:                  # incl. 'cancelling' — not final yet
                 st = "running"                # still in flight; the scheduler adopts it
             state[nid] = {
-                "job_id": jid, "status": st,
+                "job_id": jid, "status": st, "stale": bool(job.get("stale")),
                 "error": None if st in ("running", "succeeded")
                 else s.get("error") or "step did not finish (see the job log)",
             }
@@ -336,7 +336,7 @@ class WorkflowManager:
             nodes.append({"id": nid, "program": j["program"], "args": self._clean_args(j),
                           "gpu": j.get("gpu") or "0", "name": j.get("name") or "",
                           "labels": self._labels_of(j["id"]), "x": 0, "y": 0, "job_id": j["id"]})
-            state[nid] = {"job_id": j["id"], "status": j["status"], "error": None}
+            state[nid] = {"job_id": j["id"], "status": j["status"], "stale": bool(j.get("stale")), "error": None}
             for field, b in (j.get("bindings") or {}).items():
                 for one in (b if isinstance(b, list) else [b]):   # multi-valued inputs -> many edges
                     if one.get("job_id") in id_map:
@@ -527,7 +527,8 @@ class WorkflowManager:
         for n in nodes:
             jid = n.get("job_id")
             if jid and jid in by_job:
-                state[n["id"]] = {"job_id": jid, "status": by_job[jid]["status"], "error": None}
+                state[n["id"]] = {"job_id": jid, "status": by_job[jid]["status"],
+                                  "stale": bool(by_job[jid].get("stale")), "error": None}
             else:
                 state[n["id"]] = {"job_id": None, "status": "idle", "error": None}
         return graph, state
@@ -603,6 +604,63 @@ class WorkflowManager:
         if len(order) != len(ids):
             raise WorkflowError(["the workflow has a cycle — wiring must form a DAG"])
         return order
+
+    # -- what a step feeds -------------------------------------------------
+    def downstream_nodes(self, wid: str, node_ids: list[str]) -> list[str]:
+        """The steps `node_ids` feed, transitively, excluding `node_ids` themselves.
+
+        Taken from the graph rather than from the jobs' bindings, because a canvas edge
+        exists before the run that would turn it into a binding does: a step wired to a
+        not-yet-run one has no binding to find, and a standalone workflow's steps may
+        have no jobs at all. Returned in graph order so the UI lists them as they sit on
+        the canvas.
+        """
+        wf = self.get(wid)
+        if wf is None:
+            raise KeyError(wid)
+        graph = wf["graph"] or {}
+        edges = graph.get("edges", [])
+        seen, queue = set(node_ids), list(node_ids)
+        while queue:
+            cur = queue.pop(0)
+            for e in edges:
+                if e.get("from") == cur and e.get("to") not in seen:
+                    seen.add(e["to"])
+                    queue.append(e["to"])
+        start = set(node_ids)
+        return [n["id"] for n in graph.get("nodes", []) if n["id"] in seen and n["id"] not in start]
+
+    def jobs_for_nodes(self, wid: str, node_ids: list[str]) -> list[str]:
+        """The job each of these steps last ran as, skipping the ones that never ran.
+
+        A project node carries its link on the node itself; a standalone one only in
+        run_state (its steps make a new job per run), so both are consulted.
+        """
+        wf = self.get(wid)
+        if wf is None:
+            return []
+        state = wf.get("run_state") or {}
+        by_node = {n["id"]: n for n in (wf["graph"] or {}).get("nodes", [])}
+        out = []
+        for nid in node_ids:
+            jid = by_node.get(nid, {}).get("job_id") or (state.get(nid) or {}).get("job_id")
+            if jid and jid not in out:
+                out.append(jid)
+        return out
+
+    def nodes_for_jobs(self, wid: str, job_ids: list[str]) -> list[str]:
+        """The reverse of :meth:`jobs_for_nodes`: the steps these jobs are linked to."""
+        wf = self.get(wid)
+        if wf is None:
+            return []
+        state = wf.get("run_state") or {}
+        wanted = set(job_ids)
+        out = []
+        for n in (wf["graph"] or {}).get("nodes", []):
+            jid = n.get("job_id") or (state.get(n["id"]) or {}).get("job_id")
+            if jid in wanted and n["id"] not in out:
+                out.append(n["id"])
+        return out
 
     def validate(self, graph: dict[str, Any]) -> list[str]:
         nodes = graph.get("nodes", [])

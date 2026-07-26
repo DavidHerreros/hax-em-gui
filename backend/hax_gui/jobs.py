@@ -106,8 +106,8 @@ class JobNotSaved(Exception):
 
 
 class JobNotResumable(Exception):
-    def __init__(self, job_id: str):
-        super().__init__(f"job '{job_id}' has no loadable checkpoint to continue from")
+    def __init__(self, job_id: str, reason: str | None = None):
+        super().__init__(reason or f"job '{job_id}' has no loadable checkpoint to continue from")
         self.job_id = job_id
 
 
@@ -255,7 +255,7 @@ class JobManager:
         )
         # Add columns to pre-existing databases (idempotent).
         for col in ("project_id TEXT", "workdir TEXT", "cwd TEXT", "name TEXT", "bindings TEXT",
-                    "pgid INTEGER", "proc_key TEXT"):
+                    "pgid INTEGER", "proc_key TEXT", "stale INTEGER NOT NULL DEFAULT 0"):
             try:
                 self._db.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -415,9 +415,19 @@ class JobManager:
             # Replace in place: keep the same id (and created_at, so the row stays
             # put in lists) and discard the previous run folder.
             old = self.get(replace_job_id)
+            # `stale=0`: this run has just been re-made from its current inputs, so
+            # whatever invalidated it (see :meth:`mark_stale`) no longer applies.
+            #
+            # The clock is reset with it. `created_at` is deliberately kept (that is what
+            # holds the row's place in the lists), so it describes the *slot*, not the run
+            # sitting in it — started_at/finished_at are what describe the run, and leaving
+            # the previous run's times on a replaced row makes the UI quote a run that no
+            # longer exists. `_launch` fills started_at back in immediately when launching;
+            # a merely-saved replacement correctly ends up with neither.
             self._exec(
                 "UPDATE jobs SET program=?, name=?, args=?, gpu=?, command=?, status=?, log_path=?, "
-                "workdir=?, cwd=?, bindings=?, return_code=NULL, finished_at=NULL WHERE id=?",
+                "workdir=?, cwd=?, bindings=?, stale=0, return_code=NULL, started_at=NULL, "
+                "finished_at=NULL WHERE id=?",
                 (program, name_val, json.dumps(values), gpu or None, json.dumps(command),
                  status, str(log_path), str(workdir), cwd, bindings_val, replace_job_id),
             )
@@ -449,8 +459,14 @@ class JobManager:
             raise JobActive(job_id)
         if job["status"] != "saved":
             raise JobNotSaved(job_id)
+        # A saved run that was invalidated (:meth:`mark_stale`) still holds the input
+        # paths materialised from its source run's *old* folder — which a rerun of that
+        # source has since deleted. Its stored command would read a path that is gone, so
+        # rebuild the run from its bindings instead of launching what we have.
+        if job.get("stale"):
+            return await self.rerun(job_id)
         self._init_buffers(job_id)
-        self._exec("UPDATE jobs SET status='pending', return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
+        self._exec("UPDATE jobs SET status='pending', stale=0, return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
         await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"))
         return self.get(job_id)
 
@@ -568,6 +584,64 @@ class JobManager:
         return await self.create(program, args, job["gpu"], job["project_id"],
                                  name=job.get("name"), bindings=bindings, replace_job_id=job_id)
 
+    # -- what a run feeds, and what re-making it invalidates ---------------
+    def dependents(self, job_id: str) -> list[dict[str, Any]]:
+        """Every run downstream of `job_id`, transitively.
+
+        A job's ``bindings`` name the runs it consumes, so the reverse map over the
+        project *is* the dependency graph — the same one the canvas draws, whose edges
+        are derived from these bindings (see ``workflows._synced_graph``). Anything
+        reachable here was computed from this run's outputs, and stops being valid the
+        moment those outputs are re-made.
+
+        Returned oldest first, which for a pipeline built front to back reads in the
+        order the runs were chained. Execution order is not decided here: queueing hands
+        the set to the workflow scheduler, which topologically sorts it itself.
+        """
+        job = self.get(job_id)
+        if job is None:
+            raise JobNotFound(job_id)
+        project_id = job.get("project_id")
+        if not project_id:
+            return []
+        siblings = list(reversed(self.list_for_project(project_id)))    # oldest first
+        by_id = {j["id"]: j for j in siblings}
+        consumers: dict[str, list[str]] = {}
+        for consumer in siblings:
+            for binding in (consumer.get("bindings") or {}).values():
+                # A multi-valued input (e.g. FlexConsensus --input_space) holds a list of
+                # sources, so every one of them feeds this consumer.
+                for one in (binding if isinstance(binding, list) else [binding]):
+                    src = (one or {}).get("job_id")
+                    if src and src != consumer["id"]:
+                        consumers.setdefault(src, []).append(consumer["id"])
+        seen, queue = {job_id}, [job_id]
+        while queue:
+            for cid in consumers.get(queue.pop(0), []):
+                if cid not in seen and cid in by_id:
+                    seen.add(cid)
+                    queue.append(cid)
+        return [j for j in siblings if j["id"] in seen and j["id"] != job_id]
+
+    def mark_stale(self, job_ids: list[str]) -> list[str]:
+        """Flag runs whose inputs were re-made under them; returns the ids actually marked.
+
+        Deliberately *not* destructive. A stale run keeps its outputs and its log — they
+        are still a real result, just one computed from a version of its input that no
+        longer exists — so it can be inspected and compared until the user chooses to
+        re-run it, at which point the folder is rebuilt like any other rerun. What the
+        flag does buy is honesty: the UI marks it, it cannot be continued in place, and
+        it is called out when offered as the input of a new run.
+        """
+        marked = []
+        for jid in job_ids:
+            job = self.get(jid)
+            if job is None or job.get("stale"):
+                continue
+            self._exec("UPDATE jobs SET stale=1 WHERE id=?", (jid,))
+            marked.append(jid)
+        return marked
+
     async def continue_job(self, job_id: str) -> dict[str, Any]:
         """Resume a finished run **in place**: relaunch its exact command so the program
         picks up the intermediate checkpoint it wrote inside its own output folder
@@ -582,6 +656,12 @@ class JobManager:
             raise JobNotFound(job_id)
         if job["status"] in ACTIVE:
             raise JobActive(job_id)
+        # Continuing reuses this folder *and* this command, so it would read the inputs
+        # materialised from a source run that has since been re-made — paths that are now
+        # gone. An invalidated run can only be re-run, which rebuilds them.
+        if job.get("stale"):
+            raise JobNotResumable(
+                job_id, "this run's inputs were re-made after it finished — re-run it instead of continuing")
         if not adapters.is_resumable(job["program"], job.get("workdir")):
             raise JobNotResumable(job_id)
         self._prepare_resume(job["program"], job.get("workdir"), job["log_path"])
@@ -1022,6 +1102,9 @@ class JobManager:
         data["command"] = json.loads(data["command"])
         data["bindings"] = json.loads(data["bindings"]) if data.get("bindings") else None
         data["active"] = data["status"] in ACTIVE
+        # Its inputs were re-made after it ran, so its outputs no longer correspond to
+        # anything that exists (see :meth:`mark_stale`).
+        data["stale"] = bool(data.get("stale"))
         # The kinds this run can feed downstream, narrowed by its mode (a train run
         # yields its checkpoint but no latents/particles, a predict run the reverse),
         # so the chaining UI won't offer a train run where a predict run is required.

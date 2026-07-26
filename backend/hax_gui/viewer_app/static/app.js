@@ -28,7 +28,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let renderer, scatter, cloud = null, hist;
 let L = null, umapData = null, points3 = [];
 const clusterCache = {};
-const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno", current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 60, pointAlpha: 1, pathExpanded: false, smooth: 6, pickRestrict: false };
+const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno",
+  densStyle: "shells", densGamma: 1.4, densLevels: [25, 50, 75, 90], densShade: true, densFog: true, densCbar: true, current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 60, pointAlpha: 1, pathExpanded: false, smooth: 6, pickRestrict: false };
 // `state.fps` is the *motion* rate: timeline frames advanced per second. We render
 // at most DISPLAY_FPS_CAP frames/sec; once the motion rate exceeds that we keep the
 // render rate at the cap and advance several frames per tick instead. That lets a
@@ -179,6 +180,7 @@ function wireControls() {
     if (landView === "slices") setLandView("points");   // slices are the flat XY/XZ/YZ cuts; leaving them while toggling dims is confusing
     refreshAxisEnabled();
     updatePoints(); applyColor(); syncSelection();   // re-apply color so 2D↔3D keeps density/cluster/layers
+    syncDensityPanel();   // the style list is a 3D control; say so when the pane is flat
   });
   $("zaxis").addEventListener("change", (e) => { state.z = +e.target.value; updatePoints(); if (landView === "slices") loadLandSlices(); });
   $("embed").addEventListener("change", async (e) => {
@@ -222,14 +224,37 @@ function wireControls() {
   $("k").addEventListener("input", (e) => { state.k = +e.target.value; $("kval").textContent = state.k; if (state.colorBy === "cluster") applyColor(); });
   $("ptsalpha").addEventListener("input", (e) => { state.pointAlpha = +e.target.value; scatter.setPointAlpha(state.pointAlpha); if (cloud) cloud.setPointAlpha(state.pointAlpha); });
   $("pathToggle").addEventListener("click", () => { state.pathExpanded = !state.pathExpanded; updatePathLabel(); });
+  let bandwidthPending = 0;
   $("denssigma").addEventListener("input", (e) => {
     state.densBandwidth = +e.target.value;
-    if (landView === "slices") loadLandSlices();   // the slice field uses the same bandwidth
-    if (state.colorBy !== "density") return;
-    if (is3d() && cloud) applyColor(); else scatter.setDensityBandwidth(state.densBandwidth);
+    $("denssigmaOut").textContent = (0.04 + state.densBandwidth * 0.02).toFixed(2);
+    if (bandwidthPending) return;
+    bandwidthPending = requestAnimationFrame(() => {
+      bandwidthPending = 0;
+      if (landView === "slices") loadLandSlices();   // the slice field uses the same bandwidth
+      if (state.colorBy !== "density") return;
+      if (is3d() && cloud) applyColor(); else scatter.setDensityBandwidth(state.densBandwidth);
+    });
   });
-  $("densint").addEventListener("input", (e) => { state.densIntensity = +e.target.value; if (cloud) cloud.setDensityIntensity(state.densIntensity); });
-  $("densmap").addEventListener("change", (e) => { state.densMap = e.target.value; applyColormap(); if (state.colorBy === "density") applyColor(); if (landSlices) landSlices.setColormap(sliceColormap()); });
+  $("densint").addEventListener("input", (e) => {
+    state.densIntensity = +e.target.value;
+    $("densintOut").textContent = state.densIntensity.toFixed(2);
+    if (cloud) cloud.setDensityIntensity(state.densIntensity);
+  });
+  $("densgamma").addEventListener("input", (e) => {
+    state.densGamma = +e.target.value;
+    $("densgammaOut").textContent = state.densGamma.toFixed(1);
+    if (cloud) cloud.setDensityGamma(state.densGamma);
+  });
+  $("densmap").addEventListener("change", (e) => { state.densMap = e.target.value; applyColormap(); if (state.colorBy === "density") applyColor(); if (landSlices) landSlices.setColormap(sliceColormap()); drawDensityBar(); });
+  $("denslevels").addEventListener("change", (e) => {
+    state.densLevels = e.target.value.split(",").map(Number);
+    if (state.colorBy === "density") applyColor();
+  });
+  $("densshade").addEventListener("change", (e) => { state.densShade = e.target.checked; if (cloud) cloud.setDensityShade(state.densShade); });
+  $("densfog").addEventListener("change", (e) => { state.densFog = e.target.checked; if (cloud) cloud.setDensityFog(state.densFog); });
+  $("denscbar").addEventListener("change", (e) => { state.densCbar = e.target.checked; drawDensityBar(); });
+  setupDensityPanel();
   $("light").addEventListener("change", (e) => renderer.setLighting(e.target.value));
   // Smoothing is baked into the cached meshes, so changing it invalidates every frame. That
   // flush also stops the prefetcher (clearFrameCache bumps fillToken), so restart it — and
@@ -699,7 +724,11 @@ async function clusterLabels() {
 
 function toggleColorWraps() {
   $("kwrap").style.display = state.colorBy === "cluster" ? "" : "none";
-  $("denswrap").style.display = state.colorBy === "density" ? "" : "none";
+  const dens = state.colorBy === "density";
+  $("denswrap").style.display = dens ? "" : "none";
+  $("densBtn").classList.toggle("active", dens);
+  if (!dens) openDensityPanel(false);
+  syncDensityPanel();
 }
 
 async function applyColor() {
@@ -708,13 +737,22 @@ async function applyColor() {
   if (is3d() && cloud) {
     const dens = state.colorBy === "density";
     if (dens) {
-      const dv = density3(points3, 0.04 + state.densBandwidth * 0.02);
-      cloud.setDensityField(dv); cloud.setDensityIntensity(state.densIntensity);
-      cloud.setColors(densityRampColors(dv));   // inferno-tinted points, like the desktop app
+      cloud.batch(() => {
+        const d = landscapeDensity();
+        if (d) {
+          cloud.setDensityField(d.values);
+          cloud.setDensityQuantiles(d.quantiles);
+          cloud.setDensityNormals(d.normals);
+          if (state.densStyle === "volume") cloud.setDensityVolume(d.grid);
+          cloud.setColors(densityPointColors(d));
+        }
+        pushDensityParams();
+      });
     } else {
       cloud.setColors(computeColors(labels));
     }
     cloud.showDensity(dens);
+    drawDensityBar();
     return;
   }
   if (state.colorBy === "layers") { scatter.setDensity(false); scatter.setLabels(null); scatter.setPointColors(layerColorsCSS()); return; }
@@ -724,17 +762,267 @@ async function applyColor() {
   scatter.setLabels(state.colorBy === "cluster" ? labels : null);
 }
 
-// Per-point RGB (0..1) from local density through the active colormap, lifted off
-// the dark low end so even sparse points stay visible (the 2D scatter does the
-// equivalent internally). Matches the colored spheres of the desktop landscape.
-function densityRampColors(dv) {
-  const stops = COLORMAPS[state.densMap] || COLORMAPS.inferno;
-  const out = new Float32Array(dv.length * 3);
-  for (let i = 0; i < dv.length; i++) {
-    const rgb = rampRGB(stops, 0.32 + 0.68 * dv[i]);
-    out[i * 3] = rgb[0] / 255; out[i * 3 + 1] = rgb[1] / 255; out[i * 3 + 2] = rgb[2] / 255;
+// Per-point RGB (0..1) for the 3D cloud in density mode. The points are drawn over the
+// density render, so they take the same transfer function it does — otherwise the two
+// disagree about what a colour means and the picture reads as two overlaid pictures.
+const DENS_EPS = 0.004;                       // density floor of the log transfer
+const DENS_KT = -Math.log(DENS_EPS);          // ...so the free-energy scale runs 0..DENS_KT
+function densityPointColors(d) {
+  const dv = d.values, qv = d.quantiles, n = dv.length;
+  const out = new Float32Array(n * 3);
+  const put = (i, rgb) => { out[i * 3] = rgb[0] / 255; out[i * 3 + 1] = rgb[1] / 255; out[i * 3 + 2] = rgb[2] / 255; };
+  if (state.densStyle === "shells") {
+    const bands = shellBands(state.densLevels);
+    for (let i = 0; i < n; i++) {
+      let b = bands.length - 1;
+      for (let k = 0; k < bands.length; k++) if (qv[i] <= bands[k].q) { b = k; break; }
+      put(i, bands[b].color);
+    }
+    return out;
   }
+  const stops = COLORMAPS[state.densMap] || COLORMAPS.inferno;
+  if (state.densStyle === "energy") {
+    for (let i = 0; i < n; i++) {
+      const t = (Math.log(Math.max(dv[i], DENS_EPS)) + DENS_KT) / DENS_KT;
+      put(i, rampRGB(stops, 0.15 + 0.85 * t));
+    }
+    return out;
+  }
+  if (state.densStyle === "points" || state.densStyle === "volume") {
+    for (let i = 0; i < n; i++) {
+      const t = Math.pow(dv[i], 0.7);
+      put(i, [74 + 168 * t, 87 + 160 * t, 107 + 148 * t]);
+    }
+    return out;
+  }
+  // splats: the ramp tint the viewer has always used, lifted off the dark end
+  for (let i = 0; i < n; i++) put(i, rampRGB(stops, 0.32 + 0.68 * dv[i]));
   return out;
+}
+
+// Shell bands. The ramp runs light/warm at the core (read first) to dark/cool in the
+// tail, and alpha falls geometrically, so nesting reads as nesting rather than as hue.
+const SHELL_RAMP = [[252, 232, 180], [243, 168, 66], [221, 102, 58], [181, 58, 86], [104, 43, 104], [46, 56, 80]];
+const SHELL_ALPHA = [0.95, 0.62, 0.38, 0.22, 0.13, 0.07];
+function shellBands(levels) {
+  const n = Math.min(6, levels.length + 1);
+  return levels.slice(0, 5).concat([101]).map((pct, i) => ({
+    q: Math.min(1.01, pct / 100),
+    color: SHELL_RAMP[Math.round(i * (SHELL_RAMP.length - 1) / Math.max(1, n - 1))],
+    alpha: SHELL_ALPHA[Math.min(i, SHELL_ALPHA.length - 1)],
+    label: pct > 100 ? "tail" : pct + "%",
+  }));
+}
+
+// ── the density panel ─────────────────────────────────────────────────────
+// The landscape toolbar already carries eleven controls; six render styles plus their
+// parameters will not fit in it. So they live behind one button, in a panel that shows
+// only the rows the selected style actually reads — four to six at a time, never eleven.
+const DENSITY_STYLES = [
+  { id: "shells", name: "Population shells", sub: "nested quantile bands", uses: ["levels", "shade"],
+    unit: "% of particles enclosed", note: "Each shell encloses the stated share of the particles." },
+  { id: "volume", name: "Volumetric", name2: "volume", sub: "ray-marched KDE grid", uses: ["gamma", "cmap", "shade"],
+    unit: "ρ / ρmax", note: "Marches the same grid the Slices view bins. Real occlusion." },
+  { id: "energy", name: "Free energy", sub: "−ln p, in units of kT", uses: ["gamma", "cmap", "shade"],
+    unit: "ΔG (kT), 0 = most populated", note: "The log compresses six decades of occupancy without clipping." },
+  { id: "splats", name: "Sorted splats", sub: "density, composited", uses: ["gamma", "cmap", "shade"],
+    unit: "ρ / ρmax", note: "The old kernel, depth-sorted and over-blended instead of summed." },
+  { id: "points", name: "Graded points", sub: "one hue, no glow", uses: ["shade"],
+    unit: "ρ / ρmax", note: "Density as a substrate, so the path and selection stay loudest." },
+];
+const densStyleDef = (id) => DENSITY_STYLES.find((d) => d.id === id) || DENSITY_STYLES[0];
+
+function setupDensityPanel() {
+  const pop = $("densPop"), btn = $("densBtn"), list = $("densStyles");
+  DENSITY_STYLES.forEach((d) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "dens-style"; b.dataset.style = d.id;
+    b.innerHTML = `<span class="rd">○</span><span>${d.name}<small>${d.sub}</small></span>`;
+    b.addEventListener("click", () => setDensityStyle(d.id));
+    list.appendChild(b);
+  });
+  btn.addEventListener("click", (e) => { e.stopPropagation(); openDensityPanel(pop.dataset.open !== "true"); });
+  pop.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => openDensityPanel(false));
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") openDensityPanel(false); });
+  $("densReset").addEventListener("click", resetDensityPanel);
+  $("denssigma").value = state.densBandwidth;
+  $("densint").value = state.densIntensity;
+  $("densgamma").value = state.densGamma;
+  $("denssigmaOut").textContent = (0.04 + state.densBandwidth * 0.02).toFixed(2);
+  $("densintOut").textContent = state.densIntensity.toFixed(2);
+  $("densgammaOut").textContent = state.densGamma.toFixed(1);
+  syncDensityPanel();
+}
+
+function openDensityPanel(on) {
+  const pop = $("densPop");
+  if (!pop) return;
+  pop.dataset.open = String(!!on);
+  $("densBtn").setAttribute("aria-expanded", String(!!on));
+  if (!on) return;
+  // Bound it against where the button actually sits, so the panel always ends above the
+  // bottom of the window — the pane can be far shorter than the panel wants to be.
+  const r = $("densBtn").getBoundingClientRect();
+  pop.style.maxHeight = Math.max(200, window.innerHeight - r.bottom - 28) + "px";
+}
+
+function setDensityStyle(id) {
+  state.densStyle = id;
+  syncDensityPanel();
+  if (state.colorBy === "density") applyColor(); else drawDensityBar();
+}
+
+// The panel's whole job: show the rows this style reads, and nothing else.
+function syncDensityPanel() {
+  const d = densStyleDef(state.densStyle);
+  const volumeOk = !cloud || cloud.hasVolumeSupport();
+  $("densBtnStyle").textContent = (d.name2 || d.name.split(" ")[0]).toLowerCase();
+  $("densHint").textContent = d.unit;
+  for (const b of $("densStyles").children) {
+    const on = b.dataset.style === state.densStyle;
+    b.setAttribute("aria-pressed", String(on));
+    b.querySelector(".rd").textContent = on ? "◉" : "○";
+    if (b.dataset.style === "volume") {
+      b.disabled = !volumeOk;
+      b.title = volumeOk ? "" : "This browser refused the 3D-texture shader.";
+    }
+  }
+  for (const el of $("densPop").querySelectorAll("[data-when]")) {
+    const k = el.dataset.when;
+    el.classList.toggle("dens-hidden", !(k === "all" || d.uses.includes(k)));
+  }
+  // 2D keeps its own heatmap; the styles below are 3D renders of a 3D field.
+  const flat = !is3d();
+  $("densStyles").style.opacity = flat ? "0.45" : "";
+  $("densNote").textContent = flat
+    ? "The 2D view draws its own heatmap — these styles apply to the 3D landscape."
+    : d.note;
+  drawDensityBar();
+}
+
+function resetDensityPanel() {
+  state.densBandwidth = 6; state.densIntensity = 0.3; state.densGamma = 1.4;
+  state.densLevels = [25, 50, 75, 90]; state.densMap = "inferno";
+  state.densShade = true; state.densFog = true; state.densCbar = true;
+  $("denssigma").value = 6; $("densint").value = 0.3; $("densgamma").value = 1.4;
+  $("denslevels").value = "25,50,75,90"; $("densmap").value = "inferno";
+  $("densshade").checked = true; $("densfog").checked = true; $("denscbar").checked = true;
+  $("denssigmaOut").textContent = (0.04 + 6 * 0.02).toFixed(2);
+  $("densintOut").textContent = "0.30";
+  $("densgammaOut").textContent = "1.4";
+  applyColormap();
+  if (landSlices) landSlices.setColormap(sliceColormap());
+  if (state.colorBy === "density") applyColor(); else drawDensityBar();
+}
+
+// ── colour bar ────────────────────────────────────────────────────────────
+// Drawn onto the landscape rather than into the chrome: it costs no toolbar space, and
+// it lands in Save PNG, so an exported landscape is a figure with a scale on it.
+const densityBarVisible = () =>
+  state.colorBy === "density" && is3d() && state.densCbar && landView !== "slices";
+
+let densBarSig = "";
+function drawDensityBar() {
+  const cv = $("densBar");
+  if (!cv) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = cv.clientWidth, h = cv.clientHeight;
+  const on = densityBarVisible();
+  const sig = [on, w, h, dpr, state.densStyle, state.densMap, state.densLevels.join(",")].join("|");
+  if (sig === densBarSig) return;      // it does not move with the camera, so do not repaint per frame
+  densBarSig = sig;
+  const dw = Math.max(1, Math.floor(w * dpr)), dh = Math.max(1, Math.floor(h * dpr));
+  if (cv.width !== dw || cv.height !== dh) { cv.width = dw; cv.height = dh; }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  if (on) paintDensityBar(ctx, w, h, 1);
+}
+
+const BAR_MONO = 'ui-monospace, "SF Mono", Menlo, Consolas, monospace';
+function paintDensityBar(ctx, w, h, s) {
+  const d = densStyleDef(state.densStyle);
+  const x = 12 * s, yBottom = h - 12 * s;
+  const plate = (px, py, pw, ph) => {
+    ctx.fillStyle = "rgba(6,9,15,0.55)"; ctx.strokeStyle = "rgba(255,255,255,0.10)"; ctx.lineWidth = s;
+    const r = 4 * s;
+    ctx.beginPath();
+    ctx.moveTo(px + r, py);
+    ctx.arcTo(px + pw, py, px + pw, py + ph, r);
+    ctx.arcTo(px + pw, py + ph, px, py + ph, r);
+    ctx.arcTo(px, py + ph, px, py, r);
+    ctx.arcTo(px, py, px + pw, py, r);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+  };
+  ctx.save();
+  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+
+  if (state.densStyle === "shells") {
+    const bands = shellBands(state.densLevels);
+    const rowH = 13 * s, pad = 7 * s;
+    const boxH = bands.length * rowH + pad * 2 + 12 * s, boxW = 124 * s;
+    plate(x, yBottom - boxH, boxW, boxH);
+    ctx.font = `500 ${9 * s}px ${BAR_MONO}`;
+    ctx.fillStyle = "rgba(226,232,240,0.72)";
+    ctx.fillText(d.unit.toUpperCase(), x + pad, yBottom - boxH + pad + 8 * s);
+    bands.forEach((b, i) => {
+      const y = yBottom - boxH + pad + 14 * s + i * rowH;
+      ctx.fillStyle = `rgb(${b.color.join(",")})`;
+      ctx.fillRect(x + pad, y, 10 * s, 10 * s);
+      ctx.strokeStyle = "rgba(255,255,255,0.28)"; ctx.lineWidth = s;
+      ctx.strokeRect(x + pad + s / 2, y + s / 2, 10 * s - s, 10 * s - s);
+      ctx.fillStyle = "rgba(226,232,240,0.92)";
+      ctx.font = `500 ${10 * s}px ${BAR_MONO}`;
+      ctx.fillText(b.label, x + pad + 16 * s, y + 9 * s);
+    });
+    ctx.restore();
+    return;
+  }
+
+  const barW = 128 * s, barH = 8 * s, pad = 8 * s;
+  const boxW = barW + pad * 2, boxH = barH + pad * 2 + 24 * s;
+  plate(x, yBottom - boxH, boxW, boxH);
+  const stops = state.densStyle === "points"
+    ? [[74, 87, 107], [242, 247, 255]]
+    : (COLORMAPS[state.densMap] || COLORMAPS.inferno);
+  const bx = x + pad, by = yBottom - boxH + pad + 12 * s;
+  ctx.font = `500 ${9 * s}px ${BAR_MONO}`;
+  ctx.fillStyle = "rgba(226,232,240,0.72)";
+  ctx.fillText(d.unit.toUpperCase(), bx, by - 4 * s);
+  const step = Math.max(1, s);
+  for (let i = 0; i < barW; i += step) {
+    const rgb = rampRGB(stops, i / (barW - step));
+    ctx.fillStyle = `rgb(${rgb.join(",")})`;
+    ctx.fillRect(bx + i, by, step + 0.5, barH);
+  }
+  ctx.strokeStyle = "rgba(255,255,255,0.3)"; ctx.lineWidth = s;
+  ctx.strokeRect(bx + s / 2, by + s / 2, barW - s, barH - s);
+  const ticks = state.densStyle === "energy"
+    ? [DENS_KT.toFixed(1), (DENS_KT / 2).toFixed(1), "0"]
+    : ["0", "0.5", "1"];
+  ctx.font = `500 ${9.5 * s}px ${BAR_MONO}`;
+  ctx.fillStyle = "rgba(226,232,240,0.92)";
+  ticks.forEach((t, i) => {
+    const tx = bx + (barW - step) * (i / (ticks.length - 1));
+    ctx.textAlign = i === 0 ? "left" : i === ticks.length - 1 ? "right" : "center";
+    ctx.fillText(t, tx, by + barH + 11 * s);
+  });
+  ctx.restore();
+}
+
+// Everything the renderer needs that is not per-point data.
+function pushDensityParams() {
+  if (!cloud) return;
+  const style = state.densStyle === "volume" && !cloud.hasVolumeSupport() ? "splats" : state.densStyle;
+  cloud.setDensityStyle(style);
+  cloud.setDensityIntensity(state.densIntensity);
+  cloud.setDensityGamma(state.densGamma);
+  cloud.setDensityKernel(0.055 + state.densBandwidth * 0.009);
+  cloud.setDensityShade(state.densShade);
+  cloud.setDensityFog(state.densFog);
+  const bands = shellBands(state.densLevels);
+  cloud.setDensityLevels(state.densLevels, bands.map((b) => b.color), bands.map((b) => b.alpha));
 }
 function rampRGB(stops, t) {
   t = Math.max(0, Math.min(1, t));
@@ -773,6 +1061,7 @@ function layerColorsCSS() {
 // stamp them on a dedicated overlay, re-synced after every render (onRender) so the
 // markers track panning and 3D orbit.
 function syncCentroidOverlay() {
+  drawDensityBar();   // cheap: it repaints only when the box or the scale actually changed
   if (!centroidCtx) return;
   const co = $("centroidOverlay");
   sizeOverlays();   // the box may have changed since the last draw — see sizeOverlays
@@ -818,59 +1107,142 @@ function drawCentroidMarker(ctx, x, y, hex, current) {
   if (current) { ctx.beginPath(); ctx.arc(x, y, rad + 4, 0, Math.PI * 2); ctx.lineWidth = 2; ctx.strokeStyle = "#2dd4bf"; ctx.stroke(); }   // selection halo
 }
 
-// Local density in [0,1], within `frac` of the bbox diagonal.
+// One kernel-density estimate, shared by everything that needs it.
 //
-// Binned: drop the points into a uniform grid, blur it, then read each point back out
-// of its cell. O(N + G) rather than the O(N²) all-pairs neighbour count this replaces
-// — that scan was ~1e12 distance tests at a million points and simply hung the tab.
+// Binned: drop the points into a uniform grid, blur it with three box passes (a gaussian
+// to within a few percent), then read each point back out of its own cell. O(N + G)
+// rather than the O(N^2) all-pairs count it replaces — that scan was ~1e12 distance tests
+// at a million points and simply hung the tab.
 //
-// The result is a kernel-density estimate instead of an exact neighbour count. That is
-// no loss: the value only ever tints points and drives the glow overlay, and it is
-// exactly how the 2D view has always computed its density, so the two now agree.
-const DENS_GRID = 64;   // cells along the longest axis -> <=64³ = 262k cells, ~1 MB
+// It used to run twice at two resolutions: once at 64^3 to tint the points and drive the
+// glow, once at 96^3 for the Slices view. One estimate at one resolution now serves the
+// point tint, every 3D density style, the ray-marched volume and the slices — which is
+// what makes the shell / free-energy / volumetric styles nearly free.
+//
+// Returns, all keyed to the current embedding, axes and bandwidth:
+//   values     per point, density normalised to its own max
+//   quantiles  per point, the share of particles inside the smallest highest-density
+//              region containing it — a statement about the data, not about the colormap
+//   normals    per point, -grad(rho) normalised, so splats can be lit
+//   grid       { nx, ny, nz, data (uint8, x fastest), lo, hi } for slices and the volume
+const DENS_GRID = 96;          // cells along the longest axis, for an isotropic cloud
+const DENS_GRID_MAX = 256;     // ...raised for anisotropic ones, which are far cheaper per axis.
+                               // 256 is WebGL2's guaranteed MAX_3D_TEXTURE_SIZE, so the grid can
+                               // always be uploaded as the ray-march's volume texture.
+const DENS_CELL_BUDGET = 1e6;  // ceiling on total cells (~8 MB of ping-pong float grids)
+const DENS_QBINS = 4096;       // histogram bins for the quantile pass (O(N), not O(N log N))
 
-function density3(pts, frac = 0.12) {
-  const n = pts.length, d = new Float32Array(n);
-  if (!n) return d;
+let densCache = null;
+const densCacheKey = () => [state.embedding, state.x, state.y, state.z, state.densBandwidth,
+  (activeCoords() || []).length].join("|");
+const invalidateDensity = () => { densCache = null; };
 
+function landscapeDensity() {
+  const key = densCacheKey();
+  if (densCache && densCache.key === key) return densCache;
+  const c = activeCoords();
+  if (!c || !c.length) return null;
+
+  const n = c.length, ax = [state.x, state.y, state.z];
   const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
-  for (const p of pts) for (let k = 0; k < 3; k++) { const v = p[k] || 0; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
+  const P = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) { const v = c[i][ax[k]] ?? 0; P[i * 3 + k] = v; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
   const ext = [0, 1, 2].map((k) => (mx[k] - mn[k]) || 1);
-  const diag = Math.hypot(ext[0], ext[1], ext[2]) || 1;
+  const maxExt = Math.max(ext[0], ext[1], ext[2]);
 
-  // Cubic cells, so a radius in world units is the same number of cells on every axis.
-  const h = Math.max(ext[0], ext[1], ext[2]) / DENS_GRID;
-  const dim = ext.map((e) => Math.max(1, Math.min(DENS_GRID, Math.ceil(e / h))));
-  const [nx, ny, nz] = dim;
-  const grid = new Float32Array(nx * ny * nz);
-
-  // bin (O(N)), remembering each point's cell so the read-back is a lookup, not a search
-  const cellOf = new Int32Array(n);
-  for (let i = 0; i < n; i++) {
-    const p = pts[i];
-    const ix = Math.min(nx - 1, Math.max(0, ((p[0] || 0) - mn[0]) / h | 0));
-    const iy = Math.min(ny - 1, Math.max(0, ((p[1] || 0) - mn[1]) / h | 0));
-    const iz = Math.min(nz - 1, Math.max(0, ((p[2] || 0) - mn[2]) / h | 0));
-    const c = (ix * ny + iy) * nz + iz;
-    cellOf[i] = c;
-    grid[c] += 1;
+  // Cells stay cubic: both the slice view and the ray-march read this grid as geometry,
+  // and a stretched voxel would distort them. But a strongly anisotropic cloud fills only
+  // a sliver of the G^3 box — a latent space with PC1 at 98% of the variance uses well
+  // under 1% of it — so it can afford a far finer grid than an isotropic one for the same
+  // memory. Step G up while the cell count stays inside the budget; that is what gives the
+  // minor axes enough cells to carry any structure at all.
+  const cellsAt = (g) => {
+    const cell = maxExt / g;
+    return ext.reduce((count, e) => count * Math.max(1, Math.min(g, Math.ceil(e / cell))), 1);
+  };
+  // Finest cubic grid that fits the budget, never coarser than the isotropic default.
+  let G = DENS_GRID;
+  for (let g = DENS_GRID_MAX; g > DENS_GRID; g -= 32) {
+    if (cellsAt(g) <= DENS_CELL_BUDGET) { G = g; break; }
   }
 
-  // Three separable box passes ≈ a gaussian of the requested radius. Each pass is a
-  // running prefix sum, so the cost does not grow with the radius.
-  const rad = Math.max(1, Math.round((frac * diag) / h / 2));
+  const h = maxExt / G;
+  const dim = ext.map((e) => Math.max(1, Math.min(G, Math.ceil(e / h))));
+  const [nx, ny, nz] = dim;
+  const grid = new Float32Array(nx * ny * nz);   // (ix*ny+iy)*nz+iz
+  const cellOf = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    const ix = Math.min(nx - 1, Math.max(0, (P[i * 3] - mn[0]) / h | 0));
+    const iy = Math.min(ny - 1, Math.max(0, (P[i * 3 + 1] - mn[1]) / h | 0));
+    const iz = Math.min(nz - 1, Math.max(0, (P[i * 3 + 2] - mn[2]) / h | 0));
+    const cell = (ix * ny + iy) * nz + iz;
+    cellOf[i] = cell; grid[cell] += 1;
+  }
+
+  // Bandwidth per axis, each scaled to that axis's own spread rather than to the bounding
+  // box diagonal. One radius taken from the diagonal is an isotropic kernel, and in a
+  // latent space where PC1 carries 98% of the variance it is wider than the PC2 and PC3
+  // extents put together — the estimate then goes genuinely flat on those axes, which is
+  // why the ray-marched volume used to render as a featureless slab. Scaling per axis is
+  // also the standard choice: a diagonal bandwidth matrix matched to each dimension.
+  const frac = 0.04 + state.densBandwidth * 0.02;
+  const rads = ext.map((e) => Math.max(1, Math.round((frac * e) / h / 2)));
+
+  // Three separable box passes. Each is a running prefix sum, so the cost does not grow
+  // with the radius.
   let src = grid, dst = new Float32Array(grid.length);
   for (let pass = 0; pass < 3; pass++) {
-    for (let axis = 0; axis < 3; axis++) {
-      boxBlurAxis(src, dst, dim, axis, rad);
-      const t = src; src = dst; dst = t;   // ping-pong
-    }
+    for (let axis = 0; axis < 3; axis++) { boxBlurAxis(src, dst, dim, axis, rads[axis]); const t = src; src = dst; dst = t; }
   }
 
   let max = 0;
-  for (let i = 0; i < n; i++) { const v = src[cellOf[i]]; d[i] = v; if (v > max) max = v; }
-  if (max > 0) for (let i = 0; i < n; i++) d[i] /= max;
-  return d;
+  const values = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const v = src[cellOf[i]]; values[i] = v; if (v > max) max = v; }
+  if (max > 0) for (let i = 0; i < n; i++) values[i] /= max;
+
+  // Quantiles by histogram rather than by sorting: bin the densities, take the suffix sum,
+  // and a point's quantile is the share of points binned at or above it. O(N + B) instead
+  // of O(N log N), which at a million points is the difference between instant and a stall.
+  const hist = new Int32Array(DENS_QBINS);
+  const binOf = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    const b = Math.min(DENS_QBINS - 1, (values[i] * (DENS_QBINS - 1)) | 0);
+    binOf[i] = b; hist[b]++;
+  }
+  let acc = 0;
+  const above = new Float32Array(DENS_QBINS);
+  for (let b = DENS_QBINS - 1; b >= 0; b--) { acc += hist[b]; above[b] = acc / n; }
+  const quantiles = new Float32Array(n);
+  for (let i = 0; i < n; i++) quantiles[i] = above[binOf[i]];
+
+  // Surface normal per point: -grad(rho) by central differences on the blurred grid, with
+  // clamped borders. This is what lets a cloud of splats be lit instead of merely tinted.
+  const sx = ny * nz, sy = nz;
+  const normals = new Float32Array(n * 3);
+  const cl = (v, hi) => (v < 0 ? 0 : v >= hi ? hi - 1 : v);
+  for (let i = 0; i < n; i++) {
+    const cell = cellOf[i];
+    const iz = cell % nz, iy = ((cell - iz) / nz) % ny, ix = ((cell - iz) / nz - iy) / ny;
+    const at = (jx, jy, jz) => src[cl(jx, nx) * sx + cl(jy, ny) * sy + cl(jz, nz)];
+    const gx = at(ix + 1, iy, iz) - at(ix - 1, iy, iz);
+    const gy = at(ix, iy + 1, iz) - at(ix, iy - 1, iz);
+    const gz = at(ix, iy, iz + 1) - at(ix, iy, iz - 1);
+    const len = Math.hypot(gx, gy, gz);
+    if (len > 1e-9) { normals[i * 3] = -gx / len; normals[i * 3 + 1] = -gy / len; normals[i * 3 + 2] = -gz / len; }
+  }
+
+  // The slice viewer and the 3D texture both want x fastest; boxBlurAxis works on the
+  // (ix*ny+iy)*nz+iz layout, so remap on the way out.
+  const inv = max > 0 ? 255 / max : 0;
+  const data = new Uint8Array(nx * ny * nz);
+  for (let ix = 0; ix < nx; ix++) for (let iy = 0; iy < ny; iy++) for (let iz = 0; iz < nz; iz++)
+    data[(iz * ny + iy) * nx + ix] = src[(ix * ny + iy) * nz + iz] * inv;
+
+  densCache = {
+    key, values, quantiles, normals,
+    grid: { nx, ny, nz, data, lo: [mn[0], mn[1], mn[2]], hi: [mn[0] + nx * h, mn[1] + ny * h, mn[2] + nz * h] },
+  };
+  return densCache;
 }
 
 // One separable box-blur pass along `axis` of a 3D grid, as a sliding window sum, so a
@@ -1171,52 +1543,18 @@ function setLandView(mode) {
   } else {
     syncCentroidOverlay();
   }
+  drawDensityBar();   // the slice grid carries its own scale; the cloud's bar does not belong on it
 }
 
 // Bin the landscape density onto the current X/Y/Z axes and show it as orthogonal cuts.
 function loadLandSlices() {
   if (!landSlices) return;
-  const g = landscapeDensityGrid();
-  if (!g) { status("No points to build a density field.", "warn"); return; }
+  const d = landscapeDensity();
+  if (!d) { status("No points to build a density field.", "warn"); return; }
+  const g = d.grid;
   landSlices.setColormap(sliceColormap());
   landSlices.setVolume(g);
   status(`Landscape density slices ${g.nx}×${g.ny}×${g.nz} · ${axisLabel(state.x)} · ${axisLabel(state.y)} · ${axisLabel(state.z)}`);
-}
-
-// Bin the latent cloud (current x/y/z axes) into a 3D grid, blur it to a KDE, and
-// hand it to the slice viewer as a uint8 volume. Reuses the same box-blur passes as
-// the 3D density glow, so the two agree. `boxBlurAxis` works on the (ix*ny+iy)*nz+iz
-// layout; the slice viewer wants (iz*ny+iy)*nx+ix, so we remap on the way out.
-const DENS_SLICE_GRID = 96;
-function landscapeDensityGrid() {
-  const c = activeCoords();
-  if (!c || !c.length) return null;
-  const n = c.length, ax = [state.x, state.y, state.z];
-  const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
-  const P = new Float32Array(n * 3);
-  for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) { const v = c[i][ax[k]] ?? 0; P[i * 3 + k] = v; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
-  const ext = [0, 1, 2].map((k) => (mx[k] - mn[k]) || 1);
-  const diag = Math.hypot(ext[0], ext[1], ext[2]) || 1;
-  const h = Math.max(ext[0], ext[1], ext[2]) / DENS_SLICE_GRID;
-  const dim = ext.map((e) => Math.max(1, Math.min(DENS_SLICE_GRID, Math.ceil(e / h))));
-  const [nx, ny, nz] = dim;
-  const grid = new Float32Array(nx * ny * nz);   // (ix*ny+iy)*nz+iz
-  for (let i = 0; i < n; i++) {
-    const ix = Math.min(nx - 1, Math.max(0, (P[i * 3] - mn[0]) / h | 0));
-    const iy = Math.min(ny - 1, Math.max(0, (P[i * 3 + 1] - mn[1]) / h | 0));
-    const iz = Math.min(nz - 1, Math.max(0, (P[i * 3 + 2] - mn[2]) / h | 0));
-    grid[(ix * ny + iy) * nz + iz] += 1;
-  }
-  const rad = Math.max(1, Math.round(((0.04 + state.densBandwidth * 0.02) * diag) / h / 2));
-  let src = grid, dst = new Float32Array(grid.length);
-  for (let pass = 0; pass < 3; pass++) for (let axis = 0; axis < 3; axis++) { boxBlurAxis(src, dst, dim, axis, rad); const t = src; src = dst; dst = t; }
-  let max = 0;
-  for (let i = 0; i < src.length; i++) if (src[i] > max) max = src[i];
-  const inv = max > 0 ? 255 / max : 0;
-  const data = new Uint8Array(nx * ny * nz);     // (iz*ny+iy)*nx+ix, x fastest
-  for (let ix = 0; ix < nx; ix++) for (let iy = 0; iy < ny; iy++) for (let iz = 0; iz < nz; iz++)
-    data[(iz * ny + iy) * nx + ix] = src[(ix * ny + iy) * nz + iz] * inv;
-  return { nx, ny, nz, data };
 }
 
 function normThreshold() {
@@ -1826,6 +2164,7 @@ function sizeOverlays() {
 function sizeLasso() {
   sizeOverlays();
   syncCentroidOverlay();
+  drawDensityBar();
 }
 function setupLasso() {
   const lc = $("lassoCanvas"); lctx = lc.getContext("2d");
@@ -2357,8 +2696,26 @@ async function saveMrc() {
 async function savePng(src, name) {
   const scale = +$("dpi").value || 2;
   const transparent = $("transparent").checked;
-  const blob = await src.snapshot({ scale, transparent });
+  let blob = await src.snapshot({ scale, transparent });
+  // The bar lives on a separate overlay canvas, so the renderer's snapshot knows nothing
+  // about it. Composite it in here, at the export scale, so the PNG carries its own scale.
+  if (blob && name === "landscape" && densityBarVisible()) blob = await stampDensityBar(blob, scale);
   if (blob) downloadBlob(blob, `${name}.png`);
+}
+async function stampDensityBar(blob, scale) {
+  try {
+    const img = await createImageBitmap(blob);
+    const cv = document.createElement("canvas");
+    cv.width = img.width; cv.height = img.height;
+    const ctx = cv.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    paintDensityBar(ctx, img.width, img.height, scale);
+    img.close();
+    return await new Promise((r) => cv.toBlob(r, "image/png"));
+  } catch (err) {
+    console.warn("colour bar not stamped:", err.message);
+    return blob;   // an image without its legend still beats no image
+  }
 }
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);

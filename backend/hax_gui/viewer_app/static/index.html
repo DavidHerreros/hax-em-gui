@@ -49,8 +49,33 @@
           <label>points <input id="ptsalpha" type="range" min="0" max="1" step="0.05" value="1" title="Point opacity (0 = hide, to see the density)" /></label>
           <span id="kwrap" class="kwrap" style="display:none"><label>k <input id="k" type="range" min="2" max="12" value="5" /></label><span id="kval" class="muted">5</span></span>
           <span id="denswrap" class="kwrap" style="display:none">
-            <label>σ <input id="denssigma" type="range" min="1" max="20" value="6" title="Density bandwidth" /></label>
-            <label>map
+            <button id="densBtn" class="btn" aria-expanded="false" aria-controls="densPop" title="Density render style and parameters">⬡ Density · <span id="densBtnStyle">shells</span> ▾</button>
+          <!-- Density settings. One panel behind one toolbar button, because the toolbar has
+               no room left; it lists only the parameters the selected style actually reads. -->
+          <div class="dens-pop" id="densPop" role="dialog" aria-label="Density render settings">
+            <h4>Render</h4>
+            <div class="dens-styles" id="densStyles"></div>
+            <div class="dens-note" id="densNote"></div>
+
+            <hr class="dens-sep" />
+            <h4>Parameters</h4>
+            <div class="dens-row" data-when="all">
+              <span>bandwidth</span>
+              <input id="denssigma" type="range" min="1" max="20" value="6" title="KDE bandwidth, as a fraction of the bounding-box diagonal" />
+              <output id="denssigmaOut"></output>
+            </div>
+            <div class="dens-row" data-when="all">
+              <span>opacity</span>
+              <input id="densint" type="range" min="0.02" max="1" step="0.02" value="0.3" title="Density opacity" />
+              <output id="densintOut"></output>
+            </div>
+            <div class="dens-row" data-when="gamma">
+              <span>transfer γ</span>
+              <input id="densgamma" type="range" min="0.3" max="3" step="0.1" value="1.4" title="Transfer-function gamma" />
+              <output id="densgammaOut"></output>
+            </div>
+            <div class="dens-row" data-when="cmap">
+              <span>colormap</span>
               <select id="densmap" title="Density colormap">
                 <option value="viridis">viridis</option>
                 <option value="magma">magma</option>
@@ -61,8 +86,26 @@
                 <option value="gray">gray</option>
                 <option value="teal">teal</option>
               </select>
-            </label>
-            <label>glow <input id="densint" type="range" min="0" max="1" step="0.02" value="0.3" title="3D density glow intensity" /></label>
+              <span></span>
+            </div>
+            <div class="dens-row" data-when="levels">
+              <span>levels</span>
+              <select id="denslevels" title="Each shell encloses this share of the particles">
+                <option value="25,50,75,90" selected>25 · 50 · 75 · 90 %</option>
+                <option value="50,90">50 · 90 %</option>
+                <option value="10,25,50,75,90">10 · 25 · 50 · 75 · 90 %</option>
+              </select>
+              <span></span>
+            </div>
+            <label class="dens-check" data-when="shade"><input type="checkbox" id="densshade" checked /> shade gradients</label>
+            <label class="dens-check" data-when="all"><input type="checkbox" id="densfog" checked /> depth cue</label>
+            <label class="dens-check" data-when="all"><input type="checkbox" id="denscbar" checked /> colour bar</label>
+
+            <div class="dens-foot">
+              <button id="densReset" class="btn small">Reset</button>
+              <span class="muted small mono" id="densHint"></span>
+            </div>
+          </div>
           </span>
           <button id="drawBtn" class="btn" title="Draw a smooth editable curve across the landscape; it snaps to states only when you morph it (2D & 3D)">✎ Draw path</button>
           <button id="lassoBtn" class="btn" title="Lasso-select points (drag a loop)">▱ Lasso</button>
@@ -70,6 +113,7 @@
           <button id="layersBtn" class="btn" title="Show / hide the layers panel">Layers</button>
           <button id="saveLand" class="btn" title="Save landscape as PNG">Save PNG</button>
         </div>
+
       </div>
       <div class="pane-body">
         <aside class="layers" id="layersRail">
@@ -101,6 +145,7 @@
         <div class="canvas-wrap">
           <canvas id="scatter"></canvas>
           <canvas id="scatter3d" style="display:none"></canvas>
+          <canvas id="densBar" class="overlay"></canvas>
           <canvas id="centroidOverlay" class="overlay"></canvas>
           <canvas id="lassoCanvas" class="overlay"></canvas>
           <div id="landSlices" class="slices" style="display:none"></div>

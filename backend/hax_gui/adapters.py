@@ -429,6 +429,9 @@ def compatible_sources(kind: str, jobs: list[dict[str, Any]]) -> list[dict[str, 
                 "name": job.get("name"),
                 "created_at": job.get("created_at"),
                 "status": job.get("status"),
+                # Still offered, but flagged: its own inputs were re-made after it ran,
+                # so this artifact was computed from something that no longer exists.
+                "stale": bool(job.get("stale")),
                 "file": str(src),
             })
     return out

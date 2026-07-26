@@ -367,6 +367,9 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .job-row .prog { font-family: "JetBrains Mono", monospace; color: var(--accent); width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-row .jid { font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--faint); }
 .job-row .time { margin-left: auto; font-size: 12px; color: var(--faint); }
+/* The duration rides along with the timestamp; dimmer, so the row still reads as one time. */
+.time-dur { opacity: .75; }
+.time, .exec-time, .run-time { white-space: nowrap; }
 
 .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; }
 .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.2s ease-in-out infinite; }
@@ -377,6 +380,9 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .badge.cancelled, .badge.cancelling { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
 .badge.interrupted { background: color-mix(in srgb, var(--faint) 30%, transparent); color: var(--muted); }
 .badge.saved { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent); }
+/* Not a status: it sits *beside* one. The run finished perfectly well, its inputs
+   were re-made underneath it afterwards (see cascade.py). */
+.badge.stale { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 35%, transparent); padding: 3px 8px; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
 /* ---- progress line ---- */
@@ -794,6 +800,29 @@ body.vwin-dragging iframe { pointer-events: none; }
 .prompt-modal { width: 420px; }
 .prompt-body { padding: 16px; display: flex; flex-direction: column; gap: 8px; }
 
+/* ---- rerun cascade dialog ---- */
+.cascade-modal { width: 560px; max-width: calc(100vw - 32px); }
+.cascade-body { padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.cascade-list { max-height: 210px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; }
+.cascade-item { display: flex; align-items: center; gap: 10px; padding: 7px 10px; font-size: 13px; }
+.cascade-item + .cascade-item { border-top: 1px solid var(--border); }
+.cascade-item .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cascade-item .mono { font-size: 11.5px; }
+.cascade-item.active { background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.cascade-cancel { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.45;
+  padding: 9px 10px; border-radius: 8px; background: color-mix(in srgb, var(--warn) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 35%, transparent); }
+.cascade-cancel input { margin-top: 3px; }
+.cascade-q { font-size: 13px; font-weight: 500; margin-top: 2px; }
+.cascade-opts { display: flex; flex-direction: column; gap: 6px; }
+.cascade-opt { display: flex; align-items: flex-start; gap: 9px; padding: 9px 10px; border: 1px solid var(--border);
+  border-radius: 8px; cursor: pointer; font-size: 13px; }
+.cascade-opt:hover { background: var(--hover); }
+.cascade-opt:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.cascade-opt input { margin-top: 2px; }
+.cascade-opt-label { font-weight: 500; }
+.cascade-opt .muted { font-size: 12px; line-height: 1.45; }
+
 /* project-picker modal (Copy to project / Duplicate to project) */
 .pick-list { display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow: auto; }
 .pick-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; background: none; border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 13px; text-align: left; cursor: pointer; }
@@ -928,6 +957,8 @@ body.vwin-dragging iframe { pointer-events: none; }
 .wf-node-head:active { cursor: grabbing; }
 .wf-node-title { flex: 1; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wf-node-st { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.wf-node.stale { border-style: dashed; }
+.wf-node-stale { display: inline-flex; align-items: center; color: var(--warn); }
 .wf-node-x { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px; }
 .wf-node-x:hover { color: #ef4444; }
 

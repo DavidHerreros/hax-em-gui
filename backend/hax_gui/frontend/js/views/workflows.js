@@ -17,6 +17,7 @@ import { paramForm } from "./paramForm.js";
 import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
+import { confirmCascade, downstreamNodes, nodeAsDependent } from "./cascadeModal.js";
 import { pickProject } from "./pickProject.js";
 import { loadProgramGroups, isModed } from "../programGroups.js";
 import { layeredLayout } from "./wfLayout.js";
@@ -788,9 +789,11 @@ export function WorkflowsView() {
 
   function nodeEl(n) {
     const st = runState && runState[n.id] ? runState[n.id].status : null;
+    // Its inputs were re-made after it ran, so what it holds no longer matches them.
+    const stale = !!(runState && runState[n.id] && runState[n.id].stale);
     const running = wf && wf.status === "running";
     const el = h("div", {
-      class: "wf-node" + (selectedSet.has(n.id) ? " sel" : "") + (selected === n.id ? " primary" : ""),
+      class: "wf-node" + (selectedSet.has(n.id) ? " sel" : "") + (selected === n.id ? " primary" : "") + (stale ? " stale" : ""),
       style: { left: n.x + "px", top: n.y + "px", width: NODE_W + "px", height: nodeHeight(n) + "px" },
     });
     el.dataset.node = n.id;
@@ -800,6 +803,7 @@ export function WorkflowsView() {
     // header (drag handle + select + run + remove)
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
+      stale ? h("span", { class: "wf-node-stale", title: "A step this one depends on has been re-run since — these outputs are out of date. Run it again to refresh them." }, icon("refresh", 11)) : null,
       st ? h("span", { class: "wf-node-st", style: { color: statusColor(st) } }, st) : null,
       h("button", { class: "wf-node-run", title: running ? "Queue this step onto the running workflow — it starts when its device is free" : "Run this step", onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon(running ? "plus" : "play", 12)),
       h("button", { class: "wf-node-run", title: "Duplicate this step (un-run copy)", onclick: (e) => { e.stopPropagation(); duplicateNodes([n.id]); } }, icon("copy", 12)),
@@ -1432,17 +1436,39 @@ export function WorkflowsView() {
     if (!(wf && wf.project_id) && !getState().activeProjectId) { flash("Open a project first (Projects), or use “Save as project” — steps run into a project.", "err"); return; }
     if (!graph.nodes.length) { flash("Add at least one step.", "warn"); return; }
     if (ids && !ids.length) { flash("Select one or more steps first.", "warn"); return; }
+    // Running a subset re-makes those steps under everything they feed, so ask what
+    // becomes of the steps downstream. Running the *whole* graph needs no question:
+    // every one of them is being re-run anyway.
+    //
+    // Steps that never ran are listed too, even though they have nothing to lose —
+    // "queue" runs them as well, and a list that didn't mention them would understate
+    // what the button does. But if *none* of the downstream steps has ever run there is
+    // no warning to give, so the dialog is skipped and the run behaves as it always did.
+    let cascade = null;
+    if (ids) {
+      const down = downstreamNodes(graph, ids).map((n) => nodeAsDependent(n, runState));
+      cascade = await confirmCascade(down.some((d) => d.status) ? down : [], {
+        title: ids.length === 1 ? "Re-run this step?" : `Re-run ${ids.length} steps?`,
+        lead: ids.length === 1
+          ? "Its run folder is rebuilt from scratch — the current outputs and log are replaced."
+          : "Their run folders are rebuilt from scratch — the current outputs and logs are replaced.",
+      });
+      if (!cascade) return;
+    }
     // Save first — the scheduler reads the graph from the server, so a step that only
     // exists on the canvas has to be persisted before it can be queued.
     const wasRunning = !!(wf && wf.status === "running");
     await save();
     if (!wf) return;
     try {
-      wf = await api.runWorkflow(wf.id, ids || undefined);
+      wf = await api.runWorkflow(wf.id, ids || undefined, cascade);
       runState = wf.run_state || null;
+      // The queued count is read back from the server: with cascade "queue" it also took
+      // on the steps downstream, which is more than were asked for here.
+      const queued = runState ? Object.values(runState).filter((s) => s.status === "pending" || s.status === "running").length : (ids || graph.nodes).length;
       flash(wasRunning
-        ? `Queued ${ids ? ids.length : graph.nodes.length} step(s) onto the running workflow.`
-        : (ids ? `Running ${ids.length} step(s)…` : "Running…"), "busy");
+        ? `Queued onto the running workflow — ${queued} step(s) pending or running.`
+        : (ids ? `Running ${queued} step(s)…` : "Running…"), "busy");
       renderNodes();
       startPolling();
     } catch (err) {

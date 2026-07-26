@@ -6,11 +6,12 @@ import { api, subscribeLog } from "../api.js";
 import { navigate, reload } from "../router.js";
 import { store } from "../store.js";
 import { errorBox, formatSize } from "./ui.js";
-import { badge, jobDisplayName } from "./jobs.js";
+import { badge, staleBadge, jobDisplayName } from "./jobs.js";
 import { openContextMenu } from "./contextMenu.js";
 import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
 import { promptModal } from "./promptModal.js";
+import { confirmJobCascade } from "./cascadeModal.js";
 import { createTerminal } from "./terminal.js";
 import { openFileBrowser } from "./filePicker.js";
 import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
@@ -76,6 +77,7 @@ export function JobDetailView(params) {
     if (job) head.appendChild(h("button", { class: "row-menu", title: "Rename run", onclick: rename }, icon("pencil", 15)));
     if (isNamed) head.appendChild(h("span", { class: "muted mono", style: { fontSize: "12px" } }, job.program));
     head.appendChild(badge(status));
+    if (job && job.stale) head.appendChild(staleBadge(job));
     if (job && job.project_name) head.appendChild(h("span", { class: "proj-chip" }, icon("box", 12), job.project_name));
     if (job) head.appendChild(jobLabelChips(job, { editable: true }));
     const running = status === "running" || status === "pending";
@@ -134,9 +136,19 @@ export function JobDetailView(params) {
 
   // Resume this run in place: continue_job relaunches the same job (same folder), so
   // the program picks up its checkpoint. Re-render the current route to reset the view.
+  //
+  // The folder survives, so downstream input *paths* stay valid — but what they point at
+  // is about to be rewritten from a further-trained checkpoint, so anything derived from
+  // this run is just as out of date as after a full rerun. Same dialog, different words.
   async function continueRun() {
     clear(actionErr);
-    try { await api.continueJob(id); reload(); }
+    const choice = await confirmJobCascade(id, {
+      title: "Continue this run?",
+      verb: "Continue",
+      lead: "It resumes from its last checkpoint and keeps writing into the same run folder, replacing its current outputs.",
+    });
+    if (!choice) return;
+    try { await api.continueJob(id, choice); reload(); }
     catch (err) { mount(actionErr, errorBox(err)); }
   }
 
@@ -296,9 +308,11 @@ export function JobDetailView(params) {
 
   async function rerun() {
     clear(actionErr);
+    const choice = await confirmJobCascade(id);
+    if (!choice) return;
     // Rerun replaces this job in place (same id), so re-render the current route
     // to reset the log/state instead of navigating (the hash is unchanged).
-    try { await api.rerunJob(id); reload(); }
+    try { await api.rerunJob(id, choice); reload(); }
     catch (err) { mount(actionErr, errorBox(err)); }
   }
 

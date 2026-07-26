@@ -28,7 +28,7 @@ from . import chats as chat_store
 from . import metrics as metrics_reader
 from . import ollama as ollama_manager_mod
 from . import files as filebrowser
-from . import branches, gpus, groups, projects, registry, settings_store, updates, usage
+from . import branches, cascade, gpus, groups, projects, registry, settings_store, updates, usage
 from .branches import BranchError
 from .updater import UpdateBlocked, UpdateBusy, updater
 from .command import ValidationError
@@ -179,6 +179,10 @@ class JobCreate(BaseModel):
     # "Edit & continue": reuse replace_job_id's run folder (don't wipe it) so the
     # program resumes from the checkpoint it left there, with the edited args.
     resume: bool = False
+    # Only meaningful alongside replace_job_id, which re-makes an existing run and so
+    # invalidates everything downstream of it — see RerunBody / cascade.py.
+    cascade: str = "stale"
+    cancel_running: bool = False
 
 
 # -- catalog ---------------------------------------------------------------
@@ -856,6 +860,53 @@ def project_sources(project_id: str, kind: str) -> list[dict[str, Any]]:
     return adapters.compatible_sources(kind, manager.list_for_project(project_id))
 
 
+class RerunBody(BaseModel):
+    """What to do with the runs downstream of the one being re-made.
+
+    Re-running a step deletes and rebuilds its run folder, which is where its dependents
+    read their inputs from — so they are invalidated either way (see cascade.py). The
+    choice is only whether they are left flagged for the user to re-run when they like
+    ('stale'), or handed to the scheduler to re-run themselves in order ('queue').
+    """
+
+    cascade: str = "stale"
+    # Downstream runs that are still executing are reading the folder about to be
+    # deleted. The client re-submits with this set once the user has agreed to stop them.
+    cancel_running: bool = False
+
+
+async def _apply_cascade(job_ids: list[str], body: RerunBody) -> list[dict[str, Any]]:
+    """Invalidate everything downstream of `job_ids`, or refuse if that means killing a run."""
+    deps = cascade.dependents_of(job_ids)
+    if not deps:
+        return []
+    try:
+        await cascade.invalidate(deps, cancel_running=body.cancel_running)
+    except cascade.DependentsRunning as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "downstream runs are still executing",
+            "running": exc.running,
+        })
+    return deps
+
+
+async def _queue_cascade(project_id: str | None, deps: list[dict[str, Any]], body: RerunBody) -> None:
+    """Hand the invalidated runs to the scheduler, if that is what was asked for."""
+    if body.cascade != "queue" or not deps:
+        return
+    try:
+        await cascade.queue_jobs(project_id, [d["id"] for d in deps])
+    except WorkflowError as exc:
+        # The rerun itself has already been launched, so this is not a failure of the
+        # request — only of the automatic follow-up. The steps stay marked stale and can
+        # be re-run by hand, which is what the message says.
+        raise HTTPException(status_code=409, detail={
+            "error": "the downstream steps could not be queued; they are marked stale and "
+                     "can be re-run by hand",
+            "errors": exc.errors,
+        })
+
+
 @app.post("/api/projects/{project_id}/jobs", dependencies=[Depends(auth)])
 async def create_project_job(project_id: str, body: JobCreate) -> dict[str, Any]:
     # Reuse an existing job in place only when it's a real, non-active job of this
@@ -866,13 +917,23 @@ async def create_project_job(project_id: str, body: JobCreate) -> dict[str, Any]
         existing = manager.get(replace)
         if existing is None or existing.get("project_id") != project_id or existing.get("active"):
             replace = None
+    # Editing a run in place re-makes its outputs exactly as a rerun does, so the same
+    # invalidation applies to everything downstream. Done before the create call, which
+    # deletes the folder those dependents read from.
+    rerun = RerunBody(cascade=body.cascade, cancel_running=body.cancel_running)
+    deps = await _apply_cascade([replace], rerun) if replace else []
     try:
-        return await manager.create(body.program, body.args, body.gpu, project_id, body.name, body.bindings, body.launch,
-                                    replace_job_id=replace, recreate_ssd=body.recreate_ssd, resume=body.resume and bool(replace))
+        created = await manager.create(body.program, body.args, body.gpu, project_id, body.name, body.bindings, body.launch,
+                                       replace_job_id=replace, recreate_ssd=body.recreate_ssd, resume=body.resume and bool(replace))
     except ProjectNotFound:
         raise HTTPException(status_code=404, detail=f"unknown project '{project_id}'")
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    # Only a launched run can have dependents waiting on it; a merely-saved edit has
+    # produced nothing for them to start from.
+    if body.launch:
+        await _queue_cascade(project_id, deps, rerun)
+    return created
 
 
 def _project_or_404(project_id: str) -> dict[str, Any]:
@@ -922,7 +983,9 @@ def get_job(job_id: str) -> dict[str, Any]:
     # Whether this run left an intermediate checkpoint its program will auto-resume from
     # (drives the "Continue" buttons). Only meaningful once the run has finished, so
     # skip the disk check for active/saved jobs.
-    job["resumable"] = False if job.get("active") or job["status"] == "saved" else \
+    # A stale run is excluded too: continuing reuses its stored command, whose inputs
+    # point into a source run folder that has since been rebuilt (see cascade.py).
+    job["resumable"] = False if job.get("active") or job["status"] == "saved" or job.get("stale") else \
         adapters.is_resumable(job["program"], job.get("workdir"))
     # Did this run write any event files? Drives the "Metrics" button. A running job
     # gets one too — the native metrics view follows a live run.
@@ -961,34 +1024,72 @@ def job_copy_prefill(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="job not found")
 
 
-@app.post("/api/jobs/{job_id}/rerun", dependencies=[Depends(auth)])
-async def rerun_job(job_id: str) -> dict[str, Any]:
-    if manager.get(job_id) is None:
-        raise HTTPException(status_code=404, detail="job not found")
+@app.get("/api/jobs/{job_id}/dependents", dependencies=[Depends(auth)])
+def job_dependents(job_id: str) -> dict[str, Any]:
+    """The runs this one feeds, transitively — what re-running it would invalidate.
+
+    Read-only: this is what the confirmation dialog is built from, before anything has
+    been touched.
+    """
     try:
-        return await manager.rerun(job_id)
+        deps = manager.dependents(job_id)
+    except JobNotFound:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"jobs": [cascade.brief(d) for d in deps]}
+
+
+@app.post("/api/jobs/{job_id}/rerun", dependencies=[Depends(auth)])
+async def rerun_job(job_id: str, body: RerunBody = RerunBody()) -> dict[str, Any]:
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    # Checked up front, before the cascade: a rerun that is going to be refused anyway
+    # must not leave a trail of runs flagged stale for a rebuild that never happened.
+    if job.get("active"):
+        raise HTTPException(status_code=409, detail="job is already running")
+    # Invalidate downstream *before* relaunching: their inputs live in the run folder the
+    # rerun is about to delete, and one of them may still be reading it.
+    deps = await _apply_cascade([job_id], body)
+    try:
+        result = await manager.rerun(job_id)
     except JobActive:
         raise HTTPException(status_code=409, detail="job is already running")
     except ProjectNotFound:
         raise HTTPException(status_code=409, detail="the job's project no longer exists")
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    await _queue_cascade(job.get("project_id"), deps, body)
+    return result
 
 
 @app.post("/api/jobs/{job_id}/continue", dependencies=[Depends(auth)])
-async def continue_job(job_id: str) -> dict[str, Any]:
-    if manager.get(job_id) is None:
+async def continue_job(job_id: str, body: RerunBody = RerunBody()) -> dict[str, Any]:
+    job = manager.get(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    # Same as rerun: settle whether this can happen at all before invalidating anything.
+    # JobManager.continue_job re-checks both — this is only so a refusal leaves no trail.
+    if job.get("active"):
+        raise HTTPException(status_code=409, detail="job is already running")
+    if job.get("stale"):
+        raise HTTPException(status_code=409, detail="this run's inputs were re-made after it "
+                                                    "finished — re-run it instead of continuing")
+    # A continue keeps this run's folder, so downstream input *paths* survive — but the
+    # outputs behind them are about to be overwritten from a further-trained checkpoint,
+    # so anything derived from them is just as out of date.
+    deps = await _apply_cascade([job_id], body)
     try:
-        return _with_project_names([await manager.continue_job(job_id)])[0]
+        result = _with_project_names([await manager.continue_job(job_id)])[0]
     except JobActive:
         raise HTTPException(status_code=409, detail="job is already running")
-    except JobNotResumable:
-        raise HTTPException(status_code=409, detail="this run has no checkpoint to continue from")
+    except JobNotResumable as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ProjectNotFound:
         raise HTTPException(status_code=409, detail="the job's project no longer exists")
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    await _queue_cascade(job.get("project_id"), deps, body)
+    return result
 
 
 @app.post("/api/jobs/{job_id}/start", dependencies=[Depends(auth)])
@@ -1234,7 +1335,10 @@ def metrics_jobs() -> list[dict[str, Any]]:
     for job in manager.list(limit=500):
         wd = job.get("workdir")
         if wd and _has_tb_events(Path(wd)):
-            out.append({k: job[k] for k in ("id", "program", "name", "workdir", "created_at", "status", "project_id")})
+            # started_at/finished_at/active let the picker date the run itself rather than
+            # the row: created_at survives a rerun, so alone it dates a run that is gone.
+            out.append({k: job[k] for k in ("id", "program", "name", "workdir", "created_at",
+                                            "started_at", "finished_at", "active", "status", "project_id")})
     return _with_project_names(out)
 
 
@@ -2016,6 +2120,11 @@ class WorkflowRun(BaseModel):
     # Optional subset of node ids to run (a single node or a selection); when
     # omitted the whole workflow runs.
     nodes: list[str] | None = None
+    # Running a subset re-makes those steps' outputs, invalidating the steps they feed
+    # (see cascade.py). 'queue' runs those too, after their inputs land; 'stale' just
+    # flags them. Ignored when the whole graph runs — nothing is left behind to flag.
+    cascade: str = "stale"
+    cancel_running: bool = False
 
 
 class WorkflowFromProject(BaseModel):
@@ -2103,9 +2212,27 @@ def validate_workflow(wid: str) -> dict[str, Any]:
 @app.post("/api/workflows/{wid}/run", dependencies=[Depends(auth)])
 async def run_workflow(wid: str, body: WorkflowRun = WorkflowRun()) -> dict[str, Any]:
     """Queue steps. When a run is already in flight the steps are appended to its
-    queue and the live scheduler picks them up in turn."""
+    queue and the live scheduler picks them up in turn.
+
+    Running a *subset* re-makes those steps under everything they feed, so the steps
+    downstream are invalidated the same way a rerun from the Jobs view invalidates them
+    — and, with ``cascade='queue'``, simply join the same queue, which is where the
+    dependency ordering they need already lives."""
     try:
-        return await wf_manager.run(wid, body.nodes)
+        nodes = body.nodes
+        if nodes:
+            # From the graph, not the jobs' bindings: a step wired to a not-yet-run one
+            # has no binding to find yet, and it is still downstream.
+            down = wf_manager.downstream_nodes(wid, nodes)
+            if down:
+                deps = [j for j in (manager.get(jid) for jid in wf_manager.jobs_for_nodes(wid, down)) if j]
+                await cascade.invalidate(deps, cancel_running=body.cancel_running)
+                if body.cascade == "queue":
+                    nodes = list(nodes) + down
+        return await wf_manager.run(wid, nodes)
+    except cascade.DependentsRunning as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "downstream runs are still executing", "running": exc.running})
     except KeyError:
         raise HTTPException(status_code=404, detail="workflow not found")
     except WorkflowError as exc:

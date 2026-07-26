@@ -11,6 +11,7 @@ import { openFilePicker } from "./filePicker.js";
 import { jobLabelChips } from "./labels.js";
 import { metricsPanel } from "./metricsPanel.js";
 import { runBrowser, folderName } from "./runBrowser.js";
+import { jobTimeEl } from "./jobs.js";
 
 export function MetricsView() {
   const root = h("div", { class: "view metrics-view" });
@@ -34,7 +35,7 @@ export function MetricsView() {
       j.name ? h("span", { class: "run-sub mono" }, j.program) : null,
       h("span", { class: "run-folder mono" }, folderName(j.workdir)),
       (j.labels && j.labels.length) ? jobLabelChips(j) : null,
-      h("span", { class: "run-time" }, new Date(j.created_at).toLocaleString()),
+      jobTimeEl(j, "run-time"),
       h("span", { class: "run-open" }, icon("chart", 14), "Open")),
     emptyText: "No runs with metrics yet. Train a model, then refresh.",
   });

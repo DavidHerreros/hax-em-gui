@@ -42,24 +42,57 @@ void main() {
   outColor = vec4(vColor * shade, uAlpha);
 }`;
 
-// Additive "density glow" splats — large soft sprites on a heat ramp, summed with
-// additive blending so dense regions brighten (the 3D analogue of the 2D heatmap).
+// Density splats. One program covers every style except the ray-march; `uMode` picks the
+// transfer function and the compositing the caller has already set up.
+//
+//   0 splats  a gaussian kernel, world-sized and depth-sorted, composited over
+//   1 shells  nested quantile bands: each level encloses a stated share of the particles
+//   2 energy  -ln(p), so the scale is dG in kT and six decades of occupancy stop clipping
+//   3 points  one hue, opacity by occupancy — the density as a substrate, not the subject
+//
+// All of them draw back-to-front with ordinary over-blending. Additive blending is gone:
+// summing a colormap over ~40 overlapping sprites made hue a function of ray depth and
+// clipped dense cores to white, which is what this pass exists to avoid.
 const VERT_SPLAT = `#version 300 es
 precision highp float;
 layout(location=0) in vec3 aPos;
-layout(location=1) in float aDens;   // local density 0..1
+layout(location=1) in float aDens;    // local density 0..1
+layout(location=2) in float aQuant;   // share of particles in the densest set containing this point
+layout(location=3) in vec3 aNorm;     // -grad(rho), for the headlight
 uniform mat4 uProj;
 uniform mat4 uView;
-uniform float uSize;
-out float vDens;
-void main() { vDens = aDens; gl_Position = uProj * uView * vec4(aPos, 1.0); gl_PointSize = uSize * (0.45 + aDens); }`;
+uniform float uPixPerUnit;   // world radius -> device px at unit depth
+uniform float uRadius;       // splat radius, in normalized model units
+uniform float uRadGain;      // share of the radius that scales with density
+uniform vec3 uEyeModel;      // camera position in model space
+out float vDens; out float vQuant; out float vZ; out float vShade;
+void main() {
+  vDens = aDens; vQuant = aQuant;
+  vec3 ld = normalize(uEyeModel - aPos);
+  vShade = dot(aNorm, aNorm) < 1e-8 ? 1.0 : 0.42 + 0.58 * max(dot(normalize(aNorm), ld), 0.0);
+  vec4 vp = uView * vec4(aPos, 1.0);
+  float z = max(0.05, -vp.z);
+  vZ = z;
+  gl_Position = uProj * vp;
+  gl_PointSize = clamp(2.0 * uRadius * (1.0 - uRadGain + uRadGain * aDens) * uPixPerUnit / z, 1.0, 260.0);
+}`;
 
 const FRAG_SPLAT = `#version 300 es
 precision highp float;
-in float vDens;
-uniform float uIntensity;
+in float vDens; in float vQuant; in float vZ; in float vShade;
+uniform int uMode;
+uniform float uOpacity, uGamma;
 uniform vec3 uRamp[6];     // density colormap stops (low->high)
 uniform int uRampN;        // number of active stops
+uniform vec3 uShellC[6];
+uniform float uShellA[6];
+uniform float uShellQ[6];  // ascending quantiles; the last is >1 (the tail)
+uniform int uShellN;
+uniform float uEps;        // density floor for the log transfer
+uniform float uShadeAmt;
+uniform float uFog;
+uniform vec2 uZRange;
+uniform vec3 uBg;
 out vec4 outColor;
 vec3 ramp(float t) {
   t = clamp(t, 0.0, 1.0);
@@ -70,9 +103,124 @@ vec3 ramp(float t) {
 }
 void main() {
   vec2 d = gl_PointCoord - vec2(0.5);
-  float a = exp(-dot(d, d) * 9.0);          // gaussian falloff (tighter)
-  if (a < 0.01) discard;
-  outColor = vec4(ramp(vDens), a * (0.03 + 0.32 * vDens) * uIntensity);
+  float a;
+  if (uMode == 0) { a = exp(-dot(d, d) * 9.0); if (a < 0.01) discard; }
+  else { float r = length(d) * 2.0; if (r > 1.0) discard; a = smoothstep(1.0, 0.72, r); }
+
+  vec3 col; float alpha;
+  if (uMode == 0) {
+    col = ramp(vDens);
+    alpha = a * uOpacity * pow(vDens, uGamma);
+  } else if (uMode == 1) {
+    int b = uShellN - 1;
+    for (int i = 0; i < 6; i++) {
+      if (i >= uShellN) break;
+      if (vQuant <= uShellQ[i]) { b = i; break; }
+    }
+    col = uShellC[b];
+    alpha = a * uShellA[b] * uOpacity * 1.9;
+  } else if (uMode == 2) {
+    float t = clamp((log(max(vDens, uEps)) - log(uEps)) / (-log(uEps)), 0.0, 1.0);
+    col = ramp(t);
+    alpha = a * uOpacity * (0.18 + 0.82 * pow(t, uGamma));
+  } else {
+    float t = pow(vDens, 0.7);
+    col = mix(vec3(0.29, 0.34, 0.42), vec3(0.95, 0.97, 1.0), t);
+    alpha = a * uOpacity * (0.10 + 0.90 * t);
+  }
+
+  if (uShadeAmt > 0.0) col *= mix(1.0, vShade, uShadeAmt);
+  if (uFog > 0.0) {
+    float f = clamp((vZ - uZRange.x) / max(0.001, uZRange.y - uZRange.x), 0.0, 1.0);
+    col = mix(col, uBg, f * uFog * 0.8);
+    alpha *= mix(1.0, 0.55, f * uFog);
+  }
+  outColor = vec4(col, clamp(alpha, 0.0, 1.0));
+}`;
+
+// Ray-marched density volume. The KDE grid the Slices view already builds is uploaded as
+// an R8 3D texture and integrated front-to-back with emission + absorption, so the
+// landscape occludes itself the way the decoded map does in the pane next to it.
+const VERT_VOL = `#version 300 es
+precision highp float;
+out vec2 vNdc;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  vNdc = p * 2.0 - 1.0;
+  gl_Position = vec4(vNdc, 0.0, 1.0);
+}`;
+
+// `precision highp sampler3D` is not optional: ES 3.00 gives sampler types no default
+// precision in the fragment stage, and the shader fails to compile without it.
+const FRAG_VOL = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+in vec2 vNdc;
+uniform mat4 uInvVP;
+uniform vec3 uEye, uLo, uHi, uDim, uBg;
+uniform sampler3D uVol;
+uniform float uOpacity, uGamma, uShadeAmt, uFog;
+uniform vec3 uRamp[6];
+uniform int uRampN;
+out vec4 outColor;
+vec3 ramp(float t) {
+  t = clamp(t, 0.0, 1.0);
+  float f = t * float(uRampN - 1);
+  int i = int(floor(f));
+  i = min(i, uRampN - 2);
+  return mix(uRamp[i], uRamp[i + 1], f - float(i));
+}
+void main() {
+  vec4 pn = uInvVP * vec4(vNdc, -1.0, 1.0);
+  vec4 pf = uInvVP * vec4(vNdc,  1.0, 1.0);
+  vec3 ro = pn.xyz / pn.w;
+  vec3 rd = normalize(pf.xyz / pf.w - ro);
+
+  vec3 inv = 1.0 / rd;
+  vec3 t0 = (uLo - ro) * inv, t1 = (uHi - ro) * inv;
+  vec3 lo3 = min(t0, t1), hi3 = max(t0, t1);
+  float tmin = max(max(lo3.x, lo3.y), max(lo3.z, 0.0));
+  float tmax = min(min(hi3.x, hi3.y), hi3.z);
+  if (tmax <= tmin) { outColor = vec4(0.0); return; }
+
+  const int STEPS = 128;
+  float dt = (tmax - tmin) / float(STEPS);
+  vec3 span = uHi - uLo;
+  vec3 e = 1.0 / uDim;
+  vec4 acc = vec4(0.0);
+  float far = length(uEye - (uLo + uHi) * 0.5) + length(span) * 0.5;
+  float near = max(0.05, far - length(span));
+
+  for (int i = 0; i < STEPS; i++) {
+    if (acc.a > 0.985) break;
+    vec3 p = ro + rd * (tmin + (float(i) + 0.5) * dt);
+    float s = texture(uVol, (p - uLo) / span).r;
+    if (s > 0.004) {
+      float v = pow(s, uGamma);
+      vec3 c = ramp(v);
+      if (uShadeAmt > 0.0) {
+        vec3 tc = (p - uLo) / span;
+        vec3 g = vec3(
+          texture(uVol, tc + vec3(e.x, 0.0, 0.0)).r - texture(uVol, tc - vec3(e.x, 0.0, 0.0)).r,
+          texture(uVol, tc + vec3(0.0, e.y, 0.0)).r - texture(uVol, tc - vec3(0.0, e.y, 0.0)).r,
+          texture(uVol, tc + vec3(0.0, 0.0, e.z)).r - texture(uVol, tc - vec3(0.0, 0.0, e.z)).r);
+        if (dot(g, g) > 1e-10) {
+          vec3 nrm = normalize(-g), ld = normalize(uEye - p);
+          float lam = 0.34 + 0.66 * max(dot(nrm, ld), 0.0);
+          float rim = pow(1.0 - max(dot(nrm, ld), 0.0), 3.0) * 0.25;
+          c = c * mix(1.0, lam, uShadeAmt) + rim * uShadeAmt * vec3(0.55, 0.62, 0.78);
+        }
+      }
+      if (uFog > 0.0) {
+        float f = clamp((length(p - uEye) - near) / max(0.001, far - near), 0.0, 1.0);
+        c = mix(c, uBg, f * uFog * 0.6);
+      }
+      float al = 1.0 - exp(-v * uOpacity * 46.0 * dt);
+      acc.rgb += (1.0 - acc.a) * al * c;
+      acc.a += (1.0 - acc.a) * al;
+    }
+  }
+  outColor = acc;
 }`;
 
 // Morph-path polyline (a line strip through the path waypoints, drawn on top).
@@ -142,24 +290,44 @@ export function createCloud(canvas, onSelect) {
 
   const splatProg = link(gl, VERT_SPLAT, FRAG_SPLAT);
   const su = (n) => gl.getUniformLocation(splatProg, n);
-  const sProj = su("uProj"), sView = su("uView"), sSize = su("uSize"), sIntensity = su("uIntensity");
-  const sRamp = su("uRamp"), sRampN = su("uRampN");
+  const sProj = su("uProj"), sView = su("uView"), sRamp = su("uRamp"), sRampN = su("uRampN");
   let rampFlat = new Float32Array([0.27, 0.0, 0.33, 0.23, 0.32, 0.55, 0.13, 0.57, 0.55, 0.37, 0.79, 0.38, 0.99, 0.91, 0.15, 0, 0, 0]);   // viridis (normalized)
   let rampN = 5;
 
+  // The ray-marcher is the only program that needs a 3D sampler. If a driver refuses it we
+  // lose one style, not the landscape — so it links on its own and may come back null.
+  let volProg = null, vu = () => null;
+  try { volProg = link(gl, VERT_VOL, FRAG_VOL); vu = (n) => gl.getUniformLocation(volProg, n); }
+  catch (err) { console.warn("landscape: volumetric density unavailable —", err.message); }
+
   const vao = gl.createVertexArray();
-  const posBuf = gl.createBuffer(), colBuf = gl.createBuffer(), flagBuf = gl.createBuffer(), densBuf = gl.createBuffer();
+  const posBuf = gl.createBuffer(), colBuf = gl.createBuffer(), flagBuf = gl.createBuffer(),
+        densBuf = gl.createBuffer(), quantBuf = gl.createBuffer(), normBuf = gl.createBuffer(),
+        orderBuf = gl.createBuffer();
   gl.bindVertexArray(vao);
   gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
   gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
   gl.bindBuffer(gl.ARRAY_BUFFER, flagBuf); gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 0, 0);
   gl.bindVertexArray(null);
 
-  const splatVao = gl.createVertexArray();   // aPos (shared) + aDens
+  const splatVao = gl.createVertexArray();   // aPos (shared) + aDens + aQuant + aNorm
   gl.bindVertexArray(splatVao);
   gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
   gl.bindBuffer(gl.ARRAY_BUFFER, densBuf); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quantBuf); gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, normBuf); gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, orderBuf);
   gl.bindVertexArray(null);
+
+  const emptyVao = gl.createVertexArray();   // the ray-march's full-screen triangle needs no attributes
+  const volTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_3D, volTex);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+  gl.bindTexture(gl.TEXTURE_3D, null);
 
   const lineProg = link(gl, VERT_LINE, FRAG_LINE);
   const lProj = gl.getUniformLocation(lineProg, "uProj"), lView = gl.getUniformLocation(lineProg, "uView"), lColor = gl.getUniformLocation(lineProg, "uColor");
@@ -185,6 +353,22 @@ export function createCloud(canvas, onSelect) {
   let count = 0;
   let colorData = null;   // persisted per-point RGB so points are never left black
   let showDens = false, hasDens = false, densIntensity = 0.22, pointAlpha = 1.0;
+  // ── density render style ──────────────────────────────────────────────────
+  // MODE_OF maps the public style name onto the shader's uMode. "volume" has no splat
+  // mode of its own: it ray-marches, and falls back to sorted splats where the 3D-texture
+  // program failed to link.
+  const MODE_OF = { splats: 0, shells: 1, energy: 2, points: 3, volume: 0 };
+  let densStyle = "splats", densGamma = 1.4, densKernel = 0.12, densShade = 1, densFog = 1;
+  let hasQuant = false, hasNorm = false, hasVol = false;
+  let volDim = [1, 1, 1], volLo = [0, 0, 0], volHi = [0, 0, 0];
+  let shellQ = new Float32Array([0.25, 0.5, 0.75, 0.9, 1.01, 1.01]);
+  let shellC = new Float32Array(18), shellA = new Float32Array(6), shellN = 5;
+  // Back-to-front order for the splats. A counting sort into depth buckets is O(N) and
+  // allocation-free, which matters because it re-runs on every camera change.
+  const SORT_BUCKETS = 2048;
+  let order = null, depths = null, bucketOf = null, sortCounts = new Int32Array(SORT_BUCKETS);
+  let sortDirty = true, lastZRange = null;
+  const invalidateSort = () => { sortDirty = true; };
   let selected = -1, hover = -1, pathArr = [], selArr = [];
   // Mid-export the canvas is deliberately off its on-screen size. gl_PointSize is in
   // device px, so the dots have to grow with it or a 4x PNG comes out full of specks.
@@ -299,7 +483,7 @@ export function createCloud(canvas, onSelect) {
 
   // invalidatePick on every camera change: the id buffer is rendered from this camera, so
   // it goes stale the moment the camera moves — but *not* when only the hover changes.
-  const orbit = createOrbit(canvas, () => { invalidatePick(); render(); }, (e) => { const i = pick(e.clientX, e.clientY); onSelect(i, { shift: e.shiftKey, cx: e.clientX, cy: e.clientY }); },
+  const orbit = createOrbit(canvas, () => { invalidatePick(); invalidateSort(); render(); }, (e) => { const i = pick(e.clientX, e.clientY); onSelect(i, { shift: e.shiftKey, cx: e.clientX, cy: e.clientY }); },
     // normalizePoints() scales the largest extent to 1.8; fitRadius 1.41 is the height the
     // old 45°-vertical camera showed at its default distance, so the cloud keeps its framing.
     { probeDepth: centreDepth, modelWidth: 1.8, fitRadius: 1.41 });
@@ -323,20 +507,8 @@ export function createCloud(canvas, onSelect) {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     if (!count) return;
     const dpr = ratio();
-    // density glow overlay (additive, behind the points, no depth writes)
-    if (showDens && hasDens) {
-      gl.useProgram(splatProg);
-      gl.uniformMatrix4fv(sProj, false, proj);
-      gl.uniformMatrix4fv(sView, false, view);
-      gl.uniform1f(sSize, 34.0 * dpr);
-      gl.uniform1f(sIntensity, densIntensity);
-      gl.uniform3fv(sRamp, rampFlat);
-      gl.uniform1i(sRampN, rampN);
-      gl.depthMask(false); gl.disable(gl.DEPTH_TEST);
-      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
-      gl.bindVertexArray(splatVao); gl.drawArrays(gl.POINTS, 0, count); gl.bindVertexArray(null);
-      gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
-    }
+    // density overlay, behind the points and never writing depth
+    if (showDens && hasDens) drawDensity(proj, view);
     gl.useProgram(prog);
     gl.uniformMatrix4fv(uProj, false, proj);
     gl.uniformMatrix4fv(uView, false, view);
@@ -379,8 +551,122 @@ export function createCloud(canvas, onSelect) {
       gl.enable(gl.DEPTH_TEST);
     }
   }
-  function render() { resize(); drawScene(1); if (onRenderCb) onRenderCb(); }
+  // Setting up a density style touches ~10 uploads, and every setter redraws. Batch them
+  // so a style change is one frame rather than ten — at a million points that is the
+  // difference between instant and a visible hitch.
+  let batching = 0;
+  function render() {
+    if (batching > 0) return;
+    resize(); drawScene(1); if (onRenderCb) onRenderCb();
+  }
   let onRenderCb = null;
+
+  // Order the splats far-to-near for this camera. Counting sort over SORT_BUCKETS depth
+  // bins: one pass to bin, one prefix sum, one pass to place — no comparisons, no garbage.
+  function sortSplats(view) {
+    if (!order || order.length !== count) {
+      order = new Uint32Array(count); depths = new Float32Array(count); bucketOf = new Int32Array(count);
+    }
+    const m2 = view[2], m6 = view[6], m10 = view[10], m14 = view[14];
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < count; i++) {
+      const z = -(m2 * norm[i * 3] + m6 * norm[i * 3 + 1] + m10 * norm[i * 3 + 2] + m14);
+      depths[i] = z; if (z < lo) lo = z; if (z > hi) hi = z;
+    }
+    const span = (hi - lo) || 1;
+    sortCounts.fill(0);
+    for (let i = 0; i < count; i++) {
+      // reversed, so the farthest points land in bucket 0 and are drawn first
+      let k = (SORT_BUCKETS - 1) - (((depths[i] - lo) / span) * (SORT_BUCKETS - 1) | 0);
+      if (k < 0) k = 0; else if (k >= SORT_BUCKETS) k = SORT_BUCKETS - 1;
+      bucketOf[i] = k; sortCounts[k]++;
+    }
+    let acc = 0;
+    for (let k = 0; k < SORT_BUCKETS; k++) { const c = sortCounts[k]; sortCounts[k] = acc; acc += c; }
+    for (let i = 0; i < count; i++) order[sortCounts[bucketOf[i]]++] = i;
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, orderBuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, order, gl.DYNAMIC_DRAW);
+    sortDirty = false;
+    lastZRange = [lo, hi];
+    return lastZRange;
+  }
+
+  function drawDensity(proj, view) {
+    const useVolume = densStyle === "volume" && volProg && hasVol;
+    let mode = MODE_OF[densStyle] ?? 0;
+    if (mode === 1 && !hasQuant) mode = 0;   // shells without quantiles would be one flat band
+    // eye in model space: the model transform is baked into `view`, and aPos is not
+    const iv = invert(view);
+    const eye = iv ? [iv[12], iv[13], iv[14]] : [0, 0, 3];
+
+    if (useVolume) {
+      const mvp = multiply(proj, view), inv = invert(mvp);
+      if (inv) {
+        gl.useProgram(volProg);
+        gl.uniformMatrix4fv(vu("uInvVP"), false, inv);
+        gl.uniform3fv(vu("uEye"), eye);
+        gl.uniform3fv(vu("uLo"), volLo);
+        gl.uniform3fv(vu("uHi"), volHi);
+        gl.uniform3f(vu("uDim"), volDim[0], volDim[1], volDim[2]);
+        gl.uniform3fv(vu("uBg"), bg);
+        gl.uniform1f(vu("uOpacity"), densIntensity);
+        gl.uniform1f(vu("uGamma"), densGamma);
+        gl.uniform1f(vu("uShadeAmt"), densShade ? 0.85 : 0);
+        gl.uniform1f(vu("uFog"), densFog ? 1 : 0);
+        gl.uniform3fv(vu("uRamp"), rampFlat);
+        gl.uniform1i(vu("uRampN"), rampN);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_3D, volTex);
+        gl.uniform1i(vu("uVol"), 0);
+        gl.depthMask(false); gl.disable(gl.DEPTH_TEST);
+        gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);   // already premultiplied
+        gl.bindVertexArray(emptyVao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null);
+        gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+      }
+      return;
+    }
+
+    if (sortDirty || !order || order.length !== count) sortSplats(view);
+    // Reuse the sort's own near/far so the depth cue does not jump on frames that skip it.
+    let zr = lastZRange;
+    if (!zr) {
+      const dist = Math.hypot(orbit.eye[0], orbit.eye[1], orbit.eye[2]);
+      zr = [Math.max(0.05, dist - 1.1), dist + 1.1];
+    }
+
+    gl.useProgram(splatProg);
+    gl.uniformMatrix4fv(sProj, false, proj);
+    gl.uniformMatrix4fv(sView, false, view);
+    gl.uniform3fv(su("uEyeModel"), eye);
+    gl.uniform3fv(sRamp, rampFlat);
+    gl.uniform1i(sRampN, rampN);
+    gl.uniform1i(su("uMode"), mode);
+    gl.uniform1f(su("uOpacity"), densIntensity);
+    gl.uniform1f(su("uGamma"), densGamma);
+    gl.uniform1f(su("uEps"), 0.004);
+    gl.uniform1f(su("uShadeAmt"), densShade && hasNorm ? 0.85 : 0);
+    gl.uniform1f(su("uFog"), densFog ? 1 : 0);
+    gl.uniform2f(su("uZRange"), zr[0], zr[1]);
+    gl.uniform3fv(su("uBg"), bg);
+    gl.uniform3fv(su("uShellC"), shellC);
+    gl.uniform1fv(su("uShellA"), shellA);
+    gl.uniform1fv(su("uShellQ"), shellQ);
+    gl.uniform1i(su("uShellN"), shellN);
+    // Kernel width in model units, not in pixels: the picture of the density then stops
+    // depending on how far the camera happens to be zoomed in. proj[0] carries the
+    // horizontal 1/tan(fov/2), so this is device px per model unit at unit depth.
+    gl.uniform1f(su("uPixPerUnit"), proj[0] * canvas.width * 0.5);
+    gl.uniform1f(su("uRadius"), mode === 0 ? densKernel : mode === 3 ? 0.010 : 0.016);
+    gl.uniform1f(su("uRadGain"), mode === 0 ? 0.55 : mode === 3 ? 0.6 : 0.35);
+
+    gl.depthMask(false); gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.bindVertexArray(splatVao);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, orderBuf);
+    gl.drawElements(gl.POINTS, count, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+    gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+  }
 
   function normalizePoints(pts) {
     const n = pts.length;
@@ -466,6 +752,7 @@ export function createCloud(canvas, onSelect) {
       hover = -1;                // the old hover index means nothing in a new cloud
       orbit.invalidatePivot();   // a new cloud is a new front surface
       invalidatePick();          // ...and new ids in the pick buffer
+      invalidateSort();          // ...and a stale back-to-front order
       gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, norm, gl.STATIC_DRAW);
       // (re)seed colors so a fresh point set is never drawn black before applyColor()
       if (!colorData || colorData.length !== count * 3) { colorData = new Float32Array(count * 3); for (let i = 0; i < count * 3; i++) colorData[i] = [0.58, 0.64, 0.74][i % 3]; }
@@ -476,6 +763,53 @@ export function createCloud(canvas, onSelect) {
     setPickFilter(fn) { pickFilter = typeof fn === "function" ? fn : null; },   // restrict selection picks to ids where fn(i) is true
 
     setDensityField(values) { hasDens = !!(values && values.length === count); gl.bindBuffer(gl.ARRAY_BUFFER, densBuf); gl.bufferData(gl.ARRAY_BUFFER, values || new Float32Array(count), gl.STATIC_DRAW); render(); },
+    // Per-point share of the particles enclosed by the densest region containing it — what
+    // makes a shell a statement about the data rather than about the colormap.
+    setDensityQuantiles(values) { hasQuant = !!(values && values.length === count); gl.bindBuffer(gl.ARRAY_BUFFER, quantBuf); gl.bufferData(gl.ARRAY_BUFFER, values || new Float32Array(count), gl.STATIC_DRAW); render(); },
+    setDensityNormals(values) { hasNorm = !!(values && values.length === count * 3); gl.bindBuffer(gl.ARRAY_BUFFER, normBuf); gl.bufferData(gl.ARRAY_BUFFER, values || new Float32Array(count * 3), gl.STATIC_DRAW); render(); },
+    // { nx, ny, nz, data:Uint8Array (x fastest), lo, hi } in *data* coords — the object
+    // landscapeDensityGrid() already returns for the Slices view.
+    setDensityVolume(g) {
+      hasVol = !!(g && g.data && g.data.length === g.nx * g.ny * g.nz);
+      if (!hasVol || !volProg) { render(); return; }
+      // The estimator caps its grid at WebGL2's guaranteed 256, but check the real limit
+      // rather than trust it — an over-size upload is an INVALID_VALUE and a blank pane.
+      const lim = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
+      if (Math.max(g.nx, g.ny, g.nz) > lim) {
+        console.warn(`landscape: density grid ${g.nx}x${g.ny}x${g.nz} exceeds MAX_3D_TEXTURE_SIZE ${lim}`);
+        hasVol = false; render(); return;
+      }
+      volDim = [g.nx, g.ny, g.nz];
+      volLo = dataToNorm(g.lo || [0, 0, 0]);
+      volHi = dataToNorm(g.hi || [1, 1, 1]);
+      gl.bindTexture(gl.TEXTURE_3D, volTex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, g.nx, g.ny, g.nz, 0, gl.RED, gl.UNSIGNED_BYTE, g.data);
+      gl.bindTexture(gl.TEXTURE_3D, null);
+      render();
+    },
+    // "splats" | "shells" | "energy" | "volume" | "points"
+    setDensityStyle(style) { densStyle = MODE_OF[style] === undefined ? "splats" : style; invalidateSort(); render(); },
+    setDensityGamma(v) { densGamma = Math.max(0.1, v); render(); },
+    setDensityKernel(v) { densKernel = Math.max(0.01, v); render(); },
+    setDensityShade(on) { densShade = on ? 1 : 0; render(); },
+    setDensityFog(on) { densFog = on ? 1 : 0; render(); },
+    // levels: ascending percentages, e.g. [25, 50, 75, 90]; colors: [[r,g,b], ...] 0-255
+    setDensityLevels(levels, colors, alphas) {
+      const n = Math.min(6, levels.length + 1);
+      shellN = n;
+      for (let i = 0; i < 6; i++) {
+        const q = i < levels.length ? levels[i] / 100 : 1.01;
+        shellQ[i] = Math.min(1.01, q);
+        const c = colors[Math.min(i, colors.length - 1)] || [255, 255, 255];
+        shellC[i * 3] = c[0] / 255; shellC[i * 3 + 1] = c[1] / 255; shellC[i * 3 + 2] = c[2] / 255;
+        shellA[i] = alphas[Math.min(i, alphas.length - 1)] ?? 0.1;
+      }
+      render();
+    },
+    hasVolumeSupport() { return !!volProg; },
+    // batch(() => { ...many setters... }) redraws once, at the end
+    batch(fn) { batching++; try { fn(); } finally { batching--; } render(); },
     showDensity(on) { showDens = on; render(); },
     setDensityIntensity(v) { densIntensity = Math.max(0, v); render(); },
     setColormap(stops) {

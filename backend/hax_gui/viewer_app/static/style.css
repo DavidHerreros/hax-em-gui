@@ -71,6 +71,52 @@ body {
 }
 .toolbar select:disabled { opacity: 0.45; }
 .kwrap { display: inline-flex; align-items: center; gap: 6px; }
+
+/* ── density settings popover ─────────────────────────────────────────────
+   Drops from its own toolbar button, like any menu. Bounded by the viewport
+   and scrollable, because the landscape pane can be shorter than the panel —
+   a control that runs off the bottom of the screen is worse than a scrollbar.
+   Deliberately narrow and contextual: a style's parameters are the only rows
+   it shows. */
+#denswrap { position: relative; }
+.dens-pop {
+  position: absolute; z-index: 8; top: calc(100% + 7px); left: 0; width: 252px;
+  max-width: calc(100vw - 24px);
+  max-height: min(60vh, calc(100vh - 190px));
+  overflow-y: auto; overscroll-behavior: contain;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.5); padding: 10px; display: none; font-size: 12px;
+}
+.dens-pop[data-open="true"] { display: block; }
+/* max-height is also set from JS against the button's real position, so the panel
+   always ends above the bottom of the window whatever the pane layout is doing. */
+.dens-pop h4 {
+  margin: 0 0 8px; font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--muted); font-weight: 500;
+}
+.dens-sep { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
+.dens-styles { display: flex; flex-direction: column; gap: 1px; }
+.dens-style {
+  display: grid; grid-template-columns: 13px 1fr; gap: 8px; align-items: baseline;
+  background: none; border: none; border-radius: 5px; padding: 4px 6px; width: 100%;
+  color: var(--text); font: inherit; text-align: left; cursor: pointer;
+}
+.dens-style:hover { background: rgba(148, 163, 184, 0.12); }
+.dens-style[aria-pressed="true"] { background: rgba(45, 212, 191, 0.12); color: var(--accent); }
+.dens-style:disabled { opacity: 0.4; cursor: default; }
+.dens-style .rd { font-size: 10px; color: var(--muted); }
+.dens-style[aria-pressed="true"] .rd { color: var(--accent); }
+.dens-style small { display: block; color: var(--muted); font-size: 10.5px; line-height: 1.35; }
+.dens-note { color: var(--muted); font-size: 10px; line-height: 1.35; padding: 5px 6px 0; }
+.dens-note:empty { display: none; }
+.dens-row { display: grid; grid-template-columns: 62px 1fr 32px; gap: 8px; align-items: center; padding: 2px 0; }
+.dens-row > span:first-child { color: var(--muted); }
+.dens-row input[type="range"] { width: 100%; }
+.dens-row select { width: 100%; }
+.dens-row output { font-family: ui-monospace, Menlo, monospace; font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; }
+.dens-check { display: flex; align-items: center; gap: 6px; color: var(--muted); padding: 3px 0; cursor: pointer; }
+.dens-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+.dens-hidden { display: none !important; }
 input[type="range"] { accent-color: var(--accent); width: 92px; }
 input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid var(--border); border-radius: 6px; background: none; }
 
