@@ -49,9 +49,15 @@ export function confirmCascade(dependents, opts = {}) {
     verb = "Re-run",
     // What the rerun does to *this* step's own outputs, said plainly up front.
     lead = "Its run folder is rebuilt from scratch — the current outputs and log are replaced.",
+    // Steps in *this selection* that are still executing. Relaunching one means stopping
+    // it first, so it needs saying out loud: letting its current run carry on instead is
+    // what made an edited parameter look like it had been applied when it had not.
+    restarting = [],
   } = opts;
 
-  if (!dependents.length) return Promise.resolve({ cascade: lastChoice, cancel_running: false });
+  if (!dependents.length && !restarting.length) {
+    return Promise.resolve({ cascade: lastChoice, cancel_running: false, restart_running: false });
+  }
 
   const running = dependents.filter((d) => d.active);
   const n = dependents.length;
@@ -59,9 +65,18 @@ export function confirmCascade(dependents, opts = {}) {
   return new Promise((resolve) => {
     let choice = lastChoice;
     let cancelOk = !running.length;
+    let restartOk = !restarting.length;
 
-    const okBtn = h("button", { class: "btn", onclick: () => done({ cascade: choice, cancel_running: !!running.length }) },
-      icon("play", 15), verb);
+    const okBtn = h("button", { class: "btn", onclick: () => done({
+      cascade: choice, cancel_running: !!running.length, restart_running: !!restarting.length,
+    }) }, icon("play", 15), verb);
+
+    const restartRow = restarting.length ? h("label", { class: "cascade-cancel" },
+      h("input", { type: "checkbox", onchange: (e) => { restartOk = e.currentTarget.checked; syncOk(); } }),
+      h("span", null, restarting.length === 1
+        ? "This step is still running — stop it and start again with the current settings"
+        : `${restarting.length} of these steps are still running — stop them and start again with the current settings`),
+      h("span", { class: "muted" }, " — otherwise the run in progress keeps going and finishes on its previous settings.")) : null;
 
     const runningRow = running.length ? h("label", { class: "cascade-cancel" },
       h("input", {
@@ -69,9 +84,9 @@ export function confirmCascade(dependents, opts = {}) {
         onchange: (e) => { cancelOk = e.currentTarget.checked; syncOk(); },
       }),
       h("span", null, `Also stop the ${running.length} downstream run${running.length === 1 ? "" : "s"} still executing`),
-      h("span", { class: "muted" }, " — they are reading the folder this rerun deletes, so they cannot be left running.")) : null;
+      h("span", { class: "muted" }, " — they are reading the folder this rerun empties, so they cannot be left running.")) : null;
 
-    function syncOk() { okBtn.disabled = !cancelOk; }
+    function syncOk() { okBtn.disabled = !(cancelOk && restartOk); }
 
     const options = h("div", { class: "cascade-opts" },
       optionRow("stale", "Leave them as they are, flagged stale",
@@ -91,11 +106,12 @@ export function confirmCascade(dependents, opts = {}) {
         h("button", { class: "btn-icon", style: { border: "none" }, onclick: () => done(null) }, icon("x", 18))),
       h("div", { class: "cascade-body" },
         h("p", { class: "muted", style: { marginTop: "0" } }, lead),
-        h("p", null, `${n} later step${n === 1 ? "" : "s"} ${n === 1 ? "reads" : "read"} its output. Whatever ${n === 1 ? "it has" : "they have"} already produced stops matching anything that exists:`),
-        h("div", { class: "cascade-list" }, ...dependents.map(depRow)),
+        restartRow,
+        !n ? null : h("p", null, `${n} later step${n === 1 ? "" : "s"} ${n === 1 ? "reads" : "read"} its output. Whatever ${n === 1 ? "it has" : "they have"} already produced stops matching anything that exists:`),
+        !n ? null : h("div", { class: "cascade-list" }, ...dependents.map(depRow)),
         runningRow,
-        h("div", { class: "cascade-q" }, `What should happen to ${n === 1 ? "it" : "them"}?`),
-        options),
+        !n ? null : h("div", { class: "cascade-q" }, `What should happen to ${n === 1 ? "it" : "them"}?`),
+        !n ? null : options),
       h("div", { class: "modal-foot", style: { gap: "8px" } },
         h("button", { class: "btn ghost", onclick: () => done(null) }, "Cancel"),
         okBtn));

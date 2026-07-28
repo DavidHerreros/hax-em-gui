@@ -1,12 +1,17 @@
 """Keep a project honest when a run is re-made: invalidate everything derived from it.
 
-Re-running a step does not just replace that step's outputs. Its run folder is deleted
-and rebuilt (``JobManager.create`` with ``replace_job_id``), and every run downstream was
-fed *from that folder*: ``adapters.produce`` either hands the consumer a path inside it
-(checkpoints, particle metadata, volumes) or copies a file out of it (latents). So the
-moment an upstream run is re-made, its dependents are reading a path that no longer
-exists, or holding a copy of data that no longer exists — while still displaying as
-``succeeded``. Nothing used to say so.
+Re-running a step does not just replace that step's outputs. Its run folder is emptied
+and rebuilt in place (``JobManager.create`` with ``replace_job_id``), and every run
+downstream was fed *from that folder*: ``adapters.produce`` either hands the consumer a
+path inside it (checkpoints, particle metadata, volumes) or copies a file out of it
+(latents). So the moment an upstream run is re-made, its dependents are reading a path
+whose contents were thrown away — absent until the new run rewrites it, and then a
+different result than the one they were computed from — or holding a copy of data that no
+longer exists, all while still displaying as ``succeeded``. Nothing used to say so.
+
+(The folder keeps its *name* across a rerun, which is why this is about content and not
+about broken paths. Both are equally invalidating downstream; only one of them used to
+also break the stored command outright.)
 
 This module is the one place that knows what to do about it:
 
@@ -34,7 +39,7 @@ CASCADE_MODES = ("stale", "queue")
 class DependentsRunning(Exception):
     """Downstream runs are still executing and the caller did not authorise stopping them.
 
-    Not merely a courtesy: they are reading the run folder that is about to be deleted
+    Not merely a courtesy: they are reading the run folder that is about to be emptied
     out from under them, so letting them continue would produce a result from half an
     input. The caller re-submits with ``cancel_running=True`` once the user has agreed.
     """

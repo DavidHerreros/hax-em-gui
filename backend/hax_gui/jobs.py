@@ -40,8 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import adapters, mdpaths, projects, registry, settings_store
-from .command import ValidationError, build_command
+from . import adapters, mdpaths, projects, registry, settings_store, usage
+from .command import ValidationError, build_command, strip_obsolete
 from .config import settings
 
 # In-memory tail (characters) kept per job for fast WS replay on reconnect. Raw
@@ -322,31 +322,45 @@ class JobManager:
         replace_job_id: str | None = None,
         recreate_ssd: bool = False,
         resume: bool = False,
+        dropped_args: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a run. With ``launch=False`` the job is fully prepared (run
         folder, materialised inputs, validated command) but left in the ``saved``
         state to execute later via :meth:`start`.
 
         With ``replace_job_id`` set, the existing job row is updated in place
-        (same id / list position) and its previous run folder is removed, instead
-        of inserting a new job — this backs the "rerun replaces the current run"
+        (same id / list position) and its previous run folder is *reused* — cleared
+        and rebuilt, rather than replaced by a differently-named one — instead of
+        inserting a new job. This backs the "rerun replaces the current run"
         behaviour."""
         project_dir = projects.dir_for(project_id)
         if project_dir is None:
             raise ProjectNotFound(project_id)
 
-        # One uniquely-named folder per run holds its outputs + log (CryoSPARC-style).
-        # An in-place continue (resume) instead reuses the interrupted run's folder, so
-        # the program finds the checkpoint it left there and picks up where it stopped.
-        workdir = None
-        if resume and replace_job_id:
-            prev = self.get(replace_job_id)
-            if prev and prev.get("workdir") and Path(prev["workdir"]).is_dir():
-                workdir = Path(prev["workdir"])
-        if workdir is None:
-            resume = False   # nothing to resume from -> fall back to a fresh run
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            workdir = project_dir / f"{program}_{stamp}_{uuid.uuid4().hex[:4]}"
+        # One folder per job holds its outputs + log, named after the job itself:
+        # `<program>_<job_id>`. The name is *stable*, so re-running lands back in the
+        # same folder instead of minting a timestamped one and deleting the old.
+        #
+        # That stability is the point. Most job-derived inputs are referenced in place
+        # (adapters.produce hands the consumer a path *inside* the producer's run folder
+        # for checkpoints, particle metadata and volumes), so a rerun that moved the
+        # folder invalidated every downstream run's stored command by path alone — on top
+        # of the content going stale, which is the honest part and is still flagged (see
+        # mark_stale / cascade.py). Nothing is preserved by a fresh name either: a rerun
+        # already deleted the previous folder outright.
+        #
+        # An in-place continue (resume) reuses the interrupted run's folder *as it is*,
+        # so the program finds the checkpoint it left there and picks up where it stopped
+        # — including a legacy timestamped folder from before this scheme.
+        job_id = replace_job_id or uuid.uuid4().hex[:12]
+        prev = self.get(replace_job_id) if replace_job_id else None
+        prev_wd = Path(prev["workdir"]) if prev and prev.get("workdir") else None
+        workdir = project_dir / f"{program}_{job_id}"
+        if resume:
+            if prev_wd is not None and prev_wd.is_dir():
+                workdir = prev_wd
+            else:
+                resume = False   # nothing to resume from -> fall back to a fresh run
 
         # Auto-fill the program's output-dir argument with the (future) run folder.
         values = dict(values)
@@ -378,15 +392,28 @@ class JobManager:
             values[ssd_arg] = str(ssd_dir)
 
         # The run folder is created up-front so bound inputs (derived from a
-        # previous job's output) can be materialised into it. Any failure below
-        # cleans the folder back up so a bad submission leaves nothing behind.
+        # previous job's output) can be materialised into it. A failure below cleans up
+        # a folder we just created, so a bad submission leaves nothing behind — but a
+        # *reused* folder is left alone: it still holds a real previous run, and a
+        # rejected submission must not be what destroys it. (Its inputs are what they
+        # were: the only files touched so far are this job's own materialised ones,
+        # which carry the field's name and are rewritten identically every time.)
+        existed = workdir.is_dir()
         workdir.mkdir(parents=True, exist_ok=True)
         try:
             values = self._resolve_bindings(values, bindings, workdir)
             command = build_command(program, values, gpu)  # raises ValidationError
         except (ValidationError, adapters.AdapterError):
-            shutil.rmtree(workdir, ignore_errors=True)
+            if not existed:
+                shutil.rmtree(workdir, ignore_errors=True)
             raise
+        if not resume:
+            # Command accepted: now clear whatever the previous run left here, keeping the
+            # inputs just materialised above. Not optional — the networks auto-resume from
+            # an intermediate checkpoint found in their own output folder (adapters.
+            # _RESUMABLE), so a leftover one would silently turn this fresh run into a
+            # continue. A brand-new folder makes this a no-op.
+            self._clear_run_folder(workdir, keep=self._materialised(values, workdir))
         if ssd_dir is not None:
             # The SSD scratch is shared per project and reused across runs (the generator
             # skips rebuilding when cached shards exist). Optionally discard it so it's
@@ -404,17 +431,16 @@ class JobManager:
         # .star/.xmd resolve; fall back to the run folder.
         cwd = self._launch_cwd(program, values, workdir)
 
-        job_id = replace_job_id or uuid.uuid4().hex[:12]
         log_path = workdir / "run.log"
         status = "pending" if launch else "saved"
         name_val = (name or "").strip() or None
         # Persist the input bindings so a later rerun can re-materialise them into
-        # a fresh run folder (the produced files live in this job's workdir).
+        # the rebuilt run folder (the produced files live in this job's workdir).
         bindings_val = json.dumps(bindings) if bindings else None
         if replace_job_id:
-            # Replace in place: keep the same id (and created_at, so the row stays
-            # put in lists) and discard the previous run folder.
-            old = self.get(replace_job_id)
+            # Replace in place: keep the same id (and created_at, so the row stays put in
+            # lists). The run folder is normally the same one, already cleared above.
+            old = prev
             # `stale=0`: this run has just been re-made from its current inputs, so
             # whatever invalidated it (see :meth:`mark_stale`) no longer applies.
             #
@@ -431,10 +457,15 @@ class JobManager:
                 (program, name_val, json.dumps(values), gpu or None, json.dumps(command),
                  status, str(log_path), str(workdir), cwd, bindings_val, replace_job_id),
             )
+            # A different folder only happens when this job's *name* changed under it: a
+            # run made before folders were named after the job (legacy `<program>_<stamp>_
+            # <hex>`), or one whose program was swapped in an edit. Either way the old
+            # folder is now orphaned, so re-making the run is also what migrates it.
             if old and old.get("workdir"):
                 old_wd = Path(old["workdir"])
                 if old_wd != workdir and old_wd.exists():
                     shutil.rmtree(old_wd, ignore_errors=True)
+                    usage.forget(str(old_wd))
         else:
             self._exec(
                 "INSERT INTO jobs (id, program, name, args, gpu, command, status, log_path, created_at, project_id, workdir, cwd, bindings) "
@@ -447,7 +478,15 @@ class JobManager:
             if resume:
                 # Reused folder: clear metrics and mark the resume point in the kept log.
                 self._prepare_resume(program, str(workdir), str(log_path))
-            await self._launch(job_id, command, str(log_path), cwd, append_out=resume)
+            # Say so in the run's own log rather than only in the reply: this is the
+            # record someone reads months later when asking why a repeated run differs
+            # from the original.
+            notice = None
+            if dropped_args:
+                notice = (f"[hax-gui] {program} no longer accepts "
+                          f"{', '.join('--' + a for a in dropped_args)}; re-running without "
+                          f"{'it' if len(dropped_args) == 1 else 'them'}.\n\n")
+            await self._launch(job_id, command, str(log_path), cwd, append_out=resume, notice=notice)
         return self.get(job_id)
 
     async def start(self, job_id: str) -> dict[str, Any]:
@@ -459,10 +498,11 @@ class JobManager:
             raise JobActive(job_id)
         if job["status"] != "saved":
             raise JobNotSaved(job_id)
-        # A saved run that was invalidated (:meth:`mark_stale`) still holds the input
-        # paths materialised from its source run's *old* folder — which a rerun of that
-        # source has since deleted. Its stored command would read a path that is gone, so
-        # rebuild the run from its bindings instead of launching what we have.
+        # A saved run that was invalidated (:meth:`mark_stale`) holds inputs materialised
+        # from a source run that has been re-made since: copies of data that no longer
+        # exists, and references into a folder whose contents were thrown away. Launching
+        # its stored command would read whatever is there now (or nothing), so rebuild the
+        # run from its bindings instead of launching what we have.
         if job.get("stale"):
             return await self.rerun(job_id)
         self._init_buffers(job_id)
@@ -524,6 +564,59 @@ class JobManager:
                            (json.dumps(bindings), consumer["id"]))
         return restored
 
+    @staticmethod
+    def _materialised(values: dict[str, Any], workdir: Path) -> set[Path]:
+        """This run's own inputs that live *inside* ``workdir`` — what the clear-out must
+        not take with it.
+
+        Most job-derived inputs are referenced where they already are (a checkpoint or a
+        metadata file inside the producer's folder), so they are not in here; the ones
+        that are, are the copied/extracted artifacts ``adapters.produce`` writes as
+        ``<workdir>/<field>.npy``, which cost a file copy to re-make.
+
+        Every value is scanned rather than only the bound fields, because a binding that
+        was flattened to a literal path by an edit (see :meth:`relink_project`) still
+        points at that same copied file — and clearing the folder from under it would
+        leave the run reading an input that isn't there.
+        """
+        keep: set[Path] = set()
+        root = workdir.resolve()
+        for val in values.values():
+            for one in (val if isinstance(val, list) else [val]):
+                if not isinstance(one, str) or not one:
+                    continue
+                with contextlib.suppress(OSError):
+                    path = Path(one).resolve()
+                    if path.parent == root:
+                        keep.add(path)
+        return keep
+
+    @staticmethod
+    def _clear_run_folder(workdir: Path, keep: set[Path] | None = None) -> None:
+        """Empty a run folder in place, keeping `keep`.
+
+        The folder itself survives (it is this job's identity now, and the paths pointing
+        at it must stay valid). Anything that cannot be removed is left rather than raised
+        on: a rerun failing outright because one file is held open would be worse than a
+        folder with a leftover in it, and the run is about to overwrite its own outputs
+        anyway. Deleting files a *running* reader still holds open is safe on POSIX — it
+        keeps reading the data until it closes — and the cascade dialog is what stops
+        downstream runs from being left in that state (see cascade.py).
+        """
+        keep = {p.resolve() for p in (keep or set())}
+        with contextlib.suppress(OSError):
+            for entry in workdir.iterdir():
+                if entry.resolve() in keep:
+                    continue
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    with contextlib.suppress(OSError):
+                        entry.unlink()
+        # The measured size on record is the previous run's; drop it so the project page
+        # doesn't quote it for up to a TTL after the folder was emptied.
+        usage.forget(str(workdir))
+
     def _resolve_bindings(
         self, values: dict[str, Any], bindings: dict[str, dict[str, Any]] | None, workdir: Path
     ) -> dict[str, Any]:
@@ -559,8 +652,8 @@ class JobManager:
         return values
 
     async def rerun(self, job_id: str) -> dict[str, Any]:
-        """Re-launch a job in place: the same job is replaced with a fresh run
-        (new run folder, the old one removed) rather than creating a new job."""
+        """Re-launch a job in place: the same job is replaced with a fresh run — its own
+        run folder cleared and rebuilt, keeping the path — rather than creating a new job."""
         job = self.get(job_id)
         if job is None:
             raise JobNotFound(job_id)
@@ -574,6 +667,9 @@ class JobManager:
         for arg in (registry.output_arg(program), registry.ssd_arg(program)):
             if arg:
                 args.pop(arg, None)
+        # ...and anything the program has since stopped accepting, or this run could never
+        # be repeated once its CLI moved on (see command.strip_obsolete).
+        args, dropped = strip_obsolete(program, args)
         # Re-pass the original bindings so create() re-materialises job-derived
         # inputs into the fresh run folder (the previous folder is removed). Drop
         # the stale produced paths first so a missing binding can't slip through.
@@ -582,7 +678,8 @@ class JobManager:
             for field in bindings:
                 args.pop(field, None)
         return await self.create(program, args, job["gpu"], job["project_id"],
-                                 name=job.get("name"), bindings=bindings, replace_job_id=job_id)
+                                 name=job.get("name"), bindings=bindings, replace_job_id=job_id,
+                                 dropped_args=dropped)
 
     # -- what a run feeds, and what re-making it invalidates ---------------
     def dependents(self, job_id: str) -> list[dict[str, Any]]:
@@ -751,7 +848,7 @@ class JobManager:
         return str(workdir)
 
     async def _launch(self, job_id: str, command: list[str], log_path: str, cwd: str | None = None,
-                      append_out: bool = False) -> None:
+                      append_out: bool = False, notice: str | None = None) -> None:
         out_path, err_path = log_path, self._err_path(log_path)
         exit_path = _exit_path(log_path)
         with contextlib.suppress(OSError):
@@ -769,6 +866,11 @@ class JobManager:
             # frames, and the terminal in the UI still overwrites them in place.
             out_f = open(out_path, "ab" if append_out else "wb")
             err_f = open(err_path, "wb")
+            if notice:
+                # Written before the child inherits the fd, so its own output follows on
+                # from here (parent and child share one file description, hence one offset).
+                out_f.write(notice.encode())
+                out_f.flush()
         except OSError as exc:
             self._fail_launch(job_id, exc)
             return
@@ -971,10 +1073,11 @@ class JobManager:
         workdir = job.get("workdir")
         if workdir:
             wd = Path(workdir)
-            # Only remove a per-run folder (named <program>_<stamp>_<id>), never
-            # a project root or arbitrary path.
+            # Only remove a per-run folder (named <program>_<job_id>, or the legacy
+            # <program>_<stamp>_<id>), never a project root or arbitrary path.
             if wd.is_dir() and wd.name.startswith(job["program"] + "_"):
                 shutil.rmtree(wd, ignore_errors=True)
+                usage.forget(str(wd))
         self._buffers.pop(job_id, None)
         self._buflens.pop(job_id, None)
         self._subscribers.pop(job_id, None)

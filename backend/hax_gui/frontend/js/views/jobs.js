@@ -309,7 +309,7 @@ function row(job, i, hooks) {
     staleBadge(job),
     title,
     job.name ? h("span", { class: "prog-sub mono" }, job.program) : null,
-    jobLabelChips(job, { editable: true }),
+    jobLabelChips(job, { editable: true, max: 2 }),
     gpuLabel(job.gpu) ? h("span", { class: "muted", style: { fontSize: "12px" } }, gpuLabel(job.gpu)) : null,
     jobTimeEl(job),
     jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); hooks?.afterLocalRename?.(); }, onDeleted: () => a.remove() })

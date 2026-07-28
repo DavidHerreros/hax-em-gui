@@ -704,8 +704,19 @@
           ],
           "flag": "--kl_lambda",
           "required": false,
-          "help": "Weight (beta) of the VAE KL divergence, which regularizes the latent posterior towards a standard normal prior. Increase it for a smoother, more regularized latent space at the cost of reconstruction detail; decrease it (or set to 0) to let the encoder use the latent more freely. (NOTE: because the reduction changed, this is not comparable to any previously used constant)",
+          "help": "Weight (beta) of the VAE KL divergence, which regularizes the latent posterior towards a standard normal prior. Increase it for a smoother, more regularized latent space at the cost of reconstruction detail; decrease it (or set to 0) to let the encoder use the latent more freely. (NOTE: because the reduction changed, this is not comparable to any previously used constant). Setting it to 0 disables the variational machinery outright and trains a deterministic autoencoder. Pair any non-zero value with --kl_free_bits: on low-SNR data the KL's own optimum is an uninformative latent, and it will collapse to it.",
           "default": 0.001,
+          "type": "number"
+        },
+        {
+          "name": "kl_free_bits",
+          "flags": [
+            "--kl_free_bits"
+          ],
+          "flag": "--kl_free_bits",
+          "required": false,
+          "help": "Free-bits floor for the KL, in nats per latent dimension (default 0.5). A dimension whose KL has fallen below this stops being penalised, which removes the incentive to squeeze the last information out of the latent -- the failure mode (posterior collapse) where the encoder stops distinguishing particles and every one of them decodes to the consensus. It is a floor on the penalty, not on the information: a dimension the model has no use for is still free to stay unused, so a genuinely low-dimensional landscape is not forced to spread out. Raise it if the latent collapses, lower it (0 reproduces a plain KL) if the latent is noisy. Only used when --kl_lambda > 0.",
+          "default": 0.5,
           "type": "number"
         },
         {
@@ -812,13 +823,24 @@
           "type": "number"
         },
         {
-          "name": "occupancy_reg",
+          "name": "occupancy_l1",
           "flags": [
-            "--occupancy_reg"
+            "--occupancy_l1"
           ],
-          "flag": "--occupancy_reg",
+          "flag": "--occupancy_l1",
           "required": false,
-          "help": "Weight of the occupancy prior, which lets HetSIREN model compositional heterogeneity (a domain/ligand appearing or disappearing between particles) rather than forcing everything through the deformation field. Each Gaussian carries a per-particle amplitude change on top of the reference; this penalises it with a scale-normalised L1 (cost = fold change where the reference has density, so modulating existing density is cheap, while creating mass where the reference is empty costs |occ|/--occupancy_kappa -- possible but expensive). Set to 0 (default) to disable occupancy entirely (pure mass transport). Only meaningful with mass transport (--transport_mass) and a reference. NOTE: watch the occ_fraction diagnostic -- if it climbs while the pose/deformation goes quiet, lower this or --occupancy_kappa.",
+          "help": "Weight of the shrinkage half of the occupancy prior. Occupancy is what lets HetSIREN model compositional heterogeneity (a domain/ligand appearing or disappearing between particles) rather than forcing everything through the deformation field: each Gaussian carries a per-particle amplitude change on top of the reference. This term penalises how much of it there is, with a scale-normalised L1 (cost = fold change where the reference has density, so modulating existing density is cheap, while creating mass where the reference is empty costs |occ|/--occupancy_kappa -- possible but expensive). It is a mean over points, so it is on the same scale as --occupancy_tv. Only meaningful with mass transport (--transport_mass) and a reference. NOTE: this term only ever shrinks occupancy -- if the occ_fraction diagnostic collapses towards 0, this is too high.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "occupancy_tv",
+          "flags": [
+            "--occupancy_tv"
+          ],
+          "flag": "--occupancy_tv",
+          "required": false,
+          "help": "Weight of the spatial-coherence half of the occupancy prior (graph total variation). It penalises occupancy differences between neighbouring Gaussians, so a whole domain switching on together pays only at its boundary while scattered per-Gaussian noise pays everywhere -- this is what separates a genuine compositional domain from amplitude noise, and it is the term to reach for if occupancy is coming out incoherent. Raise it for blockier occupancy, lower it toward 0 to allow finer-grained occupancy. Weighted independently of --occupancy_l1: coherent-but-large occupancy is a perfectly reasonable thing to ask for, so setting this alone (L1 at 0) is a normal configuration. Occupancy is active when either weight is > 0; with both at 0 (default) the amplitudes stay at the reference (pure mass transport).",
           "default": 0.0,
           "type": "number"
         },
@@ -829,19 +851,8 @@
           ],
           "flag": "--occupancy_kappa",
           "required": false,
-          "help": "Creation threshold of the occupancy prior (as a density, in the reference's gray scale; default 0.05). It is added to the reference amplitude in the L1 denominator, so it sets how much evidence it takes to invent mass where the reference is (near) empty: smaller = harder to create mass, larger = easier. Where the reference already has substantial density it has little effect (the cost is a fold change). Only used when --occupancy_reg > 0.",
+          "help": "Creation threshold of the occupancy prior (as a density, in the reference's gray scale; default 0.05). It is added to the reference amplitude in the L1 denominator, so it sets how much evidence it takes to invent mass where the reference is (near) empty: smaller = harder to create mass, larger = easier. Where the reference already has substantial density it has little effect (the cost is a fold change). Only used when --occupancy_l1 > 0.",
           "default": 0.05,
-          "type": "number"
-        },
-        {
-          "name": "occupancy_tv",
-          "flags": [
-            "--occupancy_tv"
-          ],
-          "flag": "--occupancy_tv",
-          "required": false,
-          "help": "Relative weight of the spatial-coherence (graph total-variation) term of the occupancy prior (default 1.0). It penalises occupancy differences between neighbouring Gaussians, so a whole domain switching on together pays only at its boundary while scattered noise pays everywhere -- this is what separates a genuine compositional domain from amplitude noise. Raise it for blockier occupancy, lower it toward 0 to allow finer-grained occupancy. Only used when --occupancy_reg > 0.",
-          "default": 1.0,
           "type": "number"
         },
         {
@@ -851,7 +862,7 @@
           ],
           "flag": "--occupancy_warmup_epochs",
           "required": false,
-          "help": "Number of initial epochs over which occupancy is ramped in (default 3.0). While it ramps, the amplitudes stay at the reference so the data is explained purely by transport -- large motions organise first -- and occupancy is then released to explain only the residual that motion cannot (compositional change). Feeding occupancy from step 0 lets it short-circuit the motion (it is a strictly easier way to fit any image), so a non-zero warmup is recommended. Only used when --occupancy_reg > 0; set to 0 to use occupancy from the first step.",
+          "help": "Number of initial epochs over which occupancy is ramped in (default 3.0). While it ramps, the amplitudes stay at the reference so the data is explained purely by transport -- large motions organise first -- and occupancy is then released to explain only the residual that motion cannot (compositional change). Feeding occupancy from step 0 lets it short-circuit the motion (it is a strictly easier way to fit any image), so a non-zero warmup is recommended. Set to 0 to use occupancy from the first step. This ramp is independent of the occupancy priors -- it controls how occupancy enters the density, not how it is penalised -- so it applies whether or not --occupancy_l1/--occupancy_tv are set.",
           "default": 3.0,
           "type": "number"
         },

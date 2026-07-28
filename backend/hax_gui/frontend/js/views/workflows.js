@@ -232,8 +232,8 @@ export function WorkflowsView() {
   }
 
   // Persist the per-device cap on its own (not via save()), so changing it never drags
-  // an unsaved canvas along with it. The scheduler re-reads it each tick, so raising it
-  // mid-run takes effect as soon as a step frees a slot.
+  // an unsaved canvas along with it. The scheduler re-reads it every tick (~2s), so
+  // raising it mid-run starts the queued steps without waiting for anything to finish.
   async function setParallelism() {
     const n = Number(parSel.value) || 1;
     if (!wf) return;                       // unsaved workflow: applied when it is created
@@ -1447,7 +1447,13 @@ export function WorkflowsView() {
     let cascade = null;
     if (ids) {
       const down = downstreamNodes(graph, ids).map((n) => nodeAsDependent(n, runState));
+      // Steps in this selection that are still executing. Relaunching one means stopping
+      // it, and the alternative — letting it run on — is precisely what makes an edited
+      // parameter look like it was applied when the old run finishes on the old settings.
+      const busy = ids.map((id) => nodeById(id)).filter(Boolean)
+        .map((n) => nodeAsDependent(n, runState)).filter((d) => d.active);
       cascade = await confirmCascade(down.some((d) => d.status) ? down : [], {
+        restarting: busy,
         title: ids.length === 1 ? "Re-run this step?" : `Re-run ${ids.length} steps?`,
         lead: ids.length === 1
           ? "Its run folder is rebuilt from scratch — the current outputs and log are replaced."

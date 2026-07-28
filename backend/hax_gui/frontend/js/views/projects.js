@@ -149,26 +149,39 @@ function projectPanel(project) {
   return { el, cleanup: () => { stop = true; clearInterval(timer); } };
 }
 
+// One row per run. Its children are grouped into two zones rather than laid out as one
+// long flex line, because a flex line shrinks *everything* proportionally the moment it
+// overflows: the badges and the timestamp held their width, so the name, program and
+// folder — the only parts with anything to truncate — collapsed to a single letter each.
+// Now the identity zone is the only thing that gives (`min-width: 0`, ellipsis), and the
+// meta zone keeps its natural size.
 function execList(jobs, sizes) {
-  return h("div", null, ...jobs.map((j, i) => {
+  return h("div", { class: "exec-list" }, ...jobs.map((j, i) => {
     const title = h("span", { class: "exec-name" }, jobDisplayName(j));
+    // The program is the row's title when the run has no custom name, so printing it
+    // again beside it just showed the same word twice (and cost a column). Built either
+    // way and hidden, so naming a run reveals it without waiting for the next refresh.
+    const prog = h("span", { class: "exec-prog mono", hidden: !j.name }, j.program);
     const a = h(
       "a", { class: "exec-row", href: "#/jobs/" + j.id, title: "Drag onto a compatible input to chain it", style: { animationDelay: `${i * 0.02}s` } },
       h("span", { class: "exec-grip", title: "Drag as input" }, icon("more", 14)),
       badge(j.status),
       staleBadge(j),
-      title,
-      h("span", { class: "exec-prog mono" }, j.program),
-      h("span", { class: "exec-folder mono" }, folderName(j.workdir)),
-      // Only once the project's usage has been measured — the job list refreshes every
-      // few seconds and must never trigger a folder walk of its own.
-      sizes && sizes.has(j.id)
-        ? h("span", { class: "exec-size mono", title: "Disk used by this run's folder" }, formatSize(sizes.get(j.id)))
-        : null,
-      jobLabelChips(j, { editable: true }),
-      gpuLabel(j.gpu) ? h("span", { class: "muted small" }, gpuLabel(j.gpu)) : null,
-      jobTimeEl(j, "exec-time"),
-      jobMenuButton(j, { onRenamed: (u) => { title.textContent = jobDisplayName(u); }, onDeleted: () => a.remove() }));
+      h("span", { class: "exec-id" }, title, prog,
+        h("span", { class: "exec-folder mono", title: j.workdir || "" }, folderLabel(j))),
+      h("span", { class: "exec-meta" },
+        // Only once the project's usage has been measured — the job list refreshes every
+        // few seconds and must never trigger a folder walk of its own.
+        sizes && sizes.has(j.id)
+          ? h("span", { class: "exec-size mono", title: "Disk used by this run's folder" }, formatSize(sizes.get(j.id)))
+          : null,
+        jobLabelChips(j, { editable: true, max: 2 }),
+        gpuLabel(j.gpu) ? h("span", { class: "muted small exec-gpu" }, gpuLabel(j.gpu)) : null,
+        jobTimeEl(j, "exec-time")),
+      jobMenuButton(j, {
+        onRenamed: (u) => { title.textContent = jobDisplayName(u); prog.hidden = !u.name; },
+        onDeleted: () => a.remove(),
+      }));
     makeJobDraggable(a, j);
     return a;
   }));
@@ -178,6 +191,18 @@ function folderName(workdir) {
   if (!workdir) return "";
   const parts = workdir.replace(/\/+$/, "").split("/");
   return parts[parts.length - 1] || workdir;
+}
+
+// The run folder, minus the program name it starts with (folders are `<program>_<job_id>`
+// — see jobs.py). The row already says which program this is; what identifies the folder
+// is the id at the end, and dropping the prefix is what makes it fit next to everything
+// else. Legacy folders that don't follow the scheme are shown whole. Full path in the
+// tooltip either way.
+function folderLabel(job) {
+  const name = folderName(job.workdir);
+  if (!name) return "";
+  const prefix = job.program + "_";
+  return name.startsWith(prefix) ? "…_" + name.slice(prefix.length) : name;
 }
 
 // ---- project chooser modal ----

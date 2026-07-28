@@ -26,6 +26,28 @@ def _is_empty(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip() == "")
 
 
+def strip_obsolete(program: str, values: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Drop values whose argument the program no longer has. Returns ``(kept, dropped)``.
+
+    For *re-running a stored job* only — never for a fresh submission, where an unknown
+    key means the form and the schema disagree and :func:`build_command` should say so.
+
+    A job records the arguments it ran with, and a program's CLI moves on: an option gets
+    renamed or removed, and every run that used it becomes impossible to re-run, because
+    the stored value no longer corresponds to anything. Refusing was the honest answer but
+    a dead end — the run could not be repeated from the canvas or the Jobs view at all,
+    only rebuilt by hand through the form (which filters to the current fields and so
+    quietly did this already). Dropping the obsolete values reproduces the run as closely
+    as the program still allows, and the caller reports what went.
+    """
+    schema = get_schema(program)
+    if schema is None:
+        return dict(values), []
+    fields = {f["name"] for f in schema["fields"]}
+    dropped = sorted(k for k in values if k not in fields)
+    return ({k: v for k, v in values.items() if k in fields}, dropped)
+
+
 def build_command(program: str, values: dict[str, Any], gpu: str | None = None) -> list[str]:
     """Build the full argv list, validating required/typed fields first."""
     schema = get_schema(program)

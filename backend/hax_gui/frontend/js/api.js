@@ -134,7 +134,9 @@ export const api = {
   // to run just that subset (a single node or a selection). If a run is already in
   // flight the steps are appended to its queue rather than rejected.
   // `cascade` carries the same rerun choice as rerunJob, for the steps this subset
-  // feeds; ignored when the whole graph runs.
+  // feeds; ignored when the whole graph runs. It also carries `restart_running`: the
+  // user's yes to stopping steps in the request that are still executing (without it a
+  // busy step answers 409 rather than quietly letting its old run continue).
   runWorkflow: (id, nodes, cascade) =>
     req(`/api/workflows/${id}/run`, { method: "POST", body: JSON.stringify({ ...(nodes ? { nodes } : {}), ...(cascade || {}) }) }),
   stopWorkflow: (id) => req(`/api/workflows/${id}/stop`, { method: "POST" }),

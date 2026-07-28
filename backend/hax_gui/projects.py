@@ -1,9 +1,10 @@
 """Project management — CryoSPARC-style.
 
 A project is a folder under the common ``projects_root`` containing a
-``hax_project.json`` metadata file. Each program run inside a project gets its
-own uniquely-named subfolder holding all of its inputs-by-reference, outputs and
-logs, so users never have to specify an output path.
+``hax_project.json`` metadata file. Each program run inside a project gets its own
+subfolder — named after the job (``<program>_<job_id>``, so re-running keeps the path;
+see :meth:`jobs.JobManager.create`) — holding all of its inputs-by-reference, outputs
+and logs, so users never have to specify an output path.
 """
 
 from __future__ import annotations

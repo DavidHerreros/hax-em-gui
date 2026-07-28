@@ -35,7 +35,7 @@ from .command import ValidationError
 from .config import settings
 from .jobs import ACTIVE, JobActive, JobNotFound, JobNotResumable, JobNotSaved, ProjectNotFound, manager
 from .labels import manager as label_manager
-from .workflows import WorkflowError, manager as wf_manager
+from .workflows import StepsRunning, WorkflowError, manager as wf_manager
 from .projects import ProjectsRootUnset
 from .tensorboard import tb_manager
 from .viewer import viewer_manager
@@ -1102,6 +1102,13 @@ async def start_job(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="job is already running")
     except JobNotSaved:
         raise HTTPException(status_code=409, detail="only saved jobs can be started")
+    # Starting a *stale* saved job rebuilds it from its bindings (jobs.start -> rerun), so
+    # it can fail the same ways a rerun can — a source run deleted, or a stored argument
+    # the program no longer accepts. Surfaced as a field error instead of a 500.
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    except ProjectNotFound:
+        raise HTTPException(status_code=409, detail="the job's project no longer exists")
 
 
 @app.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(auth)])
@@ -2125,6 +2132,10 @@ class WorkflowRun(BaseModel):
     # flags them. Ignored when the whole graph runs — nothing is left behind to flag.
     cascade: str = "stale"
     cancel_running: bool = False
+    # The user's explicit yes to stopping steps in this request that are still executing,
+    # so they can be relaunched with the settings as they now stand. Without it a busy
+    # step answers 409 rather than quietly letting its current run continue.
+    restart_running: bool = False
 
 
 class WorkflowFromProject(BaseModel):
@@ -2229,7 +2240,10 @@ async def run_workflow(wid: str, body: WorkflowRun = WorkflowRun()) -> dict[str,
                 await cascade.invalidate(deps, cancel_running=body.cancel_running)
                 if body.cascade == "queue":
                     nodes = list(nodes) + down
-        return await wf_manager.run(wid, nodes)
+        return await wf_manager.run(wid, nodes, restart_running=body.restart_running)
+    except StepsRunning as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "those steps are still running", "steps": exc.steps})
     except cascade.DependentsRunning as exc:
         raise HTTPException(status_code=409, detail={
             "error": "downstream runs are still executing", "running": exc.running})

@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import adapters, projects, registry
+from .command import strip_obsolete
 from .config import settings
 from .jobs import ACTIVE, manager as jobs
 from .labels import manager as labels
@@ -36,6 +37,21 @@ class WorkflowError(Exception):
     def __init__(self, errors: list[str]):
         self.errors = errors
         super().__init__("; ".join(errors))
+
+
+class StepsRunning(Exception):
+    """Steps in the request are still executing, and the caller has not said to stop them.
+
+    Relaunching one means stopping it first: its process holds the GPU, and its run folder
+    is about to be rebuilt underneath it. Watching the existing run instead is *not* a
+    substitute — the whole point of the request is usually that the settings changed, and
+    quietly letting the old run continue makes an edited parameter look like it was
+    applied when the step goes on to finish, successfully, on the previous ones.
+    """
+
+    def __init__(self, steps: list[dict[str, Any]]):
+        self.steps = steps
+        super().__init__("; ".join(s["label"] for s in steps))
 
 
 class WorkflowManager:
@@ -222,8 +238,9 @@ class WorkflowManager:
         if name is not None:
             sets.append("name=?"); params.append(name.strip() or "Untitled workflow")
         if max_per_device is not None:
-            # Takes effect on the next scheduler tick, so raising it mid-run starts using
-            # the extra slots as soon as a step finishes — no need to stop and re-run.
+            # Takes effect on the next scheduler tick (see TICK_INTERVAL), so raising it
+            # mid-run starts filling the extra slots within a couple of seconds, while the
+            # running steps carry on — no need to stop and re-run.
             sets.append("max_per_device=?"); params.append(max(1, min(8, int(max_per_device))))
         if graph is not None:
             # Carry over node->job links the client doesn't know about. Saving during a
@@ -306,7 +323,13 @@ class WorkflowManager:
     # -- a project as a live workflow --------------------------------------
     @staticmethod
     def _clean_args(job: dict[str, Any]) -> dict[str, Any]:
-        """A job's args minus auto-managed dirs and bound (edge-fed) fields."""
+        """A job's args minus auto-managed dirs and bound (edge-fed) fields.
+
+        Options the program has since dropped are deliberately *kept* here and removed at
+        launch instead (:meth:`_run_node`), so the removal is something the run can report
+        rather than a silent edit made while the canvas syncs. The form ignores them —
+        it renders from the schema — so they are invisible either way.
+        """
         args = dict(job.get("args") or {})
         for auto in (registry.output_arg(job["program"]), registry.ssd_arg(job["program"])):
             if auto:
@@ -334,7 +357,10 @@ class WorkflowManager:
         for j in job_list:
             nid = id_map[j["id"]]
             nodes.append({"id": nid, "program": j["program"], "args": self._clean_args(j),
-                          "gpu": j.get("gpu") or "0", "name": j.get("name") or "",
+                          # Empty means CPU — the job ran without one. Defaulting to "0"
+                          # here put every CPU step on card 0, where it then contends with
+                          # the trainings for a device slot (see _device_of).
+                          "gpu": j.get("gpu") or "", "name": j.get("name") or "",
                           "labels": self._labels_of(j["id"]), "x": 0, "y": 0, "job_id": j["id"]})
             state[nid] = {"job_id": j["id"], "status": j["status"], "stale": bool(j.get("stale")), "error": None}
             for field, b in (j.get("bindings") or {}).items():
@@ -361,7 +387,7 @@ class WorkflowManager:
             # 'idle' — quietly emptying the queue we are offering to resume. Leave it be.
             if wf.get("resumable"):
                 return wf
-            graph, state = self._synced_graph(wf["graph"], project_id)
+            graph, state = self._synced_graph(wf["graph"], project_id, wf.get("run_state"))
             self._db.execute(
                 "UPDATE workflows SET graph=?, run_state=?, updated_at=? WHERE id=?",
                 (json.dumps(graph), json.dumps(state), _now(), wid),
@@ -463,7 +489,7 @@ class WorkflowManager:
         # the jobs' real statuses instead of leaving nodes stuck on 'running'.
         if wid in self._running and not self._running[wid].done():
             return wf
-        graph, state = self._synced_graph(wf["graph"], wf["project_id"])
+        graph, state = self._synced_graph(wf["graph"], wf["project_id"], wf.get("run_state"))
         statuses = [s.get("status") for s in state.values()]
         overall = ("failed" if "failed" in statuses
                    else "running" if any(s in ("pending", "running", "cancelling") for s in statuses)
@@ -476,7 +502,8 @@ class WorkflowManager:
         self._db.commit()
         return self.get(wid)
 
-    def _synced_graph(self, stored: dict[str, Any], project_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _synced_graph(self, stored: dict[str, Any], project_id: str,
+                      prior_state: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
         """Reconcile a stored project-workflow graph with the project's jobs:
         keep node positions / user-added (not-yet-run) nodes, drop nodes whose job
         was deleted, refresh linked nodes from their job, add nodes for new jobs,
@@ -497,7 +524,12 @@ class WorkflowManager:
                 nodes.append(n); node_for_job[j["id"]] = n
             n["program"] = j["program"]
             n["args"] = self._clean_args(j)
-            n["gpu"] = j.get("gpu") or n.get("gpu") or "0"
+            # The job is the authority here: this node *has* one, so an empty gpu means
+            # "runs on the CPU", not "unknown, guess 0". Falling back to "0" silently
+            # reassigned every CPU step to GPU 0 on the next reconcile — and since the
+            # scheduler contends on device, that step then queued behind whatever was
+            # training on card 0 instead of starting straight away on the CPU.
+            n["gpu"] = j.get("gpu") or ""
             n["name"] = j.get("name") or ""
             n["labels"] = self._labels_of(j["id"])
         present = {n["id"] for n in nodes}
@@ -526,7 +558,18 @@ class WorkflowManager:
         state = {}
         for n in nodes:
             jid = n.get("job_id")
-            if jid and jid in by_job:
+            # A step that failed *before* it could produce a run has no job to be derived
+            # from — and its node is still linked to whatever ran last time, which did
+            # succeed. Rebuilding blindly from the jobs therefore overwrote the verdict
+            # with that older success and dropped the reason with it, so a step that could
+            # not launch (a stored argument the program no longer accepts, a source run
+            # that never produced its output) flashed 'running' on the canvas and then read
+            # 'succeeded' seconds later, having done nothing. The failure is carried over
+            # instead; the next launch that does produce a job replaces it.
+            prior = (prior_state or {}).get(n["id"]) or {}
+            if prior.get("status") == "failed" and not prior.get("job_id"):
+                state[n["id"]] = {"job_id": None, "status": "failed", "error": prior.get("error")}
+            elif jid and jid in by_job:
                 state[n["id"]] = {"job_id": jid, "status": by_job[jid]["status"],
                                   "stale": bool(by_job[jid].get("stale")), "error": None}
             else:
@@ -703,8 +746,10 @@ class WorkflowManager:
 
     # -- execution ---------------------------------------------------------
     # The runner is a re-entrant scheduler, not a one-shot walk over a snapshot taken at
-    # launch. Each tick it re-reads the graph and run_state from the DB, so steps queued
-    # onto a live run — and edits saved while it runs — are picked up.
+    # launch. Each tick it re-reads the graph, run_state and max_per_device from the DB,
+    # so steps queued onto a live run — and edits saved while it runs — are picked up. A
+    # tick happens whenever a step finishes *and* every TICK_INTERVAL regardless, so a
+    # change that frees a slot is acted on while the other steps are still training.
     #
     # Steps run concurrently, limited by the resource they actually contend for: the
     # device. Every ready step whose device has a free slot starts; the rest wait. With
@@ -719,6 +764,8 @@ class WorkflowManager:
     # event loop, so two steps finishing at once cannot clobber each other's status.
     WAITING = ("pending", "running")
     CPU_DEVICE = "cpu"
+    # How long the scheduler may sit on a stale reading of the graph / device caps.
+    TICK_INTERVAL = 2.0
 
     @staticmethod
     def _device_of(node: dict[str, Any]) -> str:
@@ -732,7 +779,8 @@ class WorkflowManager:
         gpu = "" if gpu is None else str(gpu).strip()
         return gpu if gpu and gpu.lower() != "cpu" else WorkflowManager.CPU_DEVICE
 
-    async def run(self, wid: str, only: list[str] | None = None) -> dict[str, Any]:
+    async def run(self, wid: str, only: list[str] | None = None,
+                  restart_running: bool = False) -> dict[str, Any]:
         """Queue nodes for execution: `only` selects a subset, omit it for the whole
         graph. If a run is already in flight the nodes are *appended to its queue* and the
         live scheduler starts each as soon as its dependencies are met and its device has
@@ -753,12 +801,58 @@ class WorkflowManager:
 
         live = self._is_live(wid)
         prev = wf["run_state"] or {}
+
+        # Steps in the request that are still executing have to be stopped before they can
+        # be relaunched, and that is the user's call, not ours — so it is asked for
+        # explicitly rather than assumed either way.
+        by_id = {n["id"]: n for n in nodes}
+        busy: list[dict[str, Any]] = []
+        for nid in sorted(only_set or ()):
+            jid = (prev.get(nid) or {}).get("job_id") or by_id[nid].get("job_id")
+            job = jobs.get(jid) if jid else None
+            if job is not None and job["status"] in ACTIVE:
+                busy.append({"node": nid, "job_id": jid,
+                             "label": by_id[nid].get("name") or job["program"],
+                             "program": job["program"], "status": job["status"]})
+        if busy and not restart_running:
+            raise StepsRunning(busy)
+        for b in busy:
+            await jobs.cancel(b["job_id"])
+            # Wait for it to actually leave the active states, or _run_node's adoption
+            # guard would see a job still 'cancelling' and settle for watching it.
+            for _ in range(20):
+                job = jobs.get(b["job_id"])
+                if job is None or job["status"] not in ACTIVE:
+                    break
+                await asyncio.sleep(0.25)
+            # ...and for the watcher that was following it to record its verdict. That
+            # watcher re-reads run_state and overwrites its own node entry, so queueing
+            # the step before its 'cancelled' lands would simply be clobbered — the
+            # relaunch would go missing and the step would sit there cancelled.
+            for _ in range(24):
+                s = self._fresh_state(wid).get(b["node"]) or {}
+                if s.get("status") not in self.WAITING:
+                    break
+                await asyncio.sleep(0.25)
+        busy_nodes = {b["node"] for b in busy}
+        if busy:
+            prev = self._fresh_state(wid)     # re-read: the waits above moved it on
+
         state: dict[str, Any] = {}
         for n in nodes:
             nid = n["id"]
             if only_set is None or nid in only_set:
-                if live and prev.get(nid, {}).get("status") in self.WAITING:
-                    state[nid] = prev[nid]        # already queued or running: leave it be
+                # A step the user has explicitly asked to run is only left alone when it is
+                # *genuinely* still in flight. run_state is the scheduler's memory, and
+                # while a run is live nothing refreshes it from the jobs table (reconcile()
+                # bails out on a live workflow) — so a step whose job finished outside this
+                # run, or whose watcher died with a previous server, can sit at 'running'
+                # indefinitely. Trusting that memory dropped the request on the floor: the
+                # step was never queued, the scheduler adopted it on the next tick, and
+                # _wait_job returned the already-final status at once — so it flashed
+                # 'running' and settled 'succeeded' without having re-run anything.
+                if live and nid not in busy_nodes and self._in_flight(prev.get(nid)):
+                    state[nid] = prev[nid]        # already queued or really running
                 else:
                     state[nid] = {"job_id": None, "status": "pending", "error": None}
             else:
@@ -777,7 +871,11 @@ class WorkflowManager:
                         s = {**s, "status": job["status"]}     # it did finish — keep its result
                 state[nid] = s
         self._set_run(wid, "running", state)
-        if not live:
+        # Re-checked rather than reusing `live` from the top: stopping a busy step above
+        # can take seconds, and the scheduler that was watching it may have run out of
+        # work and exited in the meantime. Spawning off the stale reading left the queue
+        # we have just written with nobody to execute it.
+        if not self._is_live(wid):
             self._running[wid] = asyncio.create_task(self._execute(wid))
         return self.get(wid)
 
@@ -807,6 +905,22 @@ class WorkflowManager:
     def _is_live(self, wid: str) -> bool:
         task = self._running.get(wid)
         return task is not None and not task.done()
+
+    @staticmethod
+    def _in_flight(s: dict[str, Any] | None) -> bool:
+        """Is this run_state entry describing something that is *actually* still going?
+
+        The status alone cannot say: it is what the scheduler last wrote, not what is
+        true now. Only the job settles it — except for a step queued but never launched,
+        which has no job yet and is exactly what 'pending' with no id means.
+        """
+        if not s or s.get("status") not in WorkflowManager.WAITING:
+            return False
+        jid = s.get("job_id")
+        if not jid:
+            return s.get("status") == "pending"     # queued, awaiting its turn
+        job = jobs.get(jid)
+        return job is not None and job["status"] in ACTIVE
 
     def _partition(self, graph: dict[str, Any], state: dict[str, Any]) -> tuple[list[str], list[str]]:
         """Split the queued steps into (ready, blocked).
@@ -904,15 +1018,29 @@ class WorkflowManager:
                                        wf.get("kind") == "project")))
 
                 if not inflight:
-                    break                          # nothing running and nothing startable:
-                                                   # the queue is drained (or every ready
-                                                   # step's device is held by a step this
-                                                   # scheduler does not own — see below)
+                    # Nothing running and nothing startable — but a request can land in
+                    # the window between the partition above and this check (run() writes
+                    # run_state from the request handler, not from here), and exiting on
+                    # the older reading would strand it with no scheduler behind it.
+                    if any(s.get("status") == "pending" for s in self._fresh_state(wid).values()):
+                        continue
+                    break                          # the queue really is drained (or every
+                                                   # ready step's device is held by a step
+                                                   # this scheduler does not own)
 
                 # Wait for the first step to finish, then loop: re-reads the graph, so
                 # steps queued while these ran are picked up, and the slot just freed is
                 # handed to whatever is ready now.
-                done, _ = await asyncio.wait(inflight.values(), return_when=asyncio.FIRST_COMPLETED)
+                #
+                # The timeout is what makes "re-reads each tick" true while a long step is
+                # in flight. Without it the only wake-up is a step *finishing*, so anything
+                # that should let a queued step start right now — raising max_per_device,
+                # or pointing a step at an idle device (another GPU, or the CPU) — did
+                # nothing until the running training ended, sometimes hours later. The
+                # step just sat at 'pending'. Polling matches _await_node, which watches
+                # its job on the same cadence.
+                done, _ = await asyncio.wait(inflight.values(), timeout=self.TICK_INTERVAL,
+                                             return_when=asyncio.FIRST_COMPLETED)
                 for nid, task in list(inflight.items()):
                     if task in done:
                         del inflight[nid]
@@ -983,12 +1111,18 @@ class WorkflowManager:
                 bindings[e["field"]] = one
         for field in bindings:               # drop any stale literal so the binding wins
             args.pop(field, None)
+        # Second line of defence for a program whose CLI moved on: _clean_args strips
+        # obsolete options when the graph is synced from the jobs, but the client posts the
+        # graph from its own copy, which may predate that. Without this the step dies in
+        # build_command before it can create a job.
+        args, dropped = strip_obsolete(node["program"], args)
         # In a live project workflow, a node linked to an existing job reruns *that* job
         # in place (modifying the project) instead of creating a duplicate.
         replace = node.get("job_id") if (is_project and node.get("job_id") and jobs.get(node["job_id"])) else None
         try:
             job = await jobs.create(node["program"], args, node.get("gpu"), project_id,
-                                    name=node.get("name"), bindings=bindings, replace_job_id=replace)
+                                    name=node.get("name"), bindings=bindings, replace_job_id=replace,
+                                    dropped_args=dropped)
         except Exception as exc:  # noqa: BLE001 - surface build/validation failures per node
             state = self._fresh_state(wid)
             state[nid] = {"job_id": None, "status": "failed", "error": str(exc)}

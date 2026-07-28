@@ -65,11 +65,23 @@ export function labelChip(label, onRemove) {
 
 // A job's chips. `job.labels` is the attached list. Pass `editable` + `onChange`
 // to add a "+" button that opens the picker (and updates `job.labels` in place).
-export function jobLabelChips(job, { editable = false, onChange } = {}) {
+//
+// `max` bounds how many chips render, collapsing the rest into a "+N" stub. Rows in a
+// list pass it: their width is finite and shared with everything else on the row, and
+// clipping the overflow instead would eventually swallow the "+" button and with it the
+// only way to add a label from that view.
+export function jobLabelChips(job, { editable = false, onChange, max = 0 } = {}) {
   const wrap = h("span", { class: "lbl-chips" });
   const render = () => {
     clear(wrap);
-    for (const l of job.labels || []) wrap.appendChild(labelChip(l, editable ? (lab) => detach(lab) : null));
+    const all = job.labels || [];
+    const shown = max > 0 && all.length > max ? all.slice(0, max) : all;
+    for (const l of shown) wrap.appendChild(labelChip(l, editable ? (lab) => detach(lab) : null));
+    if (shown.length < all.length) {
+      const rest = all.slice(shown.length);
+      wrap.appendChild(h("span", { class: "lbl-more", title: rest.map((l) => l.name).join("\n") },
+        `+${rest.length}`));
+    }
     if (editable) {
       wrap.appendChild(h("button", {
         class: "lbl-add", title: "Add label",
