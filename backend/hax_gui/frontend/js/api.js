@@ -199,7 +199,10 @@ export const api = {
   createProjectJob: (projectId, program, args, gpu, name, bindings, launch = true, recreateSsd = false, replaceJobId = null, resume = false, cascade = null) =>
     req(`/api/projects/${projectId}/jobs`, {
       method: "POST",
-      body: JSON.stringify({ program, args, gpu, name: name || null, bindings: bindings || {}, launch, recreate_ssd: recreateSsd, replace_job_id: replaceJobId, resume, ...(cascade || {}) }),
+      // The name is always sent as a string, never null: on a replace the server reads
+      // null as "not specified" and keeps the run's current name, so clearing the field
+      // in the form has to arrive as "" to actually clear it.
+      body: JSON.stringify({ program, args, gpu, name: name || "", bindings: bindings || {}, launch, recreate_ssd: recreateSsd, replace_job_id: replaceJobId, resume, ...(cascade || {}) }),
     }),
 };
 

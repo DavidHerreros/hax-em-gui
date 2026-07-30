@@ -86,6 +86,43 @@ class PathSpec(BaseModel):
     indices: list[int] = []            # the states a morph walks through, in order
 
 
+class FilterSpec(BaseModel):
+    thr: float | None = None           # keep z < thr; None restores the full set
+    k: int = 10                        # neighbours the z-score is measured over
+
+
+def _knn_distances(x: np.ndarray, k: int) -> tuple[np.ndarray, str]:
+    """(n, k) distances from each row of `x` to its k nearest rows, itself included.
+
+    Tries the GPU first — cuML is what ``hax.utils.filter_latent_space`` uses when JAX
+    has a device — then falls back to exact CPU searches. The device is whatever this
+    process was pinned to at spawn (see ``select_gpu``); an empty CUDA_VISIBLE_DEVICES
+    means the viewer was deliberately started on the CPU, so don't build a CUDA context
+    behind its back. Nothing here imports JAX: asking ``jax.default_backend()`` which
+    path to take, as the batch program does, would initialise a backend this process
+    defers until the first decode.
+    """
+    if os.environ.get("CUDA_VISIBLE_DEVICES", "unset") != "":
+        try:
+            from cuml.neighbors.nearest_neighbors import NearestNeighbors
+            nn = NearestNeighbors(n_neighbors=k)
+            nn.fit(x)
+            dist, _idx = nn.kneighbors(x)
+            return np.asarray(dist, dtype=np.float32), "cuML (GPU)"
+        except ImportError:
+            print("[viewer] cuML not available; running the k-NN on the CPU", flush=True)
+        except Exception:  # noqa: BLE001 - a GPU that refuses is not a reason to fail
+            _log_exc("cuML k-NN failed; falling back to the CPU")
+    try:
+        from scipy.spatial import cKDTree
+        dist, _idx = cKDTree(x).query(x, k=k, workers=-1)
+        return np.asarray(dist, dtype=np.float32), "scipy cKDTree"
+    except ImportError:
+        from sklearn.neighbors import NearestNeighbors as SkNN
+        dist, _idx = SkNN(n_neighbors=k, n_jobs=-1).fit(x).kneighbors(x)
+        return np.asarray(dist, dtype=np.float32), "sklearn"
+
+
 # --------------------------------------------------------------------------
 # Landscape: embeddings (PCA/UMAP) + clustering of the latent space.
 # --------------------------------------------------------------------------
@@ -95,9 +132,34 @@ class Landscape:
         # full latent space whose rows decode to volumes. They differ only when a
         # reduced display space (z_space_reduced) is supplied — then centroids are
         # returned in the decodable full space so generated states still work.
-        self.latents = latents
-        self.decode = decode if decode is not None else latents
-        self.n, self.dim = latents.shape
+        self._all = latents
+        self._all_decode = decode if decode is not None else latents
+        self.set_filter(None)
+
+    def set_filter(self, rows: np.ndarray | None) -> None:
+        """Restrict the landscape to `rows` of the original set (None = all of it).
+
+        Everything downstream of here — the embeddings, the clustering, the snap trees,
+        the z-scores — is *fitted*, so a filtered landscape is not the old one with points
+        hidden: it is a new PCA basis and a new UMAP graph computed without the states that
+        were dropped. That refit is the entire reason to filter at all. Outliers stretch
+        the principal axes toward themselves and join the k-NN graph UMAP is built from, so
+        they distort the picture for every state that stays.
+
+        The index space the API speaks in is always this filtered one: `rows` maps it back
+        to the original particles, and only the two places that leave the viewer — decoding
+        a volume and exporting metadata — ever need that map. Nothing in the browser knows
+        a filter happened beyond the state count going down.
+        """
+        n_all = self._all.shape[0]
+        self.rows = np.arange(n_all) if rows is None else np.asarray(rows, dtype=np.int64)
+        # Identity keeps the originals rather than copying them: the unfiltered case is
+        # the common one and these are the two biggest arrays in the process.
+        full = rows is None
+        self.latents = self._all if full else self._all[self.rows]
+        self.decode = self._all_decode if full else self._all_decode[self.rows]
+        self.n, self.dim = self.latents.shape
+        self.n_all = n_all
         self._pca = None
         self._pca_var = None
         self._pca_comp = None     # (k, dim) basis, for projecting new points (centroids)
@@ -106,6 +168,25 @@ class Landscape:
         self._clusters: dict[int, list[int]] = {}
         self._kmeans: dict[tuple, tuple] = {}   # (k, seeds, space) -> (labels, centroids, cpca)
         self._trees: dict[str, object] = {}     # embed -> cKDTree, for snapping drawn curves
+        self._zscores: dict[int, np.ndarray] = {}   # k -> per-state outlier z-score
+
+    @property
+    def filtered(self) -> bool:
+        return self.n != self.n_all
+
+    def filter_by_zscore(self, thr: float, k: int) -> int:
+        """Keep the states whose neighbourhood z-score is below `thr`; returns how many.
+
+        Measured on the *current* set, so applying a filter twice narrows what is already
+        there rather than starting over — the z-scores are re-derived from the states that
+        survived, which is the same thing running `filter_latents` on its own output would
+        give you.
+        """
+        keep = np.flatnonzero(self.zscores(k) < float(thr))
+        if keep.size == 0:
+            raise ValueError("that threshold keeps no states")
+        self.set_filter(self.rows[keep])
+        return self.n
 
     @property
     def pca(self):
@@ -223,6 +304,39 @@ class Landscape:
             except Exception:  # noqa: BLE001 - degrade to the first PCs
                 self._umap = self.pca[:, :k].copy()
         return self._umap
+
+    def zscores(self, k: int) -> np.ndarray:
+        """|z| of each state's mean distance to its k nearest neighbours.
+
+        The statistic ``filter_latents`` thresholds (``hax.utils.filter_latent_space``): a
+        state sitting in a sparse part of the space has an unusually large mean neighbour
+        distance, so a large |z| marks it as an outlier. Measured in the display latents —
+        the coordinates the clustering also uses, never the PCA/UMAP projection, which is
+        display-only.
+
+        Memoised per k, and that memo is the point of doing this here at all: the
+        neighbour search is the entire cost, while the threshold is a comparison against
+        this vector that the browser does for itself. Moving ``k`` refits; moving the
+        threshold does not, so it stays interactive at any N.
+
+        The mean is over the k-1 rows ``kneighbors(k)`` returns besides the point itself —
+        deliberately the same off-by-one as ``filter_latent_space``, so a threshold tuned
+        here means the same thing when it is handed to ``filter_latents --thr``.
+        """
+        k = int(max(2, min(200, k, self.n - 1)))
+        hit = self._zscores.get(k)
+        if hit is not None:
+            return hit
+        t0 = time.time()
+        x = np.ascontiguousarray(self.latents, dtype=np.float32)
+        dist, backend = _knn_distances(x, k)
+        mean_d = dist[:, 1:].mean(axis=1)          # column 0 is the point itself, at distance 0
+        std = float(mean_d.std())
+        z = np.abs((mean_d - float(mean_d.mean())) / (std if std > 0 else 1.0)).astype(np.float32)
+        print(f"[viewer] outlier z-scores: k={k} n={self.n} dim={self.dim} "
+              f"via {backend} in {time.time() - t0:.2f}s", flush=True)
+        self._zscores[k] = z
+        return z
 
     def _coords(self, embed: str) -> np.ndarray:
         """The coordinate table a given embedding view is drawn from."""
@@ -377,10 +491,21 @@ class Decoder:
     def _latent(self, index: int) -> np.ndarray:
         n = self.landscape.n
         if 0 <= index < n:
-            return self.latents[index]
+            # Through the landscape, not `self.latents`: under a filter the two differ,
+            # and the index the browser sent addresses the filtered set.
+            return self.landscape.decode[index]
         if n <= index < n + len(self.extra):
             return self.extra[index - n]
         raise IndexError(f"latent index {index} out of range")
+
+    def invalidate_states(self) -> None:
+        """Drop everything keyed on a state index. Called when a filter renumbers them:
+        cached volume 7 is no longer state 7, and a stale hit would decode the wrong map."""
+        self.extra = []
+        self._cache.clear()
+        self._cache_order.clear()
+        self._icache.clear()
+        self._icache_order.clear()
 
     def latent(self, index: int) -> np.ndarray:
         """The decodable latent for a state index (centroids included)."""
@@ -805,7 +930,12 @@ class Exporter:
             ext = fmt if fmt in {"xmd", "star", "cs"} else "xmd"
             from xmipp_metadata.metadata import XmippMetaData
             sub = XmippMetaData()
-            sub.table = md.table.iloc[real].reset_index(drop=True)
+            # `real` addresses the landscape, which a filter renumbers; the metadata never
+            # moves. This map is what keeps an exported subset pointing at the particles it
+            # claims to be — it is the whole reason filtering lives here rather than in a
+            # `filtered_latents.npy`, which renumbers from zero and saves no way back.
+            rows = self.decoder.landscape.rows[real]
+            sub.table = md.table.iloc[rows].reset_index(drop=True)
             md_name = f"{safe}.{ext}"
             sub.write(str(folder / md_name))
             files.append(md_name)
@@ -863,16 +993,63 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         head = np.array([a.shape[0]], dtype="<i4").tobytes()
         return Response(content=head + a.tobytes(), media_type="application/octet-stream")
 
+    def _out_of_range(index: int) -> HTTPException:
+        """Reject a state index the landscape no longer has — and say so in the log.
+
+        This used to be a bare 404. It is the one error a client can provoke by holding an
+        index across a change to the state set (applying a filter renumbers them), and it
+        was the only failure in this backend that produced a message in the browser and
+        *nothing at all* on disk — which is precisely the case where a log is wanted. The
+        counts are here because the useful question is always "out of range of what".
+        """
+        msg = (f"state {index} is out of range: the landscape has {ls.n} states"
+               + (f" ({ls.n_all} before filtering)" if ls.filtered else "")
+               + f" plus {len(decoder.extra)} generated")
+        print(f"[viewer] {msg}", flush=True)
+        return HTTPException(status_code=404, detail=msg)
+
+    # Layout: int32 n, then n float32.
+    def _f32_vector(a: np.ndarray) -> Response:
+        a = np.ascontiguousarray(a, dtype="<f4")
+        head = np.array([a.shape[0]], dtype="<i4").tobytes()
+        return Response(content=head + a.tobytes(), media_type="application/octet-stream")
+
     @app.get("/api/landscape")
     def landscape() -> dict:
         """Just the metadata. The arrays are fetched separately, as binary."""
         return {
             "title": title,
             "n": int(ls.n),
+            "n_all": int(ls.n_all),
+            "filtered": bool(ls.filtered),
             "dims": int(ls.dim),
             "pca_var": ls.pca_var,
             "pca_k": int(ls.pca.shape[1]),
         }
+
+    @app.post("/api/filter")
+    def set_filter(body: FilterSpec) -> dict:
+        """Drop the outlying states and refit the landscape on what is left.
+
+        `thr: null` restores the full set. Either way the embeddings, clustering and
+        z-scores are discarded and recomputed on the new set — the refit is the point, not
+        a side effect — so the response is deliberately returned only once that is safe to
+        ask for, and the browser reloads its arrays after it."""
+        before = ls.n
+        try:
+            if body.thr is None:
+                ls.set_filter(None)
+            else:
+                ls.filter_by_zscore(body.thr, body.k)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        decoder.invalidate_states()   # index i means a different state now
+        print(f"[viewer] filter: {before} -> {ls.n} of {ls.n_all} states"
+              + (f" (z < {body.thr}, k = {body.k})" if body.thr is not None else " (reset)"), flush=True)
+        # `removed` is how many are gone *now*, not the delta — a reset would otherwise
+        # report a negative count of removed states.
+        return {"n": int(ls.n), "n_all": int(ls.n_all), "removed": int(ls.n_all - ls.n),
+                "filtered": bool(ls.filtered)}
 
     @app.get("/api/pca.bin")
     def pca_bin() -> Response:
@@ -892,6 +1069,25 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
     @app.get("/api/cluster.bin")
     def cluster_bin(k: int = Query(5)) -> Response:
         return _i32_vector(ls.clusters(k))
+
+    @app.get("/api/rows.bin")
+    def rows_bin() -> Response:
+        """Which original particle each current state is. Identity until a filter is
+        applied; after one it is what lets the browser carry its layers and its morph
+        path across the renumbering instead of losing them."""
+        return _i32_vector(ls.rows)
+
+    @app.get("/api/zscore.bin")
+    def zscore_bin(k: int = Query(10)) -> Response:
+        """Per-state outlier z-scores (see Landscape.zscores).
+
+        One request per k, then the browser thresholds the vector itself — which is what
+        makes the threshold a slider rather than a job."""
+        try:
+            return _f32_vector(ls.zscores(k))
+        except Exception as exc:  # noqa: BLE001
+            _log_exc("z-score computation failed")
+            raise HTTPException(status_code=500, detail=f"neighbour search failed: {exc}")
 
     @app.get("/api/kmeans")
     def kmeans(k: int = Query(5), seeds: str = Query("")) -> dict:
@@ -941,7 +1137,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
 
         The caller must hold `_DECODE_SLOTS`."""
         if index < 0 or index >= decoder.total:
-            raise HTTPException(status_code=404, detail="latent index out of range")
+            raise _out_of_range(index)
         if index2 is not None and 0 <= index2 < decoder.total and index2 != index:
             return decoder.volume_interp(index, index2, max(0.0, min(1.0, t)))
         return decoder.volume(index)
@@ -986,7 +1182,14 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         # not parallelise, they contend (8 at once measured 5x slower *each*), so a
         # threshold drag got slower the further it went.
         if index < 0 or index >= decoder.total:
-            raise HTTPException(status_code=404, detail="latent index out of range")
+            raise _out_of_range(index)
+        # -1 is how the client asks for a single state, so it stays the one value that
+        # means "no second endpoint". Any *other* out-of-range index2 is a stale reference,
+        # and is now rejected rather than dropped: silently ignoring it turned a morph frame
+        # into a still of its own start point, so the map stopped moving part-way through
+        # and nothing — not the response, not the log — said why.
+        if index2 < -1 or index2 >= decoder.total:
+            raise _out_of_range(index2)
         other = index2 if (0 <= index2 < decoder.total and index2 != index) else None
         with _DECODE_SLOTS:
             t_grid = time.perf_counter()
@@ -1034,7 +1237,14 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         cube the grid occupies, matching the surface mesh), then nx*ny*nz uint8 voxels
         (C order)."""
         if index < 0 or index >= decoder.total:
-            raise HTTPException(status_code=404, detail="latent index out of range")
+            raise _out_of_range(index)
+        # -1 is how the client asks for a single state, so it stays the one value that
+        # means "no second endpoint". Any *other* out-of-range index2 is a stale reference,
+        # and is now rejected rather than dropped: silently ignoring it turned a morph frame
+        # into a still of its own start point, so the map stopped moving part-way through
+        # and nothing — not the response, not the log — said why.
+        if index2 < -1 or index2 >= decoder.total:
+            raise _out_of_range(index2)
         other = index2 if (0 <= index2 < decoder.total and index2 != index) else None
         # The texture is a subsample, so decode straight to it — striding on the device
         # rather than hauling the full volume home and throwing most of it away. This is
@@ -1096,7 +1306,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         std and one masked sum: a few ms.
         """
         if index < 0 or index >= decoder.total:
-            raise HTTPException(status_code=404, detail="latent index out of range")
+            raise _out_of_range(index)
         with _DECODE_SLOTS:
             try:
                 grid, step = (_draft_grid(index, None, 0.0, int(size)) if size > 0
@@ -1114,7 +1324,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
     @app.get("/api/histogram")
     def histogram(index: int = Query(...), bins: int = Query(96)) -> dict:
         if index < 0 or index >= decoder.total:
-            raise HTTPException(status_code=404, detail="latent index out of range")
+            raise _out_of_range(index)
         vol = decoder.volume(index)
         counts, edges = np.histogram(vol.ravel(), bins=int(max(8, min(256, bins))))
         return {
@@ -1128,7 +1338,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
     @app.get("/api/mrc")
     def mrc(index: int = Query(...)) -> Response:
         if index < 0 or index >= decoder.total:
-            raise HTTPException(status_code=404, detail="latent index out of range")
+            raise _out_of_range(index)
         import tempfile
         from xmipp_metadata.image_handler import ImageHandler
 

@@ -29,7 +29,9 @@ let renderer, scatter, cloud = null, hist;
 let L = null, umapData = null, points3 = [];
 const clusterCache = {};
 const state = { embedding: "pca", dims: 2, x: 0, y: 1, z: 2, colorBy: "none", k: 5, densBandwidth: 6, densIntensity: 0.3, densMap: "inferno",
-  densStyle: "shells", densGamma: 1.4, densLevels: [25, 50, 75, 90], densShade: true, densFog: true, densCbar: true, current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 60, pointAlpha: 1, pathExpanded: false, smooth: 6, pickRestrict: false };
+  densStyle: "shells", densGamma: 1.4, densLevels: [25, 50, 75, 90], densShade: true, densFog: true, densCbar: true, current: -1, path: [], selection: [], sigma: 2.5, refMass: -1, render: "surface", vGamma: 1.4, vBright: 1.2, timeline: [], frame: 0, fps: 60, pointAlpha: 1, pathExpanded: false, smooth: 6, pickRestrict: false,
+  // outlier filter: same defaults as `filter_latents` (--thr 1.0, --n_neighbours 10)
+  zThr: 1, zK: 10, zMode: "dim" };
 // `state.fps` is the *motion* rate: timeline frames advanced per second. We render
 // at most DISPLAY_FPS_CAP frames/sec; once the motion rate exceeds that we keep the
 // render rate at the cap and advance several frames per tick instead. That lets a
@@ -141,11 +143,12 @@ async function boot() {
   try {
     L = await (await fetch("./api/landscape")).json();   // metadata only; arrays follow as binary
     L.pca = await fetchMatrix("./api/pca.bin");
+    L.rows = await fetchLabels("./api/rows.bin");   // state -> original particle, for filtering
     L.latents = null;   // fetched on demand — only the "latent" embedding view needs them
     clusterCache[5] = await fetchLabels("./api/cluster.bin?k=5");
   } catch (err) { status("Could not load landscape: " + err, "err"); return; }
   $("title").textContent = L.title || "Conformational landscape";
-  $("meta").textContent = `${L.n} states · latent dim ${L.dims}`;
+  updateMetaLabel();
   populateAxes();
   wireControls();
   setupLasso();
@@ -255,6 +258,7 @@ function wireControls() {
   $("densfog").addEventListener("change", (e) => { state.densFog = e.target.checked; if (cloud) cloud.setDensityFog(state.densFog); });
   $("denscbar").addEventListener("change", (e) => { state.densCbar = e.target.checked; drawDensityBar(); });
   setupDensityPanel();
+  setupOutlierPanel();
   $("light").addEventListener("change", (e) => renderer.setLighting(e.target.value));
   // Smoothing is baked into the cached meshes, so changing it invalidates every frame. That
   // flush also stops the prefetcher (clearFrameCache bumps fillToken), so restart it — and
@@ -734,6 +738,14 @@ function toggleColorWraps() {
 async function applyColor() {
   const labels = state.colorBy === "cluster" ? await clusterLabels() : null;
   applyLandscapeBg();   // dark backdrop in density mode, else the page theme
+  // While the filter panel is open the marking of what would be cut takes precedence over
+  // the colour mode — you are choosing a threshold, and that is the only thing you need to
+  // see. Closing the panel puts the colour mode back.
+  if (zPreviewing()) {
+    if (is3d() && cloud) { cloud.showDensity(false); cloud.setColors(zPreviewColors()); }
+    else { scatter.setDensity(false); scatter.setLabels(null); scatter.setPointColors(zColorsCSS()); }
+    return;
+  }
   if (is3d() && cloud) {
     const dens = state.colorBy === "density";
     if (dens) {
@@ -914,6 +926,322 @@ function resetDensityPanel() {
   applyColormap();
   if (landSlices) landSlices.setColormap(sliceColormap());
   if (state.colorBy === "density") applyColor(); else drawDensityBar();
+}
+
+// ── the outlier filter ────────────────────────────────────────────────────
+// `filter_latents` as a control instead of a job, in two stages that cost very different
+// things:
+//
+//   preview  the backend computes the neighbour z-scores once per k (/api/zscore.bin);
+//            the threshold is then `z < thr` over a typed array we already hold, so it
+//            can be dragged. Nothing is removed — the states that *would* go are marked.
+//   apply    the states are dropped and the PCA, UMAP and clustering are refitted on what
+//            is left. This is the part that is worth doing: outliers stretch the principal
+//            axes toward themselves and sit in the k-NN graph UMAP is built from, so a
+//            landscape drawn with them in it is distorted for every state that stays.
+//
+// Applying renumbers the states, but only inside this viewer — the backend keeps the map
+// from each state to its original particle, so decoded maps and exported metadata still
+// address the right rows. That map is exactly what `filtered_latents.npy` throws away.
+let zHist = null;
+let zData = null;      // { k, v: Float32Array, max, ms } — the fetched z-scores, for one k
+let zInflight = null;  // { k, p } — the request in flight, so concurrent callers share it
+
+// Unlike the other binary fetches this one is over a route that can genuinely fail (the
+// neighbour search is the only computation in this backend that can run out of memory),
+// so check the status rather than parsing a JSON error body as float32.
+async function fetchVector(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error((await r.text()) || r.statusText);
+  const buf = await r.arrayBuffer();
+  const n = new Int32Array(buf, 0, 1)[0];
+  return new Float32Array(buf, 4, n);
+}
+
+// The z-scores for the current k, fetched once. Returns null if the search failed.
+// Both the colour path and the k slider ask for this, and a slider release can arrive
+// while the first request is still out, so the in-flight promise is shared rather than
+// re-issued — the backend would otherwise repeat a search that costs real seconds.
+function ensureZScores() {
+  if (zData && zData.k === state.zK) return Promise.resolve(zData);
+  if (zInflight && zInflight.k === state.zK) return zInflight.p;
+  const k = state.zK;
+  status(`Searching neighbours (k = ${k})…`, "busy");
+  const t0 = performance.now();
+  const p = fetchVector(`./api/zscore.bin?k=${k}`).then((v) => {
+    let max = 0;
+    for (let i = 0; i < v.length; i++) if (v[i] > max) max = v[i];
+    // A late response for a k nobody is asking for any more must not overwrite the
+    // current one, but it is still worth keeping if nothing else has landed.
+    if (state.zK !== k && zData) return zData;
+    zData = { k, v, max, ms: performance.now() - t0 };
+    // The threshold range has to cover the tail we actually got, and that tail is
+    // heavy — a fixed 0..4 would squeeze the whole distribution into a corner.
+    $("zthr").max = Math.max(1, max).toFixed(2);
+    if (state.zThr > max) { state.zThr = max; $("zthr").value = max; }
+    zHist.setData(zHistogram(v, max), state.zThr);
+    status(`Neighbour table for k = ${k} in ${(zData.ms / 1000).toFixed(1)} s — the threshold is free from here.`);
+    return zData;
+  }).catch((err) => {
+    status("Neighbour search failed: " + err, "err");
+    return null;
+  }).finally(() => { if (zInflight && zInflight.k === k) zInflight = null; });
+  zInflight = { k, p };
+  return p;
+}
+
+// Bin the z-scores for the contour widget's data shape. Its own draw() takes the log,
+// which is what makes a distribution with a long thin tail readable at all.
+const Z_BINS = 72;
+function zHistogram(v, max) {
+  const counts = new Float32Array(Z_BINS);
+  const hi = max || 1;
+  for (let i = 0; i < v.length; i++) counts[Math.min(Z_BINS - 1, (v[i] / hi * Z_BINS) | 0)]++;
+  return { counts, edges: null, min: 0, max: hi, mean: 0, std: 1 };
+}
+
+// CSS colours for the 2D scatter: kept points keep the scatter's own neutral (the filter
+// marks what it removes, it does not restyle the rest); rejected ones are either pushed
+// back or called out. Two modes, not three — "hidden" is only expressible in 2D (the 3D
+// cloud's colours carry no alpha), and a filter that means different things in the two
+// views is worse than one that means less.
+//
+// The array is allocated once and rewritten in place. This runs on every frame of a
+// threshold drag, and a fresh million-entry array per frame is the kind of garbage that
+// turns a free operation into a stuttering one.
+const Z_KEEP_CSS = "rgba(148,163,184,0.6)";
+const Z_CUT_CSS = { dim: "rgba(100,116,139,0.14)", flag: "rgba(248,113,113,0.9)" };
+let zColorBuf = null;
+function zColorsCSS() {
+  if (!zColorBuf || zColorBuf.length !== L.n) zColorBuf = new Array(L.n);
+  const cut = Z_CUT_CSS[state.zMode] || Z_CUT_CSS.dim;
+  const v = zData ? zData.v : null, thr = state.zThr;
+  for (let i = 0; i < L.n; i++) zColorBuf[i] = (!v || v[i] < thr) ? Z_KEEP_CSS : cut;
+  return zColorBuf;
+}
+
+// The same preview for the 3D cloud. Its colours carry no alpha, so a dimmed point is a
+// dark grey rather than a faded one.
+function zPreviewColors() {
+  const out = new Float32Array(L.n * 3);
+  const cut = state.zMode === "flag" ? [0.97, 0.44, 0.44] : [0.19, 0.22, 0.28];
+  const v = zData ? zData.v : null, thr = state.zThr;
+  for (let i = 0; i < L.n; i++) {
+    const keep = !v || v[i] < thr;
+    out[i * 3] = keep ? 0.58 : cut[0];
+    out[i * 3 + 1] = keep ? 0.64 : cut[1];
+    out[i * 3 + 2] = keep ? 0.74 : cut[2];
+  }
+  return out;
+}
+
+function setupOutlierPanel() {
+  zHist = createHistogram($("zhist"), (level, dragging) => {
+    state.zThr = level;
+    $("zthr").value = level;
+    applyZThreshold(dragging);
+  }, { keep: "below" });
+
+  const pop = $("outPop");
+  $("outBtn").addEventListener("click", (e) => { e.stopPropagation(); openOutlierPanel(pop.dataset.open !== "true"); });
+  pop.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => openOutlierPanel(false));
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") openOutlierPanel(false); });
+
+  $("zthr").addEventListener("input", (e) => {
+    state.zThr = +e.target.value;
+    zHist.setLevel(state.zThr);       // the histogram line is the same threshold
+    applyZThreshold(true);
+  });
+  $("zthr").addEventListener("change", () => status(zSummary()));
+  // k is the one control that costs a round trip, so it commits on `change` (release)
+  // rather than on every intermediate value the slider passes through on the way.
+  $("zk").addEventListener("input", (e) => { state.zK = +e.target.value; $("zkOut").textContent = state.zK; });
+  $("zk").addEventListener("change", async () => {
+    if (zData && zData.k === state.zK) return;
+    if (await ensureZScores()) { applyColor(); syncOutlierPanel(); }
+  });
+  $("zModes").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-zmode]");
+    if (!b) return;
+    state.zMode = b.dataset.zmode;
+    for (const el of $("zModes").children) el.setAttribute("aria-pressed", String(el === b));
+    applyColor();
+  });
+  $("zApply").addEventListener("click", () => commitFilter(state.zThr));
+  $("zReset").addEventListener("click", () => commitFilter(null));
+}
+
+// Opening the panel turns the preview on, and closing it turns the preview off — the
+// marking is a thing you do *while* choosing a threshold, so it has no reason to outlive
+// the panel, and it composes with whatever the `color` select is set to instead of
+// competing with it for the same control.
+async function openOutlierPanel(on) {
+  const pop = $("outPop");
+  if (!pop) return;
+  const was = pop.dataset.open === "true";
+  pop.dataset.open = String(!!on);
+  $("outBtn").setAttribute("aria-expanded", String(!!on));
+  $("outBtn").classList.toggle("active", !!on);
+  if (!on) {
+    if (was) applyColor();          // drop the preview colours
+    return;
+  }
+  const r = $("outBtn").getBoundingClientRect();
+  pop.style.maxHeight = Math.max(200, window.innerHeight - r.bottom - 28) + "px";
+  // A canvas inside a display:none panel has no size, so anything drawn into it while the
+  // panel was shut went nowhere. The line above has already forced layout, so by here the
+  // canvas has its real width and a redraw lands.
+  if (zHist) zHist.setLevel(state.zThr);
+  syncOutlierPanel();
+  if (!was && await ensureZScores()) { syncOutlierPanel(); applyColor(); }
+}
+
+const zPreviewing = () => $("outPop").dataset.open === "true" && !!zData;
+
+// Recolour on a new threshold. The panel's numbers update on every event (they are a
+// single pass over the z-scores), but the repaint is coalesced to one per frame — a
+// pointer can emit several moves between two frames, and painting each of them would be
+// work nobody ever sees. The callback reads `state.zThr` when it fires, so the frame that
+// does land is always the current threshold, never a stale one.
+let zPending = 0;
+function applyZThreshold(dragging) {
+  syncOutlierPanel();
+  if (!dragging) status(zSummary());
+  if (zPending) return;
+  zPending = requestAnimationFrame(() => { zPending = 0; applyColor(); });
+}
+
+function zSummary() {
+  if (!zData) return "";
+  const kept = zCount(), cut = L.n - kept;
+  return `z < ${state.zThr.toFixed(2)} keeps ${kept} of ${L.n} states (${((cut / L.n) * 100).toFixed(1)}% cut).`;
+}
+
+function zCount() {
+  if (!zData) return L ? L.n : 0;
+  let kept = 0;
+  for (let i = 0; i < zData.v.length; i++) if (zData.v[i] < state.zThr) kept++;
+  return kept;
+}
+
+function syncOutlierPanel() {
+  $("zthrOut").textContent = state.zThr.toFixed(2);
+  $("zkOut").textContent = state.zK;
+  if (!zData) { $("zNote").textContent = ""; $("zTiming").textContent = ""; return; }
+  const kept = zCount(), cut = L.n - kept;
+  $("zKept").textContent = kept.toLocaleString();
+  $("zCut").textContent = `${cut.toLocaleString()} cut`;
+  $("zBarKeep").style.width = `${(kept / L.n) * 100}%`;
+  $("zBarCut").style.width = `${(cut / L.n) * 100}%`;
+  $("zApply").disabled = filterBusy || cut === 0;
+  $("zNote").textContent = cut === 0
+    ? "Nothing is cut at this threshold — drag the line left."
+    : `Applying drops ${((cut / L.n) * 100).toFixed(1)}% of the set and recomputes the PCA, `
+      + `UMAP and clustering on the rest. Same cut as `
+      + `filter_latents --thr ${state.zThr.toFixed(2)} --n_neighbours ${zData.k}.`;
+  $("zTiming").textContent = `k-NN ${(zData.ms / 1000).toFixed(1)}s · once per k`;
+}
+
+// Drop the outliers for real: the backend refits the embeddings on what is left and
+// renumbers the states, then everything the browser holds about the old numbering is
+// rebuilt. `thr` of null restores the full set.
+let filterBusy = false;
+async function commitFilter(thr) {
+  if (filterBusy) return;
+  if (thr !== null && !zData) { status("No z-scores yet.", "warn"); return; }
+  filterBusy = true;
+  $("zApply").disabled = $("zReset").disabled = true;
+  const oldRows = L.rows;
+  status(thr === null ? "Restoring every state and refitting…" : "Dropping outliers and refitting the landscape…", "busy");
+  try {
+    const r = await fetch("./api/filter", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ thr, k: state.zK }),
+    });
+    if (!r.ok) throw new Error(((await r.json()).detail) || r.statusText);
+    const d = await r.json();
+    await reloadLandscape(oldRows);
+    status(d.filtered
+      ? `Refitted on ${d.n} of ${d.n_all} states — PCA, UMAP and clustering recomputed without the ${d.n_all - d.n} outliers.`
+      : `Restored all ${d.n} states and refitted on the full set.`);
+  } catch (err) {
+    status("Filter failed: " + err.message, "err");
+  } finally {
+    filterBusy = false;
+    $("zApply").disabled = $("zReset").disabled = false;
+    syncOutlierPanel();
+  }
+}
+
+// Rebuild every cached view of the landscape after the state set changed. Anything keyed
+// on a state index is either remapped through the original-particle ids (which survive the
+// renumbering) or dropped, and anything derived from the old embedding is refetched.
+async function reloadLandscape(oldRows) {
+  // A morph in flight walks state indices that are about to mean something else.
+  setPlaying(false);
+  state.frame = 0;
+  const meta = await (await fetch("./api/landscape")).json();
+  Object.assign(L, meta);
+  L.pca = await fetchMatrix("./api/pca.bin");
+  L.rows = await fetchLabels("./api/rows.bin");
+  L.latents = null;                 // refetched on demand, like the initial load
+  umapData = null;                  // a new UMAP graph; the old embedding is meaningless
+  for (const k of Object.keys(clusterCache)) delete clusterCache[k];
+  clusterCache[5] = await fetchLabels("./api/cluster.bin?k=5");
+  zData = null; zInflight = null;   // z-scores are re-derived from the states that survived
+  invalidateDensity();
+  clearFrameCache();                // cached volumes were keyed on the old numbering
+  centroidVecs = {}; indexColor = {}; clusterQuery = null;
+
+  // old state index -> new one, via the original particle each one is. Layers and the
+  // morph path are real work; losing them to a renumbering would make filtering something
+  // you only dare do first, rather than whenever the picture warrants it.
+  const pos = new Int32Array(L.n_all).fill(-1);
+  for (let j = 0; j < L.rows.length; j++) pos[L.rows[j]] = j;
+  const remap = (i) => (i >= 0 && i < oldRows.length ? pos[oldRows[i]] : -1);
+
+  // Curve layers store control points in the *old* PCA coordinates. The basis just
+  // changed, so those points no longer mean anything — they are dropped rather than
+  // silently redrawn somewhere they were never put. Centroids are regenerated by
+  // clustering, so they go too.
+  const dropped = layers.filter((ly) => ly.kind === "curve" || ly.kind === "centroid").length;
+  for (let i = layers.length - 1; i >= 0; i--) {
+    const ly = layers[i];
+    if (ly.kind === "curve" || ly.kind === "centroid") { layers.splice(i, 1); continue; }
+    ly.indices = ly.indices.map(remap).filter((v) => v >= 0);
+    if (!ly.indices.length) layers.splice(i, 1);
+  }
+  editingPathLayer = null; editCurve = null;
+  state.path = state.path.map(remap).filter((v) => v >= 0);
+  setSelectionState(state.selection.map(remap).filter((v) => v >= 0));
+  state.current = remap(state.current);
+
+  populateAxes();
+  refreshAxisEnabled();
+  renderLayers();
+  updatePoints();
+  await applyColor();
+  syncSelection();
+  updatePathLabel();
+  // Rebuilt, not just emptied: buildTimeline is what owns the scrub range and the frame
+  // counter, so clearing `state.timeline` behind its back left the morph bar advertising
+  // a length the timeline no longer had. It also re-prices the hops in the new space.
+  await buildTimeline();
+  updateMetaLabel();
+  if (landView === "slices") loadLandSlices();
+  if (state.current >= 0) onSelect(state.current, {});
+  else if (L.n > 0) { scatter.select(0); onSelect(0, {}); }
+  if (dropped) status(`${dropped} curve/centroid layer(s) dropped — they were drawn in the old projection.`, "warn");
+}
+
+// "4,000 states · latent dim 10", or what is left of them once a filter is on.
+function updateMetaLabel() {
+  const base = L.filtered ? `${L.n} of ${L.n_all} states` : `${L.n} states`;
+  $("meta").textContent = `${base} · latent dim ${L.dims}`;
+  $("outBtnState").textContent = L.filtered ? ` · ${L.n_all - L.n} cut` : "";
+  $("outBtn").classList.toggle("filtered", !!L.filtered);
+  $("zReset").style.display = L.filtered ? "" : "none";
 }
 
 // ── colour bar ────────────────────────────────────────────────────────────

@@ -8,6 +8,12 @@
   --accent: #2dd4bf;
   --err: #f87171;
   --warn: #fbbf24;
+  /* Filled-button pair. The accent is tuned to be read *as* a line or a border on the
+     page ground, which is not the same job as carrying text on top of itself — at 11px
+     the plain accent only reaches ~3.5:1 under white. These two are picked together:
+     near-black ink on the bright teal here, white on a darker teal in light mode. */
+  --accent-strong: #2dd4bf;
+  --on-accent: #041014;
 }
 :root[data-theme="light"] {
   --bg: #f1f5f9;
@@ -18,6 +24,8 @@
   --accent: #0d9488;
   --err: #dc2626;
   --warn: #d97706;
+  --accent-strong: #0f766e;
+  --on-accent: #ffffff;
 }
 :root[data-theme="light"] #scatter,
 :root[data-theme="light"] #scatter3d { background: radial-gradient(120% 120% at 50% 0%, rgba(13,148,136,0.08), transparent 60%); }
@@ -117,6 +125,29 @@ body {
 .dens-check { display: flex; align-items: center; gap: 6px; color: var(--muted); padding: 3px 0; cursor: pointer; }
 .dens-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
 .dens-hidden { display: none !important; }
+
+/* ── outlier filter (shares .dens-pop) ────────────────────────────────────
+   Its own toolbar button next to the lasso, not an entry in the colour
+   select: it changes which states exist, it does not tint them. The z-score
+   histogram is the same widget as the contour strip, so the threshold is
+   dragged the same way in both places. */
+#outwrap { position: relative; }
+/* A filter is a standing change to the landscape — unlike every other control
+   here, its effect outlives the panel, so the button says so while it is on. */
+#outBtn.filtered { border-color: var(--warn); color: var(--warn); }
+.btn-state { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; opacity: 0.85; }
+.zhist { width: 100%; height: 62px; display: block; margin-bottom: 6px; cursor: ew-resize; touch-action: none; background: rgba(148, 163, 184, 0.07); border-radius: 5px; }
+.z-modes { display: flex; gap: 5px; }
+.z-modes .btn { flex: 1; justify-content: center; }
+.z-modes .btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.z-verdict { display: flex; flex-direction: column; gap: 5px; margin-top: 9px; }
+.z-big { font-size: 14px; font-variant-numeric: tabular-nums; }
+.z-big em { font-style: normal; color: var(--err); }
+/* Kept vs cut as a proportion, because a count alone doesn't say how much of the
+   set is going — the bar does that before you have read either number. */
+.z-bar { display: flex; height: 4px; border-radius: 2px; overflow: hidden; background: rgba(148, 163, 184, 0.2); }
+.z-bar i { display: block; background: var(--accent); }
+.z-bar u { display: block; background: var(--err); }
 input[type="range"] { accent-color: var(--accent); width: 92px; }
 input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid var(--border); border-radius: 6px; background: none; }
 
@@ -129,6 +160,21 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .btn:disabled:hover { border-color: var(--border); color: var(--text); }
 .btn.active { border-color: var(--accent); color: var(--accent); background: rgba(45, 212, 191, 0.12); }
 .btn.small { padding: 3px 7px; font-size: 11px; }
+
+/* Filled primary action. It has to be declared *after* the .btn states above, not with
+   the control it belongs to: `.btn:hover` has the same specificity, so from earlier in
+   the file it lost the cascade and repainted the label in the accent — accent text on an
+   accent fill, i.e. an invisible button under the pointer. Every state restates both
+   colours rather than inheriting one of them, so no later single-property rule can split
+   the pair again. */
+.btn.primary,
+.btn.primary:hover,
+.btn.primary:disabled,
+.btn.primary:disabled:hover {
+  background: var(--accent-strong); border-color: var(--accent-strong);
+  color: var(--on-accent); font-weight: 600;
+}
+.btn.primary:hover:not(:disabled) { filter: brightness(1.12); }
 
 /* ── pane body: layers rail + canvas ── */
 .pane-body { flex: 1; display: flex; min-height: 0; min-width: 0; }

@@ -5,7 +5,11 @@
 // `onLevel(level, dragging)` — `dragging` is true for every frame of a drag and false for
 // the last one, when the pointer is released. Callers use it to show a cheap draft surface
 // while the pointer is down and compute the full-resolution one only once, on release.
-export function createHistogram(canvas, onLevel) {
+//
+// `keep` says which side of the line is the kept set, and only shades it: "above" for a
+// contour level (everything denser than it is inside the surface), "below" for the outlier
+// filter, where the kept states are the ones with a *small* z-score.
+export function createHistogram(canvas, onLevel, { keep = "above" } = {}) {
   const ctx = canvas.getContext("2d");
   let data = null;   // { counts, edges, min, max, mean, std }
   let level = 0;
@@ -40,10 +44,11 @@ export function createHistogram(canvas, onLevel) {
       const bh = (Math.log1p(data.counts[i]) / maxc) * (h - 4);
       ctx.fillRect(PAD + i * bw, h - bh, Math.max(1, bw - 0.5), bh);
     }
-    // threshold line + filled region to the right (kept density)
+    // threshold line + a wash over whichever side is kept
     const lx = xOf(level);
     ctx.fillStyle = "rgba(45,212,191,0.10)";
-    ctx.fillRect(lx, 0, w - lx, h);
+    if (keep === "below") ctx.fillRect(0, 0, lx, h);
+    else ctx.fillRect(lx, 0, w - lx, h);
     ctx.strokeStyle = "#2dd4bf"; ctx.lineWidth = 2 * dpr();
     ctx.beginPath(); ctx.moveTo(lx, 0); ctx.lineTo(lx, h); ctx.stroke();
     // handle

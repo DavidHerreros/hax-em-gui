@@ -164,6 +164,9 @@ class JobCreate(BaseModel):
     program: str
     args: dict[str, Any] = {}
     gpu: str | None = None
+    # Custom display name. Alongside replace_job_id, omitting it (null) keeps the name the
+    # run already has — only an explicit "" clears it, so a client that doesn't carry the
+    # name can't wipe it by re-submitting the run.
     name: str | None = None
     # {field_name: {"job_id": ..., "kind": ...}} — fields fed from a prior job.
     bindings: dict[str, dict[str, Any]] = {}

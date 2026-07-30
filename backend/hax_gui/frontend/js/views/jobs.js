@@ -272,7 +272,7 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
     if (!target) return;
     try {
       const pf = await api.jobCopyPrefill(job.id);
-      store.prefillProgram({ program: pf.program, values: pf.values, gpu: pf.gpu,
+      store.prefillProgram({ program: pf.program, values: pf.values, gpu: pf.gpu, name: pf.name,
                              projectId: target.id, projectName: target.name });
     } catch (err) {
       alert(err && err.detail ? (typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail)) : "Could not copy this run.");

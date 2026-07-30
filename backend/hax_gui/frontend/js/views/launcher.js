@@ -114,6 +114,9 @@ export function buildLauncher() {
       const visible = new Set(visibleFields(schema).map((f) => f.name));
       for (const [k, v] of Object.entries(prefill.values || {})) if (visible.has(k)) values[k] = v;
       if (prefill.gpu) gpu = String(prefill.gpu);
+      // Keep the run's custom name. An edit submits over the same job row, so an empty
+      // name here is not "unnamed by default" — it *erases* the name the run had.
+      if (prefill.name) runName = prefill.name;
       if (prefill.jobId) targetJobId = prefill.jobId;
       resume = !!prefill.resume;
       // Re-hydrate inputs that were fed by another run, so editing keeps them *bound*
@@ -141,7 +144,8 @@ export function buildLauncher() {
     // Optional custom run name (makes executions easy to identify).
     intro.appendChild(h("div", { class: "field" },
       h("div", { class: "field-label" }, h("span", { class: "flag" }, "Run name"), h("span", { class: "ctype" }, "optional")),
-      h("input", { class: "input", placeholder: "e.g. hetsiren run 1", oninput: (e) => (runName = e.target.value) })));
+      h("input", { class: "input", placeholder: "e.g. hetsiren run 1", value: runName,
+                   oninput: (e) => (runName = e.target.value) })));
 
     if (schema.output_arg || schema.ssd_arg) {
       const note = schema.ssd_arg

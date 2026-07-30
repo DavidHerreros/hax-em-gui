@@ -125,6 +125,10 @@ export const store = {
   editFrom(job, opts = {}) {
     state.prefill = { program: job.program, values: { ...(job.args || {}) }, gpu: job.gpu || "",
                       jobId: job.id, resume: !!opts.resume,
+                      // The custom run name is part of the run, not of its parameters: an
+                      // edit replaces the job in place (same row), so leaving it out made
+                      // the form submit an empty name and silently clear it.
+                      name: job.name || "",
                       // Carry the input bindings so an edit-and-rerun keeps a field that
                       // was fed by another run *bound* (the launcher re-hydrates them),
                       // instead of freezing that run's resolved output path into the args
@@ -141,8 +145,8 @@ export const store = {
   // Open the launcher for `program` preloaded with `values` (an assistant
   // proposal). No jobId → a NEW job: the user completes any required fields and
   // launches it themselves. Nothing runs from this call.
-  prefillProgram({ program, values, gpu, projectId, projectName }) {
-    state.prefill = { program, values: { ...(values || {}) }, gpu: gpu || "" };
+  prefillProgram({ program, values, gpu, name, projectId, projectName }) {
+    state.prefill = { program, values: { ...(values || {}) }, gpu: gpu || "", name: name || "" };
     state.selectedProgram = program;
     state.rightOpen = true;
     state.formNonce++;

@@ -433,7 +433,14 @@ class JobManager:
 
         log_path = workdir / "run.log"
         status = "pending" if launch else "saved"
-        name_val = (name or "").strip() or None
+        # `None` means "not specified", and is not the same as "". Replacing a job keeps
+        # the name it already carries, so a caller that never had it — a workflow node
+        # posted from a graph built before the step was named, an API client that omits
+        # the field — cannot silently erase a name the user set from the Jobs view. An
+        # explicit empty string is what clears it.
+        name_val = None if name is None else (name.strip() or None)
+        if name is None and prev is not None:
+            name_val = prev.get("name")
         # Persist the input bindings so a later rerun can re-materialise them into
         # the rebuilt run folder (the produced files live in this job's workdir).
         bindings_val = json.dumps(bindings) if bindings else None

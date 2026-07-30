@@ -109,6 +109,46 @@
           </span>
           <button id="drawBtn" class="btn" title="Draw a smooth editable curve across the landscape; it snaps to states only when you morph it (2D & 3D)">✎ Draw path</button>
           <button id="lassoBtn" class="btn" title="Lasso-select points (drag a loop)">▱ Lasso</button>
+          <span id="outwrap" class="kwrap">
+            <button id="outBtn" class="btn" aria-expanded="false" aria-controls="outPop" title="Drop outlying states and refit the landscape without them">⧗ Filter<span id="outBtnState" class="btn-state"></span> ▾</button>
+          <!-- Outlier filter. Preview is free — the neighbour search runs once per k on the
+               backend and the threshold is then a comparison against the vector it returned.
+               Applying is not: it drops those states and refits the PCA and UMAP on the rest,
+               which is the point of removing them. -->
+          <div class="dens-pop" id="outPop" role="dialog" aria-label="Outlier filter">
+            <h4>Neighbourhood z-score</h4>
+            <canvas id="zhist" class="zhist" title="Distribution of z-scores — drag the line to set the threshold"></canvas>
+            <div class="dens-row">
+              <span>threshold</span>
+              <input id="zthr" type="range" min="0.05" max="4" step="0.01" value="1" title="Keep the states whose z-score is below this — filter_latents --thr" />
+              <output id="zthrOut">1.00</output>
+            </div>
+            <div class="dens-row">
+              <span>neighbours</span>
+              <input id="zk" type="range" min="2" max="50" step="1" value="10" title="Neighbours the mean distance is taken over — filter_latents --n_neighbours. Changing this refits on the backend." />
+              <output id="zkOut">10</output>
+            </div>
+
+            <hr class="dens-sep" />
+            <h4>Preview</h4>
+            <div class="z-modes" id="zModes">
+              <button class="btn small" data-zmode="dim" aria-pressed="true">dim outliers</button>
+              <button class="btn small" data-zmode="flag" aria-pressed="false">flag outliers</button>
+            </div>
+
+            <div class="z-verdict">
+              <span class="z-big"><span id="zKept">—</span> kept · <em id="zCut">—</em></span>
+              <span class="z-bar"><i id="zBarKeep"></i><u id="zBarCut"></u></span>
+            </div>
+            <div class="dens-note" id="zNote"></div>
+
+            <div class="dens-foot">
+              <button id="zApply" class="btn small primary" title="Drop these states and recompute the PCA, UMAP and clustering without them">Apply &amp; refit</button>
+              <button id="zReset" class="btn small" title="Restore every state and refit on the full set" style="display:none">Reset</button>
+              <span class="muted small mono" id="zTiming"></span>
+            </div>
+          </div>
+          </span>
           <button id="landSlicesBtn" class="btn" title="View the landscape as an orthogonal-slice density map (of the current X/Y/Z axes)">◫ Slices</button>
           <button id="layersBtn" class="btn" title="Show / hide the layers panel">Layers</button>
           <button id="saveLand" class="btn" title="Save landscape as PNG">Save PNG</button>
