@@ -20,6 +20,7 @@ import { api } from "../api.js";
 import { errorBox } from "./ui.js";
 import { pca } from "../pca.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
+import { prefsFor, changeWriter } from "../metricsPrefs.js";
 import { createPlot } from "/shared/plot.js";
 import { createScatter } from "/shared/scatter.js";
 import { createCloud } from "/shared/cloud.js";
@@ -72,27 +73,38 @@ export function metricsPanel({ logdir, jobId }) {
   const root = h("div", { class: "mx" });
   const body = h("div", { class: "mx-body" });
 
+  // How this run was left the last time it was open. The panel is destroyed on every
+  // navigation away from /metrics, so without this the whole configuration — cards in
+  // Split, a soloed curve, an unticked tag — is rebuilt from defaults each time.
+  const prefs = prefsFor(logdir);
+  const panelPrefs = prefs.get("panel");
+  const savePanel = changeWriter(prefs, "panel");
+  const notePanel = () => savePanel(() => ({ tab, live, scale: exportOpts.scale, transparent: exportOpts.transparent }), 0);
+
   let manifest = null;
-  let tab = "scalars";
-  let live = true;
+  let tab = panelPrefs.tab || "scalars";
+  let live = panelPrefs.live !== false;
   let timer = null;
   let destroyed = false;
 
   // Export settings live on the panel so a plot and the latent landscape come out of the
   // same run looking alike — same idea (and same wording) as the annotate viewer's.
-  const exportOpts = { scale: 2, transparent: false };
+  const exportOpts = {
+    scale: [1, 2, 3, 4].includes(panelPrefs.scale) ? panelPrefs.scale : 2,
+    transparent: !!panelPrefs.transparent,
+  };
   const dpiSel = h("select", {
     class: "input mx-select", title: "Image scale / DPI",
-    onchange: (e) => (exportOpts.scale = +e.target.value),
-  }, ...[1, 2, 3, 4].map((s) => h("option", { value: String(s), selected: s === 2 }, `${s}×`)));
+    onchange: (e) => { exportOpts.scale = +e.target.value; notePanel(); },
+  }, ...[1, 2, 3, 4].map((s) => h("option", { value: String(s), selected: s === exportOpts.scale }, `${s}×`)));
   const transpBox = h("input", {
-    type: "checkbox",
-    onchange: (e) => (exportOpts.transparent = e.target.checked),
+    type: "checkbox", checked: exportOpts.transparent,
+    onchange: (e) => { exportOpts.transparent = e.target.checked; notePanel(); },
   });
 
   // -- head: sub-tabs + export + live toggle + the TensorBoard escape hatch --
   const subtabs = h("div", { class: "mx-subtabs" });
-  const liveBox = h("input", { type: "checkbox", checked: true, onchange: (e) => { live = e.target.checked; schedule(); } });
+  const liveBox = h("input", { type: "checkbox", checked: live, onchange: (e) => { live = e.target.checked; notePanel(); schedule(); } });
   const tbBtn = h("button", {
     class: "btn ghost", title: "Open this run in real TensorBoard, in a new browser tab",
     onclick: openTensorBoard,
@@ -119,7 +131,7 @@ export function metricsPanel({ logdir, jobId }) {
         class: "mx-subtab" + (tab === d.key ? " active" : ""),
         disabled: !d.n,
         title: d.n ? "" : "nothing of this kind was logged in this run",
-        onclick: () => { tab = d.key; renderSubtabs(); showTab(); },
+        onclick: () => { tab = d.key; notePanel(); renderSubtabs(); showTab(); },
       }, icon(d.ic, 15), d.label, d.n ? h("span", { class: "mx-count" }, String(d.n)) : null));
     }
   }
@@ -154,9 +166,27 @@ export function metricsPanel({ logdir, jobId }) {
     el.appendChild(rail);
     el.appendChild(cards);
 
-    const selected = new Set(manifest.scalars.map((s) => s.tag));
-    const known = new Set(selected);   // tags a live run starts logging later get selected too
-    let smoothing = 0.6, logY = false, xAxis = "step", endLabels = true;
+    // Everything the view is configured by comes out of the saved slice first, and falls
+    // back to the defaults for a run nobody has opened yet.
+    const saved = prefs.get("scalars");
+    const saveScalars = changeWriter(prefs, "scalars");
+    const allTags = manifest.scalars.map((s) => s.tag);
+    const savedTags = Array.isArray(saved.selected) ? saved.selected.filter((t) => allTags.includes(t)) : null;
+    const savedKnown = Array.isArray(saved.known) ? saved.known : null;
+
+    // A restored selection means the tags left out were left out on purpose — except for
+    // tags this run has started logging since, which nobody has had the chance to untick.
+    const selected = new Set(
+      savedTags
+        ? [...savedTags, ...allTags.filter((t) => !savedKnown || !savedKnown.includes(t))]
+        : allTags);
+    // Seeded from every tag the manifest already has, not from the selection: an unticked
+    // tag must not come back as "new" on the next poll (see onManifest).
+    const known = new Set(allTags);
+    let smoothing = typeof saved.smoothing === "number" ? saved.smoothing : 0.6;
+    let logY = !!saved.logY;
+    let xAxis = saved.xAxis === "time" ? "time" : "step";
+    let endLabels = saved.endLabels !== false;
     let data = {};                       // {tag: {run: [[step, wall, value], …]}}
     const plots = new Map();             // tag -> card entry (see buildCard)
     const curveStyles = new Map();       // "tag\0run" -> { color, dash, width, alpha }
@@ -165,10 +195,34 @@ export function metricsPanel({ logdir, jobId }) {
     const cardOpts = new Map();          // tag -> { mode, wide, solo }
     let filter = "";
 
+    for (const [key, st] of Object.entries(saved.styles || {})) {
+      if (st && typeof st === "object") curveStyles.set(key, { ...st });
+    }
+    for (const [tag, o] of Object.entries(saved.cards || {})) {
+      if (o && typeof o === "object") {
+        cardOpts.set(tag, {
+          mode: ["shared", "norm", "split"].includes(o.mode) ? o.mode : "shared",
+          wide: !!o.wide,
+          solo: typeof o.solo === "string" ? o.solo : null,
+        });
+      }
+    }
+
     function optsFor(tag) {
       let o = cardOpts.get(tag);
       if (!o) { o = { mode: "shared", wide: false, solo: null }; cardOpts.set(tag, o); }
       return o;
+    }
+
+    // Called from refresh(), so every path that changes anything lands here; the writer
+    // drops the write when the settings are byte-identical, which is what keeps a live
+    // run's five-second poll from rewriting localStorage forever.
+    function noteScalars() {
+      saveScalars(() => ({
+        selected: [...selected], known: [...known], smoothing, logY, xAxis, endLabels,
+        cards: Object.fromEntries([...cardOpts].map(([t, o]) => [t, { mode: o.mode, wide: o.wide, solo: o.solo }])),
+        styles: Object.fromEntries(curveStyles),
+      }));
     }
 
     const search = h("input", {
@@ -176,7 +230,32 @@ export function metricsPanel({ logdir, jobId }) {
       oninput: (e) => { filter = e.target.value.toLowerCase(); buildRail(); },
     });
     const tagList = h("div", { class: "mx-taglist" });
-    const smoothVal = h("span", { class: "mono small" }, "0.60");
+    const smoothVal = h("span", { class: "mono small" }, smoothing.toFixed(2));
+    const smoothRange = h("input", {
+      type: "range", min: "0", max: "0.99", step: "0.01", value: String(smoothing), class: "mx-range",
+      oninput: (e) => { smoothing = parseFloat(e.target.value); smoothVal.textContent = smoothing.toFixed(2); refresh(); },
+    });
+    const logBox = h("input", { type: "checkbox", checked: logY, onchange: (e) => { logY = e.target.checked; refresh(); } });
+    const endBox = h("input", { type: "checkbox", checked: endLabels, onchange: (e) => { endLabels = e.target.checked; refresh(); } });
+    const xSel = h("select", { class: "input mx-select", onchange: (e) => { xAxis = e.target.value; refresh(); } },
+      h("option", { value: "step", selected: xAxis === "step" }, "Step"),
+      h("option", { value: "time", selected: xAxis === "time" }, "Time (min)"));
+
+    // Everything above is remembered per run, which is worth an escape hatch: this puts
+    // the whole view — tags, smoothing, card modes, curve colours — back to defaults.
+    function resetView() {
+      selected.clear();
+      known.forEach((t) => selected.add(t));
+      curveStyles.clear();
+      cardOpts.clear();
+      smoothing = 0.6; logY = false; xAxis = "step"; endLabels = true;
+      smoothRange.value = "0.6"; smoothVal.textContent = "0.60";
+      logBox.checked = false; endBox.checked = true; xSel.value = "step";
+      for (const e of plots.values()) e.card.remove();
+      plots.clear();
+      buildRail();
+      renderCards();
+    }
 
     function buildRail() {
       clear(tagList);
@@ -199,21 +278,16 @@ export function metricsPanel({ logdir, jobId }) {
     rail.appendChild(h("div", { class: "mx-railgrp" },
       h("div", { class: "mx-raillabel" }, "Display"),
       h("label", { class: "mx-ctl" }, h("span", null, "Smoothing"), smoothVal),
-      h("input", {
-        type: "range", min: "0", max: "0.99", step: "0.01", value: "0.6", class: "mx-range",
-        oninput: (e) => { smoothing = parseFloat(e.target.value); smoothVal.textContent = smoothing.toFixed(2); refresh(); },
-      }),
-      h("label", { class: "mx-ctl" },
-        h("input", { type: "checkbox", onchange: (e) => { logY = e.target.checked; refresh(); } }),
-        h("span", null, "Log scale (y)")),
+      smoothRange,
+      h("label", { class: "mx-ctl" }, logBox, h("span", null, "Log scale (y)")),
       h("label", { class: "mx-ctl", title: "Write each curve's name where its line ends, instead of making you match it to a legend swatch" },
-        h("input", { type: "checkbox", checked: true, onchange: (e) => { endLabels = e.target.checked; refresh(); } }),
-        h("span", null, "End-of-line labels")),
-      h("label", { class: "mx-ctl" },
-        h("span", null, "X axis"),
-        h("select", { class: "input mx-select", onchange: (e) => { xAxis = e.target.value; refresh(); } },
-          h("option", { value: "step" }, "Step"),
-          h("option", { value: "time" }, "Time (min)")))));
+        endBox, h("span", null, "End-of-line labels")),
+      h("label", { class: "mx-ctl" }, h("span", null, "X axis"), xSel),
+      h("button", {
+        class: "btn ghost small", style: { width: "100%", justifyContent: "center" },
+        title: "This run's view — tags, smoothing, card scales, curve colours — is remembered between visits. This puts it back to the defaults.",
+        onclick: resetView,
+      }, icon("restore", 14), "Reset view")));
 
     buildRail();
 
@@ -394,16 +468,10 @@ export function metricsPanel({ logdir, jobId }) {
         },
       }, icon("sliders", 14));
 
+      // The buttons take their state from `o` in refresh(), not from the click that set
+      // it — that is what lets a restored (or reset) card come up showing the truth.
       const expandBtn = h("button", {
-        class: "btn-icon" + (o.wide ? " active" : ""),
-        title: "Give this card the full width of the grid",
-        onclick: () => {
-          o.wide = !o.wide;
-          expandBtn.classList.toggle("active", o.wide);
-          expandBtn.replaceChildren(icon(o.wide ? "shrink" : "expand", 14));
-          expandBtn.title = o.wide ? "Put this card back in the grid" : "Give this card the full width of the grid";
-          refresh();
-        },
+        class: "btn-icon", onclick: () => { o.wide = !o.wide; refresh(); },
       }, icon(o.wide ? "shrink" : "expand", 14));
 
       // The y-scale control lives at the foot, next to the legend it changes the meaning
@@ -413,12 +481,8 @@ export function metricsPanel({ logdir, jobId }) {
         ["norm", "Norm", "Map each curve onto 0–1 by its own range: compare shapes, not magnitudes. Hover still reports real values."],
         ["split", "Split", "Give each curve its own strip and its own scale"],
       ].map(([k, lab, tip]) => h("button", {
-        class: "mx-modebtn" + (o.mode === k ? " active" : ""), title: tip,
-        onclick: () => {
-          o.mode = k;
-          for (const b of modeBtns) b.classList.toggle("active", b.textContent === lab);
-          refresh();
-        },
+        class: "mx-modebtn", title: tip, "data-mode": k,
+        onclick: () => { o.mode = k; refresh(); },
       }, lab));
       const hint = h("span", { class: "mx-hint" }, "");
       const foot = h("div", { class: "mx-cardfoot" }, h("div", { class: "mx-modeseg" }, ...modeBtns), hint);
@@ -444,7 +508,7 @@ export function metricsPanel({ logdir, jobId }) {
         legend,
         foot);
       cards.appendChild(card);
-      return { tag, card, body, legend, styleBox, count, foot, hint, plot: null, strips: null, focus: null };
+      return { tag, card, body, legend, styleBox, count, foot, hint, modeBtns, expandBtn, plot: null, strips: null, focus: null };
     }
 
     // Swap the renderer when the card's mode changes — and, in split mode, when the
@@ -523,6 +587,10 @@ export function metricsPanel({ logdir, jobId }) {
         const vis = ss.filter((s) => !s.hidden);
         ensureRenderer(entry, vis.length);
         entry.card.classList.toggle("wide", o.wide);
+        for (const b of entry.modeBtns) b.classList.toggle("active", b.dataset.mode === o.mode);
+        entry.expandBtn.classList.toggle("active", o.wide);
+        entry.expandBtn.replaceChildren(icon(o.wide ? "shrink" : "expand", 14));
+        entry.expandBtn.title = o.wide ? "Put this card back in the grid" : "Give this card the full width of the grid";
         entry.count.textContent = String(ss.length);
         entry.count.style.display = ss.length > 1 ? "" : "none";
         entry.foot.style.display = ss.length > 1 ? "" : "none";
@@ -535,6 +603,7 @@ export function metricsPanel({ logdir, jobId }) {
           buildStyleBox(tag, entry.styleBox);   // only when the curve set changed: a rebuild
         }                                       // mid-drag would replace the slider you hold
       }
+      noteScalars();
     }
 
     // The "Split" y-scale: one strip per curve, each on its own scale, sharing one x
@@ -698,6 +767,12 @@ export function metricsPanel({ logdir, jobId }) {
   // lands on step 0 and only wall-clock order tells them apart. Indexing by frame is
   // what turns "one picture" back into the training movie.
   function imagesView() {
+    const savedImg = prefs.get("images");
+    const saveImages = changeWriter(prefs, "images");
+    const noteImages = () => saveImages(() => ({
+      tag: tagName, open: sheetPanel.style.display !== "none", sheet: { ...sheet },
+    }), 0);
+
     const el = h("div", { class: "mx-images" });
     const chips = h("div", { class: "mx-chips" });
     const img = h("img", { class: "mx-img", alt: "" });
@@ -716,7 +791,7 @@ export function metricsPanel({ logdir, jobId }) {
       onclick: toggleSheet,
     }, icon("sheet", 15));
 
-    let tagName = manifest.images[0]?.tag || null;
+    let tagName = (manifest.images.some((t) => t.tag === savedImg.tag) ? savedImg.tag : manifest.images[0]?.tag) || null;
     let idx = 0, playing = false, ticker = null;
     const cache = new Map();      // "tag@wall" -> object URL
     const decoded = new Map();    // "tag@wall" -> HTMLImageElement, for compositing
@@ -740,6 +815,7 @@ export function metricsPanel({ logdir, jobId }) {
             tagName = t.tag;
             idx = frames().length - 1;
             syncRange(); show(); buildChips();
+            noteImages();
             if (sheetPanel.style.display !== "none") schedulePreview(0);
           },
         }, t.tag, h("span", { class: "mx-count" }, String(t.frames.length))));
@@ -806,7 +882,15 @@ export function metricsPanel({ logdir, jobId }) {
     // already carries, which is what makes it work with hax's step-0 image logging, and
     // the sheet is composed here from frames the panel has (or fetches once), so nothing
     // is asked of the backend that the movie did not already ask.
-    const sheet = { n: 10, pick: "even", cols: 4, captions: true, header: true, arrow: true };
+    const sv = savedImg.sheet || {};
+    const sheet = {
+      n: Number.isFinite(sv.n) ? Math.min(24, Math.max(2, sv.n)) : 10,
+      pick: ["even", "first", "last"].includes(sv.pick) ? sv.pick : "even",
+      cols: Number.isFinite(sv.cols) && sv.cols >= 0 && sv.cols <= 6 ? sv.cols : 4,
+      captions: sv.captions !== false,
+      header: sv.header !== false,
+      arrow: sv.arrow !== false,
+    };
     const sheetPrev = h("canvas", { class: "mx-sheetprev" });
     const sheetStatus = h("div", { class: "mx-hint" }, "");
     let sheetBuilt = false, previewTimer = null;
@@ -815,7 +899,7 @@ export function metricsPanel({ logdir, jobId }) {
       const open = sheetPanel.style.display === "none";
       sheetPanel.style.display = open ? "" : "none";
       sheetBtn.classList.toggle("active", open);
-      if (!open) return;
+      if (!open) { noteImages(); return; }
       if (!sheetBuilt) { buildSheetPanel(); sheetBuilt = true; }
       schedulePreview(0);
     }
@@ -963,6 +1047,7 @@ export function metricsPanel({ logdir, jobId }) {
     }
 
     function schedulePreview(delay = 250) {
+      noteImages();
       if (previewTimer) clearTimeout(previewTimer);
       previewTimer = setTimeout(() => { previewTimer = null; renderPreview(); }, delay);
     }
@@ -999,8 +1084,19 @@ export function metricsPanel({ logdir, jobId }) {
     syncRange();
     show();
 
+    // Reopen the sheet if that is how the run was left — but leave the preview to
+    // onShow, so a panel sitting behind the Scalars tab doesn't fetch frames nobody
+    // is looking at.
+    if (savedImg.open && frames().length > 1) {
+      sheetPanel.style.display = "";
+      sheetBtn.classList.add("active");
+      buildSheetPanel();
+      sheetBuilt = true;
+    }
+
     return {
       el,
+      onShow() { if (sheetPanel.style.display !== "none") schedulePreview(0); },
       onManifest() {
         const atEnd = idx >= frames().length - 1;
         buildChips();
@@ -1038,15 +1134,22 @@ export function metricsPanel({ logdir, jobId }) {
       },
     }, icon("image", 15));
     const info = h("div", { class: "mx-info" });
-    const colorSel = h("select", { class: "input mx-select", onchange: (e) => { colorBy = +e.target.value; paintColors(); } });
+    const colorSel = h("select", { class: "input mx-select", onchange: (e) => { colorBy = +e.target.value; noteLatent(); paintColors(); } });
     const colorRow = h("label", { class: "mx-ctl", style: { display: "none" } }, h("span", null, "Colour by"), colorSel);
     const spriteCanvas = h("canvas", { class: "mx-sprite", width: 96, height: 96 });
     const spriteBox = h("div", { class: "mx-spritebox", style: { display: "none" } },
       h("div", { class: "mx-raillabel" }, "Selected particle"), spriteCanvas);
 
+    const savedLat = prefs.get("latent");
+    const saveLatent = changeWriter(prefs, "latent");
+    const noteLatent = () => saveLatent(() => ({ tag: tagName, dims, colorBy }), 0);
+
     const tags = [...new Set(manifest.embeddings.map((e) => e.tag))];
-    let tagName = tags[0] || null;
-    let idx = 0, playing = false, ticker = null, colorBy = -1, dims = 2;
+    let tagName = (tags.includes(savedLat.tag) ? savedLat.tag : tags[0]) || null;
+    // dims stays 2 here even when 3 was saved: the WebGL cloud is built lazily, so the
+    // restore goes through setDims once the view exists (below).
+    let idx = 0, playing = false, ticker = null, dims = 2;
+    let colorBy = Number.isInteger(savedLat.colorBy) ? savedLat.colorBy : -1;
     let cloud = null;                    // built lazily: WebGL2 is only needed if 3D is asked for
     let selectedPoint = -1;
     const bases = { 2: null, 3: null };  // last basis per dimensionality — keeps the movie stable
@@ -1091,8 +1194,8 @@ export function metricsPanel({ logdir, jobId }) {
 
     const steps = () => manifest.embeddings.filter((e) => e.tag === tagName).map((e) => e.step);
 
-    const tagSel = h("select", { class: "input mx-select", onchange: (e) => { tagName = e.target.value; resetCaches(); idx = steps().length - 1; syncRange(); show(); } },
-      ...tags.map((t) => h("option", { value: t }, t)));
+    const tagSel = h("select", { class: "input mx-select", onchange: (e) => { tagName = e.target.value; noteLatent(); resetCaches(); idx = steps().length - 1; syncRange(); show(); } },
+      ...tags.map((t) => h("option", { value: t, selected: t === tagName }, t)));
     if (tags.length > 1) side.insertBefore(h("div", { class: "mx-railgrp" }, h("div", { class: "mx-raillabel" }, "Space"), tagSel), side.firstChild);
 
     el.appendChild(side);
@@ -1121,6 +1224,7 @@ export function metricsPanel({ logdir, jobId }) {
         }
       }
       dims = k;
+      noteLatent();
       dimBtns.forEach((b, i) => b.classList.toggle("active", [2, 3][i] === k));
       canvas2d.style.display = k === 2 ? "" : "none";
       canvas3d.style.display = k === 3 ? "" : "none";
@@ -1172,6 +1276,7 @@ export function metricsPanel({ logdir, jobId }) {
       const cols = meta?.columns || [];
       if (!cols.length) { colorRow.style.display = "none"; return; }
       colorRow.style.display = "";
+      if (colorBy >= cols.length) colorBy = -1;   // a restored column this space doesn't have
       if (colorSel.options.length !== cols.length + 1) {
         clear(colorSel);
         colorSel.appendChild(h("option", { value: "-1" }, "Nothing"));
@@ -1278,7 +1383,8 @@ export function metricsPanel({ logdir, jobId }) {
 
     syncRange();
     idx = Math.max(0, steps().length - 1);
-    show();
+    if (savedLat.dims === 3) setDims(3);   // builds the WebGL cloud, then shows the epoch
+    else show();
 
     return {
       el,
@@ -1310,8 +1416,9 @@ export function metricsPanel({ logdir, jobId }) {
           "This run has event files but nothing logged yet. Metrics appear as training writes them."));
         return;
       }
-      // Open on whichever view has something in it.
-      tab = manifest.scalars.length ? "scalars" : manifest.images.length ? "images" : "latent";
+      // Open where this run was left, or on whichever view has something in it.
+      const has = { scalars: manifest.scalars.length, images: manifest.images.length, latent: manifest.embeddings.length };
+      if (!has[tab]) tab = has.scalars ? "scalars" : has.images ? "images" : "latent";
       clear(body);
       if (manifest.scalars.length) views.scalars = scalarsView();
       if (manifest.images.length) views.images = imagesView();
