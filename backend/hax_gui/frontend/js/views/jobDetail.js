@@ -15,6 +15,7 @@ import { confirmJobCascade } from "./cascadeModal.js";
 import { createTerminal } from "./terminal.js";
 import { openFileBrowser } from "./filePicker.js";
 import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
+import { metricsTabInfo } from "./runBrowser.js";
 
 export function JobDetailView(params) {
   const id = params.id;
@@ -271,7 +272,8 @@ export function JobDetailView(params) {
   const metricsBtn = () => h("button", {
     class: "btn secondary", title: "Training curves, image panels and the latent space for this run",
     onclick: () => {
-      store.openMetrics({ logdir: job.workdir, title: `${job.program} · ${jobDisplayName(job)}`, jobId: id });
+      const tab = metricsTabInfo(job.workdir, job);
+      store.openMetrics({ logdir: job.workdir, title: tab.title, subtitle: tab.subtitle, jobId: id });
       navigate("/metrics");
     },
   }, icon("chart", 15), "Metrics");

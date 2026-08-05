@@ -7,6 +7,22 @@ import { icon } from "../icons.js";
 
 export function projectKey(job) { return job.project_name || "(no project)"; }
 export function folderName(p) { const s = (p || "").replace(/\/+$/, "").split("/"); return s[s.length - 1] || "run"; }
+
+// What a metrics tab is called: the run's own name on one line, and what it *is* on the
+// next — program plus the first six hex digits of its run folder (reconsiren_7c2218da8d40
+// → "reconsiren · 7c2218"), which is enough to tell two runs of the same program apart.
+// Gluing the two together into one string is what produced tabs wide enough to push the
+// rest of the tab bar off screen; the full path still lives in the tab's tooltip.
+export function metricsTabInfo(logdir, job) {
+  const folder = folderName(logdir);
+  const cut = folder.lastIndexOf("_");
+  const shortId = cut > 0 ? folder.slice(cut + 1, cut + 7) : "";
+  const program = (job && job.program) || (cut > 0 ? folder.slice(0, cut) : "");
+  return {
+    title: (job && job.name) || program || folder,
+    subtitle: [program, shortId].filter(Boolean).join(" · "),
+  };
+}
 const distinct = (arr) => [...new Set(arr)].sort((a, b) => String(a).localeCompare(String(b)));
 
 export function runBrowser({ renderRow, emptyText = "No runs." }) {

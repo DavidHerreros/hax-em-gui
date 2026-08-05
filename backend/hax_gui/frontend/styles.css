@@ -659,12 +659,16 @@ body.vwin-dragging iframe { pointer-events: none; }
 
 /* -- scalars -- */
 .mx-scalars { display: flex; gap: 16px; align-items: flex-start; }
-.mx-cards { flex: 1; min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
-.mx-card { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 10px 12px 4px; }
-.mx-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.mx-card-title { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mx-card-head .btn-icon { margin-left: auto; }
-.mx-card-head .btn-icon + .btn-icon { margin-left: 0; }
+.mx-cards { flex: 1; min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; align-items: start; }
+.mx-card { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 10px 12px 8px; min-width: 0; }
+/* one card, given the whole grid: for a split stack or a curve you are actually reading */
+.mx-card.wide { grid-column: 1 / -1; }
+.mx-card.wide .mx-canvas { height: 300px; }
+/* the head is the tag's own row — the legend used to live here, which is what squeezed
+   a five-curve title down to "Heterog…" */
+.mx-card-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; min-width: 0; }
+.mx-card-title { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.mx-card-tools { margin-left: auto; display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
 /* per-curve appearance editor, expanded inside the card it belongs to */
 .mx-stylebox { display: flex; flex-direction: column; gap: 6px; padding: 8px; margin-bottom: 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--input-bg); }
 .mx-styrow { display: flex; align-items: center; gap: 8px; }
@@ -675,14 +679,31 @@ body.vwin-dragging iframe { pointer-events: none; }
 .mx-alpha { width: 68px; flex: 0 0 auto; }
 .btn-icon.active { border-color: var(--brand); color: var(--text); background: var(--active-bg); }
 
-.mx-legend { display: flex; gap: 10px; flex-wrap: wrap; }
-/* also the per-curve on/off switch: click a name to drop that line from the plot */
-.mx-legitem { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); padding: 1px 4px; border: 1px solid transparent; border-radius: 6px; background: none; cursor: pointer; }
-.mx-legitem:hover { color: var(--text); border-color: var(--border-2); }
-.mx-legitem.off { text-decoration: line-through; opacity: 0.5; }
+/* The legend sits under the plot, one row per curve, carrying that curve's own trace and
+   what it is worth now — a curve pinned flat by a shared axis is still readable here. It
+   is also the switchboard: hover spotlights, click isolates, shift-click hides. */
+.mx-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1px 12px; margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--border); }
+.mx-legitem { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left; font-size: 11.5px; color: var(--muted); padding: 3px 5px; border: 1px solid transparent; border-radius: 7px; background: none; cursor: pointer; }
+.mx-legitem:hover { color: var(--text); background: var(--hover); }
+.mx-legitem.off { opacity: 0.45; }
+.mx-legitem.off .mx-legname { text-decoration: line-through; }
 .mx-legitem.off .mx-swatch { background: var(--muted) !important; }
-.mx-swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
-.mx-canvas { width: 100%; height: 210px; display: block; }
+.mx-legitem.dim { opacity: 0.5; }
+.mx-legitem.solo { color: var(--text); background: var(--active-bg); box-shadow: inset 0 0 0 1px var(--active-ring); }
+.mx-legname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mx-legval { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--text); flex: 0 0 auto; }
+.mx-spark { width: 26px; height: 13px; flex: 0 0 auto; opacity: .85; }
+.mx-swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex: 0 0 auto; }
+
+/* the y-scale control lives at the foot, next to the legend whose meaning it changes */
+.mx-cardfoot { display: flex; align-items: center; gap: 10px; margin-top: 7px; }
+.mx-modeseg { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: 8px; background: var(--input-bg); flex: 0 0 auto; }
+.mx-modebtn { padding: 2px 9px; border: none; border-radius: 6px; background: none; color: var(--muted); font-size: 11px; }
+.mx-modebtn:hover { color: var(--text); background: var(--hover); }
+.mx-modebtn.active { color: var(--text); background: var(--active-bg); box-shadow: inset 0 0 0 1px var(--active-ring); }
+.mx-hint { font-size: 10.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.mx-canvas { width: 100%; height: 220px; display: block; }
 .mx-empty { padding: 40px 0; text-align: center; }
 
 /* -- images -- */
@@ -694,6 +715,21 @@ body.vwin-dragging iframe { pointer-events: none; }
 .mx-imgwrap { display: flex; align-items: center; justify-content: center; min-height: 320px; border: 1px solid var(--border); border-radius: 12px; background: var(--console-bg); padding: 12px; overflow: auto; }
 .mx-img { max-width: 100%; image-rendering: pixelated; }
 .mx-transport { display: flex; align-items: center; gap: 12px; }
+
+/* progression sheet: N frames spanning the run, composed into one PNG */
+.mx-sheet { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 12px; }
+.mx-sheetgrid { display: grid; grid-template-columns: 236px 1fr; gap: 14px; align-items: start; }
+.mx-sheetform { display: flex; flex-direction: column; gap: 2px; }
+.mx-sheetform .mx-range { margin-bottom: 6px; }
+.mx-sheetform .btn { margin-top: 6px; }
+.mx-sheetprevwrap { border: 1px solid var(--border); border-radius: 10px; background: var(--console-bg); padding: 10px; overflow: auto; min-height: 120px; }
+.mx-sheetprev { display: block; margin: 0 auto; max-width: 100%; image-rendering: auto; }
+
+/* metrics run tabs: two lines, capped width — the run's name over program · run id */
+.tab.mx-tab { max-width: 268px; align-items: center; padding: 6px 10px; }
+.mx-tabcol { display: flex; flex-direction: column; gap: 1px; min-width: 0; max-width: 200px; }
+.mx-tabname { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mx-tabsub { font-size: 10.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* -- latent space -- */
 .mx-latent { display: flex; gap: 16px; align-items: flex-start; }
@@ -717,6 +753,7 @@ body.vwin-dragging iframe { pointer-events: none; }
   .mx-scalars, .mx-latent { flex-direction: column; }
   .mx-rail, .mx-latent-side { width: 100%; flex: 1 1 auto; }
   .mx-cards { width: 100%; }
+  .mx-sheetgrid { grid-template-columns: 1fr; }
 }
 
 /* ===== themed scrollbars everywhere ===== */

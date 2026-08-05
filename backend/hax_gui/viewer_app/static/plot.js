@@ -3,6 +3,15 @@
 // `points` ([[x,y],…]) for line/scatter or `bars` ([[x0,x1,h],…]) for histograms,
 // plus a name+color, and optionally `dash` ([on,off] px), `alpha` (0..1) and
 // `width` (line px).
+//
+// A point may carry a third element, [x, y, raw]: `y` is what gets drawn and `raw`
+// is what the hover box reports. That is how a caller can plot a transformed curve
+// (normalised, say) without the readout lying about the underlying value.
+//
+// setSeries takes an options object for the two things a crowded card needs:
+// `focus` (a series name — that one is drawn on top, everything else dims back) and
+// `endLabels` (write each series' name at the right end of its own line, which is the
+// shortest possible path from a curve to its identity).
 
 // `l` is only the floor: the real left margin is measured from the widest y tick label,
 // since a label like "0.998740" is far wider than one like "0.5" and would otherwise run
@@ -10,6 +19,8 @@
 const MARGIN = { l: 44, r: 16, t: 14, b: 34 };
 const TITLE_W = 18;   // css px reserved for the rotated y-axis title
 const TICK_GAP = 8;   // css px between a y tick label and the plot frame
+const LABEL_MAX = 86; // css px a right-hand end label may take before it is shortened
+const LABEL_GAP = 12; // css px of vertical room one end label needs
 
 const DASHES = { solid: [], dashed: [6, 4], dotted: [1.5, 3] };
 
@@ -32,6 +43,9 @@ export function createPlot(canvas) {
   let labels = { x: "", y: "" };
   let cursor = null;           // {px, py} device px — drives the hover readout
   let marginL = MARGIN.l;      // css px, widened to fit the y tick labels actually drawn
+  let marginR = MARGIN.r;      // css px, widened to fit the end-of-line labels
+  let focus = null;            // series name drawn on top, with the rest dimmed
+  let endLabels = false;       // write each series' name at the right end of its line
   let snapBg = null;           // set only while exporting an opaque PNG
   let snapping = false;        // exporting: the canvas is deliberately off its screen size
 
@@ -51,7 +65,7 @@ export function createPlot(canvas) {
   }
   function area() {
     const r = dpr();
-    return { l: marginL * r, t: MARGIN.t * r, w: canvas.width - (marginL + MARGIN.r) * r, h: canvas.height - (MARGIN.t + MARGIN.b) * r };
+    return { l: marginL * r, t: MARGIN.t * r, w: canvas.width - (marginL + marginR) * r, h: canvas.height - (MARGIN.t + MARGIN.b) * r };
   }
 
   function computeBounds() {
@@ -120,6 +134,17 @@ export function createPlot(canvas) {
 
     ctx.font = `${11 * r}px system-ui, sans-serif`;
 
+    // Right margin: the default is bare padding, but end labels have to be paid for out
+    // of the plot's own width — measure them before anything is laid out against `area`.
+    marginR = MARGIN.r;
+    if (endLabels && kind === "line") {
+      ctx.font = `${10.5 * r}px system-ui, sans-serif`;
+      let w = 0;
+      for (const s of series) if (s.name) w = Math.max(w, Math.min(LABEL_MAX, ctx.measureText(s.name).width / r));
+      if (w) marginR = MARGIN.r + w + 12;
+      ctx.font = `${11 * r}px system-ui, sans-serif`;
+    }
+
     // grid + ticks. Tick counts follow the plot's actual size, so a narrow card asks for
     // fewer labels instead of crowding them into each other.
     let a = area();
@@ -159,9 +184,14 @@ export function createPlot(canvas) {
     // clip to the plot area for the data
     ctx.save();
     ctx.beginPath(); ctx.rect(a.l, a.t, a.w, a.h); ctx.clip();
-    for (const s of series) {
+    // With a focus set, everyone else drops back and the focused curve is drawn last, so
+    // it sits on top of whatever it crosses.
+    const dimmed = (s) => focus != null && s.name !== focus;
+    const order = focus == null ? series
+      : [...series].sort((p, q) => (p.name === focus ? 1 : 0) - (q.name === focus ? 1 : 0));
+    for (const s of order) {
       ctx.fillStyle = s.color; ctx.strokeStyle = s.color;
-      const alpha = s.alpha == null ? 1 : s.alpha;
+      const alpha = (s.alpha == null ? 1 : s.alpha) * (dimmed(s) ? 0.16 : 1);
       const dash = (typeof s.dash === "string" ? DASHES[s.dash] : s.dash) || [];
       if (kind === "histogram" && s.bars) {
         ctx.globalAlpha = alpha * (series.length > 1 ? 0.55 : 0.85);
@@ -172,7 +202,7 @@ export function createPlot(canvas) {
         ctx.globalAlpha = 1;
       } else if (kind === "line" && s.points) {
         ctx.globalAlpha = alpha;
-        ctx.lineWidth = (s.width || 1.5) * r;
+        ctx.lineWidth = (s.width || 1.5) * (dimmed(s) ? 0.8 : s.name === focus ? 1.5 : 1) * r;
         ctx.lineJoin = "round"; ctx.lineCap = "round";
         ctx.setLineDash(dash.map((d) => d * r));
         ctx.beginPath();
@@ -196,6 +226,8 @@ export function createPlot(canvas) {
     }
     ctx.restore();
 
+    if (endLabels && kind === "line") drawEndLabels(a, r);
+
     // axis labels
     ctx.fillStyle = fg; ctx.globalAlpha = 1;
     ctx.textAlign = "center"; ctx.textBaseline = "bottom";
@@ -209,6 +241,52 @@ export function createPlot(canvas) {
     drawHover(a, r, fg, muted, grid);
   }
 
+  // ---- end-of-line labels -------------------------------------------------
+  // Each line gets its name written where it ends, in its own colour, with a leader to
+  // the last datum. Labels that would land on top of each other are pushed down in
+  // order, so five curves ending in the same corner still read as five names.
+  function drawEndLabels(a, r) {
+    const rows = [];
+    for (const s of series) {
+      if (!s.name || !s.points || !s.points.length) continue;
+      let last = null;
+      for (const p of s.points) {
+        if (p[1] == null || !isFinite(p[1])) continue;
+        if (p[0] > view.x1) break;
+        last = p;
+      }
+      if (!last) continue;
+      const py = sy(last[1]);
+      if (py < a.t - 4 * r || py > a.t + a.h + 4 * r) continue;   // ended off-screen: no label
+      rows.push({ s, px: Math.min(sx(last[0]), a.l + a.w), py });
+    }
+    if (!rows.length) return;
+    rows.sort((p, q) => p.py - q.py);
+
+    ctx.font = `${10.5 * r}px system-ui, sans-serif`;
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    let prev = -Infinity;
+    for (const row of rows) {
+      const ly = Math.max(row.py, prev + LABEL_GAP * r);
+      prev = ly;
+      ctx.globalAlpha = focus != null && row.s.name !== focus ? 0.3 : 1;
+      ctx.fillStyle = row.s.color; ctx.strokeStyle = row.s.color; ctx.lineWidth = r;
+      ctx.beginPath(); ctx.arc(row.px, row.py, 2.6 * r, 0, 6.2832); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(a.l + a.w + 2 * r, row.py); ctx.lineTo(a.l + a.w + 7 * r, ly); ctx.stroke();
+      ctx.fillText(shorten(row.s.name, LABEL_MAX * r), a.l + a.w + 9 * r, ly);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Trim to fit `maxPx` (device px), keeping the head — series names in one card share
+  // their tail far more often than their head ("candidate_coverage_kl/_weight").
+  function shorten(text, maxPx) {
+    if (ctx.measureText(text).width <= maxPx) return text;
+    let s = text;
+    while (s.length > 3 && ctx.measureText(s + "…").width > maxPx) s = s.slice(0, -1);
+    return s + "…";
+  }
+
   // ---- hover readout -----------------------------------------------------
   // What every series is worth at the x under the cursor: a guide line, a dot on each
   // series, and a box listing them — the thing TensorBoard gives you and a bare canvas
@@ -218,7 +296,7 @@ export function createPlot(canvas) {
     for (const s of series) {
       if (s.bars) {
         const b = s.bars.find(([x0, x1]) => dataX >= x0 && dataX <= x1);
-        if (b) rows.push({ name: s.name, color: s.color, x: (b[0] + b[1]) / 2, y: b[2], bar: b });
+        if (b) rows.push({ name: s.name, color: s.color, x: (b[0] + b[1]) / 2, y: b[2], val: b[2], bar: b });
         continue;
       }
       if (!s.points || !s.points.length) continue;
@@ -228,7 +306,8 @@ export function createPlot(canvas) {
         const d = Math.abs(p[0] - dataX);
         if (d < bestD) { bestD = d; best = p; }
       }
-      if (best) rows.push({ name: s.name, color: s.color, x: best[0], y: best[1] });
+      // [x, y, raw]: report the raw value if the caller plotted a transformed one.
+      if (best) rows.push({ name: s.name, color: s.color, x: best[0], y: best[1], val: best[2] != null ? best[2] : best[1] });
     }
     return rows;
   }
@@ -266,7 +345,7 @@ export function createPlot(canvas) {
     const head = `${labels.x || "x"} ${fmtValue(anchor.x)}`;
     let w = ctx.measureText(head).width;
     const texts = rows.map((q) => {
-      const t = `${q.name ? q.name + "  " : ""}${fmtValue(q.y)}`;
+      const t = `${q.name ? q.name + "  " : ""}${fmtValue(q.val != null ? q.val : q.y)}`;
       w = Math.max(w, ctx.measureText(t).width + (named ? sw + 6 * r : 0));
       return t;
     });
@@ -345,11 +424,17 @@ export function createPlot(canvas) {
   function resetZoom() { view = bounds ? { ...bounds } : null; draw(); }
 
   return {
-    setSeries(k, ss, lbls) {
+    // `opts`: { focus, endLabels } — display-only, and optional; omitting `focus`
+    // leaves the current one alone. New data still resets the view, as it always has;
+    // spotlighting on its own goes through setFocus, which must not throw away the
+    // region you had zoomed into just because the pointer crossed a legend row.
+    setSeries(k, ss, lbls, opts) {
       kind = k; series = ss || []; labels = lbls || { x: "", y: "" };
+      if (opts) { focus = opts.focus === undefined ? focus : opts.focus; endLabels = !!opts.endLabels; }
       bounds = computeBounds(); view = { ...bounds };
       draw();
     },
+    setFocus(name) { if (focus !== name) { focus = name; draw(); } },
     resetZoom,
     redraw: draw,
     // `scale` is the DPI multiplier (2 == twice the on-screen pixel size). Transparent

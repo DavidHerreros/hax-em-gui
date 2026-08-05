@@ -156,11 +156,20 @@ export function metricsPanel({ logdir, jobId }) {
 
     const selected = new Set(manifest.scalars.map((s) => s.tag));
     const known = new Set(selected);   // tags a live run starts logging later get selected too
-    let smoothing = 0.6, logY = false, xAxis = "step";
+    let smoothing = 0.6, logY = false, xAxis = "step", endLabels = true;
     let data = {};                       // {tag: {run: [[step, wall, value], …]}}
-    const plots = new Map();             // tag -> { card, plot, legend, styleBox }
+    const plots = new Map();             // tag -> card entry (see buildCard)
     const curveStyles = new Map();       // "tag\0run" -> { color, dash, width, alpha }
+    // Per-card display state, kept out of the entry so it survives a card being dropped
+    // and re-created when its tag is unticked and ticked again.
+    const cardOpts = new Map();          // tag -> { mode, wide, solo }
     let filter = "";
+
+    function optsFor(tag) {
+      let o = cardOpts.get(tag);
+      if (!o) { o = { mode: "shared", wide: false, solo: null }; cardOpts.set(tag, o); }
+      return o;
+    }
 
     const search = h("input", {
       class: "input", placeholder: "filter tags…",
@@ -197,6 +206,9 @@ export function metricsPanel({ logdir, jobId }) {
       h("label", { class: "mx-ctl" },
         h("input", { type: "checkbox", onchange: (e) => { logY = e.target.checked; refresh(); } }),
         h("span", null, "Log scale (y)")),
+      h("label", { class: "mx-ctl", title: "Write each curve's name where its line ends, instead of making you match it to a legend swatch" },
+        h("input", { type: "checkbox", checked: true, onchange: (e) => { endLabels = e.target.checked; refresh(); } }),
+        h("span", null, "End-of-line labels")),
       h("label", { class: "mx-ctl" },
         h("span", null, "X axis"),
         h("select", { class: "input mx-select", onchange: (e) => { xAxis = e.target.value; refresh(); } },
@@ -228,18 +240,76 @@ export function metricsPanel({ logdir, jobId }) {
 
     // Every curve of the tag, hidden ones included: the legend needs them all (that is
     // where you switch one back on), the plot takes only the visible subset.
+    //
+    // `hidden` is what the plot obeys and folds in the solo state; `off` is the curve's
+    // own switch, which is what the legend strikes through — a curve you soloed past is
+    // not a curve you turned off.
     function seriesFor(tag, t0) {
       const runs = data[tag] || {};
+      const o = optsFor(tag);
       return Object.entries(runs).map(([run, pts], i) => {
         const st = styleFor(tag, run, i);
+        const name = runLabel(run, tag);
         let p = pts.map(([step, wall, v]) => [xAxis === "step" ? step : (wall - t0) / 60, v]);
         if (logY) p = p.map(([x, y]) => [x, y != null && y > 0 ? Math.log10(y) : null]);
+        p = smooth(p, smoothing);
+        const plain = p;                       // pre-normalisation: the value to report
+        let last = null;
+        for (const [, y] of plain) if (y != null && isFinite(y)) last = y;
+        if (o.mode === "norm") {
+          // Min-max onto 0–1 by the series' own range, so five curves three decades apart
+          // can be compared by shape. The raw value rides along as the point's 3rd slot,
+          // which is what the plotter's hover box reports.
+          let lo = Infinity, hi = -Infinity;
+          for (const [, y] of plain) if (y != null && isFinite(y)) { if (y < lo) lo = y; if (y > hi) hi = y; }
+          const span = (hi - lo) || 1;
+          p = plain.map(([x, y]) => [x, y == null ? null : (y - lo) / span, y]);
+        }
         return {
-          name: runLabel(run, tag), points: smooth(p, smoothing),
+          name, points: p, plain, last,
           color: st.color, dash: st.dash, width: st.width, alpha: st.alpha,
-          hidden: st.hidden, style: st,
+          off: st.hidden, hidden: st.hidden || (o.solo != null && o.solo !== name),
+          style: st,
         };
       });
+    }
+
+    // TensorBoard sanitises "Reconstruction loss (ReconSIREN)" down to
+    // "Reconstruction_loss__ReconSIREN_", which is what a card title would otherwise
+    // read. The raw tag stays in the tooltip and in exported file names.
+    const prettyTag = (tag) => tag.replace(/_+/g, " ").trim();
+
+    const fmtNum = (v) => {
+      if (v == null || !isFinite(v)) return "—";
+      const a = Math.abs(v);
+      if (a !== 0 && (a >= 1e6 || a < 1e-4)) return v.toExponential(2);
+      return String(+v.toPrecision(5));
+    };
+
+    // A 52×14 trace of the whole curve, drawn on its own scale. On a shared axis a flat
+    // line tells you nothing about whether the metric moved; this does.
+    function sparkFor(s) {
+      const ns = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(ns, "svg");
+      svg.setAttribute("viewBox", "0 0 52 14");
+      svg.setAttribute("preserveAspectRatio", "none");
+      svg.setAttribute("class", "mx-spark");
+      const pts = s.plain.filter((p) => p[1] != null && isFinite(p[1]));
+      if (pts.length > 1) {
+        let lo = Infinity, hi = -Infinity, x0 = pts[0][0], x1 = pts[pts.length - 1][0];
+        for (const [, y] of pts) { if (y < lo) lo = y; if (y > hi) hi = y; }
+        const span = (hi - lo) || 1, xs = (x1 - x0) || 1;
+        const step = Math.max(1, Math.floor(pts.length / 52));
+        const d = pts.filter((_, i) => i % step === 0 || i === pts.length - 1)
+          .map((p, i) => `${i ? "L" : "M"}${((p[0] - x0) / xs) * 52} ${13 - ((p[1] - lo) / span) * 12}`).join(" ");
+        const path = document.createElementNS(ns, "path");
+        path.setAttribute("d", d);
+        path.setAttribute("fill", "none");
+        path.setAttribute("stroke", s.color);
+        path.setAttribute("stroke-width", "1.4");
+        svg.appendChild(path);
+      }
+      return svg;
     }
 
     // The style editor: one row per curve on the card it belongs to, so you tweak what
@@ -291,38 +361,147 @@ export function metricsPanel({ logdir, jobId }) {
         }
       } else cards.querySelector(".mx-empty")?.remove();
 
-      for (const tag of tags) {
-        if (plots.has(tag)) continue;
-        const canvas = h("canvas", { class: "mx-canvas" });
-        const legend = h("div", { class: "mx-legend" });
-        const styleBox = h("div", { class: "mx-stylebox", style: { display: "none" } });
-        const styleBtn = h("button", {
-          class: "btn-icon", title: "Customise the curves (colour, style, width, opacity)",
-          onclick: () => {
-            const open = styleBox.style.display === "none";
-            styleBox.style.display = open ? "" : "none";
-            styleBtn.classList.toggle("active", open);
-            if (open) buildStyleBox(tag, styleBox);
-          },
-        }, icon("sliders", 14));
-        const card = h("div", { class: "mx-card" },
-          h("div", { class: "mx-card-head" },
-            h("span", { class: "mx-card-title", title: tag }, tag),
-            legend,
+      for (const tag of tags) if (!plots.has(tag)) plots.set(tag, buildCard(tag));
+      refresh();
+    }
+
+    // One card. The head is the tag's own row — the legend used to share it, which is
+    // what squeezed a five-curve title down to "Heterog…" — and everything that reads a
+    // curve (legend, values, sparks) sits under the plot where the curves are.
+    function buildCard(tag) {
+      const o = optsFor(tag);
+      const body = h("div", { class: "mx-cardbody" });
+      // A poll rebuilds the legend's rows, which can swallow the mouseleave of the row
+      // the pointer was on and leave a curve spotlit for good. The container outlives the
+      // rebuild, so its own mouseleave is the one that can be trusted to clear it.
+      const legend = h("div", {
+        class: "mx-legend",
+        onmouseleave: () => {
+          const entry = plots.get(tag);
+          if (entry && entry.focus) { entry.focus = null; entry.plot?.setFocus(null); }
+        },
+      });
+      const styleBox = h("div", { class: "mx-stylebox", style: { display: "none" } });
+      const count = h("span", { class: "mx-count", title: "curves on this card" }, "");
+
+      const styleBtn = h("button", {
+        class: "btn-icon", title: "Customise the curves (colour, style, width, opacity)",
+        onclick: () => {
+          const open = styleBox.style.display === "none";
+          styleBox.style.display = open ? "" : "none";
+          styleBtn.classList.toggle("active", open);
+          if (open) buildStyleBox(tag, styleBox);
+        },
+      }, icon("sliders", 14));
+
+      const expandBtn = h("button", {
+        class: "btn-icon" + (o.wide ? " active" : ""),
+        title: "Give this card the full width of the grid",
+        onclick: () => {
+          o.wide = !o.wide;
+          expandBtn.classList.toggle("active", o.wide);
+          expandBtn.replaceChildren(icon(o.wide ? "shrink" : "expand", 14));
+          expandBtn.title = o.wide ? "Put this card back in the grid" : "Give this card the full width of the grid";
+          refresh();
+        },
+      }, icon(o.wide ? "shrink" : "expand", 14));
+
+      // The y-scale control lives at the foot, next to the legend it changes the meaning
+      // of, rather than crowding the head of a 380px card.
+      const modeBtns = [
+        ["shared", "Shared", "One y-axis for every curve on the card"],
+        ["norm", "Norm", "Map each curve onto 0–1 by its own range: compare shapes, not magnitudes. Hover still reports real values."],
+        ["split", "Split", "Give each curve its own strip and its own scale"],
+      ].map(([k, lab, tip]) => h("button", {
+        class: "mx-modebtn" + (o.mode === k ? " active" : ""), title: tip,
+        onclick: () => {
+          o.mode = k;
+          for (const b of modeBtns) b.classList.toggle("active", b.textContent === lab);
+          refresh();
+        },
+      }, lab));
+      const hint = h("span", { class: "mx-hint" }, "");
+      const foot = h("div", { class: "mx-cardfoot" }, h("div", { class: "mx-modeseg" }, ...modeBtns), hint);
+
+      const card = h("div", { class: "mx-card" + (o.wide ? " wide" : "") },
+        h("div", { class: "mx-card-head" },
+          h("span", { class: "mx-card-title", title: tag }, prettyTag(tag)),
+          count,
+          h("div", { class: "mx-card-tools" },
+            expandBtn,
             styleBtn,
             h("button", {
               class: "btn-icon", title: "Save as PNG (uses the export settings above)",
-              onclick: async () => download(
-                await plots.get(tag).plot.snapshot({ ...exportOpts }),
-                `${tag.replace(/[^\w.-]+/g, "_")}${exportOpts.scale}x.png`),
+              onclick: async () => {
+                const entry = plots.get(tag);
+                const r = entry.strips || entry.plot;
+                if (r) download(await r.snapshot({ ...exportOpts }), `${tag.replace(/[^\w.-]+/g, "_")}${exportOpts.scale}x.png`);
+              },
             }, icon("image", 14)),
-            h("button", { class: "btn-icon", title: "Download CSV", onclick: () => exportCsv(tag) }, icon("fileText", 14))),
-          styleBox,
-          canvas);
-        cards.appendChild(card);
-        plots.set(tag, { card, plot: createPlot(canvas), legend, styleBox });
+            h("button", { class: "btn-icon", title: "Download CSV", onclick: () => exportCsv(tag) }, icon("fileText", 14)))),
+        styleBox,
+        body,
+        legend,
+        foot);
+      cards.appendChild(card);
+      return { tag, card, body, legend, styleBox, count, foot, hint, plot: null, strips: null, focus: null };
+    }
+
+    // Swap the renderer when the card's mode changes — and, in split mode, when the
+    // number of strips changes, since that is what sets the canvas height.
+    function ensureRenderer(entry, n) {
+      const mode = optsFor(entry.tag).mode;
+      if (entry.builtMode === mode && (mode !== "split" || entry.builtN === n)) return;
+      clear(entry.body);
+      entry.plot = entry.strips = null;
+      const canvas = h("canvas", { class: "mx-canvas" });
+      if (mode === "split") {
+        canvas.style.height = `${34 + Math.max(1, n) * 46}px`;
+        entry.body.appendChild(canvas);
+        entry.strips = createStrips(canvas);
+      } else {
+        entry.body.appendChild(canvas);
+        entry.plot = createPlot(canvas);
       }
-      refresh();
+      entry.builtMode = mode;
+      entry.builtN = n;
+    }
+
+    // The legend, below the plot: a swatch, the curve's own trace, its name and what it
+    // is worth right now. Ordered by that value, so the top row is the top line.
+    function buildLegend(entry, ss) {
+      const o = optsFor(entry.tag);
+      clear(entry.legend);
+      entry.hint.textContent = o.mode === "split"
+        ? "One strip per curve, each on its own scale"
+        : o.solo ? `Showing "${o.solo}" alone — click it again for the rest`
+          : "Hover to spotlight · click to isolate · shift-click to hide";
+      if (ss.length < 2 || o.mode === "split") { entry.legend.style.display = "none"; return; }
+      entry.legend.style.display = "";
+      const rows = [...ss].sort((a, b) => (b.last == null ? -Infinity : b.last) - (a.last == null ? -Infinity : a.last));
+      for (const s of rows) {
+        const dim = o.solo != null && o.solo !== s.name;
+        const item = h("button", {
+          class: "mx-legitem" + (s.off ? " off" : "") + (dim ? " dim" : "") + (o.solo === s.name ? " solo" : ""),
+          title: `${s.name} = ${fmtNum(s.last)}\nclick to show this curve alone · shift-click to hide it`,
+          onmouseenter: () => { if (!s.hidden) { entry.focus = s.name; entry.plot?.setFocus(s.name); } },
+          onmouseleave: () => { entry.focus = null; entry.plot?.setFocus(null); },
+          onclick: (e) => {
+            if (e.shiftKey) {
+              s.style.hidden = !s.style.hidden;
+              if (o.solo === s.name) o.solo = null;
+            } else o.solo = o.solo === s.name ? null : s.name;
+            entry.focus = null;
+            refresh();
+            if (entry.styleBox.style.display !== "none") buildStyleBox(entry.tag, entry.styleBox);
+          },
+        },
+          h("i", { class: "mx-swatch", style: { background: s.color, opacity: String(s.alpha) } }),
+          sparkFor(s),
+          h("span", { class: "mx-legname" }, s.name),
+          h("span", { class: "mx-legval mono" }, fmtNum(s.last)));
+        entry.legend.appendChild(item);
+      }
     }
 
     function exportCsv(tag) {
@@ -339,28 +518,154 @@ export function metricsPanel({ logdir, jobId }) {
       const ylab = logY ? "log₁₀(value)" : "value";
       const xlab = xAxis === "step" ? "step" : "minutes";
       for (const [tag, entry] of plots) {
+        const o = optsFor(tag);
         const ss = seriesFor(tag, t0);
-        entry.plot.setSeries("line", ss.filter((s) => !s.hidden), { x: xlab, y: ylab });
-        clear(entry.legend);
-        if (ss.length > 1) {
-          // The legend doubles as the on/off switch — clicking a name drops that curve
-          // from the plot (and from the autoscale), clicking it again brings it back.
-          for (const s of ss) {
-            entry.legend.appendChild(h("button", {
-              class: "mx-legitem" + (s.hidden ? " off" : ""),
-              title: s.hidden ? `Show "${s.name}"` : `Hide "${s.name}"`,
-              onclick: () => {
-                s.style.hidden = !s.style.hidden;
-                refresh();
-                if (entry.styleBox.style.display !== "none") buildStyleBox(tag, entry.styleBox);
-              },
-            }, h("i", { class: "mx-swatch", style: { background: s.color, opacity: String(s.alpha) } }), s.name));
-          }
-        }
+        const vis = ss.filter((s) => !s.hidden);
+        ensureRenderer(entry, vis.length);
+        entry.card.classList.toggle("wide", o.wide);
+        entry.count.textContent = String(ss.length);
+        entry.count.style.display = ss.length > 1 ? "" : "none";
+        entry.foot.style.display = ss.length > 1 ? "" : "none";
+        if (entry.strips) entry.strips.setSeries(vis, { x: xlab });
+        else entry.plot.setSeries("line", vis,
+          { x: xlab, y: o.mode === "norm" ? "0–1 per series" : ylab },
+          { focus: entry.focus, endLabels });
+        buildLegend(entry, ss);
         if (entry.styleBox.style.display !== "none" && entry.styleBox.childElementCount !== ss.length) {
           buildStyleBox(tag, entry.styleBox);   // only when the curve set changed: a rebuild
         }                                       // mid-drag would replace the slider you hold
       }
+    }
+
+    // The "Split" y-scale: one strip per curve, each on its own scale, sharing one x
+    // axis. Deliberately a small renderer of its own rather than a mode inside plot.js —
+    // the plotter's contract is a single pair of axes, and this is a stack of n of them,
+    // which is a panel layout rather than a plot. It reads the same CSS variables and
+    // answers the same snapshot({scale, transparent}) call, so the card's PNG button does
+    // not care which of the two it is holding.
+    function createStrips(canvas) {
+      const ctx = canvas.getContext("2d");
+      let series = [], xlab = "";
+      let snapBg = null, snapping = false;
+
+      function dpr() {
+        if (snapping) return canvas.width / Math.max(1, canvas.clientWidth);
+        return Math.min(window.devicePixelRatio || 1, 2);
+      }
+      function resize() {
+        if (snapping) return;
+        const r = dpr();
+        const w = Math.max(1, Math.floor(canvas.clientWidth * r)), ht = Math.max(1, Math.floor(canvas.clientHeight * r));
+        if (canvas.width !== w || canvas.height !== ht) { canvas.width = w; canvas.height = ht; }
+      }
+      function niceStep(span, n) {
+        const s0 = (span || 1) / Math.max(1, n), mag = Math.pow(10, Math.floor(Math.log10(s0))), norm = s0 / mag;
+        return (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+      }
+      const fmtX = (v) => (Math.abs(v) >= 1e6 ? +(v / 1e6).toFixed(1) + "M"
+        : Math.abs(v) >= 1e4 ? +(v / 1e3).toFixed(1) + "k" : String(+v.toPrecision(4)));
+      function shorten(text, maxPx) {
+        if (ctx.measureText(text).width <= maxPx) return text;
+        let s = text;
+        while (s.length > 3 && ctx.measureText(s + "…").width > maxPx) s = s.slice(0, -1);
+        return s + "…";
+      }
+
+      function draw() {
+        resize();
+        const r = dpr(), W = canvas.width, H = canvas.height;
+        ctx.clearRect(0, 0, W, H);
+        if (snapBg) { ctx.fillStyle = snapBg; ctx.fillRect(0, 0, W, H); }
+        const live = series.filter((s) => s.plain && s.plain.some((p) => p[1] != null && isFinite(p[1])));
+        if (!live.length) return;
+
+        const css = getComputedStyle(document.documentElement);
+        const fg = css.getPropertyValue("--text").trim() || "#e5e7eb";
+        const muted = css.getPropertyValue("--muted").trim() || "#94a3b8";
+        const band = css.getPropertyValue("--hover").trim() || "rgba(30,41,59,.5)";
+
+        const NAME = 116 * r, VAL = 58 * r, BOT = 20 * r, TOP = 4 * r, GAP = 6 * r;
+        const bandH = (H - TOP - BOT - GAP * (live.length - 1)) / live.length;
+        const l = NAME, w = Math.max(20, W - NAME - VAL);
+        if (bandH < 8 * r) return;
+
+        let x0 = Infinity, x1 = -Infinity;
+        for (const s of live) for (const [x, y] of s.plain) {
+          if (y == null || !isFinite(y)) continue;
+          if (x < x0) x0 = x; if (x > x1) x1 = x;
+        }
+        if (!(x1 > x0)) { x1 = x0 + 1; }
+        const sx = (x) => l + (x - x0) / (x1 - x0) * w;
+
+        live.forEach((s, i) => {
+          const bt = TOP + i * (bandH + GAP);
+          let lo = Infinity, hi = -Infinity;
+          for (const [, y] of s.plain) if (y != null && isFinite(y)) { if (y < lo) lo = y; if (y > hi) hi = y; }
+          const span = (hi - lo) || Math.max(1e-12, Math.abs(hi) || 1);
+          const sy = (y) => bt + bandH - 3 * r - (y - lo) / span * (bandH - 6 * r);
+          const alpha = s.alpha == null ? 1 : s.alpha;
+
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = band; ctx.fillRect(l, bt, w, bandH);
+
+          ctx.textAlign = "right"; ctx.textBaseline = "middle";
+          ctx.font = `${11 * r}px system-ui, sans-serif`; ctx.fillStyle = fg;
+          ctx.fillText(shorten(s.name, NAME - 14 * r), l - 8 * r, bt + bandH / 2 - 6 * r);
+          ctx.font = `${9.5 * r}px ui-monospace, Menlo, monospace`; ctx.fillStyle = muted;
+          ctx.fillText(`${fmtNum(lo)} – ${fmtNum(hi)}`, l - 8 * r, bt + bandH / 2 + 6 * r);
+
+          ctx.save();
+          ctx.beginPath(); ctx.rect(l, bt, w, bandH); ctx.clip();
+          ctx.beginPath();
+          let started = false;
+          for (const [x, y] of s.plain) {
+            if (y == null || !isFinite(y)) { started = false; continue; }
+            const px = sx(x), py = sy(y);
+            if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
+          }
+          ctx.strokeStyle = s.color; ctx.lineWidth = (s.width || 1.5) * r;
+          ctx.lineJoin = "round"; ctx.lineCap = "round";
+          ctx.globalAlpha = alpha; ctx.stroke();
+          // close the same path down to the baseline for a faint fill: on a 40px strip
+          // the area is what carries the shape, the stroke alone is too thin to read
+          ctx.lineTo(sx(x1), bt + bandH); ctx.lineTo(sx(x0), bt + bandH); ctx.closePath();
+          ctx.fillStyle = s.color; ctx.globalAlpha = alpha * 0.14; ctx.fill();
+          ctx.restore();
+
+          ctx.globalAlpha = 1;
+          ctx.textAlign = "left"; ctx.textBaseline = "middle";
+          ctx.font = `${10 * r}px ui-monospace, Menlo, monospace`; ctx.fillStyle = s.color;
+          ctx.fillText(shorten(fmtNum(s.last), VAL - 10 * r), l + w + 6 * r, bt + bandH / 2);
+        });
+
+        // one shared x axis under the stack
+        ctx.textAlign = "center"; ctx.textBaseline = "top";
+        ctx.font = `${10.5 * r}px system-ui, sans-serif`; ctx.fillStyle = muted;
+        const step = niceStep(x1 - x0, Math.max(2, Math.min(6, Math.round(w / (86 * r)))));
+        for (let v = Math.ceil(x0 / step) * step; v <= x1; v += step) ctx.fillText(fmtX(v), sx(v), H - BOT + 4 * r);
+        if (xlab) { ctx.textAlign = "right"; ctx.fillStyle = fg; ctx.fillText(xlab, W - 4 * r, H - BOT + 4 * r); }
+      }
+
+      if (window.ResizeObserver) new ResizeObserver(() => draw()).observe(canvas);
+
+      return {
+        setSeries(ss, lbls) { series = ss || []; xlab = (lbls && lbls.x) || ""; draw(); },
+        redraw: draw,
+        setFocus() { /* nothing to spotlight: every curve already has its own strip */ },
+        async snapshot({ scale = 2, transparent = false } = {}) {
+          const ow = canvas.width, oh = canvas.height;
+          if (!transparent) snapBg = getComputedStyle(document.documentElement).getPropertyValue("--panel").trim() || "#0f172a";
+          snapping = true;
+          canvas.width = Math.max(1, Math.floor(canvas.clientWidth * scale));
+          canvas.height = Math.max(1, Math.floor(canvas.clientHeight * scale));
+          draw();
+          const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
+          snapping = false; snapBg = null;
+          canvas.width = ow; canvas.height = oh;
+          draw();
+          return blob;
+        },
+      };
     }
 
     async function load() {
@@ -374,7 +679,7 @@ export function metricsPanel({ logdir, jobId }) {
 
     return {
       el,
-      onShow() { for (const { plot } of plots.values()) plot.redraw(); },
+      onShow() { for (const e of plots.values()) (e.strips || e.plot)?.redraw(); },
       async poll() { await load(); },
       onManifest() {
         // A tag first logged mid-run (HetSIREN's inverse phase, say) should appear
@@ -406,14 +711,22 @@ export function metricsPanel({ logdir, jobId }) {
         if (t) download(await api.metricsImage(logdir, t.runs[0], t.tag, idx), `${t.tag.replace(/[^\w.-]+/g, "_")}_${idx}.png`);
       },
     }, icon("save", 15));
+    const sheetBtn = h("button", {
+      class: "btn-icon", title: "Progression sheet: N frames spanning the run, composed into one PNG",
+      onclick: toggleSheet,
+    }, icon("sheet", 15));
 
     let tagName = manifest.images[0]?.tag || null;
     let idx = 0, playing = false, ticker = null;
-    const cache = new Map();      // "tag@frame" -> object URL
+    const cache = new Map();      // "tag@wall" -> object URL
+    const decoded = new Map();    // "tag@wall" -> HTMLImageElement, for compositing
+
+    const sheetPanel = h("div", { class: "mx-sheet", style: { display: "none" } });
 
     el.appendChild(chips);
     el.appendChild(h("div", { class: "mx-imgwrap" }, img));
-    el.appendChild(h("div", { class: "mx-transport" }, playBtn, range, frameLabel, saveBtn));
+    el.appendChild(h("div", { class: "mx-transport" }, playBtn, range, frameLabel, saveBtn, sheetBtn));
+    el.appendChild(sheetPanel);
 
     const current = () => manifest.images.find((t) => t.tag === tagName) || null;
     const frames = () => current()?.frames || [];
@@ -423,7 +736,12 @@ export function metricsPanel({ logdir, jobId }) {
       for (const t of manifest.images) {
         chips.appendChild(h("button", {
           class: "mx-chip" + (t.tag === tagName ? " active" : ""),
-          onclick: () => { tagName = t.tag; idx = frames().length - 1; syncRange(); show(); buildChips(); },
+          onclick: () => {
+            tagName = t.tag;
+            idx = frames().length - 1;
+            syncRange(); show(); buildChips();
+            if (sheetPanel.style.display !== "none") schedulePreview(0);
+          },
         }, t.tag, h("span", { class: "mx-count" }, String(t.frames.length))));
       }
     }
@@ -435,16 +753,20 @@ export function metricsPanel({ logdir, jobId }) {
       range.value = String(idx);
       range.disabled = n < 2;
       playBtn.disabled = n < 2;
+      sheetBtn.disabled = n < 2;
     }
 
-    // Steps are all 0 here, so the honest x-label is elapsed time into the run.
-    function label(fs, i) {
-      const useStep = fs.some((f) => f.step !== fs[0].step);
-      if (useStep) return `step ${fs[i].step}  (${i + 1}/${fs.length})`;
+    // Steps are all 0 here, so the honest stamp is elapsed time into the run.
+    function stamp(fs, i) {
+      if (fs.some((f) => f.step !== fs[0].step)) return `step ${fs[i].step}`;
       const secs = Math.max(0, Math.round(fs[i].wall - fs[0].wall));
       const mm = String(Math.floor(secs / 60)).padStart(2, "0");
       const ss = String(secs % 60).padStart(2, "0");
-      return `+${mm}:${ss} into the run  (${i + 1}/${fs.length})`;
+      return `+${mm}:${ss}`;
+    }
+    function label(fs, i) {
+      const s = stamp(fs, i);
+      return `${s}${s.startsWith("+") ? " into the run" : ""}  (${i + 1}/${fs.length})`;
     }
 
     async function show() {
@@ -478,6 +800,200 @@ export function metricsPanel({ logdir, jobId }) {
       }
     }
 
+    // ---- progression sheet -------------------------------------------------
+    // The transport plays the epochs as a movie; this takes the same run away as one
+    // picture. Frames are chosen by index over the wall-clock-ordered list the manifest
+    // already carries, which is what makes it work with hax's step-0 image logging, and
+    // the sheet is composed here from frames the panel has (or fetches once), so nothing
+    // is asked of the backend that the movie did not already ask.
+    const sheet = { n: 10, pick: "even", cols: 4, captions: true, header: true, arrow: true };
+    const sheetPrev = h("canvas", { class: "mx-sheetprev" });
+    const sheetStatus = h("div", { class: "mx-hint" }, "");
+    let sheetBuilt = false, previewTimer = null;
+
+    function toggleSheet() {
+      const open = sheetPanel.style.display === "none";
+      sheetPanel.style.display = open ? "" : "none";
+      sheetBtn.classList.toggle("active", open);
+      if (!open) return;
+      if (!sheetBuilt) { buildSheetPanel(); sheetBuilt = true; }
+      schedulePreview(0);
+    }
+
+    function sheetSelect(text, options, get, set) {
+      return h("label", { class: "mx-ctl" }, h("span", null, text),
+        h("select", {
+          class: "input mx-select",
+          onchange: (e) => { set(e.target.value); schedulePreview(); },
+        }, ...options.map(([v, t]) => h("option", { value: v, selected: String(get()) === v }, t))));
+    }
+    function sheetCheck(text, get, set, title) {
+      return h("label", { class: "mx-ctl", title: title || "" },
+        h("input", { type: "checkbox", checked: get(), onchange: (e) => { set(e.target.checked); schedulePreview(); } }),
+        h("span", null, text));
+    }
+
+    function buildSheetPanel() {
+      const nOut = h("span", { class: "mono small" }, String(sheet.n));
+      const form = h("div", { class: "mx-sheetform" },
+        h("div", { class: "mx-raillabel" }, "Progression sheet"),
+        h("label", { class: "mx-ctl" }, h("span", null, "Frames"), nOut),
+        h("input", {
+          type: "range", class: "mx-range", min: "2", max: "24", step: "1", value: String(sheet.n),
+          oninput: (e) => { sheet.n = +e.target.value; nOut.textContent = String(sheet.n); schedulePreview(); },
+        }),
+        sheetSelect("Pick", [["even", "Evenly spaced"], ["first", "First N"], ["last", "Last N"]],
+          () => sheet.pick, (v) => (sheet.pick = v)),
+        sheetSelect("Columns", [["0", "Auto"], ["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"], ["5", "5"], ["6", "6"]],
+          () => sheet.cols, (v) => (sheet.cols = +v)),
+        sheetCheck("Caption each frame", () => sheet.captions, (v) => (sheet.captions = v),
+          "Write the step (or elapsed time) and the frame number under each panel"),
+        sheetCheck("Header strip", () => sheet.header, (v) => (sheet.header = v),
+          "Tag, run folder and the span the sheet covers"),
+        sheetCheck("Direction arrow", () => sheet.arrow, (v) => (sheet.arrow = v),
+          "A training→ arrow across the top, so the reading order is unambiguous"),
+        h("p", { class: "field-help", style: { margin: "2px 0 8px" } },
+          "Resolution and background follow the Export settings above."),
+        h("button", { class: "btn", style: { width: "100%", justifyContent: "center" }, onclick: downloadSheet },
+          icon("save", 15), "Download PNG"),
+        sheetStatus);
+      mount(sheetPanel, h("div", { class: "mx-sheetgrid" }, form, h("div", { class: "mx-sheetprevwrap" }, sheetPrev)));
+    }
+
+    function pickIndices() {
+      const total = frames().length;
+      const n = Math.max(1, Math.min(sheet.n, total));
+      if (sheet.pick === "last") return Array.from({ length: n }, (_, i) => total - n + i);
+      if (sheet.pick === "first") return Array.from({ length: n }, (_, i) => i);
+      if (n === 1) return [total - 1];
+      // evenly spaced, first and last always in
+      return Array.from({ length: n }, (_, i) => Math.round(i * (total - 1) / (n - 1)));
+    }
+
+    // The movie caches object URLs; the sheet needs decoded bitmaps. Same keys, so a
+    // frame you have already looked at costs nothing to put on the sheet.
+    async function frameImage(i) {
+      const t = current(), fs = frames();
+      const key = `${t.tag}@${fs[i].wall}`;
+      let im = decoded.get(key);
+      if (im) return im;
+      let url = cache.get(key);
+      if (!url) {
+        url = URL.createObjectURL(await api.metricsImage(logdir, t.runs[0], t.tag, i));
+        cache.set(key, url);
+      }
+      im = await new Promise((res, rej) => {
+        const x = new Image();
+        x.onload = () => res(x);
+        x.onerror = () => rej(new Error(`frame ${i + 1} could not be decoded`));
+        x.src = url;
+      });
+      decoded.set(key, im);
+      return im;
+    }
+
+    async function composeSheet(scale) {
+      const t = current(), fs = frames();
+      if (!t || fs.length < 2) throw new Error("this tag has only one frame — there is no progression to draw");
+      const idxs = pickIndices();
+      const imgs = await Promise.all(idxs.map(frameImage));
+      const iw = imgs[0].naturalWidth || 1, ih = imgs[0].naturalHeight || 1;
+      // A hax image panel can be 1500px wide; four of those side by side, times the
+      // export scale, is a PNG no viewer wants. Cap the cell and let the scale do the DPI.
+      const cw = Math.min(iw, 512), ch = Math.max(1, Math.round(ih * (cw / iw)));
+      const cols = sheet.cols || Math.min(idxs.length, Math.max(2, Math.round(Math.sqrt(idxs.length * 1.6))));
+      const rows = Math.ceil(idxs.length / cols);
+      const capH = sheet.captions ? 15 : 0, headH = sheet.header ? 36 : 0, arrowH = sheet.arrow ? 16 : 0;
+      const pad = 14, gap = 10;
+      const W = pad * 2 + cols * cw + (cols - 1) * gap;
+      const H = pad * 2 + headH + arrowH + rows * (ch + capH) + (rows - 1) * gap;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(W * scale);
+      canvas.height = Math.round(H * scale);
+      const g = canvas.getContext("2d");
+      g.scale(scale, scale);
+
+      const css = getComputedStyle(document.documentElement);
+      const fg = css.getPropertyValue("--text").trim() || "#f1f5f9";
+      const dim = css.getPropertyValue("--faint").trim() || "#64748b";
+      if (!exportOpts.transparent) {
+        g.fillStyle = css.getPropertyValue("--panel").trim() || "#0f172a";
+        g.fillRect(0, 0, W, H);
+      }
+
+      let y = pad;
+      if (headH) {
+        g.textAlign = "left"; g.textBaseline = "top";
+        g.fillStyle = fg; g.font = "600 15px system-ui, sans-serif";
+        g.fillText(t.tag, pad, y);
+        g.fillStyle = dim; g.font = "11px ui-monospace, Menlo, monospace";
+        g.fillText(`${logdir.replace(/\/+$/, "").split("/").pop()} · ${idxs.length} of ${fs.length} frames · ` +
+          `${stamp(fs, idxs[0])} → ${stamp(fs, idxs[idxs.length - 1])}`, pad, y + 19);
+        y += headH;
+      }
+      if (arrowH) {
+        const ay = y + 5;
+        g.globalAlpha = 0.8; g.strokeStyle = dim; g.fillStyle = dim; g.lineWidth = 1;
+        g.beginPath(); g.moveTo(pad, ay); g.lineTo(W - pad - 8, ay); g.stroke();
+        g.beginPath(); g.moveTo(W - pad - 8, ay - 3.5); g.lineTo(W - pad, ay); g.lineTo(W - pad - 8, ay + 3.5);
+        g.closePath(); g.fill();
+        g.font = "10px system-ui, sans-serif"; g.textAlign = "center"; g.textBaseline = "bottom";
+        g.fillText("training", W / 2, ay - 3);
+        g.globalAlpha = 1;
+        y += arrowH;
+      }
+
+      idxs.forEach((fi, k) => {
+        const cx = pad + (k % cols) * (cw + gap);
+        const cy = y + Math.floor(k / cols) * (ch + capH + gap);
+        g.drawImage(imgs[k], cx, cy, cw, ch);
+        g.strokeStyle = exportOpts.transparent ? "rgba(148,163,184,.35)" : dim;
+        g.globalAlpha = exportOpts.transparent ? 1 : 0.35;
+        g.lineWidth = 1;
+        g.strokeRect(cx + 0.5, cy + 0.5, cw - 1, ch - 1);
+        g.globalAlpha = 1;
+        if (capH) {
+          g.fillStyle = dim; g.font = "10.5px ui-monospace, Menlo, monospace"; g.textBaseline = "top";
+          g.textAlign = "left"; g.fillText(stamp(fs, fi), cx + 1, cy + ch + 3);
+          g.textAlign = "right"; g.fillText(`${fi + 1}/${fs.length}`, cx + cw - 1, cy + ch + 3);
+        }
+      });
+      return { canvas, W, H, n: idxs.length };
+    }
+
+    function schedulePreview(delay = 250) {
+      if (previewTimer) clearTimeout(previewTimer);
+      previewTimer = setTimeout(() => { previewTimer = null; renderPreview(); }, delay);
+    }
+
+    async function renderPreview() {
+      if (sheetPanel.style.display === "none" || destroyed) return;
+      sheetStatus.textContent = "Reading frames…";
+      try {
+        const { canvas, W, H, n } = await composeSheet(1);
+        sheetPrev.width = canvas.width;
+        sheetPrev.height = canvas.height;
+        sheetPrev.getContext("2d").drawImage(canvas, 0, 0);
+        sheetPrev.style.width = `${Math.min(W, 720)}px`;
+        sheetPrev.style.height = "auto";
+        sheetStatus.textContent =
+          `${n} frames · ${Math.round(W * exportOpts.scale)} × ${Math.round(H * exportOpts.scale)} px at ${exportOpts.scale}×`;
+      } catch (err) {
+        mount(sheetStatus, errorBox(err));
+      }
+    }
+
+    async function downloadSheet() {
+      try {
+        const { canvas, n } = await composeSheet(exportOpts.scale);
+        const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
+        download(blob, `${current().tag.replace(/[^\w.-]+/g, "_")}_progression_${n}.png`);
+      } catch (err) {
+        mount(sheetStatus, errorBox(err));
+      }
+    }
+
     buildChips();
     idx = Math.max(0, frames().length - 1);   // open on the newest frame
     syncRange();
@@ -490,9 +1006,11 @@ export function metricsPanel({ logdir, jobId }) {
         buildChips();
         syncRange();
         if (atEnd) { idx = Math.max(0, frames().length - 1); show(); }   // a live run keeps following
+        if (sheetPanel.style.display !== "none") schedulePreview(600);   // new epochs land on the sheet too
       },
       destroy() {
         if (ticker) clearInterval(ticker);
+        if (previewTimer) clearTimeout(previewTimer);
         for (const url of cache.values()) URL.revokeObjectURL(url);
       },
     };

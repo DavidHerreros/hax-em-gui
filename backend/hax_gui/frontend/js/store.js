@@ -75,10 +75,10 @@ export const store = {
 
   // Metrics tabs are keyed by log directory, so opening the same run twice focuses
   // the tab that is already there instead of stacking duplicates.
-  openMetrics({ logdir, title, jobId }) {
+  openMetrics({ logdir, title, subtitle, jobId }) {
     const existing = state.openMetrics.find((x) => x.id === logdir);
     if (existing) { if (jobId) existing.jobId = jobId; }
-    else state.openMetrics.push({ id: logdir, logdir, title: title || logdir, jobId: jobId || null });
+    else state.openMetrics.push({ id: logdir, logdir, title: title || logdir, subtitle: subtitle || "", jobId: jobId || null });
     state.activeMetricsId = logdir;
     emit();
   },

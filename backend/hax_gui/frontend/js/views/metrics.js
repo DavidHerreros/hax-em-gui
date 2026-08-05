@@ -10,7 +10,7 @@ import { errorBox } from "./ui.js";
 import { openFilePicker } from "./filePicker.js";
 import { jobLabelChips } from "./labels.js";
 import { metricsPanel } from "./metricsPanel.js";
-import { runBrowser, folderName } from "./runBrowser.js";
+import { runBrowser, folderName, metricsTabInfo } from "./runBrowser.js";
 import { jobTimeEl } from "./jobs.js";
 
 export function MetricsView() {
@@ -19,7 +19,7 @@ export function MetricsView() {
   let logdir = "";
   const input = h("input", { class: "input", placeholder: "server log directory (manual)", oninput: (e) => (logdir = e.target.value) });
   const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; logdir = p; }, input.value) }, icon("folderOpen", 16));
-  const openBtn = h("button", { class: "btn", onclick: () => open(logdir.trim(), null, null) }, icon("plus", 18), "Open");
+  const openBtn = h("button", { class: "btn", onclick: () => open(logdir.trim()) }, icon("plus", 18), "Open");
   const launchErr = h("div");
 
   root.appendChild(h("header", { class: "page-head" }, h("h1", null, "Metrics"),
@@ -30,7 +30,7 @@ export function MetricsView() {
   root.appendChild(runsBox);
 
   const browser = runBrowser({
-    renderRow: (j) => h("button", { class: "run-row", onclick: () => open(j.workdir, j.name || j.program, j.id) },
+    renderRow: (j) => h("button", { class: "run-row", onclick: () => open(j.workdir, j) },
       h("span", { class: "run-prog mono" }, j.name || j.program),
       j.name ? h("span", { class: "run-sub mono" }, j.program) : null,
       h("span", { class: "run-folder mono" }, folderName(j.workdir)),
@@ -65,10 +65,11 @@ export function MetricsView() {
   const panels = new Map();   // logdir -> panel instance (kept mounted so state survives tab switches)
   let shownId = null;         // which panel is currently on screen
 
-  function open(dir, program, jobId) {
+  function open(dir, job) {
     if (!dir) { mount(launchErr, h("div", { style: { marginTop: "12px" } }, errorBox("Choose a log directory first."))); return; }
     clear(launchErr);
-    store.openMetrics({ logdir: dir, title: program ? `${program} · ${folderName(dir)}` : folderName(dir), jobId });
+    const { title, subtitle } = metricsTabInfo(dir, job);
+    store.openMetrics({ logdir: dir, title, subtitle, jobId: job ? job.id : null });
   }
 
   function close(id) {
@@ -81,8 +82,17 @@ export function MetricsView() {
     const { openMetrics, activeMetricsId } = getState();
     clear(tabbar);
     for (const m of openMetrics) {
-      tabbar.appendChild(h("div", { class: "tab" + (m.id === activeMetricsId ? " active" : ""), onclick: () => store.setActiveMetrics(m.id), title: m.logdir },
-        h("span", { class: "tab-label" }, m.title),
+      // Two lines, capped width: a run called "… copy copy copy" glued to its folder is
+      // wider than the tab bar, and truncating it to one line hides exactly the part
+      // (the run id) that tells two of them apart.
+      tabbar.appendChild(h("div", {
+        class: "tab mx-tab" + (m.id === activeMetricsId ? " active" : ""),
+        onclick: () => store.setActiveMetrics(m.id),
+        title: `${m.title}\n${m.logdir}`,
+      },
+        h("span", { class: "mx-tabcol" },
+          h("span", { class: "mx-tabname" }, m.title),
+          m.subtitle ? h("span", { class: "mx-tabsub mono" }, m.subtitle) : null),
         h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); close(m.id); } }, icon("x", 14))));
     }
     for (const m of openMetrics) {
