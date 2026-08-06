@@ -11,6 +11,14 @@ const MD_RX = /\.(xmd|star|cs)$/i;
 // Which standalone viewer a file opens in, or null if it isn't viewable.
 const viewerKind = (name) => (MAP_RX.test(name) ? "map" : MD_RX.test(name) ? "md" : null);
 
+// The folder a file was opened from — the viewer tab's second line. Two runs of the
+// same program produce identically named maps, so the name alone doesn't say which
+// one a tab is showing.
+function parentName(path) {
+  const parts = (path || "").replace(/\/+$/, "").split("/");
+  return parts.length > 1 ? parts[parts.length - 2] : "";
+}
+
 // Browse-only: no field to select into, so the modal exists purely to open things.
 // Used by "Output folder" on a run — see jobDetail.js.
 export function openFileBrowser(startPath) {
@@ -327,7 +335,8 @@ export function openFilePicker(kind, onSelect, startPath) {
 
   async function inspectFile(path, kind) {
     try {
-      store.openViewer(kind === "md" ? await api.mdViewer(path) : await api.mrcViewer(path));
+      const v = kind === "md" ? await api.mdViewer(path) : await api.mrcViewer(path);
+      store.openViewer({ ...v, subtitle: parentName(path) });
       close();   // opens in the floating viewer window, which this modal would cover
     } catch (err) { mount(pickErr, errorBox(err)); }
   }
@@ -352,9 +361,10 @@ export function openFilePicker(kind, onSelect, startPath) {
       const { paths, kind } = jobs[i];
       pickCount.textContent = `Opening ${i + 1}/${jobs.length}…`;
       try {
-        store.openViewer(kind === "md" ? await api.mdViewer(paths[0])
+        const v = kind === "md" ? await api.mdViewer(paths[0])
           : paths.length > 1 ? await api.mrcViewerMulti(paths, `${paths.length} maps`)
-          : await api.mrcViewer(paths[0]));
+            : await api.mrcViewer(paths[0]);
+        store.openViewer({ ...v, subtitle: parentName(paths[0]) });
         // So a retry after a partial failure doesn't reopen what already worked.
         for (const p of paths) picked.delete(p);
       } catch (err) {

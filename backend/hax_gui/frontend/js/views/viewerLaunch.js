@@ -23,8 +23,18 @@ export async function launchViewerForJob(job) {
   const gpu = await pickViewerGpu();
   if (gpu == null) return null;
   const v = await api.viewerFromJob(job.id, index, gpu);
-  store.openViewer({ ...v, jobId: job.id });   // jobId links the tab back to the job for renaming
+  // jobId links the tab back to the job for renaming; `subtitle` is the tab's second
+  // line for a landscape, whose title is the run name alone — the same "program · run
+  // id" the metrics tabs carry. A FlexConsensus title already ends in " · <space>",
+  // which the tab prefers, since which space you are looking at matters more.
+  store.openViewer({ ...v, jobId: job.id, subtitle: jobSubtitle(job) });
   return v;
+}
+
+// Six hex digits of the run id is enough to tell two runs of the same program apart,
+// and short enough to sit under a run name without widening the tab.
+function jobSubtitle(job) {
+  return [job.program, String(job.id || "").slice(0, 6)].filter(Boolean).join(" · ");
 }
 
 // Which device the viewer backend loads the network and decodes maps on.

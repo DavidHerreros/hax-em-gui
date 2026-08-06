@@ -86,13 +86,13 @@ export function MetricsView() {
       // wider than the tab bar, and truncating it to one line hides exactly the part
       // (the run id) that tells two of them apart.
       tabbar.appendChild(h("div", {
-        class: "tab mx-tab" + (m.id === activeMetricsId ? " active" : ""),
+        class: "tab two-line" + (m.id === activeMetricsId ? " active" : ""),
         onclick: () => store.setActiveMetrics(m.id),
         title: `${m.title}\n${m.logdir}`,
       },
-        h("span", { class: "mx-tabcol" },
-          h("span", { class: "mx-tabname" }, m.title),
-          m.subtitle ? h("span", { class: "mx-tabsub mono" }, m.subtitle) : null),
+        h("span", { class: "tab-lines" },
+          h("span", { class: "tab-main" }, m.title),
+          m.subtitle ? h("span", { class: "tab-sub mono" }, m.subtitle) : null),
         h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); close(m.id); } }, icon("x", 14))));
     }
     for (const m of openMetrics) {

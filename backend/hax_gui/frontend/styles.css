@@ -409,6 +409,16 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .tab-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--err); opacity: 0; transition: opacity .15s; }
 .tab.has-err .tab-dot { opacity: 1; }
 
+/* Two-line tabs (metrics runs, viewer sessions): what the thing is called, over what it
+   is — program and run id, or the file it was opened from. A run called "… copy copy
+   copy · reconsiren_7c2218da8d40" on one line is wider than the whole tab bar, and
+   truncating it hides exactly the part that tells two of them apart. Capped width, with
+   the full string in the tab's tooltip. */
+.tab.two-line { max-width: 268px; align-items: center; padding: 6px 10px; }
+.tab-lines { display: flex; flex-direction: column; gap: 1px; min-width: 0; max-width: 200px; }
+.tab-main { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-sub { font-size: 10.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 
 /* ── floating viewer window (mrc / metadata / 3D landscape, as movable tabs) ── */
 .vwin { position: fixed; z-index: 45; display: none; flex-direction: column; overflow: hidden;
@@ -725,11 +735,6 @@ body.vwin-dragging iframe { pointer-events: none; }
 .mx-sheetprevwrap { border: 1px solid var(--border); border-radius: 10px; background: var(--console-bg); padding: 10px; overflow: auto; min-height: 120px; }
 .mx-sheetprev { display: block; margin: 0 auto; max-width: 100%; image-rendering: auto; }
 
-/* metrics run tabs: two lines, capped width — the run's name over program · run id */
-.tab.mx-tab { max-width: 268px; align-items: center; padding: 6px 10px; }
-.mx-tabcol { display: flex; flex-direction: column; gap: 1px; min-width: 0; max-width: 200px; }
-.mx-tabname { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mx-tabsub { font-size: 10.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* -- latent space -- */
 .mx-latent { display: flex; gap: 16px; align-items: flex-start; }

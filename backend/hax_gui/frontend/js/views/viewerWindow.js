@@ -123,6 +123,18 @@ export function mountViewerWindow() {
 
   // Rename the run behind a viewer tab (double-click its label). Renames the job on
   // the server and updates the tab title; the Jobs list picks it up on its next poll.
+  // A viewer's title is "<run or file> · <what of it>" — the map's file name, the
+  // consensus space, "3 maps". That is already the shape of the two-line tab the metrics
+  // run tabs use, so split on the same separator the rename path splits on. A landscape
+  // opened from a job carries no qualifier, and falls back to the subtitle the launcher
+  // attached (program · run id).
+  function tabLines(v) {
+    const title = v.title || "Viewer";
+    const sep = title.indexOf(" · ");
+    if (sep >= 0) return { main: title.slice(0, sep), sub: title.slice(sep + 3) };
+    return { main: title, sub: v.subtitle || "" };
+  }
+
   async function renameTab(v) {
     if (!v.jobId) return;
     const sep = (v.title || "").indexOf(" · ");
@@ -152,12 +164,15 @@ export function mountViewerWindow() {
 
     clear(tabs);
     for (const v of openViewers) {
+      const { main, sub } = tabLines(v);
       const label = h("span", {
-        class: "tab-label",
-        title: v.jobId ? "Double-click to rename the run" : (v.title || "Viewer"),
+        class: "tab-lines",
+        title: (v.jobId ? "Double-click to rename the run\n" : "") + (v.title || "Viewer"),
         ondblclick: v.jobId ? (e) => { e.stopPropagation(); renameTab(v); } : null,
-      }, v.title || "Viewer");
-      tabs.appendChild(h("div", { class: "tab" + (v.id === activeViewerId ? " active" : ""), onclick: () => store.setActiveViewer(v.id) },
+      },
+        h("span", { class: "tab-main" }, main),
+        sub ? h("span", { class: "tab-sub mono" }, sub) : null);
+      tabs.appendChild(h("div", { class: "tab two-line" + (v.id === activeViewerId ? " active" : ""), onclick: () => store.setActiveViewer(v.id) },
         label,
         h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); closeOne(v.id); } }, icon("x", 14))));
     }
