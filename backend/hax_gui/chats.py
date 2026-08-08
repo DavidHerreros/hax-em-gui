@@ -111,5 +111,11 @@ class ChatManager:
         self._db.commit()
         return cur.rowcount > 0
 
+    def delete_for_project(self, project_id: str) -> None:
+        """Drop a deleted project's chats; they used to linger, grouped under a
+        project id that no longer resolves."""
+        self._db.execute("DELETE FROM chats WHERE project_id=?", (project_id,))
+        self._db.commit()
+
 
 manager = ChatManager()

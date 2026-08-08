@@ -323,6 +323,12 @@ class WorkflowManager:
         self._db.execute("DELETE FROM workflows WHERE id=?", (wid,))
         self._db.commit()
 
+    def delete_for_project(self, project_id: str) -> None:
+        """Drop a deleted project's workflows (rows *and* any live scheduler task);
+        orphaned rows used to accumulate forever and their schedulers kept running."""
+        for wf in self.list(project_id):
+            self.delete(wf["id"])
+
     def seed_state(self, wid: str, state: dict) -> dict[str, Any]:
         """Attach a run_state to a workflow without marking it running. Used when
         importing a project so each node shows its existing job's status."""

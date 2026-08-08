@@ -958,10 +958,16 @@ def rename_project(project_id: str, body: ProjectRename) -> dict[str, Any]:
 @app.delete("/api/projects/{project_id}", dependencies=[Depends(auth)])
 def delete_project(project_id: str) -> dict[str, bool]:
     _project_or_404(project_id)
+    job_ids = [j["id"] for j in manager.list_for_project(project_id)]
     try:
         manager.delete_for_project(project_id)
     except JobActive:
         raise HTTPException(status_code=409, detail="cancel the project's running jobs before deleting it")
+    # Everything filed under the project goes with it: label associations,
+    # workflows (rows + any live scheduler), and chats.
+    label_manager.remove_jobs(job_ids)
+    wf_manager.delete_for_project(project_id)
+    chat_store.manager.delete_for_project(project_id)
     projects.delete(project_id)
     return {"deleted": True}
 
@@ -1314,6 +1320,7 @@ def delete_job(job_id: str) -> dict[str, bool]:
     # Drop the step the job backed from any workflow graph right away, so a canvas
     # reloaded (or polled) before the next full reconcile doesn't show it again.
     wf_manager.forget_job(job_id)
+    label_manager.remove_jobs([job_id])   # its job_labels rows must not outlive it
     return {"deleted": True}
 
 

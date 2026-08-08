@@ -99,6 +99,15 @@ class LabelManager:
             self._db.execute("DELETE FROM labels WHERE id=?", (lid,))
             self._db.commit()
 
+    def remove_jobs(self, job_ids: list[str]) -> None:
+        """Drop the associations of deleted jobs (their labels themselves stay).
+        Without this every deleted job left its job_labels rows behind forever."""
+        if not job_ids:
+            return
+        marks = ",".join("?" for _ in job_ids)
+        self._db.execute(f"DELETE FROM job_labels WHERE job_id IN ({marks})", tuple(job_ids))
+        self._db.commit()
+
     # -- job <-> label associations ---------------------------------------
     def set_job_labels(self, job_id: str, label_ids: list[str]) -> list[dict[str, Any]]:
         """Replace a job's labels with the given set (unknown ids are ignored)."""
