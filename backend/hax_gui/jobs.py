@@ -1008,6 +1008,16 @@ class JobManager:
         waiting for an EOF they were still holding open. Once the leader has exited,
         anything still in its group is exactly that debris.
         """
+        # The leader has exited, so its pid slot is free the moment it is reaped — and
+        # a fresh process that lands on it and starts its own session would make this
+        # pgid name *that stranger's* group. Every other path that signals a group
+        # re-verifies identity (_group_alive); this one must too: if a process with
+        # pid == pgid is alive again but is not the one we launched, walk away.
+        key = (self.get(job_id) or {}).get("proc_key")
+        if key and _pid_alive(pgid):
+            now = _proc_key(pgid)
+            if now is not None and now != key:
+                return
         left = [p for p in _group_members(pgid) if p != pgid]
         if not left:
             return
