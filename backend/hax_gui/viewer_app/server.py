@@ -197,6 +197,10 @@ class Decoder:
 
         self._jnp = jnp
         self._decode = _decode
+        # The physical sampling rate is a property of the trained network; it is
+        # what makes a downloaded .mrc open in ChimeraX at the right A/px
+        # instead of the writer's 1.0 default.
+        self.sr = float(getattr(network, "sr", 1.0) or 1.0)
         # The box is a property of the checkpoint, so read it off the model here. `draft`
         # needs it to choose the stride, and it used to learn it by decoding a whole volume
         # *unstrided* and copying it home — ~85 ms of PCIe on top of the decode (see
@@ -746,7 +750,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         with tempfile.NamedTemporaryFile(suffix=".mrc", delete=False) as tf:
             path = tf.name
         try:
-            ImageHandler().write(vol, path, overwrite=True)
+            ImageHandler().write(vol, path, overwrite=True, sr=getattr(decoder, "sr", 1.0))
         except Exception:
             Path(path).unlink(missing_ok=True)
             raise

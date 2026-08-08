@@ -52,7 +52,9 @@ class Exporter:
         avg = np.mean([self.decoder._latent(i) for i in idx], axis=0)
         vol = self.decoder._decode_latent(avg)
         vol_name = f"{safe}_average.mrc"
-        ImageHandler().write(vol, str(folder / vol_name), overwrite=True)
+        # sr known once the decoder has loaded its network (decoding above did).
+        ImageHandler().write(vol, str(folder / vol_name), overwrite=True,
+                             sr=getattr(self.decoder, "sr", 1.0))
         files.append(vol_name)
 
         # subset metadata for the real particles in the layer (centroids have no row)

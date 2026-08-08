@@ -50,6 +50,23 @@ STATIC = Path(__file__).resolve().parent / "static"
 PALETTE = ["#c8c8c8", "#7fb3ff", "#ff9e7a", "#8fe08f", "#e79aff", "#ffd166", "#6fdccf", "#ff8fa8"]
 
 
+def _read_scale(path: str) -> tuple[float, list[float]]:
+    """(voxel size in A, origin in A) from the MRC/CCP4 header, best-effort.
+
+    These used to be discarded outright, which is what made the viewer purely
+    qualitative: no A scale, and multi-map comparison assumed identical
+    sampling. 1.0 / (0,0,0) when the header can't be read (e.g. Spider .vol)."""
+    try:
+        import mrcfile
+        with mrcfile.open(path, mode="r", permissive=True, header_only=True) as m:
+            vs = float(m.voxel_size.x) or 1.0
+            o = m.header.origin
+            origin = [float(o.x), float(o.y), float(o.z)]
+            return (round(vs, 5), origin)
+    except Exception:  # noqa: BLE001 - unsupported container: fall back to unscaled
+        return (1.0, [0.0, 0.0, 0.0])
+
+
 def _load_mrc(path: str) -> np.ndarray:
     """Read a volume into a writable float32 3D grid.
 
@@ -97,6 +114,8 @@ class _Model:
         self.path = path
         self.name = path.name
         self.vol = vol
+        self.voxel_size, self.origin = _read_scale(str(path))
+        self._hist: dict[int, dict] = {}   # per-bins histogram cache (the volume never changes)
         self.stats = {
             "min": float(vol.min()), "max": float(vol.max()),
             "mean": float(vol.mean()), "std": float(vol.std()),
@@ -173,6 +192,8 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
                     "name": m.name,
                     "filename": str(m.path),
                     "shape": [int(s) for s in m.vol.shape],   # (nz, ny, nx), NumPy order
+                    "voxel_size": m.voxel_size,               # A per voxel (1.0 = unknown)
+                    "origin": m.origin,                       # A, from the header
                     "color": PALETTE[m.index % len(PALETTE)],
                     **m.stats,
                     "sigma_level": level_for_sigma(m.vol, 2.5),
@@ -184,13 +205,18 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
     @app.get("/api/histogram")
     def histogram(m: int = Query(0), bins: int = Query(96)) -> dict:
         model = scene.get(m)
-        counts, edges = np.histogram(model.vol.ravel(), bins=int(max(8, min(256, bins))))
-        return {
-            "counts": counts.astype(int).tolist(),
-            "edges": edges.astype(float).tolist(),
-            **model.stats,
-            "sigma_level": level_for_sigma(model.vol, 2.5),
-        }
+        nb = int(max(8, min(256, bins)))
+        cached = model._hist.get(nb)
+        if cached is None:
+            # A full-volume histogram is a whole-array pass (seconds at 512^3);
+            # the volume never changes, so pay it once per bin count.
+            counts, edges = np.histogram(model.vol.ravel(), bins=nb)
+            cached = model._hist[nb] = {
+                "counts": counts.astype(int).tolist(),
+                "edges": edges.astype(float).tolist(),
+                "sigma_level": level_for_sigma(model.vol, 2.5),
+            }
+        return {**cached, **model.stats}
 
     @app.get("/api/decode")
     def decode(
