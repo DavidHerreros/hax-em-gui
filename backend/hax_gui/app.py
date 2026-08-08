@@ -832,9 +832,14 @@ class ProjectRename(BaseModel):
 
 
 def _with_run_counts(projs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Annotate each project with the number of runs it holds (for the cards)."""
+    """Annotate each project with the number of runs it holds (for the cards).
+
+    One GROUP BY, not a full job-row fetch (args/command/bindings JSON-parsed)
+    per project per 5-second poll just to call len() — and no longer capped at
+    list_for_project's 200-row limit."""
+    counts = manager.count_by_project()
     for proj in projs:
-        proj["runs"] = len(manager.list_for_project(proj["id"]))
+        proj["runs"] = counts.get(proj["id"], 0)
     return projs
 
 

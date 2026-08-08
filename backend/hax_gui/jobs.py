@@ -1230,6 +1230,14 @@ class JobManager:
         )
         return int(row["n"]) if row else 0
 
+    def count_by_project(self) -> dict[str, int]:
+        """Run count per project — one GROUP BY for all of them (project cards)."""
+        rows = self._exec(
+            "SELECT project_id, COUNT(*) AS n FROM jobs WHERE project_id IS NOT NULL "
+            "GROUP BY project_id", fetch="all",
+        )
+        return {r["project_id"]: r["n"] for r in rows}
+
     def list_for_project(self, project_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self._exec(
             "SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT ?",

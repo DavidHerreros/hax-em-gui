@@ -4,12 +4,32 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import threading
+import time
 from typing import Any
 
 _QUERY = "index,name,memory.used,memory.total,utilization.gpu"
 
+# The launcher (and every open tab's poll) asks for the GPU list; a fork+exec
+# of nvidia-smi per request adds up. Memory/utilisation numbers a couple of
+# seconds old are equally useful, so serve a short-lived cache.
+_CACHE_TTL = 2.0
+_cache: tuple[float, list[dict[str, Any]]] | None = None
+_cache_lock = threading.Lock()
+
 
 def list_gpus() -> list[dict[str, Any]]:
+    global _cache
+    with _cache_lock:
+        if _cache is not None and time.monotonic() - _cache[0] < _CACHE_TTL:
+            return _cache[1]
+    gpus = _query_gpus()
+    with _cache_lock:
+        _cache = (time.monotonic(), gpus)
+    return gpus
+
+
+def _query_gpus() -> list[dict[str, Any]]:
     if shutil.which("nvidia-smi") is None:
         return []
     try:
