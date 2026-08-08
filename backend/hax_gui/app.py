@@ -521,6 +521,10 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                 continue  # stray message with no active turn (e.g. a late stop)
             messages = req.get("messages", [])
             grounded = bool(req.get("grounded", True))
+            # Client-generated turn id, echoed on the final done so the client
+            # can tell a cancelled turn's done from the live turn's (a stop
+            # followed immediately by a new question overlaps the two).
+            turn_id = req.get("turn")
             # Optional attached run: resolve the job id to artifact paths server-side
             # (the client never handles filesystem paths).
             run = None
@@ -540,9 +544,15 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
 
             def _worker(messages=messages, grounded=grounded, run=run,
                         allow_actions=allow_actions, cancel=cancel, out=out) -> None:
-                gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run,
-                                                     allow_actions=allow_actions)
+                # EVERYTHING inside the try, including building the generator:
+                # session construction (docs index load, embedder init) can
+                # raise, and with it outside the try neither ("error") nor the
+                # ("done") sentinel was ever queued — the socket then hung
+                # forever on out.get(), with the client stuck on "Stop".
+                gen = None
                 try:
+                    gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run,
+                                                         allow_actions=allow_actions)
                     for ev in gen:
                         if cancel.is_set():
                             break
@@ -557,18 +567,27 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                 except Exception as exc:  # noqa: BLE001 - report, keep socket alive
                     loop.call_soon_threadsafe(out.put_nowait, ("error", str(exc)))
                 finally:
-                    gen.close()  # stop the underlying model stream promptly on cancel
+                    if gen is not None:
+                        try:
+                            gen.close()  # stop the model stream promptly on cancel
+                        except Exception:  # noqa: BLE001 - the sentinel must go out
+                            pass
                     loop.call_soon_threadsafe(out.put_nowait, ("done", None))
 
             loop.run_in_executor(None, _worker)
 
-            # Forward events while watching the inbox for a client stop message
-            # (any inbound message during a turn = stop). Keep draining after a
-            # stop until the worker reports done, but stop forwarding tokens.
+            # Forward events while watching the inbox. An explicit {"stop":…}
+            # cancels this turn; a NEW turn ({"messages":…} — the user stopped
+            # and immediately asked again) cancels this one and is carried over
+            # to run next. The old behaviour treated *any* inbound frame as a
+            # stop and threw its payload away, so a question sent right after
+            # Stop vanished permanently with no error. Keep draining after a
+            # cancel until the worker reports done, but stop forwarding tokens.
             get_task = asyncio.ensure_future(out.get())
             inbox_task = asyncio.ensure_future(inbox.get())
             stopped = False
             disconnected = False
+            carry: dict | None = None
             try:
                 while True:
                     waiters = {get_task} | ({inbox_task} if inbox_task else set())
@@ -581,6 +600,8 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                             disconnected = True
                             inbox_task = None      # stop re-arming; drain to done then exit
                         else:
+                            if isinstance(msg, dict) and "messages" in msg:
+                                carry = msg        # latest next-turn request wins
                             inbox_task = asyncio.ensure_future(inbox.get())
                     if get_task in done:
                         kind, value = get_task.result()
@@ -595,7 +616,9 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                     inbox_task.cancel()
             if disconnected:
                 break
-            await websocket.send_json({"done": True})
+            await websocket.send_json({"done": True, "turn": turn_id})
+            if carry is not None:
+                inbox.put_nowait(carry)   # run the question that arrived mid-stop
     except WebSocketDisconnect:
         pass
     finally:

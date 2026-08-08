@@ -305,7 +305,7 @@ export function assistantChat({ onToken, onStatus, onAction, onDone, onError, on
       else if (m.status != null) { if (onStatus) onStatus(m.status); }
       else if (m.action != null) { if (onAction) onAction(m.action); }
       else if (m.error) { if (onError) onError(m.error); }
-      else if (m.done) onDone();
+      else if (m.done) onDone(m.turn);
     };
     ws.onclose = () => {
       if (closed) return;
