@@ -6,7 +6,7 @@ import { createScatter, clusterColor } from "./scatter.js";
 import { createCloud } from "./cloud.js";
 import { createHistogram } from "./histogram.js";
 import { createSlices } from "./slices.js";
-import { parseGrid, parseMesh } from "./wire.js";
+import { FMT, parseGrid, parseMesh, unwrap } from "./wire.js";
 import { makeLive } from "./viewerbase.js";
 
 // Density colormaps (RGB 0–255 control stops, low→high). Default inferno, to
@@ -709,7 +709,7 @@ function updatePoints() {
 // `.slice()` all behave as before, but a row costs a small view object rather than a
 // fresh array of boxed doubles.
 async function fetchMatrix(url) {
-  const buf = await (await fetch(url)).arrayBuffer();
+  const buf = unwrap(await (await fetch(url)).arrayBuffer(), FMT.f32matrix);
   const [rows, cols] = new Int32Array(buf, 0, 2);
   const data = new Float32Array(buf, 8, rows * cols);
   const out = new Array(rows);
@@ -717,7 +717,7 @@ async function fetchMatrix(url) {
   return out;
 }
 async function fetchLabels(url) {
-  const buf = await (await fetch(url)).arrayBuffer();
+  const buf = unwrap(await (await fetch(url)).arrayBuffer(), FMT.i32vector);
   const n = new Int32Array(buf, 0, 1)[0];
   return new Int32Array(buf, 4, n);
 }
@@ -955,7 +955,7 @@ let zInflight = null;  // { k, p } — the request in flight, so concurrent call
 async function fetchVector(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error((await r.text()) || r.statusText);
-  const buf = await r.arrayBuffer();
+  const buf = unwrap(await r.arrayBuffer(), FMT.f32vector);
   const n = new Int32Array(buf, 0, 1)[0];
   return new Float32Array(buf, 4, n);
 }

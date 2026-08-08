@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import numpy as np
 
+import wirefmt
+
 def level_for_sigma(vol: np.ndarray, sigma: float) -> float:
     """Contour level at mean + sigma*std (scale-invariant cryo-EM convention)."""
     return float(vol.mean()) + float(sigma) * (float(vol.std()) or 1.0)
@@ -200,7 +202,8 @@ def mesh_at(vol: np.ndarray, level: float, smooth: int = 0,
     verts = (verts.astype(np.float32) * float(step) + off - size / 2.0) / (size / 2.0)
 
     header = (
-        np.array([verts.shape[0], faces.shape[0]], dtype="<i4").tobytes()
+        wirefmt.header(wirefmt.MESH)
+        + np.array([verts.shape[0], faces.shape[0]], dtype="<i4").tobytes()
         + np.array([level, enclosed_mass(vol, level) * float(step) ** 3, vmax], dtype="<f4").tobytes()
     )
     body = (

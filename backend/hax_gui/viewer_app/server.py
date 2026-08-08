@@ -40,6 +40,7 @@ from exporter import Exporter, _parse_seeds  # noqa: E402
 from landscape import Landscape  # noqa: E402
 from meshing import enclosed_mass, grid_box, level_for_mass, level_for_sigma, mesh_at  # noqa: E402
 from vlog import _TIMING, log_exc as _log_exc, timing as _timing  # noqa: E402
+import wirefmt  # noqa: E402
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -381,13 +382,13 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
     # Layout: int32 rows, int32 cols, then rows*cols float32 (C order).
     def _f32_matrix(a: np.ndarray) -> Response:
         a = np.ascontiguousarray(a, dtype=np.float32)
-        head = np.array(a.shape[:2], dtype="<i4").tobytes()
+        head = wirefmt.header(wirefmt.F32_MATRIX) + np.array(a.shape[:2], dtype="<i4").tobytes()
         return Response(content=head + a.tobytes(), media_type="application/octet-stream")
 
     # Layout: int32 n, then n int32.
     def _i32_vector(a: np.ndarray) -> Response:
         a = np.ascontiguousarray(a, dtype="<i4")
-        head = np.array([a.shape[0]], dtype="<i4").tobytes()
+        head = wirefmt.header(wirefmt.I32_VECTOR) + np.array([a.shape[0]], dtype="<i4").tobytes()
         return Response(content=head + a.tobytes(), media_type="application/octet-stream")
 
     def _out_of_range(index: int) -> HTTPException:
@@ -408,7 +409,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
     # Layout: int32 n, then n float32.
     def _f32_vector(a: np.ndarray) -> Response:
         a = np.ascontiguousarray(a, dtype="<f4")
-        head = np.array([a.shape[0]], dtype="<i4").tobytes()
+        head = wirefmt.header(wirefmt.F32_VECTOR) + np.array([a.shape[0]], dtype="<i4").tobytes()
         return Response(content=head + a.tobytes(), media_type="application/octet-stream")
 
     @app.get("/api/landscape")
@@ -663,7 +664,8 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         # the full volume's — and taking them here keeps the full array out of the request.
         lo, hi = grid_box((full, full, full), ds.shape, step)
         header = (
-            np.array([nx, ny, nz], dtype="<i4").tobytes()
+            wirefmt.header(wirefmt.GRID)
+            + np.array([nx, ny, nz], dtype="<i4").tobytes()
             + np.array([vmin, vmax, float(ds.mean()), float(ds.std())], dtype="<f4").tobytes()
             + np.array(lo + hi, dtype="<f4").tobytes()
         )

@@ -1,11 +1,30 @@
 // Binary wire formats shared by the landscape viewer (app.js) and the map
 // viewer (mrc.js). One parser per format, in one place — these used to be
 // copy-pasted per app and had already started to drift.
+//
+// Every payload starts with an 8-byte prelude: "HXW1" + format id (u8) +
+// format version (u8) + 2 reserved bytes (see wirefmt.py). Before this, a
+// frontend/backend version mismatch — or an HTML error page fetched as
+// arrayBuffer() — was parsed as geometry and rendered as garbage.
+
+export const FMT = { mesh: 1, grid: 2, f32matrix: 3, i32vector: 4, f32vector: 5 };
+const MAGIC = 0x48585731; // "HXW1"
+
+export function unwrap(buf, fmt) {
+  const dv = new DataView(buf);
+  if (buf.byteLength < 8 || dv.getUint32(0, false) !== MAGIC) {
+    throw new Error("unrecognized binary payload — the viewer page and its backend "
+                    + "disagree on the wire format (reload the page / restart the viewer)");
+  }
+  if (dv.getUint8(4) !== fmt) throw new Error(`unexpected payload format ${dv.getUint8(4)} (wanted ${fmt})`);
+  return buf.slice(8);
+}
 
 // int32 nverts, nfaces | float32 level, mass, vmax | positions, normals, indices.
 // `mass` is the enclosed density above the contour: the morph holds it constant
 // across a series, so it has to come back out of the header.
-export function parseMesh(buf) {
+export function parseMesh(wireBuf) {
+  const buf = unwrap(wireBuf, FMT.mesh);
   const dv = new DataView(buf);
   const nverts = dv.getInt32(0, true), nfaces = dv.getInt32(4, true);
   const level = dv.getFloat32(8, true), mass = dv.getFloat32(12, true);
@@ -18,7 +37,8 @@ export function parseMesh(buf) {
 
 // int32 nx, ny, nz | float32 vmin, vmax, mean, std | float32 boxLo[3], boxHi[3] |
 // uint8 data[nx*ny*nz].
-export function parseGrid(buf) {
+export function parseGrid(wireBuf) {
+  const buf = unwrap(wireBuf, FMT.grid);
   const dv = new DataView(buf);
   const nx = dv.getInt32(0, true), ny = dv.getInt32(4, true), nz = dv.getInt32(8, true);
   const vmin = dv.getFloat32(12, true), vmax = dv.getFloat32(16, true), mean = dv.getFloat32(20, true), std = dv.getFloat32(24, true);

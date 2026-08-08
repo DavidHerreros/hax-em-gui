@@ -27,6 +27,8 @@ from meshing import _downsample, grid_box, mesh_at  # noqa: E402
 # --------------------------------------------------------------------------
 def parse_mesh(buf: bytes):
     """Unpack mesh_at's wire format (see its docstring)."""
+    assert buf[:4] == b"HXW1" and buf[4] == 1, "mesh payload must carry the wire prelude"
+    buf = buf[8:]
     nverts, nfaces = (int(v) for v in np.frombuffer(buf[:8], "<i4"))
     off = 8 + 12  # header: 2*i4 + 3*f4 (level, mass, vmax)
     verts = np.frombuffer(buf, "<f4", nverts * 3, off).reshape(-1, 3)

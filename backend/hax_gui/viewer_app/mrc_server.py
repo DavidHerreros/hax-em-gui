@@ -40,6 +40,7 @@ from fastapi.responses import FileResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from meshing import _downsample, grid_box, level_for_mass, level_for_sigma, mesh_at  # noqa: E402
+import wirefmt  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -293,7 +294,8 @@ def _grid_payload(ds: np.ndarray, stats: dict[str, Any], lo, hi) -> bytes:
     u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)
     nx, ny, nz = ds.shape[2], ds.shape[1], ds.shape[0]
     header = (
-        np.array([nx, ny, nz], dtype="<i4").tobytes()
+        wirefmt.header(wirefmt.GRID)
+        + np.array([nx, ny, nz], dtype="<i4").tobytes()
         + np.array([vmin, vmax, stats["mean"], stats["std"]], dtype="<f4").tobytes()
         + np.array(list(lo) + list(hi), dtype="<f4").tobytes()
     )
