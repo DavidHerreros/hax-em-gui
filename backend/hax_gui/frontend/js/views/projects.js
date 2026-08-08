@@ -4,6 +4,7 @@ import { h, mount, clear, append } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
+import { poller } from "../poller.js";
 import { badge, staleBadge, jobsSignature, gpuLabel, jobDisplayName, jobMenuButton, jobTimeEl } from "./jobs.js";
 import { errorBox, formatSize } from "./ui.js";
 import { ProjectManager } from "./projectManager.js";
@@ -155,11 +156,10 @@ function projectPanel(project) {
       if (!stop) mount(execWrap, errorBox(err));
     }
   }
-  refreshJobs();
+  const p = poller(refreshJobs, 3000);
   loadUsage(false);
-  const timer = setInterval(refreshJobs, 3000);
 
-  return { el, cleanup: () => { stop = true; clearInterval(timer); } };
+  return { el, cleanup: () => { stop = true; p.stop(); } };
 }
 
 // One row per run. Its children are grouped into two zones rather than laid out as one

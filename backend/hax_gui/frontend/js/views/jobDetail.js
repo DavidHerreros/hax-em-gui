@@ -1,6 +1,7 @@
 // Live job view: streams the log over WebSocket into a terminal renderer
 // (ANSI colors + progress lines), with cancel / rerun / delete actions.
 import { h, mount, clear } from "../h.js";
+import { poller } from "../poller.js";
 import { icon } from "../icons.js";
 import { api, subscribeLog } from "../api.js";
 import { navigate, reload } from "../router.js";
@@ -370,8 +371,8 @@ export function JobDetailView(params) {
   const isActive = () => status === "running" || status === "pending" || status === "cancelling";
   function updatePolling() {
     const active = isActive();
-    if (active && !poll) poll = setInterval(loadOutputs, 4000);
-    else if (!active && poll) { clearInterval(poll); poll = null; }
+    if (active && !poll) poll = poller(() => loadOutputs(), 4000, { immediate: false });
+    else if (!active && poll) { poll.stop(); poll = null; }
   }
 
   let closeLog = null;
@@ -401,5 +402,5 @@ export function JobDetailView(params) {
   }
   connectLog();
 
-  return { el: root, cleanup: () => { if (closeLog) closeLog(); if (poll) clearInterval(poll); } };
+  return { el: root, cleanup: () => { if (closeLog) closeLog(); if (poll) poll.stop(); } };
 }

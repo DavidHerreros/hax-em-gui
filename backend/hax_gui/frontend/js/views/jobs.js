@@ -9,6 +9,7 @@ import { pickProject } from "./pickProject.js";
 import { openFileBrowser } from "./filePicker.js";
 import { jobLabelChips, loadLabels } from "./labels.js";
 import { store } from "../store.js";
+import { poller } from "../poller.js";
 
 export function badge(status) {
   const animated = status === "running" || status === "pending";
@@ -174,10 +175,9 @@ export function JobsView() {
     }
   }
   loadLabels().catch(() => {});
-  refresh();
-  const timer = setInterval(refresh, 3000);
+  const p = poller(refresh, 3000);
 
-  return { el: root, cleanup: () => { stop = true; clearInterval(timer); } };
+  return { el: root, cleanup: () => { stop = true; p.stop(); } };
 }
 
 function projectKey(job) { return job.project_name || "(no project)"; }

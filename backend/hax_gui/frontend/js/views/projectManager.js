@@ -6,6 +6,7 @@ import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox, formatSize } from "./ui.js";
+import { poller } from "../poller.js";
 import { openContextMenu } from "./contextMenu.js";
 
 export function ProjectManager() {
@@ -190,8 +191,7 @@ export function ProjectManager() {
   const unsub = subscribe(syncStore);
   syncStore();
 
-  load();
-  const timer = setInterval(load, 5000);
+  const p = poller(load, 5000);
 
-  return { el: root, cleanup: () => { stop = true; clearInterval(timer); unsub(); } };
+  return { el: root, cleanup: () => { stop = true; p.stop(); unsub(); } };
 }

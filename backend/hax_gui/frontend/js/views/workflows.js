@@ -7,6 +7,7 @@
 // per-node status, predict<->train parameter inheritance on wiring, file-browser
 // pickers for path args, and "import a project as a workflow".
 import { h, clear, mount } from "../h.js";
+import { poller } from "../poller.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { navigate } from "../router.js";
@@ -1520,7 +1521,7 @@ export function WorkflowsView() {
 
   function startPolling() {
     stopPolling();
-    poll = setInterval(async () => {
+    poll = poller(async () => {
       if (!wf) return stopPolling();
       try {
         const w = await api.workflow(wf.id);
@@ -1541,9 +1542,9 @@ export function WorkflowsView() {
         // old stopPolling() here froze node statuses on the first hiccup with
         // no retry and no indication.
       }
-    }, 2000);
+    }, 2000, { immediate: false });
   }
-  function stopPolling() { if (poll) { clearInterval(poll); poll = null; } }
+  function stopPolling() { if (poll) { poll.stop(); poll = null; } }
   function countStatuses() {
     if (!runState) return "";
     const c = {};
