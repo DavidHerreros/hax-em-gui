@@ -1570,7 +1570,8 @@ async def start_viewer_from_job(job_id: str, space: int | None = None,
     # FlexConsensus: pick one consensus output space; its input space supplies the
     # full latents to decode, and the decoder network is auto-detected.
     if program == "flexconsensus":
-        spaces = _flexconsensus_spaces(job)
+        # Off the loop: resolving spaces can load and compare latent arrays.
+        spaces = await asyncio.to_thread(_flexconsensus_spaces, job)
         if space is None:
             raise HTTPException(status_code=422,
                                 detail={"choose_flexconsensus_space": True,
@@ -1582,7 +1583,8 @@ async def start_viewer_from_job(job_id: str, space: int | None = None,
             raise HTTPException(status_code=422, detail=sp["reason"] or "this consensus space is not viewable")
         title = f"{job.get('name') or 'FlexConsensus'} · {sp['name']}"
         project_dir = projects.dir_for(job.get("project_id"))
-        metadata = _find_latent_metadata(project_dir, sp["input_space"])
+        metadata = await asyncio.to_thread(
+            _find_latent_metadata, project_dir, sp["input_space"], job.get("project_id"))
         return await _ensure_viewer(sp["input_space"], sp["reload"], title, metadata,
                                     str(project_dir) if project_dir else None, sp["consensus"], gpu)
     reload_raw = args.get("pickled_nn") or args.get("reload")
@@ -1591,7 +1593,10 @@ async def start_viewer_from_job(job_id: str, space: int | None = None,
     latents = args.get("z_space") or args.get("latents") or args.get("latents_file")
     if not latents:
         try:
-            latents = adapters.produce("latents", job, settings.data_dir / "viewer_cache" / job_id, "z_space")
+            # Off the loop: extracting the latents column parses per-particle metadata.
+            latents = await asyncio.to_thread(
+                adapters.produce, "latents", job,
+                settings.data_dir / "viewer_cache" / job_id, "z_space")
         except adapters.AdapterError:
             latents = None
     if not latents or not reload_raw:
@@ -1605,17 +1610,26 @@ async def start_viewer_from_job(job_id: str, space: int | None = None,
     reduced = args.get("z_space_reduced")
     title = job.get("name") or job.get("program") or "Conformational landscape"
     project_dir = projects.dir_for(job.get("project_id"))
-    metadata = _find_latent_metadata(project_dir, latents)
+    metadata = await asyncio.to_thread(
+        _find_latent_metadata, project_dir, latents, job.get("project_id"))
     return await _ensure_viewer(latents, reload, title, metadata,
                                 str(project_dir) if project_dir else None, reduced, gpu)
 
 
-def _find_latent_metadata(project_dir: "Path | None", latents: str) -> str | None:
+def _find_latent_metadata(project_dir: "Path | None", latents: str,
+                          project_id: str | None = None) -> str | None:
     """Find the project's particle metadata that is row-aligned with these latents.
 
     The latents `.npy` was materialised from a predict run's `_latent_space` column;
     we recover that metadata (poses/CTF/latent) so layers can be exported with full
     per-particle info. Matched by `_latent_space` presence + row count + first-row value.
+
+    The metadata almost always lives in a predict run's own folder, so those are
+    scanned first (from the job records — a handful of directories) before falling
+    back to a lazy walk of the whole project. The old version `sorted(rglob("*"))`-ed
+    the entire project tree up front and parsed every metadata file on the way — a
+    mature project holds hundreds of GB across millions of files, so opening the
+    viewer hung the server for minutes. Blocking: call from a worker thread.
     """
     if project_dir is None:
         return None
@@ -1626,9 +1640,32 @@ def _find_latent_metadata(project_dir: "Path | None", latents: str) -> str | Non
         lp = Path(latents)
         lat = np.loadtxt(lp) if lp.suffix == ".txt" else np.load(lp)
         lat = np.atleast_2d(np.asarray(lat, dtype=np.float32))
-        for p in sorted(project_dir.rglob("*")):
-            if p.suffix.lower() not in (".xmd", ".star"):
-                continue
+
+        seen: set[Path] = set()
+
+        def _candidates():
+            # Pass 1: predict-run folders, newest jobs first (deterministic).
+            if project_id:
+                for j in manager.list_for_project(project_id):
+                    wd = j.get("workdir")
+                    if not wd or j.get("program") not in _predict_programs():
+                        continue
+                    hits: list[Path] = []
+                    for pat in ("*.xmd", "*.star"):
+                        hits.extend(Path(wd).rglob(pat))
+                    for p in sorted(hits):
+                        if p not in seen:
+                            seen.add(p)
+                            yield p
+            # Pass 2 (fallback): the rest of the project, lazily — no up-front
+            # materialisation, and only suffix matches are ever touched.
+            for pat in ("*.xmd", "*.star"):
+                for p in project_dir.rglob(pat):
+                    if p not in seen:
+                        seen.add(p)
+                        yield p
+
+        for p in _candidates():
             try:
                 md = XmippMetaData(str(p))
                 if not md.isMetaDataLabel("latent_space") or len(md) != lat.shape[0]:
