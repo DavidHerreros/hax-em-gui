@@ -1355,6 +1355,7 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         if index < 0 or index >= decoder.total:
             raise _out_of_range(index)
         import tempfile
+        from starlette.background import BackgroundTask
         from xmipp_metadata.image_handler import ImageHandler
 
         vol = decoder.volume(index)
@@ -1362,13 +1363,17 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
             path = tf.name
         try:
             ImageHandler().write(vol, path, overwrite=True)
-            data = Path(path).read_bytes()
-        finally:
+        except Exception:
             Path(path).unlink(missing_ok=True)
-        return Response(
-            content=data,
+            raise
+        # Stream the file instead of slurping it back into RAM (two extra full
+        # copies of the map, per download); the temp file is removed after the
+        # response has been sent.
+        return FileResponse(
+            path,
             media_type="application/octet-stream",
             headers={"Content-Disposition": f'attachment; filename="state_{index:04d}.mrc"'},
+            background=BackgroundTask(lambda: Path(path).unlink(missing_ok=True)),
         )
 
     @app.get("/api/export_info")

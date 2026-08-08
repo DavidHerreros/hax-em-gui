@@ -42,13 +42,50 @@ from .viewer import viewer_manager
 from .mrc_viewer import mrc_viewer_manager
 from .md_viewer import md_viewer_manager
 
-# Hop-by-hop headers must not be forwarded through the TensorBoard proxy.
+# Hop-by-hop headers must not be forwarded through the reverse proxies.
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
 }
 
+
+async def _proxy(request: "Request", url: str) -> "Response":
+    """Stream one request through to a local subprocess (TB / viewers).
+
+    Streaming, not buffered: the old handlers awaited the full upstream body
+    into memory before answering, so a 512³ map download or a full-resolution
+    mesh staged hundreds of MB in this process — per request. Bytes are
+    forwarded raw (no decode), so upstream content-encoding/length are
+    preserved as-is; the upstream response is closed when the client is done.
+    """
+    from starlette.background import BackgroundTask
+    from starlette.responses import StreamingResponse
+
+    fwd_headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in _HOP_BY_HOP and k.lower() != "host"}
+    body = await request.body()
+    client: httpx.AsyncClient = request.app.state.http
+    upstream = await client.send(
+        client.build_request(request.method, url, headers=fwd_headers, content=body),
+        stream=True,
+    )
+    out_headers = {k: v for k, v in upstream.headers.items()
+                   if k.lower() not in _HOP_BY_HOP}
+    return StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers=out_headers,
+        media_type=upstream.headers.get("content-type"),
+        background=BackgroundTask(upstream.aclose),
+    )
+
 app = FastAPI(title="Hax GUI", version="0.1.0")
+# Compress responses when the browser accepts it (mesh/grid binaries and JSON
+# job lists shrink a lot); already-encoded upstream bodies are left alone
+# (starlette's guard), and small responses aren't worth the header.
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -1513,22 +1550,7 @@ async def tb_proxy(tb_id: str, path: str, request: Request) -> Response:
 
     query = request.url.query
     url = f"http://127.0.0.1:{inst['port']}/tb/{tb_id}/{path}" + (f"?{query}" if query else "")
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP and k.lower() != "host"}
-    body = await request.body()
-
-    upstream = await request.app.state.http.request(request.method, url, headers=fwd_headers, content=body)
-    # httpx already decoded content-encoding, so drop length/encoding and let
-    # the Response recompute them.
-    out_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() not in ("content-encoding", "content-length")
-    }
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=out_headers,
-        media_type=upstream.headers.get("content-type"),
-    )
+    return await _proxy(request, url)
 
 
 # -- WebGL viewer (per-session subprocess, reverse-proxied) ----------------
@@ -1814,19 +1836,7 @@ async def viewer_proxy(vid: str, path: str, request: Request) -> Response:
     # The viewer subprocess serves at root; strip the /viewer/<id> prefix.
     query = request.url.query
     url = f"http://127.0.0.1:{inst['port']}/{path}" + (f"?{query}" if query else "")
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP and k.lower() != "host"}
-    body = await request.body()
-    upstream = await request.app.state.http.request(request.method, url, headers=fwd_headers, content=body)
-    out_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() not in ("content-encoding", "content-length")
-    }
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=out_headers,
-        media_type=upstream.headers.get("content-type"),
-    )
+    return await _proxy(request, url)
 
 
 # -- Map (.mrc) viewer: inspect any volume a job produced -------------------
@@ -2111,19 +2121,7 @@ async def mrc_viewer_proxy(vid: str, path: str, request: Request) -> Response:
         raise HTTPException(status_code=404, detail="unknown map-viewer session")
     query = request.url.query
     url = f"http://127.0.0.1:{inst['port']}/{path}" + (f"?{query}" if query else "")
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP and k.lower() != "host"}
-    body = await request.body()
-    upstream = await request.app.state.http.request(request.method, url, headers=fwd_headers, content=body)
-    out_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() not in ("content-encoding", "content-length")
-    }
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=out_headers,
-        media_type=upstream.headers.get("content-type"),
-    )
+    return await _proxy(request, url)
 
 
 # -- Metadata (.xmd/.star/.cs) viewer: browse any table a job produced ------
@@ -2190,19 +2188,7 @@ async def md_viewer_proxy(vid: str, path: str, request: Request) -> Response:
         raise HTTPException(status_code=404, detail="unknown metadata-viewer session")
     query = request.url.query
     url = f"http://127.0.0.1:{inst['port']}/{path}" + (f"?{query}" if query else "")
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP and k.lower() != "host"}
-    body = await request.body()
-    upstream = await request.app.state.http.request(request.method, url, headers=fwd_headers, content=body)
-    out_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() not in ("content-encoding", "content-length")
-    }
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=out_headers,
-        media_type=upstream.headers.get("content-type"),
-    )
+    return await _proxy(request, url)
 
 
 # -- workflows (visual pipeline builder + DAG engine) ----------------------
