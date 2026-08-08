@@ -7,6 +7,7 @@ import { api, getToken, setToken } from "./api.js";
 import { store, getState, subscribe } from "./store.js";
 import { buildLauncher } from "./views/launcher.js";
 import { startUpdates, updateBadge } from "./updates.js";
+import { startNotifications } from "./notify.js";
 import { loadProgramGroups } from "./programGroups.js";
 import { mountViewerWindow } from "./views/viewerWindow.js";
 import { HomeView } from "./views/home.js";
@@ -141,5 +142,6 @@ defineRoutes([
 
 startRouter();
 startUpdates();
+startNotifications();   // /ws/events → title badge + browser Notification
 loadProgramGroups();   // derive program groupings (moded / predict-latents) from the backend
 mountViewerWindow();   // floating window that hosts all opened viewers as tabs

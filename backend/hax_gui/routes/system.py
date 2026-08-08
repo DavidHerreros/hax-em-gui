@@ -307,3 +307,34 @@ def set_job_labels(job_id: str, body: JobLabels) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="job not found")
     return {"labels": label_manager.set_job_labels(job_id, body.labels)}
 
+
+
+@router.websocket("/ws/events")
+async def events_ws(websocket: WebSocket) -> None:
+    """Global server-push channel: one JSON message per job status transition.
+
+    The SPA opens one of these per tab; views kick their pollers on receipt
+    (poll stays as the fallback), and the notifications module watches for
+    terminal states. See hax_gui/events.py."""
+    from .. import events
+
+    if not _ws_authorized(websocket):
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    queue = events.subscribe()
+    try:
+        shutdown = websocket.app.state.shutdown
+        while True:
+            getter = asyncio.ensure_future(queue.get())
+            stopper = asyncio.ensure_future(shutdown.wait())
+            done, pending = await asyncio.wait({getter, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            if stopper in done:
+                break
+            await websocket.send_json(getter.result())
+    except WebSocketDisconnect:
+        pass
+    finally:
+        events.unsubscribe(queue)

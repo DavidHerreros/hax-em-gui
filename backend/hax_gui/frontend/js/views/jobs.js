@@ -10,6 +10,7 @@ import { openFileBrowser } from "./filePicker.js";
 import { jobLabelChips, loadLabels } from "./labels.js";
 import { store } from "../store.js";
 import { poller } from "../poller.js";
+import { onJobEvent } from "../events.js";
 
 export function badge(status) {
   const animated = status === "running" || status === "pending";
@@ -176,8 +177,9 @@ export function JobsView() {
   }
   loadLabels().catch(() => {});
   const p = poller(refresh, 3000);
+  const offEvents = onJobEvent(() => p.kick());   // push beats the 3 s tick
 
-  return { el: root, cleanup: () => { stop = true; p.stop(); } };
+  return { el: root, cleanup: () => { stop = true; p.stop(); offEvents(); } };
 }
 
 function projectKey(job) { return job.project_name || "(no project)"; }

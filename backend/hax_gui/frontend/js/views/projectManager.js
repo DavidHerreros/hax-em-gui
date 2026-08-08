@@ -7,6 +7,7 @@ import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox, formatSize } from "./ui.js";
 import { poller } from "../poller.js";
+import { onJobEvent } from "../events.js";
 import { openContextMenu } from "./contextMenu.js";
 
 export function ProjectManager() {
@@ -192,6 +193,7 @@ export function ProjectManager() {
   syncStore();
 
   const p = poller(load, 5000);
+  const offEvents = onJobEvent(() => p.kick());   // push beats the 5 s tick
 
-  return { el: root, cleanup: () => { stop = true; p.stop(); unsub(); } };
+  return { el: root, cleanup: () => { stop = true; p.stop(); unsub(); offEvents(); } };
 }

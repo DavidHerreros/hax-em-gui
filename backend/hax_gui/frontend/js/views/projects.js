@@ -5,6 +5,7 @@ import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { poller } from "../poller.js";
+import { onJobEvent } from "../events.js";
 import { badge, staleBadge, jobsSignature, gpuLabel, jobDisplayName, jobMenuButton, jobTimeEl } from "./jobs.js";
 import { errorBox, formatSize } from "./ui.js";
 import { ProjectManager } from "./projectManager.js";
@@ -157,9 +158,10 @@ function projectPanel(project) {
     }
   }
   const p = poller(refreshJobs, 3000);
+  const offEvents = onJobEvent(() => p.kick());   // push beats the 3 s tick
   loadUsage(false);
 
-  return { el, cleanup: () => { stop = true; p.stop(); } };
+  return { el, cleanup: () => { stop = true; p.stop(); offEvents(); } };
 }
 
 // One row per run. Its children are grouped into two zones rather than laid out as one

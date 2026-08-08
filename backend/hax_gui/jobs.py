@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import adapters, db, mdpaths, projects, registry, settings_store, usage
+from . import adapters, db, events, mdpaths, projects, registry, settings_store, usage
 from .command import ValidationError, build_command, strip_obsolete
 from .config import settings
 
@@ -1284,6 +1284,14 @@ class JobManager:
     def _publish(self, job_id: str, message: dict[str, Any]) -> None:
         for queue in self._subscribers.get(job_id, set()):
             queue.put_nowait(message)
+        # Status transitions also fan out on the global /ws/events channel so the
+        # UI updates immediately (and can notify) instead of waiting out a poll.
+        if message.get("type") == "status":
+            job = self.get(job_id) or {}
+            events.publish({"kind": "job", "job_id": job_id, "status": message.get("status"),
+                            "return_code": message.get("return_code"),
+                            "program": job.get("program"), "name": job.get("name"),
+                            "project_id": job.get("project_id")})
 
     # -- reads -------------------------------------------------------------
     def get(self, job_id: str) -> dict[str, Any] | None:
