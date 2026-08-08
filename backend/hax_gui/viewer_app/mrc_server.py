@@ -52,17 +52,42 @@ PALETTE = ["#c8c8c8", "#7fb3ff", "#ff9e7a", "#8fe08f", "#e79aff", "#ffd166", "#6
 
 
 def _load_mrc(path: str) -> np.ndarray:
-    """Read a .mrc/.vol into a writable float32 3D grid (via xmipp ImageHandler)."""
-    from xmipp_metadata.image_handler import ImageHandler
+    """Read a volume into a writable float32 3D grid.
 
-    vol = np.asarray(ImageHandler(path).getData(), dtype=np.float32)
+    `.mrc`/`.vol` go through xmipp's ImageHandler like everywhere else in hax.
+    `.map`/`.ccp4` (and gzipped variants) are the *same* on-disk format, but
+    ImageHandler does not dispatch those suffixes (BINARIES stays None and
+    getData() returns None) — and `.map` is the extension every EMDB deposition
+    ships under, so anyone comparing against a reference map hit a dead end.
+    Read them with mrcfile directly: read-only + permissive, which also avoids
+    ImageHandler's habit of rewriting the header of a file it fails to parse
+    (deposited maps often live on read-only mounts)."""
+    name = Path(path).name.lower()
+    if name.endswith((".map", ".ccp4", ".map.gz", ".mrc.gz", ".ccp4.gz")):
+        import mrcfile
+
+        with mrcfile.open(path, mode="r", permissive=True) as m:
+            if m.data is None:
+                raise ValueError(f"{path}: could not read volume data")
+            vol = np.asarray(m.data, dtype=np.float32)
+    else:
+        from xmipp_metadata.image_handler import ImageHandler
+
+        data = ImageHandler(path).getData()
+        if data is None:
+            raise ValueError(f"{path}: unsupported volume format")
+        vol = np.asarray(data, dtype=np.float32)
     vol = np.squeeze(vol)
     if vol.ndim == 4:
         vol = vol[0]
     if vol.ndim != 3:
         raise ValueError(f"{path} is not a 3D volume (got shape {vol.shape})")
-    # ImageHandler may hand back a read-only view; mesh_at / slicing need a copy.
-    return np.ascontiguousarray(vol, dtype=np.float32)
+    # Both readers can hand back a read-only view (mrcfile flags its data
+    # read-only; ImageHandler can return an mmap view), and mesh_at / slicing
+    # need a writable buffer. ascontiguousarray alone does NOT guarantee a
+    # copy, so force one when needed.
+    vol = np.ascontiguousarray(vol, dtype=np.float32)
+    return vol if vol.flags.writeable else vol.copy()
 
 
 class _Model:

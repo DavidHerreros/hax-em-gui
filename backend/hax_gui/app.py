@@ -1721,7 +1721,7 @@ async def viewer_proxy(vid: str, path: str, request: Request) -> Response:
 
 
 # -- Map (.mrc) viewer: inspect any volume a job produced -------------------
-_MAP_SUFFIXES = (".mrc", ".map", ".vol")
+_MAP_SUFFIXES = (".mrc", ".map", ".vol", ".ccp4")
 _MD_SUFFIXES = (".xmd", ".star", ".cs")
 
 

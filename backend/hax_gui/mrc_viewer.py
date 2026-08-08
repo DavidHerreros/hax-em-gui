@@ -64,7 +64,7 @@ class MrcViewerManager:
             path = Path(one).expanduser().resolve()
             if not path.exists():
                 raise FileNotFoundError(f"map not found: {path}")
-            if path.suffix.lower() not in (".mrc", ".map", ".vol"):
+            if path.suffix.lower() not in (".mrc", ".map", ".vol", ".ccp4"):
                 raise ValueError(f"not a volume file: {path}")
             paths.append(path)
 
