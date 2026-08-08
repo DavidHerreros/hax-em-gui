@@ -7,6 +7,13 @@ const routes = [];
 let outlet = null;
 let onNavigate = null;
 let currentCleanup = null;
+let navGuard = null;      // () => string | null — a message blocks navigation
+let lastPath = null;
+
+// Views with unsaved state register a guard; navigating away asks first.
+// Cleared automatically on every successful navigation (a stale guard from a
+// torn-down view must never block the next one).
+export function setNavGuard(fn) { navGuard = fn; }
 
 export function defineRoutes(list) { routes.push(...list); }
 export function setOutlet(el) { outlet = el; }
@@ -37,6 +44,15 @@ function render(route, params, path) {
 
 function resolve() {
   const path = currentPath();
+  if (navGuard && lastPath !== null && path !== lastPath) {
+    const msg = navGuard();
+    if (msg && !window.confirm(msg)) {
+      history.replaceState(null, "", "#" + lastPath);   // no hashchange refire
+      return;
+    }
+  }
+  navGuard = null;
+  lastPath = path;
   for (const r of routes) {
     const c = r._c || (r._c = compile(r.path));
     const m = path.match(c.re);

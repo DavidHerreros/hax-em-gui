@@ -8,6 +8,7 @@
 // pickers for path args, and "import a project as a workflow".
 import { h, clear, mount } from "../h.js";
 import { poller } from "../poller.js";
+import { setNavGuard } from "../router.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { navigate } from "../router.js";
@@ -1628,5 +1629,11 @@ export function WorkflowsView() {
   boot();
   // cleanup runs before the view is detached, so the canvas is still laid out here and
   // its final scroll/zoom can be recorded.
-  return { el: root, cleanup: () => { rememberViewport(); stopPolling(); document.removeEventListener("keydown", onKey); } };
+  // Unsaved-changes guards: SPA navigation asks via the router; closing or
+  // reloading the tab asks via beforeunload. Both key off the same dirty flag.
+  const unsavedMsg = () => (dirty && wf ? "This workflow has unsaved changes — leave and discard them?" : null);
+  setNavGuard(unsavedMsg);
+  const onBeforeUnload = (e) => { if (unsavedMsg()) { e.preventDefault(); e.returnValue = ""; } };
+  window.addEventListener("beforeunload", onBeforeUnload);
+  return { el: root, cleanup: () => { rememberViewport(); stopPolling(); document.removeEventListener("keydown", onKey); window.removeEventListener("beforeunload", onBeforeUnload); } };
 }

@@ -2,14 +2,16 @@
 // program launcher. Routing for the top-level sections; tabs live in the views.
 import { h, mount } from "./h.js";
 import { icon } from "./icons.js";
-import { defineRoutes, setOutlet, onRoute, startRouter } from "./router.js";
-import { api, getToken, setToken } from "./api.js";
+import { defineRoutes, setOutlet, onRoute, startRouter, currentPath, reload } from "./router.js";
+import { api, ApiError, getToken, setToken } from "./api.js";
 import { store, getState, subscribe } from "./store.js";
 import { buildLauncher } from "./views/launcher.js";
 import { startUpdates, updateBadge } from "./updates.js";
 import { startNotifications } from "./notify.js";
 import { loadProgramGroups } from "./programGroups.js";
+import { poller } from "./poller.js";
 import { mountViewerWindow } from "./views/viewerWindow.js";
+import { promptModal } from "./views/promptModal.js";
 import { HomeView } from "./views/home.js";
 import { ProjectsView } from "./views/projects.js";
 import { SettingsView } from "./views/settings.js";
@@ -32,20 +34,27 @@ const NAV = [
   { path: "/workflows", label: "Workflows", icon: "workflow", match: (p) => p.startsWith("/workflows") },
 ];
 
-// The AI assistant is an optional, separately-installed package. Probe once at
-// startup (top-level await); when it's absent the nav item and route are simply
-// never added, so the GUI is unchanged. Failure to reach the endpoint => hidden.
-let ASSISTANT_AVAILABLE = false;
-try {
-  const s = await api.assistantStatus();
-  ASSISTANT_AVAILABLE = !!s.available;
-} catch { /* server offline or endpoint missing: leave the assistant hidden */ }
-if (ASSISTANT_AVAILABLE) {
-  NAV.push({ path: "/assistant", label: "Assistant", icon: "chat", match: (p) => p.startsWith("/assistant") });
+// The AI assistant is an optional, separately-installed package. Probed in the
+// background — this used to be a top-level await, so a slow or down backend
+// held the entire module (a blank page) hostage to one request. When the probe
+// lands, the route and nav item appear; until then the GUI is simply without it.
+function probeAssistant() {
+  api.assistantStatus().then((s) => {
+    if (!s.available) return;
+    defineRoutes([{ path: "/assistant", view: AssistantView }]);
+    const nav = document.querySelector(".sidebar .nav");
+    if (nav) nav.appendChild(h("a", { href: "#/assistant", "data-path": "/assistant", class: "side-item" },
+                              icon("chat"), labelSpan("Assistant")));
+    if (currentPath().startsWith("/assistant")) reload();   // deep link opened early
+  }).catch(() => { /* offline or endpoint missing: stay hidden */ });
 }
 
 // ---- theme ----
-function initTheme() { document.documentElement.dataset.theme = localStorage.getItem(THEME_KEY) || "dark"; }
+function initTheme() {
+  const stored = localStorage.getItem(THEME_KEY);
+  const preferred = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  document.documentElement.dataset.theme = stored || preferred;
+}
 function currentTheme() { return document.documentElement.dataset.theme === "light" ? "light" : "dark"; }
 function makeThemeToggle() {
   const render = () => {
@@ -72,9 +81,11 @@ function buildSidebar() {
   subscribe(() => collapseBtn.replaceChildren(icon(getState().leftCollapsed ? "chevronRight" : "chevronLeft", 18)));
 
   const settingsLink = h("a", { href: "#/settings", "data-path": "/settings", class: "side-item" }, icon("gear"), labelSpan("Settings"));
-  const tokenBtn = h("button", { class: "side-item", onclick: () => {
-    const t = window.prompt("Access token (leave empty if the server has none):", getToken());
-    if (t !== null) { setToken(t.trim()); location.reload(); }
+  const tokenBtn = h("button", { class: "side-item", onclick: async () => {
+    const t = await promptModal({ title: "Access token", okText: "Apply",
+                                  label: "Bearer token for this server (leave empty if it has none):",
+                                  value: getToken() });
+    if (t !== null) { setToken(t); location.reload(); }
   } }, icon("cpu"), labelSpan("Access token"));
   const docsLink = h("a", { href: DOCS_URL, target: "_blank", rel: "noreferrer", class: "side-item docs" }, icon("book"), labelSpan("Documentation"));
 
@@ -137,11 +148,22 @@ defineRoutes([
   { path: "/viewer", view: ViewerView },
   { path: "/settings", view: SettingsView },
   { path: "/workflows", view: WorkflowsView },
-  ...(ASSISTANT_AVAILABLE ? [{ path: "/assistant", view: AssistantView }] : []),
 ]);
 
 startRouter();
 startUpdates();
 startNotifications();   // /ws/events → title badge + browser Notification
+probeAssistant();
+
+// ---- backend-gone indicator -------------------------------------------------
+// A fetch that *throws* is a network failure (server down / unreachable); any
+// HTTP answer — even a 401 — means the backend is there.
+const offlineBar = h("div", { class: "offline-bar", hidden: true },
+                     "Backend unreachable — retrying…");
+document.body.appendChild(offlineBar);
+poller(async () => {
+  try { await api.health(); offlineBar.hidden = true; }
+  catch (err) { offlineBar.hidden = err instanceof ApiError; }
+}, 10000);
 loadProgramGroups();   // derive program groupings (moded / predict-latents) from the backend
 mountViewerWindow();   // floating window that hosts all opened viewers as tabs

@@ -178,7 +178,7 @@ function execList(jobs, sizes, hooks) {
     // way and hidden, so naming a run reveals it without waiting for the next refresh.
     const prog = h("span", { class: "exec-prog mono", hidden: !j.name }, j.program);
     const a = h(
-      "a", { class: "exec-row", href: "#/jobs/" + j.id, title: "Drag onto a compatible input to chain it", style: { animationDelay: `${i * 0.02}s` } },
+      "a", { class: "exec-row", href: "#/jobs/" + j.id, title: "Drag onto a compatible input to chain it", style: { animationDelay: `${Math.min(i, 30) * 0.02}s` } },
       h("span", { class: "exec-grip", title: "Drag as input" }, icon("more", 14)),
       badge(j.status),
       staleBadge(j),

@@ -1409,3 +1409,11 @@ body.vwin-dragging iframe { pointer-events: none; }
 .fp-selectall:hover { color: var(--text); }
 .fp-selectall[hidden] { display: none; }
 .fp-selectall .fp-pick { margin: 0; }
+
+/* Backend-gone indicator (see the health poller in app.js). */
+.offline-bar {
+  position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+  background: color-mix(in srgb, var(--warn) 22%, var(--panel));
+  color: var(--warn); border: 1px solid var(--warn);
+  padding: 6px 14px; border-radius: 8px; font-size: 13px; z-index: 300;
+}

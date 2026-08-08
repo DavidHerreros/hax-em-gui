@@ -307,7 +307,7 @@ function row(job, i, hooks) {
   const title = h("span", { class: "prog" }, jobDisplayName(job));
   const a = h(
     "a",
-    { class: "job-row", href: "#/jobs/" + job.id, style: { animationDelay: `${i * 0.02}s` } },
+    { class: "job-row", href: "#/jobs/" + job.id, style: { animationDelay: `${Math.min(i, 30) * 0.02}s` } },
     badge(job.status),
     staleBadge(job),
     title,
