@@ -179,6 +179,25 @@ def _read_exit(path: str) -> int | None:
         return None
 
 
+_VERSIONS: dict[str, str] | None = None
+
+
+def _pkg_versions() -> dict[str, str]:
+    """Installed versions of the packages that determine what a run computes.
+    Cached: they cannot change under a running server (an update restarts it)."""
+    global _VERSIONS
+    if _VERSIONS is None:
+        import importlib.metadata as md
+        out = {}
+        for pkg in ("hax-em", "hax-em-gui", "jax", "flax"):
+            try:
+                out[pkg] = md.version(pkg)
+            except md.PackageNotFoundError:
+                pass
+        _VERSIONS = out
+    return _VERSIONS
+
+
 def _wrap(command: list[str], exit_path: str) -> list[str]:
     """Run `command`, then leave its exit status somewhere a future server can read it.
 
@@ -235,7 +254,8 @@ class JobManager:
         )
         # Add columns to pre-existing databases (idempotent).
         for col in ("project_id TEXT", "workdir TEXT", "cwd TEXT", "name TEXT", "bindings TEXT",
-                    "pgid INTEGER", "proc_key TEXT", "stale INTEGER NOT NULL DEFAULT 0"):
+                    "pgid INTEGER", "proc_key TEXT", "stale INTEGER NOT NULL DEFAULT 0",
+                    "provenance TEXT"):
             try:
                 self._db.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -440,6 +460,14 @@ class JobManager:
         # Persist the input bindings so a later rerun can re-materialise them into
         # the rebuilt run folder (the produced files live in this job's workdir).
         bindings_val = json.dumps(bindings) if bindings else None
+        # Provenance: what produced this run. The versions answer "which hax was
+        # this?" months later; dropped_args records what strip_obsolete removed
+        # on a rerun instead of only mentioning it in the log.
+        provenance_val = json.dumps({
+            "packages": _pkg_versions(),
+            "dropped_args": list(dropped_args or []),
+            "stamped_at": _now(),
+        })
         if replace_job_id:
             # Replace in place: keep the same id (and created_at, so the row stays put in
             # lists). The run folder is normally the same one, already cleared above.
@@ -455,10 +483,10 @@ class JobManager:
             # a merely-saved replacement correctly ends up with neither.
             self._exec(
                 "UPDATE jobs SET program=?, name=?, args=?, gpu=?, command=?, status=?, log_path=?, "
-                "workdir=?, cwd=?, bindings=?, stale=0, return_code=NULL, started_at=NULL, "
+                "workdir=?, cwd=?, bindings=?, provenance=?, stale=0, return_code=NULL, started_at=NULL, "
                 "finished_at=NULL WHERE id=?",
                 (program, name_val, json.dumps(values), gpu or None, json.dumps(command),
-                 status, str(log_path), str(workdir), cwd, bindings_val, replace_job_id),
+                 status, str(log_path), str(workdir), cwd, bindings_val, provenance_val, replace_job_id),
             )
             # A different folder only happens when this job's *name* changed under it: a
             # run made before folders were named after the job (legacy `<program>_<stamp>_
@@ -472,10 +500,10 @@ class JobManager:
                     usage.forget(str(old_wd))
         else:
             self._exec(
-                "INSERT INTO jobs (id, program, name, args, gpu, command, status, log_path, created_at, project_id, workdir, cwd, bindings) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO jobs (id, program, name, args, gpu, command, status, log_path, created_at, project_id, workdir, cwd, bindings, provenance) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, program, name_val, json.dumps(values), gpu or None,
-                 json.dumps(command), status, str(log_path), _now(), project_id, str(workdir), cwd, bindings_val),
+                 json.dumps(command), status, str(log_path), _now(), project_id, str(workdir), cwd, bindings_val, provenance_val),
             )
         self._init_buffers(job_id)
         if launch:
@@ -1380,6 +1408,7 @@ class JobManager:
         data["args"] = json.loads(data["args"])
         data["command"] = json.loads(data["command"])
         data["bindings"] = json.loads(data["bindings"]) if data.get("bindings") else None
+        data["provenance"] = json.loads(data["provenance"]) if data.get("provenance") else None
         data["active"] = data["status"] in ACTIVE
         # Its inputs were re-made after it ran, so its outputs no longer correspond to
         # anything that exists (see :meth:`mark_stale`).

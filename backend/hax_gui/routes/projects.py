@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from .. import adapters, projects, settings_store, usage
@@ -217,3 +217,47 @@ async def create_project_job(project_id: str, body: JobCreate) -> dict[str, Any]
     return created
 
 
+
+
+@router.get("/api/projects/{project_id}/export", dependencies=[Depends(auth)])
+async def export_project(project_id: str):
+    """Download the project as a .tar.gz (folder + job-record manifest), for
+    moving it to another machine — see hax_gui/transfer.py."""
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    from .. import transfer
+
+    _project_or_404(project_id)
+    try:
+        # Off the loop: tarring a project can walk many GB.
+        path = await asyncio.to_thread(transfer.export_project, project_id)
+    except transfer.TransferError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return FileResponse(str(path), media_type="application/gzip",
+                        filename=f"{project_id}.hax-project.tar.gz",
+                        background=BackgroundTask(lambda: path.unlink(missing_ok=True)))
+
+
+@router.post("/api/projects/import", dependencies=[Depends(auth)])
+async def import_project(request: Request) -> dict[str, Any]:
+    """Import a project export. The request body is the raw .tar.gz bytes
+    (streamed to disk — no multipart, no size-of-project RAM spike)."""
+    import tempfile
+    from pathlib import Path as _P
+
+    from .. import transfer
+
+    fd, tmp = tempfile.mkstemp(suffix=".tar.gz", prefix="hax_import_upload_")
+    try:
+        with open(fd, "wb") as f:
+            async for chunk in request.stream():
+                f.write(chunk)
+        result = await asyncio.to_thread(transfer.import_project, _P(tmp))
+    except transfer.TransferError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except ProjectsRootUnset as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    finally:
+        _P(tmp).unlink(missing_ok=True)
+    return result

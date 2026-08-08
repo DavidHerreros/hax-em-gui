@@ -112,3 +112,45 @@ def test_workflow_crud_roundtrip(client, run, project):
     r = run(client.delete(f"/api/workflows/{wid}"))
     assert r.status_code == 200
     assert run(client.get(f"/api/workflows/{wid}")).status_code == 404
+
+
+def test_project_export_import_roundtrip(client, run, project, md_file):
+    """Export the project, import it back. Importing onto the same server keeps
+    the folder (fresh name) but skips job rows whose ids already exist; once the
+    originals are deleted, a second import brings the rows through with their
+    paths remapped into the new project folder."""
+    r = run(client.post(f"/api/projects/{project['id']}/jobs", json={
+        "program": "estimate_latent_covariances", "args": {"md": str(md_file)}, "launch": True}))
+    assert r.status_code == 200, r.text
+    jid = r.json()["id"]
+    wait_for_status(client, run, jid, {"succeeded"})
+    job = run(client.get(f"/api/jobs/{jid}")).json()
+    assert job["provenance"] and "packages" in job["provenance"]   # provenance stamped
+
+    r = run(client.get(f"/api/projects/{project['id']}/export"))
+    assert r.status_code == 200
+    blob = r.content
+    assert blob[:2] == b"\x1f\x8b"          # gzip magic
+
+    r = run(client.post("/api/projects/import", content=blob))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["project"]["id"] != project["id"]      # fresh folder name
+    assert jid in out["skipped"]                       # same server: rows already exist
+
+    # delete the original rows, import again: now the jobs come through, remapped
+    for j in run(client.get(f"/api/projects/{project['id']}/jobs")).json():
+        run(client.delete(f"/api/jobs/{j['id']}"))
+    r = run(client.post("/api/projects/import", content=blob))
+    assert r.status_code == 200, r.text
+    out2 = r.json()
+    assert out2["imported"] >= 1 and not out2["skipped"]
+    imported_jobs = run(client.get(f"/api/projects/{out2['project']['id']}/jobs")).json()
+    assert any(j["id"] == jid for j in imported_jobs)
+    the_job = next(j for j in imported_jobs if j["id"] == jid)
+    assert the_job["workdir"].startswith(out2["project"]["path"])   # paths remapped
+    # cleanup the imported copies
+    for p2 in (out["project"], out2["project"]):
+        for j in run(client.get(f"/api/projects/{p2['id']}/jobs")).json():
+            run(client.delete(f"/api/jobs/{j['id']}"))
+        run(client.delete(f"/api/projects/{p2['id']}"))
