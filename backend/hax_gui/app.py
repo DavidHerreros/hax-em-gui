@@ -153,6 +153,9 @@ async def _on_startup(app: FastAPI) -> None:
 async def _warm_assistant(app: FastAPI) -> None:
     """Bring up Ollama (when managed), then build the assistant's doc index —
     in that order, so the index embeds against a live Ollama."""
+    import os
+    if os.environ.get("HAX_GUI_ASSISTANT_WARMUP", "1") in ("0", "false", "no"):
+        return   # tests / minimal deployments: skip Ollama and the index build
     if not assistant_bridge.available():
         return
     if settings.manage_ollama:
@@ -172,9 +175,10 @@ async def _warm_assistant(app: FastAPI) -> None:
 
 async def _on_shutdown(app: FastAPI) -> None:
     app.state.shutdown.set()  # unblock idle log WebSockets so the server can exit
-    poller = getattr(app.state, "update_poller", None)
-    if poller is not None:
-        poller.cancel()
+    for name in ("update_poller", "viewer_reaper"):
+        task = getattr(app.state, name, None)
+        if task is not None:
+            task.cancel()
     tb_manager.shutdown()
     viewer_manager.shutdown()
     mrc_viewer_manager.shutdown()
