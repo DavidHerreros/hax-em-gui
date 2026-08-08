@@ -204,14 +204,22 @@ export function JobDetailView(params) {
   }
 
   // ── outputs this run produced: inspect maps (.mrc) and metadata (.xmd/.star/.cs) ──
-  async function loadOutputs() {
+  let outputsSig = null;
+  async function loadOutputs(force) {
     const [m, t] = await Promise.allSettled([api.jobMrcs(id), api.jobMetadata(id)]);
     const mapsF = m.status === "fulfilled" ? (m.value.files || []) : [];
     const tablesF = t.status === "fulfilled" ? (t.value.files || []) : [];
     // While the run is active, keep the section (with a refresh) visible even when
     // empty, so files show up as they're written without reopening the view.
     const active = isActive();
-    renderGroup(maps, "produced", mapsF, tablesF, loadOutputs, active);
+    // Rebuild only when the file set actually changed: the 4 s poll used to
+    // clear+rebuild unconditionally, wiping hover state and an in-flight
+    // "Opening…" button mid-interaction.
+    const sig = [active, ...mapsF.map((f) => `${f.path}:${f.size}`),
+                 "|", ...tablesF.map((f) => `${f.path}:${f.size}`)].join(",");
+    if (!force && sig === outputsSig) return;
+    outputsSig = sig;
+    renderGroup(maps, "produced", mapsF, tablesF, () => loadOutputs(true), active);
   }
   async function loadInputs() {
     let mapsF = [], tablesF = [];

@@ -1526,13 +1526,21 @@ export function WorkflowsView() {
         const w = await api.workflow(wf.id);
         wf = w; runState = w.run_state || null;
         // when a run settles, adopt the server graph so live node<->job links and
-        // statuses (project workflows write job ids back) are reflected
-        if (w.status !== "running" && w.graph) { adoptGraph(w.graph); if (!dirty) renderInspector(); }
+        // statuses (project workflows write job ids back) are reflected.
+        // NOT while `dirty`: adoptGraph replaces the node objects the open
+        // inspector is writing into, so a run finishing mid-edit silently
+        // discarded the user's keystrokes on the next Save. The user's graph
+        // wins until they save or reopen.
+        if (w.status !== "running" && w.graph && !dirty) { adoptGraph(w.graph); renderInspector(); }
         renderNodes();
         const counts = countStatuses();
         flash(`${w.status} — ${counts}`, w.status === "running" ? "busy" : (w.status === "succeeded" ? "muted" : "err"));
         if (w.status !== "running") stopPolling();
-      } catch { stopPolling(); }
+      } catch {
+        // Transient fetch failure (server restart, blip): keep polling — the
+        // old stopPolling() here froze node statuses on the first hiccup with
+        // no retry and no indication.
+      }
     }, 2000);
   }
   function stopPolling() { if (poll) { clearInterval(poll); poll = null; } }

@@ -169,6 +169,7 @@ export function JobsView() {
       syncFilters();
       renderBody();
     } catch (err) {
+      lastSig = null; // next successful poll must repaint over the error box
       if (!stop) mount(body, errorBox(err));
     }
   }

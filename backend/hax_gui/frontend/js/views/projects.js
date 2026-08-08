@@ -124,7 +124,18 @@ function projectPanel(project) {
 
   let stop = false;
   let lastSig = null;
+  let lastJobs = [];
   let animatedOnce = false;
+  // A rename patches the row's DOM in place; realign the signature to what we
+  // already show, or the next 3 s poll sees the new name, rebuilds the whole
+  // list and the scroll jumps to the top (same fix as the Jobs view).
+  const hooks = {
+    afterLocalRename(u) {
+      const i = lastJobs.findIndex((j) => j.id === u.id);
+      if (i >= 0) lastJobs[i] = u;
+      lastSig = jobsSignature(lastJobs);
+    },
+  };
   loadLabels().catch(() => {});
   async function refreshJobs() {
     try {
@@ -133,12 +144,14 @@ function projectPanel(project) {
       const sig = jobsSignature(jobs);
       if (sig === lastSig) return; // unchanged -> skip rebuild (avoids flicker)
       lastSig = sig;
-      mount(execWrap, jobs.length ? execList(jobs, sizes) : h("p", { class: "muted" }, "No runs yet."));
+      lastJobs = jobs;
+      mount(execWrap, jobs.length ? execList(jobs, sizes, hooks) : h("p", { class: "muted" }, "No runs yet."));
       // Animate rows only on first paint; later refreshes rebuild the list and
       // re-animating them (e.g. after adding a label) makes it visibly "jump".
       execWrap.classList.toggle("no-anim", animatedOnce);
       animatedOnce = true;
     } catch (err) {
+      lastSig = null; // next successful poll must repaint over the error box
       if (!stop) mount(execWrap, errorBox(err));
     }
   }
@@ -155,7 +168,7 @@ function projectPanel(project) {
 // folder — the only parts with anything to truncate — collapsed to a single letter each.
 // Now the identity zone is the only thing that gives (`min-width: 0`, ellipsis), and the
 // meta zone keeps its natural size.
-function execList(jobs, sizes) {
+function execList(jobs, sizes, hooks) {
   return h("div", { class: "exec-list" }, ...jobs.map((j, i) => {
     const title = h("span", { class: "exec-name" }, jobDisplayName(j));
     // The program is the row's title when the run has no custom name, so printing it
@@ -179,7 +192,7 @@ function execList(jobs, sizes) {
         gpuLabel(j.gpu) ? h("span", { class: "muted small exec-gpu" }, gpuLabel(j.gpu)) : null,
         jobTimeEl(j, "exec-time")),
       jobMenuButton(j, {
-        onRenamed: (u) => { title.textContent = jobDisplayName(u); prog.hidden = !u.name; },
+        onRenamed: (u) => { title.textContent = jobDisplayName(u); prog.hidden = !u.name; hooks?.afterLocalRename?.(u); },
         onDeleted: () => a.remove(),
       }));
     makeJobDraggable(a, j);

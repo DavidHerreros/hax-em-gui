@@ -65,10 +65,15 @@ export function ProjectManager() {
     try {
       const list = await api.projects();
       if (stop) return;
+      // A rename input is open: never rebuild the cards under it (the poll used
+      // to wipe the user's text every 5 s — the old condition was inverted).
+      // sig is dropped so the first poll after the rename closes repaints.
+      if (renamingId !== null) { sig = null; return; }
       const s = list.map((p) => `${p.id}:${p.name}:${p.runs}`).join("|");
-      if (s === sig && renamingId === null) return; // unchanged -> avoid flicker
+      if (s === sig) return; // unchanged -> avoid flicker
       sig = s; projects = list; renderCards();
     } catch (err) {
+      sig = null; // next successful poll must repaint over the error box
       if (!stop) mount(cards, errorBox(err));
     }
   }
