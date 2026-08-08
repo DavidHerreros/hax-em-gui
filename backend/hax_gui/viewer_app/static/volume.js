@@ -49,7 +49,8 @@ void main() {
   vec3 ro = uEye;
   vec3 rd = normalize(toWorld(vec3(vUv * 2.0 - 1.0, 1.0)) - ro);
   vec3 inv = 1.0 / rd;
-  vec3 boxInv = 1.0 / (uBoxHi - uBoxLo);     // model -> [0,1]; box is in model/numpy-axis order
+  vec3 boxInv = 1.0 / (uBoxHi - uBoxLo);     // model -> [0,1]; box is in model (x,y,z) order,
+                                             // matching the texture layout (s,t,r) = (x,y,z)
   vec3 t0 = (uBoxLo - ro) * inv, t1 = (uBoxHi - ro) * inv;
   vec3 tmin = min(t0, t1), tmax = max(t0, t1);
   float tn = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
@@ -65,7 +66,7 @@ void main() {
     float m = 0.0;
     for (int i = 0; i < 512; i++) {
       if (i >= steps) break;
-      float s = density(((ro + rd * t - uBoxLo) * boxInv).zyx);
+      float s = density((ro + rd * t - uBoxLo) * boxInv);
       m = max(m, s); t += dt;
     }
     float v = pow(clamp((m - uThreshold) / denom, 0.0, 1.0), uGamma) * uBright;
@@ -74,7 +75,7 @@ void main() {
     vec3 acc = vec3(0.0); float alpha = 0.0;
     for (int i = 0; i < 512; i++) {
       if (i >= steps) break;
-      float s = density(((ro + rd * t - uBoxLo) * boxInv).zyx);
+      float s = density((ro + rd * t - uBoxLo) * boxInv);
       float d = pow(clamp((s - uThreshold) / denom, 0.0, 1.0), uGamma) * uBright;
       float a = clamp(d * 0.12, 0.0, 1.0) * (1.0 - alpha);
       acc += a * uColor; alpha += a;

@@ -743,9 +743,10 @@ def grid_box(full_shape, ds_shape, step: int, full_size: int | None = None, offs
     The strided grid samples voxels `{0, step, 2*step, ...}`, so its sample `j` sits at
     `2*(j*step + off)/S - 1` — exactly where the mesh puts that voxel. Corners are
     edge-extended by half a cell so a ray-marcher recovers the texture coord with a plain
-    `(p - lo)/(hi - lo)`. Returned per **model axis** = numpy axis (X=axis 0, Y=axis 1,
-    Z=axis 2), matching the marching-cubes vertex order — the ray-marcher swaps to its
-    own texture-axis order itself.
+    `(p - lo)/(hi - lo)`. Inputs (`full_shape`, `ds_shape`, `offset`) are in **numpy axis
+    order**; the returned corners are in **model (x, y, z) order** — numpy axes reversed —
+    matching the flipped marching-cubes vertices (see `mesh_at`), so the ray-marcher
+    samples the texture with no swizzle: normalized model coords are texture (s, t, r).
 
     `full_size` and `offset` mirror `mesh_at`'s: pass the same values there and here, or
     the surface and the ray-march will disagree about where the map is."""
@@ -754,7 +755,7 @@ def grid_box(full_shape, ds_shape, step: int, full_size: int | None = None, offs
     half = step / S                                   # half a strided cell, model units
     lo = [2.0 * o / S - 1.0 - half for o in off]
     hi = [(2 * (n * step + off[a]) - step) / S - 1.0 for a, n in enumerate(ds_shape)]
-    return lo, hi
+    return lo[::-1], hi[::-1]
 
 
 def _scatter_add(idx: np.ndarray, vals: np.ndarray, n: int) -> np.ndarray:
@@ -827,7 +828,8 @@ def mesh_at(vol: np.ndarray, level: float, smooth: int = 0,
 
     int32 nverts, int32 nfaces, float32 level, float32 mass, float32 vmax,
     then float32[nverts*3] positions, float32[nverts*3] normals,
-    then uint32[nfaces*3] indices. Positions are normalized to a [-1,1] cube.
+    then uint32[nfaces*3] indices. Positions are normalized to a [-1,1] cube, in
+    spatial (x, y, z) order — numpy axes reversed, see the flip below.
     `smooth` runs that many Taubin smoothing iterations on the surface.
 
     `step`/`full_size` describe a *draft* mesh taken from a strided view of a bigger
@@ -856,12 +858,25 @@ def mesh_at(vol: np.ndarray, level: float, smooth: int = 0,
         faces = np.zeros((0, 3), np.int64)
         normals = np.zeros((0, 3), np.float32)
 
+    # marching_cubes returns coordinates in array-index order (axis0, axis1, axis2),
+    # which for an MRC-convention volume is (z, y, x). Rendering that directly as
+    # model (x, y, z) is a transposition (det = -1): every map came out mirror-imaged
+    # (left-handed alpha-helices). Flip to spatial (x, y, z) order, and reverse the
+    # triangle winding so the faces' geometric orientation stays consistent with the
+    # flipped normals (`_vertex_normals` re-derives normals from winding after
+    # smoothing, and a mirror alone would flip their sense).
+    verts = verts[:, ::-1]
+    normals = normals[:, ::-1]
+    faces = faces[:, ::-1]
+
     if smooth and faces.shape[0] > 0:
         verts = _taubin_smooth(verts, faces, smooth)
         normals = _vertex_normals(verts, faces)   # recompute from the relaxed surface
 
     size = float(full_size if full_size else max(vol.shape))
-    off = np.zeros(3, np.float32) if offset is None else np.asarray(offset, np.float32)
+    # `offset` arrives in numpy axis order (callers derive it from vol.shape);
+    # the vertices were just flipped to spatial order, so flip it to match.
+    off = np.zeros(3, np.float32) if offset is None else np.asarray(offset, np.float32)[::-1]
     verts = (verts.astype(np.float32) * float(step) + off - size / 2.0) / (size / 2.0)
 
     header = (
