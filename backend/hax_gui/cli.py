@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from .config import settings
+from .config import is_loopback_host, settings
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -170,8 +170,21 @@ def cmd_start(args: argparse.Namespace) -> int:
     if args.reload:
         cmd.append("--reload")
 
+    # Tell the server what it is bound to (drives the Host allowlist), and never
+    # start open on a public interface: without HAX_GUI_TOKEN, mint/reuse the
+    # persisted token and say where it lives. The job API is command execution
+    # as this user — exposing it unauthenticated was the old (bad) default.
+    env = {**os.environ, "HAX_GUI_BIND_HOST": host}
+    if not is_loopback_host(host) and not os.environ.get("HAX_GUI_TOKEN"):
+        env["HAX_GUI_TOKEN"] = settings.load_or_create_token()
+        print(_warn("Public bind: an access token is now required.") +
+              f" Token file: {settings.token_path}")
+        print("Browsers will prompt for it; set " + _bold("HAX_GUI_TOKEN") +
+              " to use a different one.")
+
     if args.foreground:
         print(_bold(f"Starting hax-gui (foreground) on http://{_connect_host(host)}:{port}") + " — Ctrl-C to stop.")
+        os.environ.update(env)
         os.execvp(cmd[0], cmd)   # replace this process; never returns
         return 0                 # unreachable
 
@@ -182,6 +195,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     proc = subprocess.Popen(
         cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
         start_new_session=True,   # survive the CLI exiting / terminal close
+        env=env,
     )
     _write_state({"pid": proc.pid, "host": host, "port": port,
                   "started_at": datetime.now(timezone.utc).isoformat()})

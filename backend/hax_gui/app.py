@@ -32,7 +32,7 @@ from . import branches, cascade, gpus, groups, projects, registry, settings_stor
 from .branches import BranchError
 from .updater import UpdateBlocked, UpdateBusy, updater
 from .command import ValidationError
-from .config import settings
+from .config import is_loopback_host, settings
 from .jobs import ACTIVE, JobActive, JobNotFound, JobNotResumable, JobNotSaved, ProjectNotFound, manager
 from .labels import manager as label_manager
 from .workflows import StepsRunning, WorkflowError, manager as wf_manager
@@ -70,6 +70,60 @@ _CSP = (
     "frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
 )
 _CSP_EXEMPT = ("/tb/", "/viewer/", "/mrcviewer/", "/mdviewer/")
+
+
+# --- auth-by-default -------------------------------------------------------
+# The job API is arbitrary command execution as the server user, so an open
+# server is only tolerable when nothing but this machine can reach it. On a
+# public bind with no HAX_GUI_TOKEN the app adopts a persisted token instead of
+# starting open (hax-gui start prints where it lives).
+_auth_note = settings.ensure_auth_for_bind()
+if _auth_note:
+    print(f"[hax-gui] {_auth_note}", flush=True)
+print("[hax-gui] auth: " + ("token required" if settings.auth_token else
+      "OPEN (no token; loopback only — set HAX_GUI_TOKEN before sharing this machine)"),
+      flush=True)
+
+
+def _host_allowed(hostport: str | None) -> bool:
+    """Reject requests whose Host header we don't recognise (DNS rebinding).
+
+    A hostile page pointed at a domain that resolves to this server becomes
+    same-origin with the API — CORS never enters into it — and on an open
+    loopback server that is full read + command execution. So: on a loopback
+    bind only loopback names are accepted; on a public bind the legitimate name
+    can't be inferred, so a list applies only when HAX_GUI_ALLOWED_HOSTS is set
+    (auth is always on for public binds, which closes the unauthenticated
+    hole). "*" disables the check."""
+    if "*" in settings.allowed_hosts:
+        return True
+    if not hostport:
+        return False
+    if hostport.startswith("["):                     # [::1]:8000
+        host = hostport.split("]", 1)[0] + "]"
+    else:
+        host = hostport.rsplit(":", 1)[0] if ":" in hostport else hostport
+    host = host.strip("[]").lower()
+    if any(host == h.strip("[]").lower() for h in settings.allowed_hosts):
+        return True
+    if settings.is_public_bind:
+        return not settings.allowed_hosts
+    return is_loopback_host(host)
+
+
+@app.middleware("http")
+async def host_allowlist(request: Request, call_next):
+    if not _host_allowed(request.headers.get("host")):
+        return Response("unrecognized Host header", status_code=421, media_type="text/plain")
+    return await call_next(request)
+
+
+def _ws_authorized(websocket: WebSocket) -> bool:
+    """Host allowlist + ?token= (browsers can't set headers on WebSockets)."""
+    if not _host_allowed(websocket.headers.get("host")):
+        return False
+    return (not settings.auth_token
+            or websocket.query_params.get("token") == settings.auth_token)
 
 
 @app.middleware("http")
@@ -272,7 +326,7 @@ async def assistant_prepare_motion_ws(websocket: WebSocket) -> None:
     """Run the (confirmed) prepare-motion pipeline for a job, streaming progress
     lines. Client sends ``{job_id, gpu}``; server streams ``{status}`` then a final
     ``{done, deformation_dir}`` or ``{error}``."""
-    if settings.auth_token and websocket.query_params.get("token") != settings.auth_token:
+    if not _ws_authorized(websocket):
         await websocket.close(code=4401)
         return
     await websocket.accept()
@@ -394,7 +448,7 @@ def ollama_status() -> dict[str, Any]:
 
 @app.websocket("/ws/assistant/chat")
 async def assistant_chat_ws(websocket: WebSocket) -> None:
-    if settings.auth_token and websocket.query_params.get("token") != settings.auth_token:
+    if not _ws_authorized(websocket):
         await websocket.close(code=4401)
         return
     await websocket.accept()
@@ -632,7 +686,7 @@ async def run_update(body: UpdateRun) -> dict[str, Any]:
 
 @app.websocket("/ws/updates/log")
 async def update_log_ws(websocket: WebSocket) -> None:
-    if settings.auth_token and websocket.query_params.get("token") != settings.auth_token:
+    if not _ws_authorized(websocket):
         await websocket.close(code=4401)
         return
     await websocket.accept()
@@ -1155,7 +1209,7 @@ def delete_job(job_id: str) -> dict[str, bool]:
 @app.websocket("/ws/jobs/{job_id}/log")
 async def job_log_ws(websocket: WebSocket, job_id: str) -> None:
     # WebSockets can't send custom headers from the browser, so auth via ?token=.
-    if settings.auth_token and websocket.query_params.get("token") != settings.auth_token:
+    if not _ws_authorized(websocket):
         await websocket.close(code=4401)
         return
     job = manager.get(job_id)
