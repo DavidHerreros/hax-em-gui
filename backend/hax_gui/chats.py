@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from . import db
 from .config import settings
 
 
@@ -23,12 +24,11 @@ def _now() -> str:
 
 class ChatManager:
     def __init__(self) -> None:
-        self._db: sqlite3.Connection | None = None
+        self._db: db.LockedConnection | None = None
 
     def init(self) -> None:
         settings.ensure_dirs()
-        self._db = sqlite3.connect(settings.db_path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
+        self._db = db.connect(settings.db_path)
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS chats (
@@ -89,17 +89,21 @@ class ChatManager:
     def update(self, cid: str, *, title: Optional[str] = None,
                project_id: Optional[str] = None, project_id_set: bool = False,
                messages: Optional[list] = None) -> dict[str, Any] | None:
-        row = self._db.execute("SELECT * FROM chats WHERE id=?", (cid,)).fetchone()
-        if not row:
-            return None
-        new_title = title.strip() if isinstance(title, str) and title.strip() else row["title"]
-        new_pid = project_id if project_id_set else row["project_id"]
-        new_msgs = json.dumps(messages) if messages is not None else row["messages"]
-        self._db.execute(
-            "UPDATE chats SET title=?, project_id=?, messages=?, updated_at=? WHERE id=?",
-            (new_title, new_pid, new_msgs, _now(), cid),
-        )
-        self._db.commit()
+        # Read-modify-write under the connection lock: a rename racing the
+        # end-of-turn message persist used to overwrite whichever landed first
+        # with the other's stale snapshot (lost update).
+        with self._db.transaction():
+            row = self._db.execute("SELECT * FROM chats WHERE id=?", (cid,)).fetchone()
+            if not row:
+                return None
+            new_title = title.strip() if isinstance(title, str) and title.strip() else row["title"]
+            new_pid = project_id if project_id_set else row["project_id"]
+            new_msgs = json.dumps(messages) if messages is not None else row["messages"]
+            self._db.execute(
+                "UPDATE chats SET title=?, project_id=?, messages=?, updated_at=? WHERE id=?",
+                (new_title, new_pid, new_msgs, _now(), cid),
+            )
+            self._db.commit()
         return self.get(cid)
 
     def delete(self, cid: str) -> bool:

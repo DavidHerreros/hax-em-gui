@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import adapters, mdpaths, projects, registry, settings_store, usage
+from . import adapters, db, mdpaths, projects, registry, settings_store, usage
 from .command import ValidationError, build_command, strip_obsolete
 from .config import settings
 
@@ -218,7 +218,7 @@ def _wrap(command: list[str], exit_path: str) -> list[str]:
 
 class JobManager:
     def __init__(self) -> None:
-        self._db: sqlite3.Connection | None = None
+        self._db: db.LockedConnection | None = None
         self._procs: dict[str, asyncio.subprocess.Process] = {}
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
         # Recent raw text tail per job, split by stream: job_id -> {stream: deque}.
@@ -233,8 +233,7 @@ class JobManager:
     # -- lifecycle ---------------------------------------------------------
     def init(self) -> None:
         settings.ensure_dirs()
-        self._db = sqlite3.connect(settings.db_path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
+        self._db = db.connect(settings.db_path)
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -1286,7 +1285,11 @@ class JobManager:
         assert self._db is not None, "JobManager.init() not called"
         cur = self._db.execute(sql, params)
         result = cur.fetchone() if fetch == "one" else cur.fetchall() if fetch == "all" else None
-        self._db.commit()
+        # Commit only what needs it: committing after every SELECT took the
+        # write lock for reads, which is what made the 3-second list polls
+        # contend with the scheduler's writes.
+        if not sql.lstrip().upper().startswith("SELECT"):
+            self._db.commit()
         return result
 
 

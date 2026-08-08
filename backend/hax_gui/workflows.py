@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import adapters, projects, registry
+from . import adapters, db, projects, registry
 from .command import strip_obsolete
 from .config import settings
 from .jobs import ACTIVE, manager as jobs
@@ -73,13 +73,12 @@ class StepsRunning(Exception):
 
 class WorkflowManager:
     def __init__(self) -> None:
-        self._db: sqlite3.Connection | None = None
+        self._db: db.LockedConnection | None = None
         self._running: dict[str, asyncio.Task] = {}
 
     def init(self) -> None:
         settings.ensure_dirs()
-        self._db = sqlite3.connect(settings.db_path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
+        self._db = db.connect(settings.db_path)
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS workflows (
