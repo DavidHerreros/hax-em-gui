@@ -396,3 +396,28 @@ def delete_chat(cid: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="chat not found")
     return {"ok": True}
 
+
+
+@router.post("/api/jobs/{job_id}/diagnose", dependencies=[Depends(auth)])
+async def diagnose_job(job_id: str) -> dict[str, Any]:
+    """Diagnose a failed run from its log (assistant's classifier + LLM).
+
+    The classifier findings are deterministic and come back even when the model
+    is unreachable; the narrative can take tens of seconds (one LLM call), so
+    the whole thing runs off the event loop."""
+    if not assistant_bridge.available():
+        raise HTTPException(status_code=404, detail="assistant not installed")
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    def _run() -> dict[str, Any]:
+        # stderr usually holds the traceback; stdout the run context. Feed both.
+        err = "\n".join(manager.tail(job_id, max_lines=200, stream="err"))
+        out = "\n".join(manager.tail(job_id, max_lines=200, stream="out"))
+        log_text = (out + "\n" + err).strip()
+        config = " ".join(job.get("command") or [])
+        return assistant_bridge.diagnose_job_log(log_text, config)
+
+    result = await asyncio.to_thread(_run)
+    return {**result, "job_id": job_id, "status": job["status"]}

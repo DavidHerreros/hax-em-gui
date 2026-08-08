@@ -69,6 +69,29 @@ def reindex_docs(*, force: bool = True) -> dict:
         return {"ok": False, "reason": str(e), "chunks": 0}
 
 
+def diagnose_job_log(log_text: str, run_config: str | None = None) -> dict:
+    """Diagnose a failed run's log: deterministic classifier findings always,
+    an LLM root-cause/fix narrative when the model is reachable.
+
+    The classifier (hax_assistant.context.logs) is a rule table — GPU OOM, shape
+    mismatch, NaN divergence, missing metadata labels, checkpoint errors — so
+    the findings arrive even with Ollama down; the narrative is best-effort.
+    """
+    if not _INSTALLED:
+        return {"available": False}
+    from hax_assistant.context.logs import classify_log
+    findings = [{"kind": f.kind, "title": f.title, "hint": f.hint, "evidence": f.evidence}
+                for f in classify_log(log_text)]
+    analysis, error = None, None
+    try:
+        from hax_assistant.skills.diagnose_logs import diagnose_logs
+        analysis = diagnose_logs(_get().backend, log_text, run_config)
+    except Exception as e:  # noqa: BLE001 - the findings alone are still useful
+        error = str(e)
+    return {"available": True, "findings": findings, "analysis": analysis,
+            "analysis_error": error}
+
+
 def list_gpus() -> list[dict]:
     """Visible GPUs (for the prepare-motion confirmation's GPU picker)."""
     if not _INSTALLED:

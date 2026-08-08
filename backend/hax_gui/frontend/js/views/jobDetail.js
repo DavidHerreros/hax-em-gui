@@ -35,6 +35,42 @@ export function JobDetailView(params) {
   const inputs = h("div", { class: "job-maps" });
   const maps = h("div", { class: "job-maps" });
   const actionErr = h("div", { style: { marginBottom: "12px" } });
+  // "Diagnose" result panel: classifier findings (deterministic) + the LLM's
+  // root-cause/fix narrative. Only ever filled for failed/interrupted runs.
+  const diagPanel = h("div", { class: "diag-panel", hidden: true });
+  let assistantOk = false;
+  api.assistantStatus().then((s) => { assistantOk = !!s.available; renderHead(); }).catch(() => {});
+
+  async function diagnose(btn) {
+    btn.disabled = true;
+    btn.lastChild.textContent = "Diagnosing…";
+    diagPanel.hidden = false;
+    diagPanel.replaceChildren(h("div", { class: "muted" }, "Reading the log and consulting the model…"));
+    try {
+      const d = await api.diagnoseJob(id);
+      diagPanel.replaceChildren(
+        h("div", { class: "diag-head" }, icon("chat", 15), h("strong", null, "Failure diagnosis"),
+          h("button", { class: "btn-icon", style: { marginLeft: "auto", border: "none" },
+                        title: "Close", onclick: () => { diagPanel.hidden = true; } }, icon("x", 15))),
+        d.findings && d.findings.length
+          ? h("div", { class: "diag-findings" },
+              ...d.findings.map((f) => h("div", { class: "diag-finding" },
+                h("div", null, h("span", { class: "badge failed" }, f.kind), " ", h("strong", null, f.title)),
+                h("div", { class: "muted small" }, f.hint),
+                h("pre", { class: "cmdline", style: { margin: "6px 0 0" } }, f.evidence))))
+          : h("div", { class: "muted small" }, "No known failure signature matched — see the model's reading below."),
+        d.analysis ? h("div", { class: "diag-analysis" }, d.analysis)
+                   : h("div", { class: "muted small" },
+                       "Model analysis unavailable" + (d.analysis_error ? `: ${d.analysis_error}` : " (is Ollama running?")
+                       + (d.analysis_error ? "" : ")")),
+      );
+    } catch (err) {
+      diagPanel.replaceChildren(h("div", { class: "muted" }, "Diagnosis failed: " + err.message));
+    } finally {
+      btn.disabled = false;
+      btn.lastChild.textContent = "Diagnose";
+    }
+  }
   // Terminal output split into stdout / stderr tabs.
   const outConsole = h("div", { class: "console" });
   const errConsole = h("div", { class: "console", style: { display: "none" } });
@@ -51,6 +87,7 @@ export function JobDetailView(params) {
   root.appendChild(inputs);
   root.appendChild(maps);
   root.appendChild(actionErr);
+  root.appendChild(diagPanel);
   root.appendChild(consoleTabs);
   root.appendChild(outConsole);
   root.appendChild(errConsole);
@@ -117,7 +154,11 @@ export function JobDetailView(params) {
       // actions (Continue/Rerun + their "Edit &" variant) collapse into split buttons.
       const canResume = job.resumable &&
         (status === "failed" || status === "cancelled" || status === "interrupted");
+      const canDiagnose = assistantOk && (status === "failed" || status === "interrupted");
       head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
+        canDiagnose ? h("button", { class: "btn secondary",
+          title: "Ask the assistant why this run failed (classifier + model, from the log)",
+          onclick: (e) => diagnose(e.currentTarget) }, icon("chat", 15), "Diagnose") : null,
         job.has_metrics ? metricsBtn() : null,
         viewable(job) ? viewerBtn() : null,
         canResume ? splitButton(

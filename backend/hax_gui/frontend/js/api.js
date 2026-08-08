@@ -209,6 +209,7 @@ export const api = {
 // Optional AI assistant. status() is always safe to call (reports
 // {available:false} when the hax-em-assistant package isn't installed).
 api.assistantStatus = () => req("/api/assistant/status");
+api.diagnoseJob = (id) => req(`/api/jobs/${id}/diagnose`, { method: "POST" });
 // Rebuild the docs vector index from the current hax-em-docs checkout (live,
 // no GUI restart). Returns {ok, rebuilt, chunks, ...}.
 api.assistantReindexDocs = (force = true) =>

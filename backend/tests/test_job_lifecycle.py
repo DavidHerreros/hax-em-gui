@@ -137,3 +137,27 @@ def test_gpu_admission_queue(client, run, project, md_file):
         wait_for_status(client, run, b["id"], {"succeeded"})
     finally:
         GATE.unlink(missing_ok=True)
+
+
+def test_diagnose_failed_job(client, run, project, md_file):
+    """The diagnose endpoint returns deterministic classifier findings from the
+    log even when no model is reachable (skipped when the assistant package is
+    not installed)."""
+    import pytest
+    from hax_gui import assistant as bridge
+    if not bridge.available():
+        pytest.skip("hax-em-assistant not installed")
+    job = _create(client, run, project, md_file)
+    wait_for_status(client, run, job["id"], {"succeeded"})
+    # plant a known failure signature in the log
+    with open(job["log_path"], "a") as f:
+        f.write("\njaxlib.xla_extension.XlaRuntimeError: RESOURCE_EXHAUSTED: "
+                "CUDA_ERROR_OUT_OF_MEMORY: out of memory\n")
+    r = run(client.post(f"/api/jobs/{job['id']}/diagnose"))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["available"] is True
+    kinds = [f["kind"] for f in d["findings"]]
+    assert "gpu_oom" in kinds, kinds
+    oom = next(f for f in d["findings"] if f["kind"] == "gpu_oom")
+    assert "batch_size" in oom["hint"]
