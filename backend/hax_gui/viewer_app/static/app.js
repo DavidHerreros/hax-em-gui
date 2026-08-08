@@ -6,6 +6,8 @@ import { createScatter, clusterColor } from "./scatter.js";
 import { createCloud } from "./cloud.js";
 import { createHistogram } from "./histogram.js";
 import { createSlices } from "./slices.js";
+import { parseGrid, parseMesh } from "./wire.js";
+import { makeLive } from "./viewerbase.js";
 
 // Density colormaps (RGB 0–255 control stops, low→high). Default inferno, to
 // match the desktop annotate_space landscape (napari "inferno" over a dark
@@ -1698,22 +1700,8 @@ async function recontourSeries(draft) {
 }
 const liveSeriesContour = makeLive((draft) => recontourSeries(draft));
 
-// Coalescing single-flight runner: fires immediately, and if more updates arrive while a
-// request is in flight, re-runs once with the latest values when it returns. Gives
-// continuous (server-bounded) updates without piling up requests.
-//
-// It must *wait* for the in-flight request, not abandon it. This used to abort the fetch
-// on supersede, to avoid downloading a mesh that was already stale — but `/api/decode` is
-// a sync route, so it runs in a threadpool task that cannot be cancelled: aborting freed
-// the browser to fire the next request while the server kept grinding on the abandoned
-// one. A drag therefore stacked up marching-cubes jobs that don't parallelise (8 at once
-// measured ~5x slower *each*), so the further you dragged the slower it got. Waiting keeps
-// the server at exactly one mesh at a time; the draft below is what makes that cheap.
-function makeLive(fn) {
-  let busy = false, pending = false, args = [];
-  async function run() { busy = true; do { pending = false; try { await fn(...args); } catch { /* ignore */ } } while (pending); busy = false; }
-  return (...a) => { args = a; if (busy) pending = true; else run(); };
-}
+// makeLive comes from viewerbase.js (single-flight, waits rather than aborts —
+// see the note there); the draft resolutions below are what make coalescing cheap.
 const liveDecode = makeLive((draft) => decode(draft));
 const liveFrame = makeLive((i, draft) => renderFrame(i, draft));
 
@@ -1906,16 +1894,6 @@ async function loadVolume(index) {
     volRenderer.setColor(colorForIndex(index));
     status(`Volume ${g.nx}×${g.ny}×${g.nz} · ${state.render === "emission" ? "glow" : "MIP"}`);
   } catch (err) { if (token === decodeToken) status("Volume load failed: " + err.message, "err"); }
-}
-
-function parseGrid(buf) {
-  const dv = new DataView(buf);
-  const nx = dv.getInt32(0, true), ny = dv.getInt32(4, true), nz = dv.getInt32(8, true);
-  const vmin = dv.getFloat32(12, true), vmax = dv.getFloat32(16, true), mean = dv.getFloat32(20, true), std = dv.getFloat32(24, true);
-  const boxLo = [dv.getFloat32(28, true), dv.getFloat32(32, true), dv.getFloat32(36, true)];
-  const boxHi = [dv.getFloat32(40, true), dv.getFloat32(44, true), dv.getFloat32(48, true)];
-  const data = new Uint8Array(buf, 52, nx * ny * nz);
-  return { nx, ny, nz, vmin, vmax, mean, std, boxLo, boxHi, data };
 }
 
 // ---- morph / volume series as a scrubbable timeline ----
@@ -3051,16 +3029,6 @@ function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
-function parseMesh(buf) {
-  const dv = new DataView(buf);
-  const nverts = dv.getInt32(0, true), nfaces = dv.getInt32(4, true);
-  const level = dv.getFloat32(8, true), mass = dv.getFloat32(12, true);
-  let off = 20;
-  const positions = new Float32Array(buf, off, nverts * 3); off += nverts * 12;
-  const normals = new Float32Array(buf, off, nverts * 3); off += nverts * 12;
-  const indices = new Uint32Array(buf, off, nfaces * 3);
-  return { positions, normals, indices, level, mass };
-}
 function hexToRgb(hex) { const n = parseInt(hex.slice(1), 16); return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]; }
 
 boot();

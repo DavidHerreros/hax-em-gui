@@ -15,14 +15,25 @@ import { createRenderer } from "./gl.js";
 import { createVolume } from "./volume.js";
 import { createHistogram } from "./histogram.js";
 import { createSlices } from "./slices.js";
+import { parseGrid, parseMesh } from "./wire.js";
+import { latestWins, makeLive } from "./viewerbase.js";
 
 const $ = (id) => document.getElementById(id);
 const THEME_BG = { dark: "#040610", light: "#e7ecf3" };
 
-const renderer = createRenderer($("gl"));       // surface meshes (all visible maps)
-const volRenderer = createVolume($("glvol"));   // MIP / glow ray-march (active map)
-const slices = createSlices($("slices"));       // orthogonal cuts (active map)
-const hist = createHistogram($("hist"), onLevel);
+// Guarded construction: a WebGL2 failure used to throw at module load, leaving the
+// page stuck on "Loading…" with the reason only in the console (app.js already
+// guarded this; mrc.js had drifted).
+let renderer, volRenderer, slices, hist;
+try {
+  renderer = createRenderer($("gl"));       // surface meshes (all visible maps)
+  volRenderer = createVolume($("glvol"));   // MIP / glow ray-march (active map)
+  slices = createSlices($("slices"));       // orthogonal cuts (active map)
+  hist = createHistogram($("hist"), onLevel);
+} catch (err) {
+  status("WebGL2 unavailable: " + err.message, "err");
+  throw err;
+}
 
 const state = { render: "surface", active: 0 };
 let info = null;        // /api/info
@@ -97,42 +108,9 @@ async function loadHistogram() {
   hist.setData(h, h.mean + m.sigma * h.std);
 }
 
-// int32 nverts, nfaces | float32 level, mass, vmax | positions, normals, indices.
-// `mass` is the enclosed density above the contour: the morph holds it constant across
-// the series, so it has to come back out of the header.
-function parseMesh(buf) {
-  const dv = new DataView(buf);
-  const nverts = dv.getInt32(0, true), nfaces = dv.getInt32(4, true);
-  const level = dv.getFloat32(8, true), mass = dv.getFloat32(12, true);
-  let off = 20;
-  const positions = new Float32Array(buf, off, nverts * 3); off += nverts * 12;
-  const normals = new Float32Array(buf, off, nverts * 3); off += nverts * 12;
-  const indices = new Uint32Array(buf, off, nfaces * 3);
-  return { positions, normals, indices, level, mass };
-}
-
-function parseGrid(buf) {
-  const dv = new DataView(buf);
-  const nx = dv.getInt32(0, true), ny = dv.getInt32(4, true), nz = dv.getInt32(8, true);
-  const vmin = dv.getFloat32(12, true), vmax = dv.getFloat32(16, true), mean = dv.getFloat32(20, true), std = dv.getFloat32(24, true);
-  const boxLo = [dv.getFloat32(28, true), dv.getFloat32(32, true), dv.getFloat32(36, true)];
-  const boxHi = [dv.getFloat32(40, true), dv.getFloat32(44, true), dv.getFloat32(48, true)];
-  const data = new Uint8Array(buf, 52, nx * ny * nz);
-  return { nx, ny, nz, vmin, vmax, mean, std, boxLo, boxHi, data };
-}
-
 async function fetchGrid(m, size) {
   const buf = await (await fetch(`./api/grid?m=${m}&size=${size}`)).arrayBuffer();
   return parseGrid(buf);
-}
-
-// Run `fn` at most once at a time, re-running it after it settles if it was asked
-// again meanwhile. Gives continuous (server-bounded) updates without piling up
-// requests — same helper the landscape app uses.
-function makeLive(fn) {
-  let busy = false, pending = false, args = [];
-  async function run() { busy = true; do { pending = false; try { await fn(...args); } catch { /* fn reports */ } } while (pending); busy = false; }
-  return (...a) => { args = a; if (busy) pending = true; else run(); };
 }
 
 // One contour costs a full marching-cubes pass over the whole volume plus a multi-MB mesh
@@ -197,11 +175,14 @@ async function loadSurfaces() {
   reportSurface();
 }
 
+const volGuard = latestWins();
 async function loadVolume() {
   const m = active();
   status("Loading volume…", "busy");
+  const tok = volGuard.take();   // switching the active map mid-download: newest wins
   try {
     if (!m.gridVol) m.gridVol = await fetchGrid(m.index, 96);
+    if (volGuard.stale(tok)) return;
     volRenderer.setVolume(m.gridVol.nx, m.gridVol.ny, m.gridVol.nz, m.gridVol.data, m.gridVol.boxLo, m.gridVol.boxHi);
     volRenderer.setColor(hexToRgb(m.color));
     volRenderer.setThreshold(normThreshold());
@@ -210,11 +191,14 @@ async function loadVolume() {
   } catch (err) { status("Volume load failed: " + err.message, "err"); }
 }
 
+const sliceGuard = latestWins();
 async function loadSlices() {
   const m = active();
   status("Loading slices…", "busy");
+  const tok = sliceGuard.take();
   try {
     if (!m.gridSlice) m.gridSlice = await fetchGrid(m.index, 192);
+    if (sliceGuard.stale(tok)) return;
     slices.setVolume(m.gridSlice);
     status(`Slices ${m.gridSlice.nx}×${m.gridSlice.ny}×${m.gridSlice.nz} · ${m.name}`
            + (models.length > 1 ? " · active map only" : ""));
@@ -462,6 +446,9 @@ function stopMorph() {
   if (state.render !== "surface") loadVolume();
 }
 
+const MORPH_BUDGET_MB = 512;
+const MORPH_BUDGET_BYTES = MORPH_BUDGET_MB * 1024 * 1024;
+
 async function prepareMorph() {
   if (!morphLegs()) return;
   const btn = $("morphPrepare");
@@ -490,11 +477,24 @@ async function prepareMorph() {
     const first = await fetchMorphMesh(morph.seq[0], morph.seq[1], 0, `sigma=${sigma.toFixed(3)}`, smooth, size);
     cache[0] = first;
     morph.refMass = first.mass;
+    // Byte budget on the cached meshes: the cache is what makes playback instant, but
+    // unbounded it OOMs the tab (n frames x multi-MB full-quality meshes). Frame 0
+    // prices the series before the long grind; the running total catches variation.
+    let cachedBytes = first.bytes;
+    if (first.bytes * n > MORPH_BUDGET_BYTES) {
+      throw new Error(`~${Math.round(first.bytes * n / (1024 * 1024))} MB of meshes for ${n} frames — ` +
+                      `switch Quality to draft or shorten the sequence (budget ${MORPH_BUDGET_MB} MB)`);
+    }
     const level = morph.mass ? `mass=${morph.refMass}` : `sigma=${sigma.toFixed(3)}`;
     for (let k = 1; k < n; k++) {
       const { a, b, t } = frameSpec(k);
       status(`Preparing morph… ${k + 1}/${n}`, "busy");
       cache[k] = await fetchMorphMesh(a, b, t, level, smooth, size);
+      cachedBytes += cache[k].bytes;
+      if (cachedBytes > MORPH_BUDGET_BYTES) {
+        throw new Error(`morph cache passed ${MORPH_BUDGET_MB} MB at frame ${k + 1}/${n} — ` +
+                        "switch Quality to draft or shorten the sequence");
+      }
     }
     morph.cache = cache;
     morph.cacheKey = morphKey();
