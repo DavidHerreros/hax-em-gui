@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from .. import assistant as assistant_bridge
 from .. import assistant_actions
+from .. import gpus as gpus_mod
 from .. import chats as chat_store
 from .. import ollama as ollama_manager_mod
 from ..config import settings
@@ -263,7 +264,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             out: asyncio.Queue = asyncio.Queue()
             cancel = threading.Event()
 
-            def _worker(messages=messages, grounded=grounded, run=run,
+            def _worker(messages=messages, grounded=grounded, run=run, job=job if run_job_id else None,
                         allow_actions=allow_actions, cancel=cancel, out=out) -> None:
                 # EVERYTHING inside the try, including building the generator:
                 # session construction (docs index load, embedder init) can
@@ -272,6 +273,13 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                 # forever on out.get(), with the client stuck on "Stop".
                 gen = None
                 try:
+                    if run is not None and job is not None:
+                        # Off the loop (metadata heads + nvidia-smi): measured data
+                        # facts + free VRAM the model can ground advice in.
+                        try:
+                            run["facts"] = _run_facts(job)
+                        except Exception:  # noqa: BLE001 - facts are optional
+                            pass
                     gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run,
                                                          allow_actions=allow_actions)
                     for ev in gen:
@@ -396,6 +404,38 @@ def delete_chat(cid: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="chat not found")
     return {"ok": True}
 
+
+
+def _run_facts(job: dict[str, Any]) -> str:
+    """Measured facts about the attached run's data and this machine's GPUs,
+    for the model to ground parameter advice in (P6.2). Deterministic and
+    cheap: metadata heads and MRC headers only, plus one nvidia-smi query."""
+    lines: list[str] = []
+    args = job.get("args") or {}
+    for field in ("md", "vol", "mask"):
+        val = args.get(field)
+        if not isinstance(val, str) or not val:
+            continue
+        facts = assistant_actions.inspect_path(val)
+        if not facts.get("exists"):
+            lines.append(f"--{field}: {val} (MISSING on disk)")
+            continue
+        bits = [f"--{field}: {val}"]
+        for key in ("kind", "particles", "box", "voxel_size", "columns_count",
+                    "has_ctf", "has_latents", "volumes", "size"):
+            if key in facts:
+                bits.append(f"{key}={facts[key]}")
+        if "columns" in facts:
+            bits.append(f"columns={','.join(facts['columns'][:12])}")
+        lines.append("  ".join(bits))
+    for g in gpus_mod.list_gpus():
+        used, total = g.get("memory_used_mb"), g.get("memory_total_mb")
+        free = (total - used) if (used is not None and total is not None) else None
+        lines.append(f"GPU {g.get('index')}: {g.get('name')}"
+                     + (f", {free} MB free of {total} MB" if free is not None else ""))
+    if job.get("gpu"):
+        lines.append(f"This run is pinned to GPU {job['gpu']}.")
+    return "\n".join(lines)
 
 
 @router.post("/api/jobs/{job_id}/diagnose", dependencies=[Depends(auth)])
