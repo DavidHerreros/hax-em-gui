@@ -378,6 +378,9 @@ export function JobDetailView(params) {
   let closeLog = null;
   function connectLog() {
     if (closeLog) closeLog();
+    // Reconnect while the run is active (a server restart or proxy timeout used
+    // to freeze the log silently); a finished job's socket is closed by the
+    // server after the replay, and must stay closed.
     closeLog = subscribeLog(id, (m) => {
       if (m.type === "snapshot") {
         status = m.status;
@@ -398,7 +401,7 @@ export function JobDetailView(params) {
         if (m.status !== "running") api.job(id).then((j) => { job = j; renderHead(); loadOutputs(); if (!isActive()) loadUsage(true); }).catch(() => renderHead());
         else renderHead();
       }
-    });
+    }, { shouldReconnect: isActive });
   }
   connectLog();
 

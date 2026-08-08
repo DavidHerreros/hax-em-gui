@@ -224,15 +224,18 @@ api.assistantPrepareMotion = ({ jobId, gpu, onStatus, onDone, onError }) => {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const q = token ? `?token=${encodeURIComponent(token)}` : "";
   const ws = new WebSocket(`${proto}://${location.host}/ws/assistant/prepare-motion${q}`);
+  let settled = false;   // done/error already delivered (or caller closed)
   ws.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch { return; }
     if (m.status != null) { if (onStatus) onStatus(m.status); }
-    else if (m.done) { if (onDone) onDone(m.deformation_dir); ws.close(); }
-    else if (m.error != null) { if (onError) onError(m.error); ws.close(); }
+    else if (m.done) { settled = true; if (onDone) onDone(m.deformation_dir); ws.close(); }
+    else if (m.error != null) { settled = true; if (onError) onError(m.error); ws.close(); }
   };
   ws.onopen = () => ws.send(JSON.stringify({ job_id: jobId, gpu }));
-  ws.onerror = () => { if (onError) onError("connection error"); };
-  return { close: () => ws.close() };
+  // One-shot pipeline: no auto-reconnect (the server-side run can't be
+  // rejoined), but a drop must not leave the dialog spinning forever.
+  ws.onclose = () => { if (!settled) { settled = true; if (onError) onError("connection lost"); } };
+  return { close: () => { settled = true; ws.close(); } };
 };
 // Expand an assistant job proposal (program + path) into a draft spec + path facts.
 api.assistantPreviewJob = (program, path) =>
@@ -276,53 +279,116 @@ api.deleteChat = (id) => req(`/api/chats/${id}`, { method: "DELETE" });
 // Open a chat socket. Send full-history requests via send({messages, grounded});
 // tokens arrive through onToken, then onDone; onError on failure. Returns
 // { send, close }.
-export function assistantChat({ onToken, onStatus, onAction, onDone, onError }) {
-  const token = getToken();
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const q = token ? `?token=${encodeURIComponent(token)}` : "";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/assistant/chat${q}`);
-  ws.onmessage = (e) => {
-    const m = JSON.parse(e.data);
-    if (m.token != null) onToken(m.token);
-    else if (m.status != null) { if (onStatus) onStatus(m.status); }
-    else if (m.action != null) { if (onAction) onAction(m.action); }
-    else if (m.error) { if (onError) onError(m.error); }
-    else if (m.done) onDone();
+export function assistantChat({ onToken, onStatus, onAction, onDone, onError, onClose }) {
+  // Reconnecting: the old socket was created once and cached for the app's
+  // lifetime with no onclose — after a server restart every Send silently
+  // dropped its payload and the composer locked on "Stop" forever. Now a drop
+  // notifies once via onClose (so the view can unlock a stuck turn) and the
+  // socket reopens with backoff; later sends queue until it is OPEN again.
+  let ws = null;
+  let closed = false;
+  let attempt = 0;
+  let timer = null;
+  let pending = [];
+
+  const open = () => {
+    if (closed) return;
+    ws = new WebSocket(wsUrl("/ws/assistant/chat"));
+    ws.onopen = () => {
+      attempt = 0;
+      const queued = pending; pending = [];
+      for (const d of queued) ws.send(d);
+    };
+    ws.onmessage = (e) => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (m.token != null) onToken(m.token);
+      else if (m.status != null) { if (onStatus) onStatus(m.status); }
+      else if (m.action != null) { if (onAction) onAction(m.action); }
+      else if (m.error) { if (onError) onError(m.error); }
+      else if (m.done) onDone();
+    };
+    ws.onclose = () => {
+      if (closed) return;
+      // A mid-turn drop loses the turn server-side; tell the view once so it
+      // can unlock, then quietly reopen for the next question.
+      if (onClose) onClose();
+      attempt += 1;
+      timer = setTimeout(open, Math.min(15000, 500 * 2 ** Math.min(attempt, 5)));
+    };
   };
-  ws.onerror = () => { if (onError) onError("connection error"); };
+  open();
 
   // `new WebSocket()` returns in CONNECTING state; calling send() before the
-  // socket is OPEN throws InvalidStateError. Queue payloads until onopen flushes.
-  let pending = [];
+  // socket is OPEN throws InvalidStateError. Queue payloads until onopen
+  // flushes (also covers the reconnecting window).
   const raw = (payload) => {
     const data = JSON.stringify(payload);
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
-    else if (ws.readyState === WebSocket.CONNECTING) pending.push(data);
-    // CLOSING/CLOSED: drop silently
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(data);
+    else pending.push(data);
   };
-  ws.onopen = () => { const queued = pending; pending = []; for (const d of queued) ws.send(d); };
   return {
     send: (payload) => raw(payload),
     stop: () => raw({ stop: true }),
-    close: () => { pending = []; try { ws.close(); } catch { /* already closed */ } },
+    close: () => {
+      closed = true; pending = [];
+      if (timer) clearTimeout(timer);
+      try { ws.close(); } catch { /* already closed */ }
+    },
   };
 }
 
 // Subscribe to a job's live log. Returns a close() function.
-export function subscribeLog(jobId, onMessage) {
-  return subscribeWS(`/ws/jobs/${jobId}/log`, onMessage);
+// `shouldReconnect` (from the caller, which knows the job's status) gates the
+// reconnect: a finished job's socket is closed by the server on purpose after
+// the replay, and blindly reopening it would loop forever.
+export function subscribeLog(jobId, onMessage, opts) {
+  return subscribeWS(`/ws/jobs/${jobId}/log`, onMessage, opts);
 }
 
 // Subscribe to the live update-installer log. Returns a close() function.
+// Always reconnects: the update restarts the server, and reconnecting through
+// that restart is exactly how the modal shows the tail end of the install.
 export function subscribeUpdateLog(onMessage) {
   return subscribeWS(`/ws/updates/log`, onMessage);
 }
 
-function subscribeWS(path, onMessage) {
+function wsUrl(path) {
   const token = getToken();
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const q = token ? `?token=${encodeURIComponent(token)}` : "";
-  const ws = new WebSocket(`${proto}://${location.host}${path}${q}`);
-  ws.onmessage = (e) => onMessage(JSON.parse(e.data));
-  return () => { try { ws.close(); } catch { /* already closed */ } };
+  return `${proto}://${location.host}${path}${q}`;
+}
+
+// A WebSocket subscription that survives the other end going away. The old
+// version set only onmessage: a server restart (which the GUI itself triggers
+// on update) or a proxy idle-timeout silently froze the stream — the log
+// stopped mid-training with no indication and no recovery short of a reload.
+// Reconnects with exponential backoff (0.5 s → 15 s), resets on success, and
+// guards JSON.parse so one malformed frame can't kill the handler.
+function subscribeWS(path, onMessage, { shouldReconnect } = {}) {
+  let ws = null;
+  let closed = false;
+  let attempt = 0;
+  let timer = null;
+  const open = () => {
+    if (closed) return;
+    ws = new WebSocket(wsUrl(path));
+    ws.onopen = () => { attempt = 0; };
+    ws.onmessage = (e) => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      onMessage(m);
+    };
+    ws.onclose = () => {
+      if (closed) return;
+      if (shouldReconnect && !shouldReconnect()) { closed = true; return; }
+      attempt += 1;
+      timer = setTimeout(open, Math.min(15000, 500 * 2 ** Math.min(attempt, 5)));
+    };
+  };
+  open();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    try { ws.close(); } catch { /* already closed */ }
+  };
 }
