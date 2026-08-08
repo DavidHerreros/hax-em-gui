@@ -606,6 +606,17 @@ export function WorkflowsView() {
     else flash(wf ? `Removed ${removed} ${noun}.` : `Removed ${removed} ${noun} — Save to persist.`, "muted");
   }
 
+  // "<base> copy", then "<base> copy 2", "<base> copy 3", … : a copy of a copy re-uses the
+  // base instead of stacking suffixes ("Name copy copy copy"), and the number is the first
+  // one free among `taken`, so duplicating any of the siblings lands on the same series.
+  function copyName(name, taken) {
+    const trimmed = name.trim();
+    const base = trimmed.replace(/\s+copy(\s+\d+)?$/i, "").trim() || trimmed;
+    let candidate = `${base} copy`;
+    for (let i = 2; taken.has(candidate); i++) candidate = `${base} copy ${i}`;
+    return candidate;
+  }
+
   // Duplicate node(s) as fresh, un-run steps: copy program/args/gpu/name/labels at
   // an offset and preserve edges internal to the set, leaving the copies unlinked
   // (no job_id) so they become new jobs only when the workflow is run. The copies
@@ -614,14 +625,19 @@ export function WorkflowsView() {
     const src = [...new Set(ids || [])].map(nodeById).filter(Boolean);
     if (!src.length) { flash("Select a step to duplicate.", "muted"); return; }
     const idMap = new Map(), made = [];
+    // every name on the canvas, grown as we go so a multi-step duplicate does not
+    // hand the same "… copy" to two of its own copies
+    const taken = new Set(graph.nodes.map((n) => (n.name || "").trim()).filter(Boolean));
     for (const n of src) {
       const id = "n" + (nodeSeq++);
       idMap.set(n.id, id);
+      const name = n.name ? copyName(n.name, taken) : "";
+      if (name) taken.add(name);
       graph.nodes.push({
         id, program: n.program,
         args: JSON.parse(JSON.stringify(n.args || {})),   // deep copy so edits don't bleed back
         gpu: n.gpu || "0",
-        name: n.name ? n.name + " copy" : "",
+        name,
         labels: [...(n.labels || [])],
         x: (n.x || 0) + 40, y: (n.y || 0) + 40,
       });

@@ -31,6 +31,23 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _copy_name(name: str, taken: set[str]) -> str:
+    """``"<base> copy"``, then ``"<base> copy 2"``, ``"<base> copy 3"``, …
+
+    A copy of a copy re-uses the base rather than stacking suffixes ("Name copy copy"),
+    and the number is the first one free in `taken`, so copies of any sibling land in
+    the same series. Mirrors `copyName` in the workflow canvas (views/workflows.js).
+    """
+    trimmed = name.strip()
+    base = re.sub(r"\s+copy(\s+\d+)?$", "", trimmed, flags=re.I).strip() or trimmed
+    candidate = f"{base} copy"
+    i = 2
+    while candidate in taken:
+        candidate = f"{base} copy {i}"
+        i += 1
+    return candidate
+
+
 class WorkflowError(Exception):
     """Validation/build error with one or more user-facing messages."""
 
@@ -621,7 +638,10 @@ class WorkflowManager:
             for field in adapters.bindable_fields(program):
                 args.pop(field, None)
             node["args"] = args
-        new_name = (name or "").strip() or f"{src.get('name') or 'Workflow'} (copy)"
+        new_name = (name or "").strip() or _copy_name(
+            src.get("name") or "Workflow",
+            {(w.get("name") or "").strip() for w in self.list(target_project_id)},
+        )
         return self.save(target_project_id, new_name, graph, kind="standalone")
 
     # -- validation --------------------------------------------------------
