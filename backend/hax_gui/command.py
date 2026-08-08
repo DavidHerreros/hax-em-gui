@@ -76,7 +76,11 @@ def build_command(program: str, values: dict[str, Any], gpu: str | None = None) 
         ftype = field["type"]
 
         if ftype == "boolean":
-            if value:
+            # The form value is the *destination* value. For store_true the flag
+            # produces True, so emit it when checked; for store_false (invert) the
+            # flag produces False, so emit it when UNchecked — appending it for a
+            # checked box would silently flip the user's choice.
+            if bool(value) != bool(field.get("invert")):
                 argv.append(field["flag"])
             continue
 
