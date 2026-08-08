@@ -18,10 +18,16 @@ export function buildLauncher() {
   let programsCache = null;
   let formCleanup = null;
   let lastNonce;
+  // Generation counter: buildForm resolves asynchronously, and a fast program
+  // switch used to let a stale buildForm append into a detached body and
+  // register a store subscription nothing would ever clean up (one leaked
+  // subscription + retained form tree per switch).
+  let renderGen = 0;
 
   const programs = () => programsCache || (programsCache = api.programs());
 
   function render() {
+    renderGen += 1;
     if (formCleanup) { formCleanup(); formCleanup = null; }
     clear(content);
     const sel = getState().selectedProgram;
@@ -85,9 +91,10 @@ export function buildLauncher() {
     const jobsP = wantNames && getState().activeProjectId
       ? api.projectJobs(getState().activeProjectId).catch(() => [])
       : Promise.resolve([]);
+    const gen = renderGen;
     Promise.all([api.program(name), api.gpus().catch(() => []), jobsP])
-      .then(([schema, gpus, projJobs]) => buildForm(body, schema, gpus, projJobs))
-      .catch((err) => mount(body, errorBox(err)));
+      .then(([schema, gpus, projJobs]) => { if (gen === renderGen) buildForm(body, schema, gpus, projJobs); })
+      .catch((err) => { if (gen === renderGen) mount(body, errorBox(err)); });
   }
 
   function buildForm(body, schema, gpus, projJobs = []) {

@@ -517,6 +517,10 @@ export function metricsPanel({ logdir, jobId }) {
     function ensureRenderer(entry, n) {
       const mode = optsFor(entry.tag).mode;
       if (entry.builtMode === mode && (mode !== "split" || entry.builtN === n)) return;
+      // Swapping renderers must release the old one's ResizeObserver, or every
+      // mode toggle left an observer (and its canvas + series closure) alive.
+      entry.strips?.destroy?.();
+      entry.plot?.destroy?.();
       clear(entry.body);
       entry.plot = entry.strips = null;
       const canvas = h("canvas", { class: "mx-canvas" });
@@ -716,11 +720,13 @@ export function metricsPanel({ logdir, jobId }) {
         if (xlab) { ctx.textAlign = "right"; ctx.fillStyle = fg; ctx.fillText(xlab, W - 4 * r, H - BOT + 4 * r); }
       }
 
-      if (window.ResizeObserver) new ResizeObserver(() => draw()).observe(canvas);
+      let ro = null;
+      if (window.ResizeObserver) { ro = new ResizeObserver(() => draw()); ro.observe(canvas); }
 
       return {
         setSeries(ss, lbls) { series = ss || []; xlab = (lbls && lbls.x) || ""; draw(); },
         redraw: draw,
+        destroy() { if (ro) { ro.disconnect(); ro = null; } },
         setFocus() { /* nothing to spotlight: every curve already has its own strip */ },
         async snapshot({ scale = 2, transparent = false } = {}) {
           const ow = canvas.width, oh = canvas.height;
@@ -750,6 +756,7 @@ export function metricsPanel({ logdir, jobId }) {
     return {
       el,
       onShow() { for (const e of plots.values()) (e.strips || e.plot)?.redraw(); },
+      destroy() { for (const e of plots.values()) { e.strips?.destroy?.(); e.plot?.destroy?.(); } },
       async poll() { await load(); },
       onManifest() {
         // A tag first logged mid-run (HetSIREN's inverse phase, say) should appear

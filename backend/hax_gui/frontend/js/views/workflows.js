@@ -982,11 +982,19 @@ export function WorkflowsView() {
         const el = nodesLayer.querySelector(`.wf-node[data-node="${node.id}"]`);
         if (el) { el.style.left = node.x + "px"; el.style.top = node.y + "px"; }
       }
-      // ports move with the node; cheapest correct redraw is a full re-render
-      renderNodes();
+      // Ports are computed from node data (outPort/inPort), so only the wires
+      // and the minimap need repainting — the old full renderNodes() rebuilt
+      // every node element at pointer-event rate, which made dragging a
+      // 15-node graph visibly lag. Throttled to one repaint per frame.
+      scheduleDragRedraw();
     } else {
       redrawWires(p);
     }
+  }
+  let dragRaf = 0;
+  function scheduleDragRedraw() {
+    if (dragRaf) return;
+    dragRaf = requestAnimationFrame(() => { dragRaf = 0; redrawWires(); drawMinimap(); });
   }
   function onUp(e) {
     window.removeEventListener("pointermove", onMove);
@@ -1366,7 +1374,14 @@ export function WorkflowsView() {
     const live = minimapOn && !mmCollapsed && runState && root.isConnected
       && graph.nodes.some((n) => runState[n.id] && runState[n.id].status === "running");
     if (live && mmPulse === null) {
-      const tick = () => { mmPulse = requestAnimationFrame(tick); drawMinimap(); };
+      // The pulse is a slow 1.6 s glow: ~10 repaints/s renders it just as
+      // smoothly as the old every-frame loop, at a sixth of the work — this
+      // used to repaint the full minimap at 60 fps for a multi-hour run.
+      let last = 0;
+      const tick = (t) => {
+        mmPulse = requestAnimationFrame(tick);
+        if (t - last >= 100) { last = t; drawMinimap(); }
+      };
       mmPulse = requestAnimationFrame(tick);
     } else if (!live && mmPulse !== null) {
       cancelAnimationFrame(mmPulse); mmPulse = null;

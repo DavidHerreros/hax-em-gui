@@ -411,7 +411,8 @@ export function createPlot(canvas) {
   // into it lands in a 1px bitmap and is effectively lost. That happens whenever a plot
   // is built on a tab that isn't on screen yet. Watch our own box instead of trusting
   // callers to redraw us at the right moment.
-  if (window.ResizeObserver) new ResizeObserver(() => draw()).observe(canvas);
+  let ro = null;
+  if (window.ResizeObserver) { ro = new ResizeObserver(() => draw()); ro.observe(canvas); }
 
   // Hover readout. Skipped while panning — you're moving the plot, not reading it.
   canvas.addEventListener("mousemove", (e) => {
@@ -437,6 +438,13 @@ export function createPlot(canvas) {
     setFocus(name) { if (focus !== name) { focus = name; draw(); } },
     resetZoom,
     redraw: draw,
+    // Release what outlives the canvas: the ResizeObserver and the global
+    // resize listener each kept the whole plot closure (canvas + series)
+    // alive after the renderer was swapped out or the panel closed.
+    destroy() {
+      if (ro) { ro.disconnect(); ro = null; }
+      window.removeEventListener("resize", draw);
+    },
     // `scale` is the DPI multiplier (2 == twice the on-screen pixel size). Transparent
     // exports drop the background so the chart drops onto a slide or a paper figure;
     // opaque ones get the panel colour, which is what you want for a screenshot.
