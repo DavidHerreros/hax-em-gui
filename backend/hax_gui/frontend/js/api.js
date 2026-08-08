@@ -366,7 +366,7 @@ function wsUrl(path) {
 // stopped mid-training with no indication and no recovery short of a reload.
 // Reconnects with exponential backoff (0.5 s → 15 s), resets on success, and
 // guards JSON.parse so one malformed frame can't kill the handler.
-function subscribeWS(path, onMessage, { shouldReconnect } = {}) {
+export function subscribeWS(path, onMessage, { shouldReconnect } = {}) {
   let ws = null;
   let closed = false;
   let attempt = 0;

@@ -99,6 +99,8 @@ print("[hax-gui] auth: " + ("token required" if settings.auth_token else
 @app.middleware("http")
 async def host_allowlist(request: Request, call_next):
     if not shared.host_allowed(request.headers.get("host")):
+        print(f"[hax-gui] rejected Host header: {request.headers.get('host')!r} "
+              f"from {request.client.host if request.client else '?'}", flush=True)
         return Response("unrecognized Host header", status_code=421, media_type="text/plain")
     return await call_next(request)
 

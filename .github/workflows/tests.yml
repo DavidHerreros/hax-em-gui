@@ -36,3 +36,7 @@ jobs:
           for f in $(find backend/hax_gui/frontend/js backend/hax_gui/viewer_app/static -name '*.js'); do
             node --check --input-type=module < "$f" || { echo "FAILED: $f"; exit 1; }
           done
+      - name: Cross-file import/export resolution
+        # node --check is per-file; an import of a missing export passes it and
+        # still blank-pages the whole SPA. See backend/tests/check_js_imports.py.
+        run: python3 backend/tests/check_js_imports.py
