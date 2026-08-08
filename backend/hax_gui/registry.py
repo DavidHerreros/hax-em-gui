@@ -7,8 +7,11 @@ Schemas are produced by :mod:`hax_gui.introspect`. We prefer the cached JSON
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
 import json
+import os
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -37,19 +40,46 @@ def _category(module_path: str) -> str:
     return "Other"
 
 
+def _write_cache(data: dict[str, Any]) -> None:
+    """Persist the user schema cache atomically — a half-written cache file used
+    to 500 every schema endpoint until it was deleted by hand."""
+    try:
+        settings.schema_cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = settings.schema_cache.with_name(settings.schema_cache.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, default=str))
+        os.replace(tmp, settings.schema_cache)
+    except OSError:
+        pass
+
+
+def _read_cache(path: Path) -> dict[str, Any] | None:
+    """One cache file, or None if it is absent or corrupt. A corrupt *user* cache
+    is quarantined so the fallback chain (seed, then live extraction) rebuilds it
+    instead of the corruption 500ing forever."""
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        if path == settings.schema_cache and path.exists():
+            with contextlib.suppress(OSError):
+                os.replace(path, path.with_name(path.name + ".corrupt"))
+        return None
+
+
 def _load_cached() -> dict[str, Any]:
-    if settings.schema_cache.exists():
-        return json.loads(settings.schema_cache.read_text())
-    # No user cache yet: use the seed shipped inside the package, if present.
-    if settings.packaged_schema_cache.exists():
-        return json.loads(settings.packaged_schema_cache.read_text())
+    data = _read_cache(settings.schema_cache)
+    if data is not None:
+        return data
+    # No (usable) user cache: use the seed shipped inside the package, if present.
+    data = _read_cache(settings.packaged_schema_cache)
+    if data is not None:
+        return data
     # Nothing cached anywhere: extract live (imports JAX; slow but correct) and
     # persist into the (writable) user cache.
     from .introspect import extract_all
 
     data = extract_all()
-    settings.schema_cache.parent.mkdir(parents=True, exist_ok=True)
-    settings.schema_cache.write_text(json.dumps(data, indent=2, default=str))
+    _write_cache(data)
     return data
 
 
@@ -107,18 +137,21 @@ def _autodiscover(data: dict[str, Any]) -> None:
                 progs[name] = schema_for_program(name, module_path, desc)
             except Exception as exc:  # noqa: BLE001 - record & skip, like extract_all
                 errs[name] = str(exc)
-    try:
-        settings.schema_cache.parent.mkdir(parents=True, exist_ok=True)
-        settings.schema_cache.write_text(json.dumps(data, indent=2, default=str))
-    except OSError:
-        pass
+    _write_cache(data)
+
+
+# lru_cache doesn't serialize concurrent misses: two first requests would both
+# run _load_cached + _autodiscover and co-write the cache file. Under the lock
+# the second instead waits and reads the cache the first just wrote.
+_LOAD_LOCK = threading.Lock()
 
 
 @lru_cache(maxsize=1)
 def _load() -> dict[str, Any]:
-    data = _load_cached()
-    _autodiscover(data)
-    return data
+    with _LOAD_LOCK:
+        data = _load_cached()
+        _autodiscover(data)
+        return data
 
 
 def refresh() -> None:
