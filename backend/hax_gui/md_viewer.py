@@ -9,7 +9,6 @@ reverse-proxied at ``/mdviewer/<id>/``. The id is an unguessable capability toke
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import secrets
 import socket
 import subprocess
@@ -19,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from . import mdpaths, viewer_logs
+from . import children, mdpaths, viewer_logs
 
 _SERVER = Path(__file__).resolve().parent / "viewer_app" / "md_server.py"
 
@@ -74,14 +73,14 @@ class MdViewerManager:
         log = viewer_logs.log_path("mdviewer", vid)
         with viewer_logs.spawn_log(log) as log_fh:
             proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, cwd=str(cwd))
+        children.register("mdviewer", proc.pid)
         instance = {"id": vid, "port": port, "md": str(path), "title": title,
                     "proc": proc, "log": str(log)}
         try:
             await self._wait_ready(instance)
         except BaseException:
             # Untracked once we raise, so nothing else would reap it.
-            with contextlib.suppress(OSError):
-                proc.terminate()
+            children.release(proc)
             raise
         self._by_path[key] = instance
         self._by_id[vid] = instance
@@ -111,18 +110,12 @@ class MdViewerManager:
         if not inst:
             return False
         self._by_path.pop(inst["md"], None)
-        try:
-            inst["proc"].terminate()
-        except OSError:
-            pass
+        children.release(inst["proc"])
         return True
 
     def shutdown(self) -> None:
         for inst in list(self._by_id.values()):
-            try:
-                inst["proc"].terminate()
-            except OSError:
-                pass
+            children.release(inst["proc"])
 
     @staticmethod
     def _public(instance: dict[str, Any]) -> dict[str, Any]:

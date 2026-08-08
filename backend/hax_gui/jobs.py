@@ -122,38 +122,9 @@ def _now() -> str:
 TAIL_INTERVAL = 0.2
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True   # exists, just not ours to signal
-    return True
-
-
-def _proc_key(pid: int) -> str | None:
-    """A cheap identity for a pid: its start time, in clock ticks since boot.
-
-    A pid on its own is *not* safe to signal across a restart — the kernel recycles
-    them, so a pid stored yesterday may name something else entirely today, and
-    `killpg` on it would take out an innocent process group. Pairing the pid with its
-    start time makes reuse detectable: a recycled pid is necessarily younger than the
-    one we recorded.
-    """
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as f:
-            data = f.read()
-    except OSError:
-        return None
-    # Field 2 (comm) is parenthesised and may itself contain spaces and ')', so split
-    # only what follows the *last* ')'. starttime is field 22 overall, i.e. index 19
-    # of the remainder.
-    try:
-        rest = data[data.rindex(b")") + 2:].split()
-        return rest[19].decode()
-    except (ValueError, IndexError):
-        return None
+# Shared with children.py (viewer/TensorBoard reaping): pids are only ever
+# signalled after their recorded identity is re-verified.
+from .procs import pid_alive as _pid_alive, proc_key as _proc_key  # noqa: E402
 
 
 def _group_alive(pgid: int, key: str | None) -> bool:

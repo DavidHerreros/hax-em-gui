@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from . import children
 from .files import AccessDenied, resolve
 
 
@@ -69,8 +70,14 @@ class TensorBoardManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
         )
+        children.register("tb", proc.pid)
         instance = {"id": tb_id, "port": port, "prefix": prefix, "logdir": key, "proc": proc}
-        await self._wait_ready(instance)
+        try:
+            await self._wait_ready(instance)
+        except BaseException:
+            # Never tracked, so nothing else would ever reap it.
+            children.release(proc)
+            raise
         self._by_logdir[key] = instance
         self._by_id[tb_id] = instance
         return self._public(instance)
@@ -96,10 +103,7 @@ class TensorBoardManager:
         if not inst:
             return False
         self._by_logdir.pop(inst["logdir"], None)
-        try:
-            inst["proc"].terminate()
-        except OSError:
-            pass
+        children.release(inst["proc"])
         return True
 
     async def restart(self, tb_id: str) -> dict[str, Any] | None:
@@ -119,10 +123,7 @@ class TensorBoardManager:
 
     def shutdown(self) -> None:
         for inst in list(self._by_id.values()):
-            try:
-                inst["proc"].terminate()
-            except OSError:
-                pass
+            children.release(inst["proc"])
 
     @staticmethod
     def _public(instance: dict[str, Any]) -> dict[str, Any]:

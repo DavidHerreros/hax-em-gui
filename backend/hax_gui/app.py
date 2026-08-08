@@ -28,7 +28,7 @@ from . import chats as chat_store
 from . import metrics as metrics_reader
 from . import ollama as ollama_manager_mod
 from . import files as filebrowser
-from . import branches, cascade, gpus, groups, projects, registry, settings_store, updates, usage
+from . import branches, cascade, children, gpus, groups, projects, registry, settings_store, updates, usage
 from .branches import BranchError
 from .updater import UpdateBlocked, UpdateBusy, updater
 from .command import ValidationError
@@ -199,6 +199,9 @@ def _startup() -> None:
     # the rest are parked for the user to confirm, since resuming them would launch work).
     app.state.job_reattach = asyncio.create_task(manager.reattach())
     app.state.wf_resume = asyncio.create_task(wf_manager.resume_all())
+    # TensorBoard/viewer children a crashed server left behind keep holding their
+    # ports (and, for landscape viewers, GPU memory) — kill them now, off the loop.
+    app.state.child_reap = asyncio.create_task(asyncio.to_thread(children.reap_orphans))
 
     # Optionally bring up a local Ollama for the assistant (only if not already
     # running); shutdown stops only an instance we started. See ollama.py.

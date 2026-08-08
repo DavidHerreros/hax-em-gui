@@ -11,7 +11,6 @@ bearer header).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import secrets
 import socket
 import subprocess
@@ -21,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from . import viewer_logs
+from . import children, viewer_logs
 
 # The viewer backend ships inside the package: hax_gui/viewer_app/server.py
 _SERVER = Path(__file__).resolve().parent / "viewer_app" / "server.py"
@@ -96,6 +95,7 @@ class ViewerManager:
         log = viewer_logs.log_path("viewer", vid)
         with viewer_logs.spawn_log(log) as log_fh:
             proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
+        children.register("viewer", proc.pid)
         instance = {"id": vid, "port": port, "latents": str(lat), "reload": str(ckpt),
                     "title": title, "gpu": gpu or "", "key": key, "proc": proc, "log": str(log)}
         try:
@@ -103,8 +103,7 @@ class ViewerManager:
         except BaseException:
             # A backend that never came up is not tracked anywhere, so nothing else
             # would ever reap it: kill it here rather than leave it holding a GPU.
-            with contextlib.suppress(OSError):
-                proc.terminate()
+            children.release(proc)
             raise
         self._by_key[key] = instance
         self._by_id[vid] = instance
@@ -134,18 +133,12 @@ class ViewerManager:
         if not inst:
             return False
         self._by_key.pop(inst["key"], None)   # the key we actually filed it under
-        try:
-            inst["proc"].terminate()
-        except OSError:
-            pass
+        children.release(inst["proc"])
         return True
 
     def shutdown(self) -> None:
         for inst in list(self._by_id.values()):
-            try:
-                inst["proc"].terminate()
-            except OSError:
-                pass
+            children.release(inst["proc"])
 
     @staticmethod
     def _public(instance: dict[str, Any]) -> dict[str, Any]:
