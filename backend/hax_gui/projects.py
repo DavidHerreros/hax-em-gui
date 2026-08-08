@@ -9,14 +9,13 @@ and logs, so users never have to specify an output path.
 
 from __future__ import annotations
 
-import json
 import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import settings_store
+from . import jsonfile, settings_store
 
 META = "hax_project.json"
 
@@ -55,10 +54,11 @@ def list_projects() -> list[dict[str, Any]]:
     for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
         meta = child / META
         if child.is_dir() and meta.exists():
-            try:
-                out.append(_public(json.loads(meta.read_text()), child))
-            except (json.JSONDecodeError, OSError):
-                continue
+            # A corrupt metadata file must not make the project vanish from the
+            # list — jsonfile recovers the .bak, or falls back to {} and the
+            # folder-name defaults in _public.
+            data = jsonfile.read(meta, {})
+            out.append(_public(data if isinstance(data, dict) else {}, child))
     return out
 
 
@@ -72,7 +72,7 @@ def create(name: str) -> dict[str, Any]:
         folder = root / f"{slug}_{i}"
     folder.mkdir(parents=True)
     data = {"id": folder.name, "name": name.strip() or folder.name, "created_at": _now()}
-    (folder / META).write_text(json.dumps(data, indent=2))
+    jsonfile.write(folder / META, data)
     return _public(data, folder)
 
 
@@ -80,7 +80,8 @@ def get(project_id: str) -> dict[str, Any] | None:
     folder = dir_for(project_id)
     if folder is None:
         return None
-    return _public(json.loads((folder / META).read_text()), folder)
+    data = jsonfile.read(folder / META, {})
+    return _public(data if isinstance(data, dict) else {}, folder)
 
 
 def dir_for(project_id: str) -> Path | None:
@@ -98,9 +99,12 @@ def rename(project_id: str, new_name: str) -> dict[str, Any] | None:
     if folder is None:
         return None
     meta = folder / META
-    data = json.loads(meta.read_text())
+    data = jsonfile.read(meta, {})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("id", folder.name)
     data["name"] = new_name.strip() or data.get("name", folder.name)
-    meta.write_text(json.dumps(data, indent=2))
+    jsonfile.write(meta, data)
     return _public(data, folder)
 
 

@@ -6,11 +6,16 @@ are created (set from the GUI's Settings page). Stored as JSON in the data dir.
 
 from __future__ import annotations
 
-import json
+import threading
 from pathlib import Path
 from typing import Any
 
+from . import jsonfile
 from .config import settings
+
+# update() is read-modify-write; concurrent updates from two threadpool workers
+# must not interleave and drop each other's keys.
+_WRITE_LOCK = threading.Lock()
 
 
 # The shared roots the first-run setup notice nags about.
@@ -23,27 +28,25 @@ def _path() -> Path:
 
 
 def load() -> dict[str, Any]:
-    p = _path()
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+    # Atomic + self-recovering read: a truncated settings.json used to come back
+    # as {} — which silently made every project vanish (projects_root gone).
+    data = jsonfile.read(_path(), {})
+    return data if isinstance(data, dict) else {}
 
 
 def update(data: dict[str, Any]) -> dict[str, Any]:
     settings.ensure_dirs()
-    current = load()
-    for k, v in data.items():
-        if v is not None:
-            current[k] = v
-    # A root that now has a value loses its "silenced" mark, so if it is ever
-    # cleared again the setup notice comes back instead of staying hidden.
-    silenced = current.get(_SILENCED_KEY)
-    if isinstance(silenced, list):
-        current[_SILENCED_KEY] = [k for k in silenced if not current.get(k)]
-    _path().write_text(json.dumps(current, indent=2))
+    with _WRITE_LOCK:
+        current = load()
+        for k, v in data.items():
+            if v is not None:
+                current[k] = v
+        # A root that now has a value loses its "silenced" mark, so if it is ever
+        # cleared again the setup notice comes back instead of staying hidden.
+        silenced = current.get(_SILENCED_KEY)
+        if isinstance(silenced, list):
+            current[_SILENCED_KEY] = [k for k in silenced if not current.get(k)]
+        jsonfile.write(_path(), current)
     return current
 
 
