@@ -16,6 +16,7 @@
 // sync — and a latent space looks the same here as it does in the full landscape.
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
+import { sanitizedHtml } from "../markdown.js";
 import { api } from "../api.js";
 import { errorBox } from "./ui.js";
 import { pca } from "../pca.js";
@@ -1432,11 +1433,16 @@ export function metricsPanel({ logdir, jobId }) {
     for (const v of Object.values(views)) v.onManifest?.();
   }
 
-  // The colour legends hax logs with add_text (what blue/red mean on the variation map).
+  // The colour legends hax logs with add_text (what blue/red mean on the variation
+  // map). The payload comes straight out of a run's event files — an arbitrary
+  // server directory the user pointed the Metrics page at — so it is UNTRUSTED
+  // HTML: sanitize it, never hand it to an `html:` prop (that was an XSS).
   function legends(texts) {
     const box = h("details", { class: "mx-legends" }, h("summary", null, "Colour legends"));
-    for (const [tag, html] of Object.entries(texts)) {
-      box.appendChild(h("div", { class: "mx-legendtext", html }));
+    for (const html of Object.values(texts)) {
+      const div = h("div", { class: "mx-legendtext" });
+      div.appendChild(sanitizedHtml(html));
+      box.appendChild(div);
     }
     return box;
   }

@@ -58,6 +58,20 @@ app.add_middleware(
 )
 
 
+# Defence in depth for the SPA (the app builds its DOM via textContent, but one
+# missed `html:` prop is all it takes — see the TB add_text legend fix). Inline
+# <script> is forbidden ('self' only); styles are applied via CSSOM, which CSP
+# does not restrict; images use blob:/data: object URLs; WebSockets are
+# same-origin. Proxied apps (TensorBoard, the viewer subprocesses) ship their
+# own inline scripts, so the header is not applied under their prefixes.
+_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; "
+    "img-src 'self' blob: data:; connect-src 'self' ws: wss:; "
+    "frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
+)
+_CSP_EXEMPT = ("/tb/", "/viewer/", "/mrcviewer/", "/mdviewer/")
+
+
 @app.middleware("http")
 async def revalidate_static(request: Request, call_next):
     """Force the browser to revalidate static assets so edits show up without a
@@ -65,6 +79,8 @@ async def revalidate_static(request: Request, call_next):
     response = await call_next(request)
     if not request.url.path.startswith(("/api", "/ws", "/tb")):
         response.headers["Cache-Control"] = "no-cache"
+    if not request.url.path.startswith(_CSP_EXEMPT):
+        response.headers["Content-Security-Policy"] = _CSP
     return response
 
 
