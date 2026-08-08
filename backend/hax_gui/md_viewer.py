@@ -13,6 +13,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,9 +36,28 @@ class MdViewerManager:
     def __init__(self) -> None:
         self._by_path: dict[str, dict[str, Any]] = {}
         self._by_id: dict[str, dict[str, Any]] = {}
+        # ensure() is check-then-spawn; without this a double-click spawned two
+        # subprocesses for the same key and leaked one (see viewer.py).
+        self._spawn_locks: dict[str, asyncio.Lock] = {}
 
     def get(self, vid: str) -> dict[str, Any] | None:
         return self._by_id.get(vid)
+
+    def touch(self, vid: str) -> None:
+        inst = self._by_id.get(vid)
+        if inst is not None:
+            inst["last_seen"] = time.time()
+
+    def reap_idle(self, max_idle_s: float) -> list[str]:
+        """Stop sessions with no proxied request for ``max_idle_s``; drop dead ones."""
+        stopped = []
+        for vid, inst in list(self._by_id.items()):
+            if inst["proc"].poll() is not None:
+                self.stop(vid)
+            elif time.time() - inst.get("last_seen", 0) > max_idle_s:
+                self.stop(vid)
+                stopped.append(vid)
+        return stopped
 
     def list(self) -> list[dict[str, Any]]:
         return [self._public(i) for i in self._by_id.values()]
@@ -52,39 +72,48 @@ class MdViewerManager:
             raise ValueError(f"not a metadata file: {path}")
 
         key = str(path)
-        existing = self._by_path.get(key)
-        if existing and existing["proc"].poll() is None:
-            existing["title"] = title
-            return self._public(existing)
+        async with self._spawn_locks.setdefault(key, asyncio.Lock()):
+            existing = self._by_path.get(key)
+            if existing and existing["proc"].poll() is None:
+                existing["title"] = title
+                return self._public(existing)
 
-        vid = secrets.token_urlsafe(9)
-        port = _free_port()
-        cmd = [
-            sys.executable, str(_SERVER),
-            "--md", str(path),
-            "--title", title,
-            "--host", "127.0.0.1",
-            "--port", str(port),
-        ]
-        # Run from wherever the file's relative image refs resolve — its own
-        # folder by the Xmipp/Relion convention, an ancestor under Scipion.
-        cwd = mdpaths.image_base_dir(path) or path.parent
-        viewer_logs.prune("mdviewer")
-        log = viewer_logs.log_path("mdviewer", vid)
-        with viewer_logs.spawn_log(log) as log_fh:
-            proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, cwd=str(cwd))
-        children.register("mdviewer", proc.pid)
-        instance = {"id": vid, "port": port, "md": str(path), "title": title,
-                    "proc": proc, "log": str(log)}
-        try:
-            await self._wait_ready(instance)
-        except BaseException:
-            # Untracked once we raise, so nothing else would reap it.
-            children.release(proc)
-            raise
-        self._by_path[key] = instance
-        self._by_id[vid] = instance
-        return self._public(instance)
+            vid = secrets.token_urlsafe(9)
+            # Run from wherever the file's relative image refs resolve — its own
+            # folder by the Xmipp/Relion convention, an ancestor under Scipion.
+            cwd = mdpaths.image_base_dir(path) or path.parent
+            viewer_logs.prune("mdviewer")
+            log = viewer_logs.log_path("mdviewer", vid)
+            last_exc: BaseException | None = None
+            for _ in range(3):
+                port = _free_port()
+                cmd = [
+                    sys.executable, str(_SERVER),
+                    "--md", str(path),
+                    "--title", title,
+                    "--host", "127.0.0.1",
+                    "--port", str(port),
+                ]
+                with viewer_logs.spawn_log(log) as log_fh:
+                    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, cwd=str(cwd))
+                children.register("mdviewer", proc.pid)
+                instance = {"id": vid, "port": port, "md": str(path), "title": title,
+                            "proc": proc, "log": str(log), "last_seen": time.time()}
+                try:
+                    await self._wait_ready(instance)
+                    break
+                except BaseException as exc:
+                    # Untracked once we raise, so nothing else would reap it.
+                    children.release(proc)
+                    if isinstance(exc, RuntimeError) and viewer_logs.bind_failure(Path(log)):
+                        last_exc = exc     # port lost to the bind race: retry fresh
+                        continue
+                    raise
+            else:
+                raise last_exc
+            self._by_path[key] = instance
+            self._by_id[vid] = instance
+            return self._public(instance)
 
     async def _wait_ready(self, instance: dict[str, Any], timeout: float = 40.0) -> None:
         url = f"http://127.0.0.1:{instance['port']}/api/health"

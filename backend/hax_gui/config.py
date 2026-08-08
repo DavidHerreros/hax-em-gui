@@ -68,6 +68,12 @@ class Settings:
     assistant_actions: bool = field(
         default_factory=lambda: os.environ.get("HAX_GUI_ASSISTANT_ACTIONS", "0") in ("1", "true", "yes")
     )
+    # Minutes a viewer session (landscape/map/metadata) may go without a single
+    # proxied request before it is stopped, releasing its port — and, for the
+    # landscape viewer, its GPU memory. 0 disables the timeout.
+    viewer_idle_minutes: float = field(
+        default_factory=lambda: float(os.environ.get("HAX_GUI_VIEWER_IDLE_MINUTES", "120") or 0)
+    )
     # CORS origins for the SPA during dev (Vite default is 5173).
     cors_origins: list[str] = field(
         default_factory=lambda: _env_list("HAX_GUI_CORS_ORIGINS", ["http://localhost:5173", "http://127.0.0.1:5173"])

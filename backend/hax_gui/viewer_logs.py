@@ -85,6 +85,19 @@ def tail(path: Path, lines: int = TAIL_LINES) -> str:
     return "\n".join(text.splitlines()[-lines:]).strip()
 
 
+def bind_failure(path: Path) -> bool:
+    """Did this session die because its port was taken?
+
+    The managers probe for a free port and then let the child bind it — a window
+    in which anything else on the machine can grab it. That loss is visible only
+    as a startup exit whose log names the bind, which is what a caller checks
+    for before retrying on a fresh port.
+    """
+    text = tail(path, 200).lower()
+    return ("address already in use" in text
+            or "error while attempting to bind" in text)
+
+
 def startup_error(message: str, path: Path) -> str:
     """``message``, with the tail of the log appended when there is one.
 

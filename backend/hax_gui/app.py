@@ -202,6 +202,7 @@ def _startup() -> None:
     # TensorBoard/viewer children a crashed server left behind keep holding their
     # ports (and, for landscape viewers, GPU memory) — kill them now, off the loop.
     app.state.child_reap = asyncio.create_task(asyncio.to_thread(children.reap_orphans))
+    app.state.viewer_reaper = asyncio.create_task(_reap_idle_viewers())
 
     # Optionally bring up a local Ollama for the assistant (only if not already
     # running); shutdown stops only an instance we started. See ollama.py.
@@ -233,6 +234,31 @@ async def _shutdown() -> None:
         except Exception:  # noqa: BLE001
             pass
     await app.state.http.aclose()
+
+
+async def _reap_idle_viewers() -> None:
+    """Stop viewer sessions nobody has touched for `viewer_idle_minutes`.
+
+    An abandoned landscape viewer holds GPU memory for as long as it lives; the
+    map/metadata viewers hold a port and their loaded data. Every proxied request
+    counts as activity (see the `touch` calls in the proxy routes), so an open,
+    in-use viewer tab is never reaped — only sessions whose tab was closed or
+    forgotten. TensorBoard is deliberately exempt: it follows a training run the
+    user may check hours apart, and holds no GPU."""
+    if settings.viewer_idle_minutes <= 0:
+        return
+    max_idle = settings.viewer_idle_minutes * 60
+    while not app.state.shutdown.is_set():
+        try:
+            await asyncio.wait_for(app.state.shutdown.wait(), timeout=60)
+            break     # shutdown was signalled
+        except asyncio.TimeoutError:
+            pass
+        for mgr in (viewer_manager, mrc_viewer_manager, md_viewer_manager):
+            try:
+                mgr.reap_idle(max_idle)
+            except Exception:  # noqa: BLE001 - the reaper must outlive one bad pass
+                pass
 
 
 async def _run_update_check() -> None:
@@ -1864,6 +1890,7 @@ async def viewer_proxy(vid: str, path: str, request: Request) -> Response:
     inst = viewer_manager.get(vid)
     if inst is None:
         raise HTTPException(status_code=404, detail="unknown viewer session")
+    viewer_manager.touch(vid)   # any proxied request defers the idle timeout
     # The viewer subprocess serves at root; strip the /viewer/<id> prefix.
     query = request.url.query
     url = f"http://127.0.0.1:{inst['port']}/{path}" + (f"?{query}" if query else "")
@@ -2150,6 +2177,7 @@ async def mrc_viewer_proxy(vid: str, path: str, request: Request) -> Response:
     inst = mrc_viewer_manager.get(vid)
     if inst is None:
         raise HTTPException(status_code=404, detail="unknown map-viewer session")
+    mrc_viewer_manager.touch(vid)   # any proxied request defers the idle timeout
     query = request.url.query
     url = f"http://127.0.0.1:{inst['port']}/{path}" + (f"?{query}" if query else "")
     return await _proxy(request, url)
@@ -2217,6 +2245,7 @@ async def md_viewer_proxy(vid: str, path: str, request: Request) -> Response:
     inst = md_viewer_manager.get(vid)
     if inst is None:
         raise HTTPException(status_code=404, detail="unknown metadata-viewer session")
+    md_viewer_manager.touch(vid)   # any proxied request defers the idle timeout
     query = request.url.query
     url = f"http://127.0.0.1:{inst['port']}/{path}" + (f"?{query}" if query else "")
     return await _proxy(request, url)

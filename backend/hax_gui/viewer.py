@@ -15,6 +15,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +37,31 @@ class ViewerManager:
     def __init__(self) -> None:
         self._by_key: dict[tuple[str, ...], dict[str, Any]] = {}
         self._by_id: dict[str, dict[str, Any]] = {}
+        # Per-key spawn locks: ensure() is otherwise check-then-spawn, and two
+        # concurrent requests (a double-click) each passed the check and spawned
+        # their own JAX/CUDA subprocess — one of which then leaked, unreachable,
+        # because both filed under the same key.
+        self._spawn_locks: dict[tuple[str, ...], asyncio.Lock] = {}
 
     def get(self, vid: str) -> dict[str, Any] | None:
         return self._by_id.get(vid)
+
+    def touch(self, vid: str) -> None:
+        """Note activity on a session (called by the reverse proxy per request)."""
+        inst = self._by_id.get(vid)
+        if inst is not None:
+            inst["last_seen"] = time.time()
+
+    def reap_idle(self, max_idle_s: float) -> list[str]:
+        """Stop sessions with no proxied request for ``max_idle_s``; drop dead ones."""
+        stopped = []
+        for vid, inst in list(self._by_id.items()):
+            if inst["proc"].poll() is not None:
+                self.stop(vid)                      # already dead: just unfile it
+            elif time.time() - inst.get("last_seen", 0) > max_idle_s:
+                self.stop(vid)
+                stopped.append(vid)
+        return stopped
 
     def list(self) -> list[dict[str, Any]]:
         return [self._public(i) for i in self._by_id.values()]
@@ -68,46 +91,59 @@ class ViewerManager:
             red = None   # ignore a missing reduced-space file rather than failing the launch
 
         key = (str(lat), str(ckpt), str(red) if red else "", gpu or "")
-        existing = self._by_key.get(key)
-        if existing and existing["proc"].poll() is None:
-            existing["title"] = title
-            return self._public(existing)
+        async with self._spawn_locks.setdefault(key, asyncio.Lock()):
+            existing = self._by_key.get(key)
+            if existing and existing["proc"].poll() is None:
+                existing["title"] = title
+                return self._public(existing)
 
-        vid = secrets.token_urlsafe(9)
-        port = _free_port()
-        cmd = [
-            sys.executable, str(_SERVER),
-            "--latents", str(lat),
-            "--reload", str(ckpt),
-            "--title", title,
-            "--host", "127.0.0.1",
-            "--port", str(port),
-        ]
-        if red is not None:
-            cmd += ["--z_space_reduced", str(red)]
-        if project_dir:
-            cmd += ["--project-dir", str(project_dir)]
-        if metadata:
-            cmd += ["--metadata", str(metadata)]
-        if gpu:
-            cmd += ["--gpu", str(gpu)]
-        viewer_logs.prune("viewer")
-        log = viewer_logs.log_path("viewer", vid)
-        with viewer_logs.spawn_log(log) as log_fh:
-            proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
-        children.register("viewer", proc.pid)
-        instance = {"id": vid, "port": port, "latents": str(lat), "reload": str(ckpt),
-                    "title": title, "gpu": gpu or "", "key": key, "proc": proc, "log": str(log)}
-        try:
-            await self._wait_ready(instance)
-        except BaseException:
-            # A backend that never came up is not tracked anywhere, so nothing else
-            # would ever reap it: kill it here rather than leave it holding a GPU.
-            children.release(proc)
-            raise
-        self._by_key[key] = instance
-        self._by_id[vid] = instance
-        return self._public(instance)
+            vid = secrets.token_urlsafe(9)
+            viewer_logs.prune("viewer")
+            log = viewer_logs.log_path("viewer", vid)
+            last_exc: BaseException | None = None
+            for _ in range(3):
+                port = _free_port()
+                cmd = [
+                    sys.executable, str(_SERVER),
+                    "--latents", str(lat),
+                    "--reload", str(ckpt),
+                    "--title", title,
+                    "--host", "127.0.0.1",
+                    "--port", str(port),
+                ]
+                if red is not None:
+                    cmd += ["--z_space_reduced", str(red)]
+                if project_dir:
+                    cmd += ["--project-dir", str(project_dir)]
+                if metadata:
+                    cmd += ["--metadata", str(metadata)]
+                if gpu:
+                    cmd += ["--gpu", str(gpu)]
+                with viewer_logs.spawn_log(log) as log_fh:
+                    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
+                children.register("viewer", proc.pid)
+                instance = {"id": vid, "port": port, "latents": str(lat), "reload": str(ckpt),
+                            "title": title, "gpu": gpu or "", "key": key, "proc": proc,
+                            "log": str(log), "last_seen": time.time()}
+                try:
+                    await self._wait_ready(instance)
+                    break
+                except BaseException as exc:
+                    # A backend that never came up is not tracked anywhere, so nothing
+                    # else would ever reap it: kill it here rather than leave it
+                    # holding a GPU.
+                    children.release(proc)
+                    # The probed port can be taken between the probe and the child's
+                    # bind; that specific loss is worth a fresh port, not a failure.
+                    if isinstance(exc, RuntimeError) and viewer_logs.bind_failure(Path(log)):
+                        last_exc = exc
+                        continue
+                    raise
+            else:
+                raise last_exc
+            self._by_key[key] = instance
+            self._by_id[vid] = instance
+            return self._public(instance)
 
     async def _wait_ready(self, instance: dict[str, Any], timeout: float = 40.0) -> None:
         url = f"http://127.0.0.1:{instance['port']}/api/health"
