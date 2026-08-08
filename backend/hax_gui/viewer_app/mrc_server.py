@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -33,15 +32,14 @@ import numpy as np
 # Be a good GPU citizen even though this backend never touches the GPU.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-# Run as a plain script (the GUI spawns `python mrc_server.py`), so the sibling
-# `server.py` is importable as a top-level module for the shared mesh/grid helpers.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Run as a plain script (the GUI spawns `python mrc_server.py`); the script's own
+# directory is on sys.path, so the sibling `meshing.py` imports as a top-level module.
 
 from fastapi import FastAPI, HTTPException, Query, Response  # noqa: E402
 from fastapi.responses import FileResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
-from server import _downsample, grid_box, level_for_mass, level_for_sigma, mesh_at  # noqa: E402
+from meshing import _downsample, grid_box, level_for_mass, level_for_sigma, mesh_at  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
 

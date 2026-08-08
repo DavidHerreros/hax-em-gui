@@ -19,7 +19,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hax_gui" / "viewer_app"))
 
-from server import _downsample, grid_box, mesh_at  # noqa: E402
+from meshing import _downsample, grid_box, mesh_at  # noqa: E402
 
 
 # --------------------------------------------------------------------------
