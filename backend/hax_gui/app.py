@@ -1086,7 +1086,14 @@ async def create_project_job(project_id: str, body: JobCreate) -> dict[str, Any]
             replace = None
     # Editing a run in place re-makes its outputs exactly as a rerun does, so the same
     # invalidation applies to everything downstream. Done before the create call, which
-    # deletes the folder those dependents read from.
+    # deletes the folder those dependents read from — but only once the submission has
+    # passed a dry validation: a 422 must not leave dependents killed/staled for a
+    # rebuild that never happened.
+    if replace:
+        try:
+            manager.precheck(body.program, body.args, body.gpu, body.bindings)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail={"errors": exc.errors})
     rerun = RerunBody(cascade=body.cascade, cancel_running=body.cancel_running)
     deps = await _apply_cascade([replace], rerun) if replace else []
     try:
@@ -1214,6 +1221,12 @@ async def rerun_job(job_id: str, body: RerunBody = RerunBody()) -> dict[str, Any
     # must not leave a trail of runs flagged stale for a rebuild that never happened.
     if job.get("active"):
         raise HTTPException(status_code=409, detail="job is already running")
+    # Same principle for a 422: dry-validate the stored command before the cascade so a
+    # refused rerun leaves no dependents killed or flagged stale.
+    try:
+        manager.precheck_rerun(job_id)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
     # Invalidate downstream *before* relaunching: their inputs live in the run folder the
     # rerun is about to delete, and one of them may still be reading it.
     deps = await _apply_cascade([job_id], body)
@@ -1241,6 +1254,10 @@ async def continue_job(job_id: str, body: RerunBody = RerunBody()) -> dict[str, 
     if job.get("stale"):
         raise HTTPException(status_code=409, detail="this run's inputs were re-made after it "
                                                     "finished — re-run it instead of continuing")
+    # Also settled up front: whether there is a checkpoint to continue from. Discovering
+    # there isn't one *after* the cascade would strand the dependents it invalidated.
+    if not adapters.is_resumable(job["program"], job.get("workdir")):
+        raise HTTPException(status_code=409, detail="no intermediate checkpoint to continue from")
     # A continue keeps this run's folder, so downstream input *paths* survive — but the
     # outputs behind them are about to be overwritten from a further-trained checkpoint,
     # so anything derived from them is just as out of date.

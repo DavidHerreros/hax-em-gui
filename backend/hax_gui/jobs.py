@@ -647,6 +647,51 @@ class JobManager:
                 raise ValidationError({field: str(exc)})
         return values
 
+    def precheck(self, program: str, values: dict[str, Any], gpu: str | None,
+                 bindings: dict[str, Any] | None = None) -> None:
+        """Validate a submission as far as possible *without side effects*.
+
+        The rerun/edit endpoints invalidate everything downstream — cancelling
+        runs, flagging staleness — before rebuilding this job, so a submission
+        that is going to be refused with a 422 must be refused *before* that
+        cascade, not after it has already done its damage. Auto-filled and
+        binding-fed fields can't be validated without materialising them, so they
+        are stubbed with the placeholders create() will overwrite; what remains is
+        exactly the user-typed surface that produces 422s, plus an existence check
+        on each binding's source job (the other common late failure). Adapter
+        errors while materialising can still surface later — this is a best-effort
+        gate, not a guarantee.
+        """
+        values = dict(values)
+        for field, binding in (bindings or {}).items():
+            many = isinstance(binding, list)
+            for one in (binding if many else [binding]):
+                if self.get((one or {}).get("job_id", "")) is None:
+                    raise ValidationError({field: "source job no longer exists"})
+            values[field] = ["/placeholder"] if many else "/placeholder"
+        for arg in (registry.output_arg(program), registry.ssd_arg(program)):
+            if arg:
+                values[arg] = "/placeholder"
+        build_command(program, values, gpu)   # raises ValidationError
+
+    def precheck_rerun(self, job_id: str) -> None:
+        """`precheck` for an existing job, preparing its stored args exactly the
+        way :meth:`rerun` will."""
+        job = self.get(job_id)
+        if job is None:
+            raise JobNotFound(job_id)
+        program = job["program"]
+        args = dict(job["args"])
+        for arg in (registry.output_arg(program), registry.ssd_arg(program)):
+            if arg:
+                args.pop(arg, None)
+        args, _ = strip_obsolete(program, args)
+        bindings = job.get("bindings")
+        if bindings:
+            for field in bindings:
+                args.pop(field, None)
+        self.precheck(program, args, job["gpu"], bindings)
+
     async def rerun(self, job_id: str) -> dict[str, Any]:
         """Re-launch a job in place: the same job is replaced with a fresh run — its own
         run folder cleared and rebuilt, keeping the path — rather than creating a new job."""
@@ -1219,11 +1264,23 @@ class JobManager:
         )
         return {r["project_id"]: r["n"] for r in rows}
 
-    def list_for_project(self, project_id: str, limit: int = 200) -> list[dict[str, Any]]:
-        rows = self._exec(
-            "SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
-            (project_id, limit), fetch="all",
-        )
+    def list_for_project(self, project_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+        """All of a project's jobs (newest first), unlimited by default.
+
+        This feeds the dependency graph (cascade invalidation, workflow sync) and
+        the project's ACTIVE check on delete — a row cap here silently broke all
+        three past that many runs, so a cap is now strictly opt-in (UI pagination).
+        """
+        if limit is not None:
+            rows = self._exec(
+                "SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
+                (project_id, limit), fetch="all",
+            )
+        else:
+            rows = self._exec(
+                "SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC",
+                (project_id,), fetch="all",
+            )
         return [self._row(r) for r in rows]
 
     def tail(self, job_id: str, max_lines: int | None = None, stream: str = "out") -> list[str]:
