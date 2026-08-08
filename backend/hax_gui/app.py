@@ -7,6 +7,7 @@ Run (inside the hax conda env):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 from pathlib import Path
@@ -79,7 +80,18 @@ async def _proxy(request: "Request", url: str) -> "Response":
         background=BackgroundTask(upstream.aclose),
     )
 
-app = FastAPI(title="Hax GUI", version="0.1.0")
+@contextlib.asynccontextmanager
+async def _lifespan(app: "FastAPI"):
+    # Bodies live in _on_startup/_on_shutdown below (they reference managers and
+    # helpers defined later in the module; names resolve at call time).
+    await _on_startup(app)
+    try:
+        yield
+    finally:
+        await _on_shutdown(app)
+
+
+app = FastAPI(title="Hax GUI", version="0.1.0", lifespan=_lifespan)
 # Compress responses when the browser accepts it (mesh/grid binaries and JSON
 # job lists shrink a lot); already-encoded upstream bodies are left alone
 # (starlette's guard), and small responses aren't worth the header.
@@ -181,8 +193,7 @@ async def revalidate_static(request: Request, call_next):
 _UPDATE_POLL_SECONDS = 6 * 60 * 60
 
 
-@app.on_event("startup")
-def _startup() -> None:
+async def _on_startup(app: FastAPI) -> None:
     manager.init()
     label_manager.init()
     wf_manager.init()
@@ -203,21 +214,35 @@ def _startup() -> None:
     # ports (and, for landscape viewers, GPU memory) — kill them now, off the loop.
     app.state.child_reap = asyncio.create_task(asyncio.to_thread(children.reap_orphans))
     app.state.viewer_reaper = asyncio.create_task(_reap_idle_viewers())
-
-    # Optionally bring up a local Ollama for the assistant (only if not already
-    # running); shutdown stops only an instance we started. See ollama.py.
+    # Assistant warmup runs in the background: the old sync handler blocked the
+    # accept loop for up to 20 s polling Ollama — and built the docs index (via
+    # assistant status) BEFORE starting Ollama, leaving the index without
+    # embeddings for the life of the process.
     app.state.ollama = {"managed": False}
-    if settings.manage_ollama and assistant_bridge.available():
+    app.state.assistant_warmup = asyncio.create_task(_warm_assistant(app))
+
+
+async def _warm_assistant(app: FastAPI) -> None:
+    """Bring up Ollama (when managed), then build the assistant's doc index —
+    in that order, so the index embeds against a live Ollama."""
+    if not assistant_bridge.available():
+        return
+    if settings.manage_ollama:
         try:
-            base_url = assistant_bridge.status().get("base_url", "")
-            if base_url:
-                app.state.ollama = ollama_manager_mod.manager.ensure_started(base_url)
-        except Exception:  # noqa: BLE001 - never block startup on Ollama
+            url = assistant_bridge.base_url()   # config only; must not build the index
+            if url:
+                app.state.ollama = await asyncio.to_thread(
+                    ollama_manager_mod.manager.ensure_started, url)
+        except Exception:  # noqa: BLE001 - never fail startup on Ollama
             app.state.ollama = {"managed": False, "reason": "startup error"}
+    try:
+        # Constructs the session, which builds the docs index with embeddings.
+        await asyncio.to_thread(assistant_bridge.status)
+    except Exception:  # noqa: BLE001 - the assistant stays optional
+        pass
 
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
+async def _on_shutdown(app: FastAPI) -> None:
     app.state.shutdown.set()  # unblock idle log WebSockets so the server can exit
     poller = getattr(app.state, "update_poller", None)
     if poller is not None:

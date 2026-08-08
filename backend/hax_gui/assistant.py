@@ -31,6 +31,23 @@ def _get() -> "AssistantSession":
     return _session
 
 
+def base_url() -> str:
+    """The configured Ollama endpoint, read from config alone.
+
+    Deliberately does NOT construct the session: construction builds the docs
+    vector index, whose embeddings need Ollama up — the caller uses this to
+    start Ollama *first* (see the warmup task in app.py). ``status()`` here
+    would re-create the old ordering bug it exists to fix.
+    """
+    if not _INSTALLED:
+        return ""
+    try:
+        from hax_assistant.config import Settings
+        return Settings.from_env().base_url
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def status() -> dict:
     """Availability + (when installed) model/grounding info for the SPA."""
     if not _INSTALLED:
