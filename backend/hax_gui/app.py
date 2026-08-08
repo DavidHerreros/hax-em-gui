@@ -1218,27 +1218,29 @@ async def job_log_ws(websocket: WebSocket, job_id: str) -> None:
         return
 
     await websocket.accept()
-    # subscribe() registers our queue atomically; we then snapshot from the full
-    # persisted log (read_log runs with no await in between, so no streamed chunk is
-    # dropped or duplicated). The in-memory buffer is only a small tail and would
-    # lose the earliest lines once tqdm progress output has filled it.
+    # subscribe() registers our queue atomically, and tail_positions() is captured
+    # in the same tick: the snapshot then reads the file only up to those offsets,
+    # while everything past them arrives through the queue — no chunk duplicated
+    # or dropped even though the (multi-MB) file read itself happens in a worker
+    # thread. Reading it inline used to freeze the whole event loop for seconds.
     queue, _ = manager.subscribe(job_id)
+    cut = manager.tail_positions(job_id)
     try:
         # One snapshot carrying both streams' full replay, so the UI seeds its
         # stdout / stderr tabs; live chunks that follow are tagged per stream.
         def _snapshot() -> dict[str, Any]:
             return {"type": "snapshot", "status": job["status"],
-                    "streams": {"out": manager.read_log(job_id, "out"),
-                                "err": manager.read_log(job_id, "err")}}
+                    "streams": {"out": manager.read_log(job_id, "out", upto=cut.get("out")),
+                                "err": manager.read_log(job_id, "err", upto=cut.get("err"))}}
 
         if not job["active"]:
             # Finished job: replay the full log and close — nothing more will stream.
             manager.unsubscribe(job_id, queue)
-            await websocket.send_json(_snapshot())
+            await websocket.send_json(await run_in_threadpool(_snapshot))
             await websocket.send_json({"type": "status", "status": job["status"], "return_code": job["return_code"]})
             return
 
-        await websocket.send_json(_snapshot())
+        await websocket.send_json(await run_in_threadpool(_snapshot))
         shutdown = websocket.app.state.shutdown
         while True:
             getter = asyncio.ensure_future(queue.get())

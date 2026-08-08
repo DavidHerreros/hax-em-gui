@@ -224,6 +224,11 @@ class JobManager:
         # Recent raw text tail per job, split by stream: job_id -> {stream: deque}.
         self._buffers: dict[str, dict[str, deque[str]]] = {}
         self._buflens: dict[str, dict[str, int]] = {}
+        # Byte offset each stream's tailer has *published* up to, per job. This is
+        # the cut point a log-WebSocket snapshot must stop at: everything past it
+        # arrives through the subscriber queue, so reading the file further would
+        # duplicate those chunks (see tail_positions / read_log's `upto`).
+        self._tail_pos: dict[str, dict[str, int]] = {}
 
     # -- lifecycle ---------------------------------------------------------
     def init(self) -> None:
@@ -401,7 +406,11 @@ class JobManager:
         existed = workdir.is_dir()
         workdir.mkdir(parents=True, exist_ok=True)
         try:
-            values = self._resolve_bindings(values, bindings, workdir)
+            # Off the event loop: materialising a binding can parse a million-row
+            # metadata file into an .npy (tens of seconds). Blocking here froze the
+            # entire server — every request, every log WebSocket, the scheduler —
+            # for the duration, indistinguishable from a hang.
+            values = await asyncio.to_thread(self._resolve_bindings, values, bindings, workdir)
             command = build_command(program, values, gpu)  # raises ValidationError
         except (ValidationError, adapters.AdapterError):
             if not existed:
@@ -413,7 +422,11 @@ class JobManager:
             # an intermediate checkpoint found in their own output folder (adapters.
             # _RESUMABLE), so a leftover one would silently turn this fresh run into a
             # continue. A brand-new folder makes this a no-op.
-            self._clear_run_folder(workdir, keep=self._materialised(values, workdir))
+            #
+            # Off the loop: this rmtree walks a whole previous run (checkpoints,
+            # decoded volume series) — minutes on a big one.
+            await asyncio.to_thread(
+                self._clear_run_folder, workdir, self._materialised(values, workdir))
         if ssd_dir is not None:
             # The SSD scratch is shared per project and reused across runs (the generator
             # skips rebuilding when cached shards exist). Optionally discard it so it's
@@ -424,7 +437,12 @@ class JobManager:
             # caches of every dataset in the project, and wiping it would throw away hours of
             # rebuilding for datasets this run has nothing to do with.
             if recreate_ssd and launch and ssd_dir.exists():
-                self._purge_dataset_cache(ssd_dir, values.get(registry.working_dir_arg(program)))
+                # Off the loop: the array-record cache is enormous (the module
+                # comment above sizes it at 410 GB for 1M particles) — deleting
+                # it inline blocked the whole server for up to an hour.
+                await asyncio.to_thread(
+                    self._purge_dataset_cache, ssd_dir,
+                    values.get(registry.working_dir_arg(program)))
             ssd_dir.mkdir(parents=True, exist_ok=True)
 
         # Launch from the metadata file's folder so relative image references in
@@ -471,7 +489,8 @@ class JobManager:
             if old and old.get("workdir"):
                 old_wd = Path(old["workdir"])
                 if old_wd != workdir and old_wd.exists():
-                    shutil.rmtree(old_wd, ignore_errors=True)
+                    # A whole orphaned run folder — delete it off the loop.
+                    await asyncio.to_thread(shutil.rmtree, old_wd, ignore_errors=True)
                     usage.forget(str(old_wd))
         else:
             self._exec(
@@ -484,7 +503,7 @@ class JobManager:
         if launch:
             if resume:
                 # Reused folder: clear metrics and mark the resume point in the kept log.
-                self._prepare_resume(program, str(workdir), str(log_path))
+                await asyncio.to_thread(self._prepare_resume, program, str(workdir), str(log_path))
             # Say so in the run's own log rather than only in the reply: this is the
             # record someone reads months later when asking why a repeated run differs
             # from the original.
@@ -971,6 +990,7 @@ class JobManager:
         """
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         pos = offset
+        self._tail_pos.setdefault(job_id, {})[kind] = pos
         while True:
             data = b""
             try:
@@ -985,6 +1005,7 @@ class JobManager:
                 if text:
                     self._buffer_append(job_id, text, kind)
                     self._publish(job_id, {"type": "chunk", "stream": kind, "data": text})
+                    self._tail_pos.setdefault(job_id, {})[kind] = pos
                 continue                      # keep draining while there is more
             if stop.is_set():
                 return                        # the job is gone and the file is drained
@@ -1131,30 +1152,54 @@ class JobManager:
         if subs:
             subs.discard(queue)
 
-    def read_log(self, job_id: str, stream: str = "out", cap: int = 4_000_000, raw_cap: int = 64_000_000) -> str:
-        """Full persisted log for one stream ("out"/"err"), tqdm frames collapsed.
+    def tail_positions(self, job_id: str) -> dict[str, int]:
+        """Byte offset each stream's tailer has published up to (may be empty).
+
+        Captured in the same event-loop tick as :meth:`subscribe`, this is the
+        exact cut for a replay snapshot: bytes below it are read from the file,
+        bytes at/after it arrive as live chunks — nothing duplicated, nothing
+        lost, even when the file read itself happens later in a worker thread.
+        """
+        return dict(self._tail_pos.get(job_id, {}))
+
+    def read_log(self, job_id: str, stream: str = "out", cap: int = 4_000_000,
+                 raw_cap: int = 16_000_000, upto: int | None = None) -> str:
+        """Persisted log for one stream ("out"/"err"), tqdm frames collapsed.
 
         The in-memory buffer is only a recent tail, so reopening a job (running or
         finished) replays from the file to keep the earliest lines. We read up to
-        ``raw_cap`` bytes from the end (enough for any realistic run in full),
+        ``raw_cap`` bytes from the end (a truncation notice marks anything beyond),
         collapse repeated ``\\r`` progress frames to their final state, then cap the
         result to ``cap`` characters — so early lines survive even when a run has
         written megabytes of progress output.
+
+        ``upto`` stops the read at that byte offset (the tailer's published
+        position): a live subscriber gets everything past it as queued chunks, so
+        reading further here would replay those bytes twice. This is a blocking
+        read of up to ``raw_cap`` bytes — call it from a worker thread, never on
+        the event loop.
         """
         job = self.get(job_id)
         if not job:
             return ""
         log_path = job["log_path"] if stream == "out" else self._err_path(job["log_path"])
+        truncated = False
         try:
             p = Path(log_path)
-            size = p.stat().st_size
+            end = p.stat().st_size
+            if upto is not None:
+                end = min(end, upto)
+            start = max(0, end - raw_cap)
+            truncated = start > 0
             with open(p, "rb") as f:
-                if size > raw_cap:
-                    f.seek(size - raw_cap)
-                data = f.read()
+                f.seek(start)
+                data = f.read(end - start)
         except OSError:
             return "".join(self._buffers.get(job_id, {}).get(stream, ()))
-        return _collapse_progress(data.decode("utf-8", errors="replace"))[-cap:]
+        text = _collapse_progress(data.decode("utf-8", errors="replace"))[-cap:]
+        if truncated:
+            text = f"[hax-gui] log truncated: showing the last {raw_cap // 1_000_000} MB\n" + text
+        return text
 
     def _publish(self, job_id: str, message: dict[str, Any]) -> None:
         for queue in self._subscribers.get(job_id, set()):
@@ -1194,15 +1239,31 @@ class JobManager:
         return [self._row(r) for r in rows]
 
     def tail(self, job_id: str, max_lines: int | None = None, stream: str = "out") -> list[str]:
+        """The last ``max_lines`` of a job's log, reading only the end of the file.
+
+        The old ``read().splitlines()`` slurped the whole log — a 500 MB
+        progress-bar log was a >1 GB allocation per request, and forty threadpool
+        slots of that is an OOM. Seek to a bounded window from the end instead
+        (generous 4 KB/line, 8 MB floor/ceiling) and drop the first, possibly
+        partial, line when the window didn't reach the start.
+        """
         job = self.get(job_id)
         if not job:
             return []
         log_path = job["log_path"] if stream == "out" else self._err_path(job["log_path"])
+        window = min(32_000_000, max(8_000_000, (max_lines or 0) * 4096))
         try:
-            with open(log_path, encoding="utf-8") as log:
-                lines = log.read().splitlines()
+            with open(log_path, "rb") as log:
+                size = os.fstat(log.fileno()).st_size
+                start = max(0, size - window)
+                log.seek(start)
+                text = log.read().decode("utf-8", errors="replace")
         except FileNotFoundError:
             lines = list(self._buffers.get(job_id, {}).get(stream, ()))
+            return lines[-max_lines:] if max_lines else lines
+        lines = text.splitlines()
+        if start > 0 and lines:
+            lines = lines[1:]                       # first line is likely cut mid-way
         return lines[-max_lines:] if max_lines else lines
 
     # -- helpers -----------------------------------------------------------
