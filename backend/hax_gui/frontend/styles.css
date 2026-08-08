@@ -377,6 +377,8 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; }
 .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.2s ease-in-out infinite; }
 .badge.pending { background: color-mix(in srgb, var(--faint) 30%, transparent); color: var(--text); }
+/* admission-queued: created and ready, waiting for a free slot on its GPU */
+.badge.queued { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
 .badge.running { background: rgba(99, 102, 241, 0.2); color: var(--brand-300); box-shadow: inset 0 0 0 1px var(--active-ring); }
 .badge.succeeded { background: color-mix(in srgb, var(--ok) 20%, transparent); color: var(--ok); }
 .badge.failed { background: color-mix(in srgb, var(--err) 20%, transparent); color: var(--err); }

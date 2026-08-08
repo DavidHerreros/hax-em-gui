@@ -53,7 +53,9 @@ LIVE_BUFFER_CHARS = 256_000
 # process group has been signalled but nothing is final until the supervisor reaps it
 # and writes 'cancelled'. Leaving it out made the log WS treat a cancelling job as
 # finished and hang up, so the client never saw that final status.
-ACTIVE = {"pending", "running", "cancelling"}
+# "queued" is admission control (see _admit): created and ready to run, but its
+# GPU already has its full complement of jobs; dispatched FIFO as slots free up.
+ACTIVE = {"pending", "queued", "running", "cancelling"}
 
 # The subprocess' output streams, kept separate so the UI can show one tab each.
 STREAMS = ("out", "err")
@@ -200,6 +202,9 @@ class JobManager:
         # arrives through the subscriber queue, so reading the file further would
         # duplicate those chunks (see tail_positions / read_log's `upto`).
         self._tail_pos: dict[str, dict[str, int]] = {}
+        # Launch details of admission-queued jobs (append/notice flags only; the
+        # command itself lives in the row, so a restart can still dispatch them).
+        self._queue_held: dict[str, dict[str, Any]] = {}
 
     # -- lifecycle ---------------------------------------------------------
     def init(self) -> None:
@@ -283,6 +288,9 @@ class JobManager:
                 r["id"], int(r["pgid"] or 0), r["proc_key"], out_path, err_path,
                 _size(out_path), _size(err_path),
             ))
+        # Jobs the previous server left admission-queued still hold their command
+        # in the row; launch whichever now fit on their device.
+        await self._dispatch_queued()
 
     # -- creation / launch -------------------------------------------------
     async def create(
@@ -888,8 +896,45 @@ class JobManager:
                 return str(md.parent)
         return str(workdir)
 
+    def _admit(self, job_id: str) -> bool:
+        """May this job start now, or is its device full?
+
+        Two launches on the same GPU used to both start and OOM together; now the
+        device (the job's `gpu` string; unpinned jobs share the "" pool) admits
+        `max_jobs_per_gpu` (settings, default 1) at a time. 0 disables admission.
+        """
+        limit = settings_store.max_jobs_per_gpu()
+        if limit <= 0:
+            return True
+        job = self.get(job_id)
+        device = job.get("gpu") or ""
+        row = self._exec(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status IN ('pending','running','cancelling') "
+            "AND COALESCE(gpu,'')=? AND id != ?", (device, job_id), fetch="one")
+        return int(row["n"]) < limit
+
+    async def _dispatch_queued(self) -> None:
+        """Launch queued jobs whose device now has a free slot (FIFO)."""
+        rows = self._exec(
+            "SELECT id FROM jobs WHERE status='queued' ORDER BY created_at", fetch="all")
+        for r in rows:
+            job = self.get(r["id"])
+            if job is None or not self._admit(job["id"]):
+                continue
+            held = self._queue_held.pop(job["id"], {})
+            self._exec("UPDATE jobs SET status='pending' WHERE id=?", (job["id"],))
+            await self._launch(job["id"], job["command"], job["log_path"], job.get("cwd"),
+                               append_out=held.get("append_out", False), notice=held.get("notice"))
+
     async def _launch(self, job_id: str, command: list[str], log_path: str, cwd: str | None = None,
                       append_out: bool = False, notice: str | None = None) -> None:
+        if not self._admit(job_id):
+            # Park it. Everything needed to launch later is already in the row;
+            # only the launch niceties (append/notice) need holding on the side.
+            self._queue_held[job_id] = {"append_out": append_out, "notice": notice}
+            self._exec("UPDATE jobs SET status='queued' WHERE id=?", (job_id,))
+            self._publish(job_id, {"type": "status", "status": "queued"})
+            return
         out_path, err_path = log_path, self._err_path(log_path)
         exit_path = _exit_path(log_path)
         with contextlib.suppress(OSError):
@@ -1043,6 +1088,9 @@ class JobManager:
             (status, return_code, _now(), job_id),
         )
         self._publish(job_id, {"type": "status", "status": status, "return_code": return_code})
+        # A slot on this job's device just freed: hand it to the next queued job.
+        with contextlib.suppress(RuntimeError):        # no loop: nothing can be queued either
+            asyncio.get_running_loop().create_task(self._dispatch_queued())
 
     async def _reap_group(self, job_id: str, pgid: int) -> None:
         """Kill whatever is left in a finished job's process group.
@@ -1098,6 +1146,13 @@ class JobManager:
         """
         job = self.get(job_id)
         if job is None or job["status"] not in ACTIVE:
+            return
+        if job["status"] == "queued":
+            # Never launched: nothing to signal, just take it out of the queue.
+            self._queue_held.pop(job_id, None)
+            self._exec("UPDATE jobs SET status='cancelled', finished_at=? WHERE id=?",
+                       (_now(), job_id))
+            self._publish(job_id, {"type": "status", "status": "cancelled"})
             return
         pgid, key = int(job.get("pgid") or 0), job.get("proc_key")
         if not _group_alive(pgid, key):

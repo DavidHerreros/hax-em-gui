@@ -98,6 +98,16 @@ def ssd_scratch_root() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
+def max_jobs_per_gpu() -> int:
+    """Jobs admitted per device at once (admission control, jobs._admit).
+    Default 1 — two trainings on one GPU just OOM each other. 0 disables."""
+    raw = load().get("max_jobs_per_gpu", 1)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
 def source_repos() -> dict[str, str]:
     """User-configured source-clone paths per package, for the branch panel to
     manage a dev checkout that the install itself doesn't point at (e.g. a PyPI

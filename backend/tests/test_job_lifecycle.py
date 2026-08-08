@@ -108,3 +108,32 @@ def test_delete_job_cleans_up(client, run, project, md_file):
     from hax_gui.labels import manager as label_manager
     assert label_manager.labels_for(job["id"]) == []
     run(client.delete(f"/api/labels/{lid}"))
+
+
+def test_gpu_admission_queue(client, run, project, md_file):
+    """Two launches on the same GPU: the second queues, and is dispatched the
+    moment the first frees the slot (here: by being cancelled)."""
+    GATE.write_text("")
+    try:
+        a = _create(client, run, project, md_file, extra={}, launch=True)
+        # pin both to the same device
+        from hax_gui.jobs import manager
+        wait_for_status(client, run, a["id"], {"running"})
+        b = _create(client, run, project, md_file, launch=True)
+        queued = wait_for_status(client, run, b["id"], {"queued", "running"})
+        assert queued["status"] == "queued", "second job on the device must queue"
+        # a queued job can be cancelled without ever running
+        c = _create(client, run, project, md_file, launch=True)
+        wait_for_status(client, run, c["id"], {"queued"})
+        r = run(client.post(f"/api/jobs/{c['id']}/cancel"))
+        assert r.status_code == 200
+        assert wait_for_status(client, run, c["id"], {"cancelled"})["status"] == "cancelled"
+        # freeing the slot dispatches the queued job FIFO
+        run(client.post(f"/api/jobs/{a['id']}/cancel"))
+        wait_for_status(client, run, a["id"], {"cancelled"})
+        running = wait_for_status(client, run, b["id"], {"running"})
+        assert running["status"] == "running"
+        GATE.unlink(missing_ok=True)
+        wait_for_status(client, run, b["id"], {"succeeded"})
+    finally:
+        GATE.unlink(missing_ok=True)

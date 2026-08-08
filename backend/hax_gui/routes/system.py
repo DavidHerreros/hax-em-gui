@@ -164,6 +164,8 @@ class SettingsUpdate(BaseModel):
     # Device the landscape viewer loads the network and decodes maps on: a GPU index
     # ("0"), "cpu", or "" to be asked at launch time (see _viewer_gpu).
     viewer_gpu: str | None = None
+    # Jobs admitted per GPU at once (admission control; 0 disables the queue).
+    max_jobs_per_gpu: int | None = None
 
 
 @router.get("/api/settings", dependencies=[Depends(auth)])

@@ -67,7 +67,7 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 // Concrete status colors for the overview map. Canvas 2D takes only resolved colors,
 // and these are semantic (green succeeded / red failed) rather than themed, so unlike
 // the map's ink they are literals rather than read off the computed style.
-const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", running: "#38bdf8", succeeded: "#22c55e", failed: "#ef4444", blocked: "#f59e0b", cancelling: "#f59e0b", cancelled: "#94a3b8", interrupted: "#f59e0b", idle: "#94a3b8" };
+const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", queued: "#f59e0b", running: "#38bdf8", succeeded: "#22c55e", failed: "#ef4444", blocked: "#f59e0b", cancelling: "#f59e0b", cancelled: "#94a3b8", interrupted: "#f59e0b", idle: "#94a3b8" };
 
 // Programs that expose a train/predict mode (derived from the backend, see
 // programGroups.js) — wiring their model output into another node of the same
@@ -80,6 +80,7 @@ const STATUS_COLOR = {
   saved: "#a78bfa", pending: "var(--muted)", running: "var(--accent)",
   succeeded: "#22c55e", failed: "var(--err)", blocked: "var(--warn)",
   cancelling: "var(--warn)", cancelled: "var(--muted)", interrupted: "var(--warn)",
+  queued: "var(--warn)",
   idle: "var(--muted)", skipped: "var(--muted)",
 };
 // Any status not in the map must still get a concrete color, or SVG strokes /
