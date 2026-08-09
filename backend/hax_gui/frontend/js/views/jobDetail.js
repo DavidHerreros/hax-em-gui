@@ -79,18 +79,35 @@ export function JobDetailView(params) {
   const tabErr = h("div", { class: "tab", onclick: () => selectStream("err") }, h("span", { class: "tab-label" }, "stderr"), errDot);
   const consoleTabs = h("div", { class: "tabbar console-tabs" }, tabOut, tabErr);
 
+  // The page had accreted everything in one vertical stack; the streams, the file
+  // lists and the run's identity now live in tabs so each gets the full height.
+  // Head, progress, errors and the diagnosis stay global — they matter on any tab.
+  const paneLog = h("div", null, consoleTabs, outConsole, errConsole);
+  const paneFiles = h("div", { style: { display: "none" } }, inputs, maps);
+  const paneDetails = h("div", { style: { display: "none" } }, cmd, wd);
+  const PANES = { log: paneLog, files: paneFiles, details: paneDetails };
+  const pageTabs = {};
+  const filesCount = h("span", { class: "tab-count", hidden: true });
+  function selectPane(key) {
+    for (const [k, el] of Object.entries(PANES)) {
+      el.style.display = k === key ? "" : "none";
+      pageTabs[k].classList.toggle("active", k === key);
+    }
+  }
+  const pageTabbar = h("div", { class: "tabbar", style: { marginBottom: "10px" } },
+    pageTabs.log = h("div", { class: "tab active", onclick: () => selectPane("log") }, h("span", { class: "tab-label" }, "Log")),
+    pageTabs.files = h("div", { class: "tab", onclick: () => selectPane("files") }, h("span", { class: "tab-label" }, "Files"), filesCount),
+    pageTabs.details = h("div", { class: "tab", onclick: () => selectPane("details") }, h("span", { class: "tab-label" }, "Details")));
+
   root.appendChild(h("a", { class: "back", href: "#/jobs" }, icon("arrowLeft", 16), "Jobs"));
   root.appendChild(head);
   root.appendChild(progress);
-  root.appendChild(cmd);
-  root.appendChild(wd);
-  root.appendChild(inputs);
-  root.appendChild(maps);
   root.appendChild(actionErr);
   root.appendChild(diagPanel);
-  root.appendChild(consoleTabs);
-  root.appendChild(outConsole);
-  root.appendChild(errConsole);
+  root.appendChild(pageTabbar);
+  root.appendChild(paneLog);
+  root.appendChild(paneFiles);
+  root.appendChild(paneDetails);
 
   const termOut = createTerminal(outConsole);
   const termErr = createTerminal(errConsole);
@@ -328,11 +345,21 @@ export function JobDetailView(params) {
                  "|", ...tablesF.map((f) => `${f.path}:${f.size}`)].join(",");
     if (!force && sig === outputsSig) return;
     outputsSig = sig;
+    fileCounts.out = mapsF.length + tablesF.length;
+    updateFilesBadge();
     renderGroup(maps, "produced", mapsF, tablesF, () => loadOutputs(true), active);
+  }
+  const fileCounts = { in: 0, out: 0 };
+  function updateFilesBadge() {
+    const n = fileCounts.in + fileCounts.out;
+    filesCount.hidden = !n;
+    filesCount.textContent = String(n);
   }
   async function loadInputs() {
     let mapsF = [], tablesF = [];
     try { const r = await api.jobInputs(id); mapsF = r.maps || []; tablesF = r.metadata || []; } catch { /* none */ }
+    fileCounts.in = mapsF.length + tablesF.length;
+    updateFilesBadge();
     renderGroup(inputs, "inputs", mapsF, tablesF, loadInputs, false);
   }
   function renderGroup(container, kindWord, mapsF, tablesF, reload, showEmpty) {
@@ -459,6 +486,10 @@ export function JobDetailView(params) {
       job = j; status = j.status;
       cmd.textContent = j.command.join(" ");
       if (j.cwd) wdLine.textContent = "Working directory: " + j.cwd;
+      // Details tab: the provenance stamp (what code produced this run).
+      const pkgs = j.provenance && j.provenance.packages;
+      if (pkgs) paneDetails.appendChild(h("div", { class: "muted small", style: { marginTop: "4px" } },
+        "Recorded versions: " + Object.entries(pkgs).map(([k, v]) => `${k} ${v}`).join(" · ")));
       renderHead();
       renderDiskLine();
       loadUsage(false);
