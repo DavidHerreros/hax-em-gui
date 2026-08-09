@@ -78,7 +78,54 @@ export function JobDetailView(params) {
   const errDot = h("span", { class: "tab-dot", title: "New stderr output" });
   const tabOut = h("div", { class: "tab active", onclick: () => selectStream("out") }, h("span", { class: "tab-label" }, "stdout"));
   const tabErr = h("div", { class: "tab", onclick: () => selectStream("err") }, h("span", { class: "tab-label" }, "stderr"), errDot);
-  const consoleTabs = h("div", { class: "tabbar console-tabs" }, tabOut, tabErr);
+
+  // ── log search (line-level highlight + jump) and raw-log download ──
+  let hits = [], hitIdx = -1, searchTimer = null;
+  const hitCount = h("span", { class: "muted small", style: { minWidth: "48px", textAlign: "right" } });
+  const searchIn = h("input", { class: "input log-search", placeholder: "Search log…",
+    oninput: () => { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 200); },
+    onkeydown: (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") { e.preventDefault(); e.shiftKey ? stepHit(-1) : stepHit(1); }
+      else if (e.key === "Escape") { searchIn.value = ""; runSearch(); searchIn.blur(); }
+    } });
+  function activeConsole() { return activeStream === "err" ? errConsole : outConsole; }
+  function clearHits() {
+    for (const el of [...outConsole.querySelectorAll(".thit, .thit-cur"), ...errConsole.querySelectorAll(".thit, .thit-cur")])
+      el.classList.remove("thit", "thit-cur");
+    hits = []; hitIdx = -1; hitCount.textContent = "";
+  }
+  function runSearch() {
+    clearHits();
+    const q = searchIn.value.trim().toLowerCase();
+    if (q.length < 2) return;
+    for (const line of activeConsole().querySelectorAll(".tline")) {
+      if (line.textContent.toLowerCase().includes(q)) { line.classList.add("thit"); hits.push(line); }
+    }
+    hitCount.textContent = hits.length ? `${hits.length} hit${hits.length > 1 ? "s" : ""}` : "no hits";
+    if (hits.length) stepHit(1);
+  }
+  function stepHit(dir) {
+    if (!hits.length) return;
+    if (hitIdx >= 0) hits[hitIdx].classList.remove("thit-cur");
+    hitIdx = (hitIdx + dir + hits.length) % hits.length;
+    hits[hitIdx].classList.add("thit-cur");
+    hits[hitIdx].scrollIntoView({ block: "center" });
+    hitCount.textContent = `${hitIdx + 1}/${hits.length}`;
+  }
+  async function downloadLog() {
+    try {
+      const data = await api.downloadLog(id, activeStream);
+      const a = h("a", { href: URL.createObjectURL(data),
+                         download: `${job ? jobDisplayName(job) : id}.${activeStream}.log` });
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    } catch (err) { mount(actionErr, errorBox(err)); }
+  }
+  const consoleTabs = h("div", { class: "tabbar console-tabs" }, tabOut, tabErr,
+    h("span", { class: "ml-auto" }), searchIn, hitCount,
+    h("button", { class: "btn-icon", title: "Download the raw log file of the current stream",
+                  onclick: downloadLog }, icon("save", 14)));
 
   // The page had accreted everything in one vertical stack; the streams, the file
   // lists and the run's identity now live in tabs so each gets the full height.
@@ -123,6 +170,7 @@ export function JobDetailView(params) {
     tabOut.classList.toggle("active", s === "out");
     tabErr.classList.toggle("active", s === "err");
     if (s === "err") tabErr.classList.remove("has-err");   // seen — clear the dot
+    if (searchIn.value.trim()) runSearch();                // search follows the visible stream
   }
   // Flag the stderr tab when it gets output while it isn't the one on screen.
   function markErr(text) { if (text && activeStream !== "err") tabErr.classList.add("has-err"); }

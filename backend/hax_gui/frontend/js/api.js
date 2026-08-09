@@ -89,6 +89,8 @@ export const api = {
   projectUsage: (id, refresh) => req(`/api/projects/${id}/usage${refresh ? "?refresh=true" : ""}`),
   projectsUsage: (refresh) => req(`/api/projects/usage${refresh ? "?refresh=true" : ""}`),
   deleteJob: (id) => req(`/api/jobs/${id}`, { method: "DELETE" }),
+  // Raw log file as a blob (stream: "out" | "err").
+  downloadLog: (id, stream = "out") => blob(`/api/jobs/${id}/log/download?stream=${stream}`),
   // labels (colored tags on jobs)
   labels: () => req("/api/labels"),
   createLabel: (name, color) => req("/api/labels", { method: "POST", body: JSON.stringify({ name, color: color || null }) }),

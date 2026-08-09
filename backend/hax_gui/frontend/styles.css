@@ -1492,3 +1492,8 @@ body.vwin-dragging iframe { pointer-events: none; }
 .jp { display: inline-flex; align-items: center; gap: 6px; }
 .jp-bar { width: 72px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; display: inline-block; }
 .jp-fill { display: block; height: 100%; border-radius: 3px; background: var(--accent); transition: width .6s ease; }
+
+/* log search */
+.log-search { width: 180px; padding: 4px 8px; font-size: 12px; }
+.console .tline.thit { background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.console .tline.thit-cur { background: color-mix(in srgb, var(--warn) 28%, transparent); outline: 1px solid var(--warn); }

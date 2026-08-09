@@ -56,6 +56,21 @@ def job_log(job_id: str, max_lines: int | None = None, stream: str = "out") -> d
     return {"lines": manager.tail(job_id, max_lines, stream)}
 
 
+@router.get("/api/jobs/{job_id}/log/download", dependencies=[Depends(auth)])
+def job_log_download(job_id: str, stream: str = "out"):
+    """The raw log file (ANSI and all), for sharing or grepping outside the GUI."""
+    from fastapi.responses import FileResponse
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    path = job["log_path"] if stream != "err" else manager._err_path(job["log_path"])
+    if not Path(path).is_file():
+        raise HTTPException(status_code=404, detail="no log file yet")
+    stem = (job.get("name") or job["program"]).replace("/", "_")
+    return FileResponse(path, media_type="text/plain; charset=utf-8",
+                        filename=f"{stem}_{job_id}.{'err' if stream == 'err' else 'out'}.log")
+
+
 class JobRename(BaseModel):
     name: str | None = None
 
