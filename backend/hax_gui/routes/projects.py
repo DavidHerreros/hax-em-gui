@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from .. import adapters, projects, settings_store, usage
 from ..command import ValidationError
-from ..jobs import JobActive, ProjectNotFound, manager
+from ..jobs import JobActive, ProjectNotFound, job_progress, manager
 from ..labels import manager as label_manager
 from ..projects import ProjectsRootUnset
 from ..workflows import manager as wf_manager
@@ -123,7 +123,10 @@ def delete_project(project_id: str) -> dict[str, bool]:
 @router.get("/api/projects/{project_id}/jobs", dependencies=[Depends(auth)])
 def project_jobs(project_id: str) -> list[dict[str, Any]]:
     _project_or_404(project_id)
-    return _attach_labels(manager.list_for_project(project_id))
+    rows = manager.list_for_project(project_id)
+    for j in rows:
+        j["progress"] = job_progress(j)
+    return _attach_labels(rows)
 
 
 @router.get("/api/projects/{project_id}/usage", dependencies=[Depends(auth)])

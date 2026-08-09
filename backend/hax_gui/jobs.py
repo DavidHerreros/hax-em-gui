@@ -30,6 +30,7 @@ import codecs
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -196,6 +197,70 @@ def _pkg_versions() -> dict[str, str]:
                 pass
         _VERSIONS = out
     return _VERSIONS
+
+
+# ── live progress, parsed from the log tail ────────────────────────────────
+# hax training loops print tqdm bars with "Epoch N/M" descriptions; the last
+# such frame in the log tail is the run's position. Overall fraction folds the
+# in-epoch percentage into the epoch count; ETA is scaled from elapsed wall time
+# (started_at), which absorbs setup cost better than tqdm's per-epoch estimate.
+_PROGRESS_RX = re.compile(rb"Epoch\s+(\d+)\s*/\s*(\d+)\D{0,60}?(\d{1,3})%")
+_PCT_RX = re.compile(rb"(\d{1,3})%\|")
+_PROGRESS_CACHE: dict[str, tuple[int, dict[str, Any] | None]] = {}
+
+
+def job_progress(job: dict[str, Any]) -> dict[str, Any] | None:
+    """{pct, epoch?, epochs?, eta_s?} for a running job, from its log tail.
+    None when the job isn't running or nothing parseable has been printed yet.
+    One cached 8 KB read per log-file growth — cheap enough for every list poll."""
+    if job.get("status") != "running":
+        return None
+    path = job.get("log_path")
+    if not path:
+        return None
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    cached = _PROGRESS_CACHE.get(path)
+    if cached and cached[0] == size:
+        parsed = cached[1]
+    else:
+        try:
+            with open(path, "rb") as f:
+                f.seek(max(0, size - 8192))
+                tail = f.read()
+        except OSError:
+            return None
+        m = None
+        for m in _PROGRESS_RX.finditer(tail):
+            pass
+        if m:
+            epoch, epochs, pct = int(m[1]), int(m[2]), min(100, int(m[3]))
+            frac = ((epoch - 1) + pct / 100.0) / max(epochs, 1)
+            parsed = {"epoch": epoch, "epochs": epochs, "frac": min(max(frac, 0.0), 1.0)}
+        else:
+            m2 = None
+            for m2 in _PCT_RX.finditer(tail):
+                pass
+            parsed = {"frac": min(100, int(m2[1])) / 100.0} if m2 else None
+        if len(_PROGRESS_CACHE) > 512:      # bound: one entry per log path ever seen
+            _PROGRESS_CACHE.clear()
+        _PROGRESS_CACHE[path] = (size, parsed)
+    if not parsed:
+        return None
+    out = dict(parsed)
+    started = job.get("started_at")
+    if started:
+        try:
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(started)).total_seconds()
+            # Too early, the estimate is noise; past that it's simple proportionality.
+            if out["frac"] >= 0.02 and elapsed > 30:
+                out["eta_s"] = int(elapsed * (1.0 - out["frac"]) / out["frac"])
+        except ValueError:
+            pass
+    out["pct"] = round(out.pop("frac") * 100.0, 1)
+    return out
 
 
 def _wrap(command: list[str], exit_path: str) -> list[str]:

@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from .. import cascade, projects, updates
 from ..config import is_loopback_host, settings
-from ..jobs import manager
+from ..jobs import job_progress, manager
 from ..labels import manager as label_manager
 from ..projects import ProjectsRootUnset
 from ..workflows import WorkflowError
@@ -195,7 +195,7 @@ def project_or_404(project_id: str) -> dict[str, Any]:
 
 
 def with_project_names(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Attach the project display name + labels to each job (best-effort)."""
+    """Attach the project display name, labels and live progress to each job."""
     names: dict[str, str | None] = {}
     for job in jobs:
         pid = job.get("project_id")
@@ -206,6 +206,7 @@ def with_project_names(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 proj = None
             names[pid] = proj["name"] if proj else None
         job["project_name"] = names.get(pid) if pid else None
+        job["progress"] = job_progress(job)   # None unless running with a parseable tail
     return attach_labels(jobs)
 
 

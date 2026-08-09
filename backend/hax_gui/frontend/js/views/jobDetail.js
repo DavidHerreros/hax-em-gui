@@ -8,7 +8,7 @@ import { api, subscribeLog } from "../api.js";
 import { navigate, reload } from "../router.js";
 import { store } from "../store.js";
 import { errorBox, formatSize } from "./ui.js";
-import { badge, staleBadge, jobDisplayName } from "./jobs.js";
+import { badge, staleBadge, jobDisplayName, fmtEta } from "./jobs.js";
 import { openContextMenu } from "./contextMenu.js";
 import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
@@ -475,11 +475,29 @@ export function JobDetailView(params) {
     clear(progress);
     if (status === "saved") return; // not started yet — nothing to show
     if (running) {
-      progress.appendChild(h("div", { class: "sweep" }));
+      const p = job && job.progress;
+      if (p) {
+        // A real position: determinate bar + epoch + ETA, refreshed by the poll.
+        progress.appendChild(h("div", { class: "bar succeeded", style: { width: `${Math.max(2, p.pct)}%` } }));
+        progress.appendChild(h("div", { class: "muted small", style: { marginTop: "3px" } },
+          (p.epochs ? `Epoch ${p.epoch}/${p.epochs} · ` : "") + `${p.pct}%` +
+          (fmtEta(p.eta_s) ? ` · ${fmtEta(p.eta_s)}` : "")));
+      } else {
+        progress.appendChild(h("div", { class: "sweep" }));
+      }
     } else {
       const kind = status === "succeeded" ? "succeeded" : status === "failed" ? "failed" : "other";
       progress.appendChild(h("div", { class: "bar " + kind, style: { width: "100%" } }));
     }
+  }
+
+  // While active, refresh the parsed progress alongside the outputs poll.
+  async function refreshProgress() {
+    if (!isActive()) return;
+    try {
+      const j = await api.job(id);
+      if (j && j.progress !== undefined) { job = { ...(job || {}), ...j }; renderProgress(isActive()); }
+    } catch { /* transient — the next poll retries */ }
   }
 
   // Fetch job metadata (command + program name), then stream the log.
@@ -514,7 +532,7 @@ export function JobDetailView(params) {
   const isActive = () => status === "running" || status === "pending" || status === "cancelling";
   function updatePolling() {
     const active = isActive();
-    if (active && !poll) poll = poller(() => loadOutputs(), 4000, { immediate: false });
+    if (active && !poll) poll = poller(() => { loadOutputs(); refreshProgress(); }, 4000, { immediate: false });
     else if (!active && poll) { poll.stop(); poll = null; }
   }
 

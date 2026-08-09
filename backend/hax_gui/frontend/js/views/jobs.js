@@ -78,6 +78,32 @@ export function jobTimeTitle(job) {
   return lines.join("\n");
 }
 
+// "~2h 10m left" from a seconds estimate. Coarse on purpose: an ETA that ticks
+// every second promises a precision the estimate does not have.
+export function fmtEta(s) {
+  if (!(s > 0)) return null;
+  if (s < 90) return "~1m left";
+  const m = Math.round(s / 60);
+  if (m < 90) return `~${m}m left`;
+  const hr = Math.floor(m / 60);
+  if (hr < 48) return `~${hr}h ${m % 60}m left`;
+  return `~${Math.round(hr / 24)}d left`;
+}
+
+// Inline progress for a running run: epoch, a small bar, percent, ETA. Parsed
+// server-side from the log tail (jobs.job_progress); null hides it entirely.
+export function jobProgressEl(job) {
+  const p = job && job.progress;
+  if (!p) return null;
+  const eta = fmtEta(p.eta_s);
+  const label = p.epochs ? `Epoch ${p.epoch}/${p.epochs}` : null;
+  return h("span", { class: "jp", title: (label ? label + " · " : "") + `${p.pct}%` + (eta ? " · " + eta : "") },
+    label ? h("span", { class: "muted small" }, label) : null,
+    h("span", { class: "jp-bar" }, h("span", { class: "jp-fill", style: { width: `${Math.max(2, p.pct)}%` } })),
+    h("span", { class: "muted small mono" }, `${Math.round(p.pct)}%`),
+    eta ? h("span", { class: "muted small" }, eta) : null);
+}
+
 // The one-line form used in every run list: "finished 25/07/2026, 14:32:10 · 2h 14m".
 export function jobTimeEl(job, cls = "time") {
   const { label, stamp } = jobTime(job);
@@ -237,7 +263,10 @@ export function jobsSignature(jobs) {
   // `stale` is in here because it changes with no status change of its own: a run goes
   // stale when a *different* run is re-made, and without it the badge would only appear
   // the next time something else about the list moved.
-  return jobs.map((j) => `${j.id}:${j.status}:${j.stale ? "s" : ""}:${j.name || ""}`).join("|");
+  // Whole-percent progress is in the signature so a training run's bar advances
+  // on the poll, without sub-percent noise rebuilding the list constantly.
+  return jobs.map((j) => `${j.id}:${j.status}:${j.stale ? "s" : ""}:${j.name || ""}:` +
+                         `${j.progress ? Math.round(j.progress.pct) : ""}`).join("|");
 }
 
 // What to show as a run's title: its custom name, falling back to the program.
@@ -329,6 +358,7 @@ function row(job, i, hooks) {
     title,
     job.name ? h("span", { class: "prog-sub mono" }, job.program) : null,
     jobLabelChips(job, { editable: true, max: 2 }),
+    jobProgressEl(job),
     gpuLabel(job.gpu) ? h("span", { class: "muted", style: { fontSize: "12px" } }, gpuLabel(job.gpu)) : null,
     jobTimeEl(job),
     jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); hooks?.afterLocalRename?.(); }, onDeleted: () => a.remove() })

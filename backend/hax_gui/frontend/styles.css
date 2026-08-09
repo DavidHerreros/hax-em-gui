@@ -1487,3 +1487,8 @@ body.vwin-dragging iframe { pointer-events: none; }
 /* red confirm button for destructive actions */
 .btn.danger { background: var(--err); border-color: var(--err); color: #fff; }
 .btn.danger:hover { filter: brightness(1.1); }
+
+/* inline job progress (jobs list rows) */
+.jp { display: inline-flex; align-items: center; gap: 6px; }
+.jp-bar { width: 72px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; display: inline-block; }
+.jp-fill { display: block; height: 100%; border-radius: 3px; background: var(--accent); transition: width .6s ease; }
