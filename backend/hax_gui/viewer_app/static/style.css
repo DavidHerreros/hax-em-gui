@@ -413,7 +413,11 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .models-compute .btn { flex: none; }
 
 /* axes gizmo + solo + hist options + view buttons */
-.gizmo { position: absolute; right: 10px; bottom: 10px; pointer-events: none; opacity: 0.9; }
+/* The generic `.canvas-wrap > canvas` rule stretches children to fill the stage
+   (inset:0 + 100%/100%); the gizmo must escape it or its 64px backing store is
+   blown up across the whole canvas. Same specificity is not enough — beat it. */
+.canvas-wrap > canvas.gizmo { inset: auto; left: auto; top: auto; right: 10px; bottom: 10px;
+  width: 64px; height: 64px; pointer-events: none; opacity: 0.85; }
 .canvas-wrap { position: relative; }
 .model-solo { flex: none; width: 18px; height: 18px; line-height: 16px; font-size: 10px; border-radius: 4px; border: 1px solid rgba(128,128,128,0.4); background: transparent; color: inherit; cursor: pointer; opacity: 0.55; }
 .model-solo:hover { opacity: 1; border-color: currentColor; }

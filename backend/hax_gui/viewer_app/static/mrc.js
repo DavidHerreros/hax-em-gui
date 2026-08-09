@@ -68,19 +68,66 @@ function applyTheme(theme) {
   $("bg").value = bg;
   const rgb = hexToRgb(bg);
   renderer.setBackground(rgb); volRenderer.setBackground(rgb); slices.setBackground(bg);
+  // The gizmo's label halo tracks the theme; before startGizmo runs this is a no-op.
+  try { gizmoInvalidate(); } catch { /* module still loading */ }
 }
 applyTheme(new URLSearchParams(location.search).get("theme"));
 window.addEventListener("message", (e) => { if (e.data && e.data.type === "hax-theme") applyTheme(e.data.theme); });
 
+// ---- persistence ---------------------------------------------------------
+// (a) Per-map memory, keyed by the file's path: reopening a map lands on the contour,
+//     colour and smoothing you last chose for it, in any scene. LRU-capped.
+// (g) Per-scene session state, keyed by the set of files: render mode, visibility,
+//     active map, background and camera survive closing and reopening the viewer.
+const MAP_PREFS_KEY = "hax_mrc_map_prefs";
+const MAP_PREFS_CAP = 300;
+function readJSON(key) { try { return JSON.parse(localStorage.getItem(key) || "null"); } catch { return null; } }
+function writeJSON(key, v) { try { localStorage.setItem(key, JSON.stringify(v)); } catch { /* storage off/full */ } }
+
+function saveMapPref(m) {
+  const all = readJSON(MAP_PREFS_KEY) || {};
+  delete all[m.filename];                      // reinsert: object order doubles as LRU order
+  all[m.filename] = { sigma: m.sigma, color: m.color, smooth: m.smooth };
+  const keys = Object.keys(all);
+  for (let i = 0; i < keys.length - MAP_PREFS_CAP; i++) delete all[keys[i]];
+  writeJSON(MAP_PREFS_KEY, all);
+}
+
+const sceneKey = () => "hax_mrc_scene:" + models.map((m) => m.filename).slice().sort().join("|");
+let sceneRestored = false;   // suppress saves while the restore itself fires the handlers
+let sceneSaveTimer = null;
+function schedSaveScene() {
+  if (!sceneRestored) return;
+  clearTimeout(sceneSaveTimer);
+  sceneSaveTimer = setTimeout(saveScene, 400);
+}
+function saveScene() {
+  if (!models.length || !sceneRestored) return;
+  const target = camera3d(state.render);
+  const cam = target ? target.getCamera() : camera;
+  writeJSON(sceneKey(), {
+    mode: state.render,
+    active: state.active,
+    visible: models.map((m) => m.visible),
+    bg: $("bg").value,
+    // Typed arrays serialize as objects; force plain arrays so setState can .slice().
+    camera: cam ? { R: Array.from(cam.R), dist: cam.dist, offset: Array.from(cam.offset), pivot: Array.from(cam.pivot) } : null,
+  });
+}
+// The camera has no change hook, so the leave events are what capture its final state.
+window.addEventListener("pagehide", saveScene);
+document.addEventListener("visibilitychange", () => { if (document.hidden) saveScene(); });
+
 // ---- data loaders --------------------------------------------------------
 async function loadInfo() {
   info = await (await fetch("./api/info")).json();
+  const prefs = readJSON(MAP_PREFS_KEY) || {};
   models = info.models.map((m, i) => ({
     ...m,
     visible: true,
-    color: m.color,
-    sigma: 2.5,
-    smooth: 6,
+    color: (prefs[m.filename] && prefs[m.filename].color) || m.color,
+    sigma: (prefs[m.filename] && Number.isFinite(prefs[m.filename].sigma)) ? prefs[m.filename].sigma : 2.5,
+    smooth: (prefs[m.filename] && Number.isFinite(prefs[m.filename].smooth)) ? prefs[m.filename].smooth : 6,
     surface: null,     // the sigma the loaded mesh was cut at, so it isn't refetched
   }));
   $("title").textContent = info.title || "Map";
@@ -117,6 +164,7 @@ async function setActive(i) {
   // silently applies them to this one.
   $("smooth").value = String(m.smooth);
   if (models.length > 1) markActiveRow();
+  schedSaveScene();
   await loadHistogram();
   if (state.render === "mip" || state.render === "emission") loadVolume();
   else if (state.render === "slices") loadSlices();
@@ -253,13 +301,14 @@ function onLevel(level, dragging) {
     loadSurface(state.active, !!dragging);   // the active map tracks the drag live
     if (linkContour && !dragging) {
       for (const other of visibleModels()) {
-        if (other !== m) { other.sigma = m.sigma; other.surface = null; }
+        if (other !== m) { other.sigma = m.sigma; other.surface = null; saveMapPref(other); }
       }
       loadSurfaces();                        // full pass over the rest on release
     }
   } else if (state.render === "mip" || state.render === "emission") {
     volRenderer.setThreshold(normThreshold());
   }
+  if (!dragging) saveMapPref(m);             // release: this is the level you chose
 }
 
 // ---- model panel (a resizable right rail, ChimeraX-style) ----------------
@@ -386,6 +435,7 @@ function toggleSolo(i) {
   });
   if (!alreadySolo) setActive(i);            // the lone visible map is the one you act on
   if (state.render === "surface") loadSurfaces(); else reportSurface();
+  schedSaveScene();
 }
 
 function setVisible(i, on) {
@@ -393,6 +443,7 @@ function setVisible(i, on) {
   renderer.setModelVisible(models[i].index, on);
   // A map switched on for the first time has no surface yet.
   if (on && state.render === "surface") loadSurfaces(); else reportSurface();
+  schedSaveScene();
 }
 
 function setColor(i, hex) {
@@ -402,6 +453,7 @@ function setColor(i, hex) {
     $("color").value = hex;
     volRenderer.setColor(hexToRgb(hex));
   }
+  saveMapPref(models[i]);
 }
 
 // ---- morph ---------------------------------------------------------------
@@ -688,6 +740,7 @@ function setMode(mode) {
   // Morphing is a 3D notion; orthogonal slices have nothing to animate.
   $("morph").hidden = !(models.length > 1 && info && info.morph_shape) || isSlices;
   if (!$("morph").hidden) updateMorphUI();
+  schedSaveScene();
 }
 
 // ---- controls ------------------------------------------------------------
@@ -697,6 +750,7 @@ $("smooth").addEventListener("input", (e) => {
   active().smooth = +e.target.value;
   active().surface = null;                     // the cached mesh was cut at the old smoothing
   if (state.render === "surface") loadSurface(state.active, false);
+  saveMapPref(active());
 });
 $("vgamma").addEventListener("input", (e) => volRenderer.setGamma(+e.target.value));
 $("vbright").addEventListener("input", (e) => volRenderer.setBrightness(+e.target.value));
@@ -710,7 +764,7 @@ $("color").addEventListener("input", (e) => {
   const row = $("modelsList").children[state.active];
   if (row) row.querySelector(".model-color").value = e.target.value;
 });
-$("bg").addEventListener("input", (e) => { const rgb = hexToRgb(e.target.value); renderer.setBackground(rgb); volRenderer.setBackground(rgb); slices.setBackground(e.target.value); });
+$("bg").addEventListener("input", (e) => { const rgb = hexToRgb(e.target.value); renderer.setBackground(rgb); volRenderer.setBackground(rgb); slices.setBackground(e.target.value); schedSaveScene(); });
 $("reset").addEventListener("click", () => { camera = null; renderer.resetView(); volRenderer.resetView(); slices.resetZoom(); });
 $("mrc").addEventListener("click", () => { window.location.href = `./api/mrc?m=${active().index}`; });
 $("saveMap").addEventListener("click", saveMap);
@@ -766,6 +820,7 @@ function setAllVisible(on) {
     if (row) row.querySelector("input[type=checkbox]").checked = on;
   });
   if (on && state.render === "surface") loadSurfaces(); else reportSurface();
+  schedSaveScene();
 }
 
 async function saveMap() {
@@ -800,30 +855,50 @@ function setStandardView(which) {
   target.setCamera({ ...cam, R: VIEW_R[which].slice(), offset: [0, 0, 0], pivot: [0, 0, 0] });
 }
 
-// Tiny always-on axes indicator, redrawn only when the orientation changes.
+// Small orientation tripod in the corner, redrawn only when the orientation changes.
+// Rendered at devicePixelRatio (the CSS box is 64px; the backing store is scaled) so
+// the lines stay crisp, and toggleable — some people find any overlay noise.
+const GIZMO_KEY = "hax_mrc_gizmo";
+let gizmoOn = localStorage.getItem(GIZMO_KEY) !== "off";
+let gizmoInvalidate = () => {};
 function startGizmo() {
   const cv = $("gizmo");
   const ctx = cv.getContext("2d");
+  const CSS = 64, c = CSS / 2, len = c - 12;
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  cv.width = CSS * dpr; cv.height = CSS * dpr;
+  ctx.scale(dpr, dpr);
   let lastKey = "";
-  const AXES = [["X", "#ff6b6b", 0], ["Y", "#51cf66", 4], ["Z", "#5c9dff", 8]];
+  gizmoInvalidate = () => { lastKey = ""; };
+  const AXES = [["X", "#e15b5b", 0], ["Y", "#3fae5a", 4], ["Z", "#4a86e8", 8]];
   function draw(R) {
-    const c = 35, len = 24;
-    ctx.clearRect(0, 0, 70, 70);
+    ctx.clearRect(0, 0, CSS, CSS);
+    // Text halo in the background colour so labels read over any map.
+    const halo = document.documentElement.dataset.theme === "light"
+      ? "rgba(231,236,243,0.9)" : "rgba(4,6,16,0.8)";
     // Back-to-front so nearer axes draw over farther ones.
     const order = AXES.map(([lbl, col, o]) => ({ lbl, col, x: R[o], y: R[o + 1], z: R[o + 2] }))
                       .sort((a, b) => a.z - b.z);
     for (const a of order) {
-      const dim = 0.55 + 0.45 * (a.z + 1) / 2;
-      ctx.strokeStyle = a.col; ctx.globalAlpha = dim; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(c, c); ctx.lineTo(c + a.x * len, c - a.y * len); ctx.stroke();
+      const dim = 0.5 + 0.5 * (a.z + 1) / 2;
+      const tx = c + a.x * len, ty = c - a.y * len;
+      ctx.globalAlpha = dim;
+      ctx.strokeStyle = a.col; ctx.lineWidth = 2; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(c, c); ctx.lineTo(tx, ty); ctx.stroke();
       ctx.fillStyle = a.col;
-      ctx.font = "10px system-ui, sans-serif";
-      ctx.fillText(a.lbl, c + a.x * (len + 4) - 3, c - a.y * (len + 4) + 3);
+      ctx.beginPath(); ctx.arc(tx, ty, 2.5, 0, 2 * Math.PI); ctx.fill();
+      // The label sits past the tip; a foreshortened axis keeps its label on the dot.
+      const r2 = Math.hypot(a.x, a.y);
+      const lx = c + a.x * (len + (r2 > 0.35 ? 7 : 0)), ly = c - a.y * (len + (r2 > 0.35 ? 7 : 0));
+      ctx.font = "bold 9px system-ui, sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.lineWidth = 3; ctx.strokeStyle = halo; ctx.strokeText(a.lbl, lx, ly);
+      ctx.fillText(a.lbl, lx, ly);
     }
     ctx.globalAlpha = 1;
   }
   (function tick() {
-    const target = camera3d(state.render);
+    const target = gizmoOn ? camera3d(state.render) : null;
     cv.style.display = target ? "" : "none";
     if (target) {
       const R = target.getCamera().R;
@@ -835,6 +910,11 @@ function startGizmo() {
     requestAnimationFrame(tick);
   })();
 }
+$("gizmoOn").checked = gizmoOn;
+$("gizmoOn").addEventListener("change", (e) => {
+  gizmoOn = e.target.checked;
+  try { localStorage.setItem(GIZMO_KEY, gizmoOn ? "on" : "off"); } catch { /* storage off */ }
+});
 startGizmo();
 
 // ---- mesh export (binary STL, in Å) --------------------------------------
@@ -1008,7 +1088,36 @@ async function togglePdb() {
 (async function boot() {
   try {
     await loadInfo();
-    setMode("surface");
+    // (g) Restore the last session for this exact set of files: visibility, active
+    // map, render mode, background and camera. Anything malformed is just skipped.
+    const saved = readJSON(sceneKey());
+    if (saved) {
+      if (Array.isArray(saved.visible) && saved.visible.length === models.length) {
+        models.forEach((m, i) => {
+          m.visible = saved.visible[i] !== false;
+          renderer.setModelVisible(m.index, m.visible);
+          const row = $("modelsList").children[i];
+          if (row) row.querySelector("input[type=checkbox]").checked = m.visible;
+        });
+      }
+      if (saved.bg && /^#[0-9a-f]{6}$/i.test(saved.bg)) {
+        $("bg").value = saved.bg;
+        const rgb = hexToRgb(saved.bg);
+        renderer.setBackground(rgb); volRenderer.setBackground(rgb); slices.setBackground(saved.bg);
+      }
+      if (Number.isInteger(saved.active) && saved.active >= 0 && saved.active < models.length) {
+        await setActive(saved.active);
+      }
+    }
+    const mode = saved && ["surface", "mip", "emission", "slices"].includes(saved.mode)
+      ? saved.mode : "surface";
+    setMode(mode);
+    if (saved && saved.camera && Array.isArray(saved.camera.R)) {
+      const target = camera3d(mode);
+      if (target) target.setCamera(saved.camera);
+      camera = saved.camera;   // carried across future mode switches too
+    }
+    sceneRestored = true;      // from here on, changes are worth saving
   } catch (err) {
     status("Failed to load map: " + err.message, "err");
   }

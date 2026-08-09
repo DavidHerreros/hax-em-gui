@@ -80,6 +80,7 @@
             <button id="viewTop" class="btn" title="Top view">T</button>
             <button id="viewSide" class="btn" title="Side view">S</button>
           </span>
+          <label class="hist-opt" title="Show the small orientation axes in the corner"><input id="gizmoOn" type="checkbox" checked /> axes</label>
           <button id="reset" class="btn">Reset view</button>
           <button id="saveMap" class="btn" title="Save the current view as PNG">Save PNG</button>
           <button id="mrc" class="btn" title="Download this map as .mrc">.mrc</button>
@@ -102,7 +103,7 @@
         <div class="canvas-wrap"
              title="Drag to rotate · drag near the edge to spin in-plane · middle-drag to pan · wheel to zoom">
           <canvas id="gl"></canvas>
-          <canvas id="gizmo" class="gizmo" width="70" height="70" title="Model axes (X red · Y green · Z blue)"></canvas>
+          <canvas id="gizmo" class="gizmo" width="64" height="64" title="Model axes (X red · Y green · Z blue)"></canvas>
           <canvas id="glvol" style="display:none"></canvas>
           <div id="slices" class="slices" style="display:none"></div>
           <!-- Reopens the rail once collapsed; the rail itself is gone by then. -->
