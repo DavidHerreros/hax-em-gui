@@ -12,6 +12,7 @@ import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { promptModal } from "./promptModal.js";
+import { openFilePicker } from "./filePicker.js";
 
 const GEO_KEY = "hax_gui_viewer_window";
 const MIN_W = 380, MIN_H = 260;
@@ -52,6 +53,18 @@ export function mountViewerWindow() {
   window.addEventListener("hax-theme", (e) => {
     const theme = e.detail === "light" ? "light" : "dark";
     for (const f of frames.values()) { try { f.contentWindow.postMessage({ type: "hax-theme", theme }, "*"); } catch { /* cross-origin/none */ } }
+  });
+
+  // ── file picking on behalf of a viewer iframe (e.g. the PDB overlay) ──
+  // The viewer apps are separate pages with no access to the GUI's file browser,
+  // so they ask over postMessage and get the chosen server path back. Only our
+  // own iframes are answered; the reply goes to whichever frame asked.
+  window.addEventListener("message", (e) => {
+    const d = e.data;
+    if (!d || d.type !== "hax-pick-file" || !e.source) return;
+    if (![...frames.values()].some((f) => f.contentWindow === e.source)) return;
+    const reply = (path) => { try { e.source.postMessage({ type: "hax-picked-file", token: d.token, path }, "*"); } catch { /* frame gone */ } };
+    openFilePicker("file", reply, d.startPath || undefined);
   });
 
   function applyGeom() {

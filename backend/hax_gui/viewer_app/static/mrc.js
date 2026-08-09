@@ -811,6 +811,26 @@ async function runCompute() {
 const pdb = { loaded: null };   // { name, chainIds: [] }
 const PDB_COLORS = ["#ffd166", "#7fb3ff", "#8fe08f", "#ff9e7a", "#e79aff", "#6fdccf", "#ff8fa8", "#c8c8c8"];
 
+// Choose a server-side file. Embedded in the GUI, this opens the app's real file
+// browser (viewerWindow.js answers over postMessage); standalone (the viewer's own
+// port, no parent) it falls back to a plain prompt. Resolves to a path or null.
+function pickServerFile() {
+  if (window.parent === window) {
+    return Promise.resolve(window.prompt("Server path of the PDB file to overlay (e.g. /data/model.pdb):"));
+  }
+  return new Promise((resolve) => {
+    const token = Math.random().toString(36).slice(2);
+    const onMsg = (e) => {
+      const d = e.data;
+      if (!d || d.type !== "hax-picked-file" || d.token !== token) return;
+      window.removeEventListener("message", onMsg);
+      resolve(d.path || null);
+    };
+    window.addEventListener("message", onMsg);
+    window.parent.postMessage({ type: "hax-pick-file", token }, "*");
+  });
+}
+
 async function togglePdb() {
   if (pdb.loaded) {
     for (const id of pdb.loaded.chainIds) renderer.dropLineModel(id);
@@ -819,7 +839,7 @@ async function togglePdb() {
     status("PDB overlay removed");
     return;
   }
-  const path = window.prompt("Server path of the PDB file to overlay (e.g. /data/model.pdb):");
+  const path = await pickServerFile();
   if (!path) return;
   status("Loading PDB…", "busy");
   try {
