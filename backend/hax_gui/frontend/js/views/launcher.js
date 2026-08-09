@@ -117,7 +117,9 @@ export function buildLauncher() {
     // Preload from a past job ("Edit" / "Edit & rerun"), keeping only visible fields
     // so the auto-managed output/SSD dirs regenerate. Editing reuses the source job.
     const prefill = getState().prefill;
+    let prefillNotice = "";     // warning banner carried by the prefill (version drift)
     if (prefill && prefill.program === schema.name) {
+      prefillNotice = prefill.notice || "";
       const visible = new Set(visibleFields(schema).map((f) => f.name));
       for (const [k, v] of Object.entries(prefill.values || {})) if (visible.has(k)) values[k] = v;
       if (prefill.gpu) gpu = String(prefill.gpu);
@@ -147,6 +149,7 @@ export function buildLauncher() {
     // settings that aren't program parameters at all.
     const intro = h("div", { class: "pf-intro" });
     intro.appendChild(h("p", { class: "field-help", style: { margin: "0 0 12px" } }, schema.description));
+    if (prefillNotice) intro.appendChild(h("div", { class: "prefill-notice" }, prefillNotice));
 
     // Optional custom run name (makes executions easy to identify).
     intro.appendChild(h("div", { class: "field" },
@@ -204,7 +207,10 @@ export function buildLauncher() {
           ...gpus.map((g) => h("option", { value: String(g.index), selected: String(g.index) === gpu }, `GPU ${g.index}`)))
       : null;
     const runBtn = h("button", { class: "btn", style: { flex: "1" }, onclick: () => submit(true) }, icon("play", 18), h("span", null, "Run"));
-    const saveBtn = h("button", { class: "btn secondary", style: { width: "100%", justifyContent: "center" }, title: "Prepare this job and save it to run later", onclick: () => submit(false) }, icon("save", 16), h("span", null, "Save job"));
+    const saveBtn = h("button", { class: "btn secondary", style: { flex: "1", justifyContent: "center" }, title: "Prepare this job and save it to run later", onclick: () => submit(false) }, icon("save", 16), h("span", null, "Save job"));
+    const sweepBtn = h("button", { class: "btn secondary", style: { flex: "1", justifyContent: "center" },
+      title: "Launch several runs at once, varying ONE parameter over a list of values — the GPU queue runs them in turn",
+      onclick: () => sweep() }, icon("sliders", 16), h("span", null, "Sweep…"));
     const runBar = h("div", { class: "launcher-run" });
     body.appendChild(runBar);
 
@@ -221,7 +227,7 @@ export function buildLauncher() {
       saveBtn.disabled = false;
       runBar.appendChild(h("div", { class: "run-target" }, "Run in ", h("strong", null, proj.name)));
       runBar.appendChild(h("div", { class: "row", style: { gap: "8px" } }, gpuSel, runBtn));
-      runBar.appendChild(h("div", { class: "row", style: { marginTop: "8px" } }, saveBtn));
+      runBar.appendChild(h("div", { class: "row", style: { marginTop: "8px", gap: "8px" } }, saveBtn, sweepBtn));
     }
     formCleanup = subscribe(refreshRunBar);
     refreshRunBar();
@@ -280,6 +286,102 @@ export function buildLauncher() {
         runBtn.lastChild.textContent = "Run";
         saveBtn.lastChild.textContent = "Save job";
       }
+    }
+
+    // -- parameter sweep: N runs varying one flag over a list of values -------
+    // Every run beyond the GPU's slot limit parks as `queued` and dispatches as
+    // slots free up (jobs.py admission control) — which is what makes launching
+    // a handful at once safe rather than an OOM festival.
+    async function sweep() {
+      const proj = store.activeProject();
+      if (!proj) return;
+      // A field is sweepable when the user can type it: visible and not bound.
+      const fields = visibleFields(schema).filter((f) => !bindings[f.name]);
+      if (!fields.length) return;
+      const choice = await sweepModal(fields, values);
+      if (!choice) return;
+      const { field, vals } = choice;
+      clear(formErr);
+      form.clearErrors();
+      sweepBtn.disabled = true;
+      const base = runName || schema.name;
+      let launched = 0;
+      try {
+        for (const v of vals) {
+          const payload = { ...values, [field]: v };
+          for (const f of Object.keys(bindings)) delete payload[f];
+          sweepBtn.lastChild.textContent = `Launching ${launched + 1}/${vals.length}…`;
+          // Each call creates a NEW job (no replace target): a sweep must never
+          // overwrite the run the form was editing.
+          await api.createProjectJob(proj.id, schema.name, payload, gpu || null,
+                                     `${base} [${field}=${v}]`, bindings, true, recreateSsd);
+          launched += 1;
+        }
+        store.setActiveProject(proj.id);
+        navigate("/projects");
+      } catch (err) {
+        const done = launched ? ` (${launched} of ${vals.length} runs were already launched)` : "";
+        if (err instanceof ApiError && err.status === 422 && err.detail && err.detail.errors) {
+          form.setErrors(err.detail.errors);
+          if (done) mount(formErr, errorBox(new Error("Sweep stopped on a validation error" + done + ".")));
+        } else {
+          mount(formErr, errorBox(new Error((err && err.message) || "sweep failed" + done)));
+        }
+      } finally {
+        sweepBtn.disabled = false;
+        sweepBtn.lastChild.textContent = "Sweep…";
+      }
+    }
+
+    // Small dedicated modal: pick the parameter and type its values. Resolves to
+    // { field, vals } or null on cancel.
+    function sweepModal(fields, current) {
+      return new Promise((resolve) => {
+        const sel = h("select", { class: "input", onchange: () => preview() },
+          ...fields.map((f) => h("option", { value: f.name }, "--" + f.name)));
+        const valsIn = h("input", { class: "input", placeholder: "e.g. 1e-4, 5e-4, 1e-3",
+                                    oninput: () => preview() });
+        const previewEl = h("div", { class: "muted small", style: { minHeight: "18px" } });
+        const okBtn = h("button", { class: "btn", disabled: true, onclick: () => commit() }, "Launch sweep");
+
+        function parsed() {
+          return valsIn.value.split(",").map((s) => s.trim()).filter((s) => s.length);
+        }
+        function preview() {
+          const vals = parsed();
+          okBtn.disabled = vals.length < 2;
+          const cur = current[sel.value];
+          previewEl.textContent = vals.length < 2
+            ? `Give at least two comma-separated values${cur != null && cur !== "" ? ` (current: ${cur})` : ""}.`
+            : `${vals.length} runs: ` + vals.map((v) => `--${sel.value}=${v}`).join("  ·  ");
+        }
+        function commit() {
+          const vals = parsed();
+          if (vals.length < 2) return;
+          done({ field: sel.value, vals });
+        }
+        const onKey = (e) => {
+          e.stopPropagation();
+          if (e.key === "Enter" && !okBtn.disabled) { e.preventDefault(); commit(); }
+          else if (e.key === "Escape") { e.preventDefault(); done(null); }
+        };
+        const modal = h("div", { class: "modal prompt-modal", onclick: (e) => e.stopPropagation(), onkeydown: onKey },
+          h("div", { class: "modal-head" }, h("span", null, "Parameter sweep"),
+            h("button", { class: "btn-icon", style: { border: "none" }, onclick: () => done(null) }, icon("x", 18))),
+          h("div", { class: "prompt-body" },
+            h("p", { class: "field-help", style: { margin: "0 0 10px" } },
+              "One run per value, everything else exactly as configured in the form. Runs beyond the per-GPU limit queue and start as slots free up."),
+            h("label", { class: "field-label" }, "Parameter"), sel,
+            h("label", { class: "field-label", style: { marginTop: "10px" } }, "Values (comma-separated)"), valsIn,
+            previewEl),
+          h("div", { class: "modal-foot", style: { gap: "8px" } },
+            h("button", { class: "btn ghost", onclick: () => done(null) }, "Cancel"), okBtn));
+        const overlay = h("div", { class: "overlay", onclick: () => done(null) }, modal);
+        document.body.appendChild(overlay);
+        queueMicrotask(() => valsIn.focus());
+        preview();
+        function done(v) { overlay.remove(); resolve(v); }
+      });
     }
   }
 

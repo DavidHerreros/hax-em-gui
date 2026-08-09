@@ -19,6 +19,7 @@ import { MetricsView } from "./views/metrics.js";
 import { ViewerView } from "./views/viewer.js";
 import { JobsView } from "./views/jobs.js";
 import { JobDetailView } from "./views/jobDetail.js";
+import { CompareView } from "./views/compare.js";
 import { WorkflowsView } from "./views/workflows.js";
 import { AssistantView } from "./views/assistant.js";
 
@@ -144,6 +145,7 @@ defineRoutes([
   { path: "/projects", view: ProjectsView },
   { path: "/jobs", view: JobsView },
   { path: "/jobs/:id", view: JobDetailView },
+  { path: "/compare/:a/:b", view: CompareView },
   { path: "/metrics", view: MetricsView },
   { path: "/viewer", view: ViewerView },
   { path: "/settings", view: SettingsView },

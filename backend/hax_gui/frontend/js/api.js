@@ -31,10 +31,10 @@ async function req(path, init = {}) {
   return res.json();
 }
 
-// Same as `req`, for endpoints that answer with binary (image/png).
-async function blob(path) {
+// Same as `req`, for endpoints that answer with binary (image/png, pdf).
+async function blob(path, init = {}) {
   const token = getToken();
-  const res = await fetch(path, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  const res = await fetch(path, { ...init, headers: token ? { Authorization: `Bearer ${token}` } : {} });
   if (!res.ok) {
     let detail;
     try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
@@ -48,6 +48,9 @@ export const api = {
   programs: () => req("/api/programs"),
   program: (name) => req(`/api/programs/${name}`),
   gpus: () => req("/api/gpus"),
+  // Installed versions of the packages stamped into each job's provenance
+  // (hax-em / hax-em-gui / jax / flax) — for the reproduce-run mismatch warning.
+  systemVersions: () => req("/api/system/versions"),
   updates: () => req("/api/updates"),
   checkUpdates: () => req("/api/updates/check", { method: "POST" }),
   updateRunState: () => req("/api/updates/run"),
@@ -210,6 +213,10 @@ export const api = {
 // {available:false} when the hax-em-assistant package isn't installed).
 api.assistantStatus = () => req("/api/assistant/status");
 api.diagnoseJob = (id) => req(`/api/jobs/${id}/diagnose`, { method: "POST" });
+// PDF run report (deterministic figures + measured values, AI discussion when the
+// model is up). Slow — the server builds it synchronously; returns the PDF blob.
+api.runReport = (id, narrate = true) =>
+  blob(`/api/assistant/run-report/${id}?narrate=${narrate ? "true" : "false"}`, { method: "POST" });
 // Rebuild the docs vector index from the current hax-em-docs checkout (live,
 // no GUI restart). Returns {ok, rebuilt, chunks, ...}.
 api.assistantReindexDocs = (force = true) =>

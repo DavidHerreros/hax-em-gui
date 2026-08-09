@@ -55,6 +55,14 @@ def list_gpus() -> list[dict[str, Any]]:
     return gpus.list_gpus()
 
 
+@router.get("/api/system/versions", dependencies=[Depends(auth)])
+def system_versions() -> dict[str, str]:
+    """Currently installed versions of the packages stamped into each job's
+    provenance — lets the UI warn when reproducing a run made under different ones."""
+    from ..jobs import _pkg_versions
+    return _pkg_versions()
+
+
 @router.get("/api/updates", dependencies=[Depends(auth)])
 def get_updates(request: Request) -> dict[str, Any]:
     """Cached update status for hax-em / hax-em-gui (refreshed in the background)."""

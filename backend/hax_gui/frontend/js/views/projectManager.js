@@ -9,6 +9,7 @@ import { errorBox, formatSize } from "./ui.js";
 import { poller } from "../poller.js";
 import { onJobEvent } from "../events.js";
 import { openContextMenu } from "./contextMenu.js";
+import { openStorageModal } from "./storageModal.js";
 
 export function ProjectManager() {
   const root = h("div", { class: "project-manager" });
@@ -133,6 +134,7 @@ export function ProjectManager() {
     openContextMenu(anchor, [
       { label: "Open", icon: icon("arrowRight", 15), onClick: () => store.openProject(p) },
       { label: "Rename", icon: icon("pencil", 15), onClick: () => { renamingId = p.id; renderCards(); } },
+      { label: "Storage…", icon: icon("box", 15), onClick: () => openStorageModal(p) },
       { label: "Delete", icon: icon("trash", 15), danger: true, onClick: () => remove(p) },
     ]);
   }

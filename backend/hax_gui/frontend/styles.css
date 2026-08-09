@@ -1423,3 +1423,37 @@ body.vwin-dragging iframe { pointer-events: none; }
 .diag-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .diag-finding { margin: 8px 0; }
 .diag-analysis { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); white-space: pre-wrap; line-height: 1.5; }
+
+/* Run comparison view (compare.js) */
+.cmp-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 4px; }
+.cmp-table th, .cmp-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+.cmp-table th { color: var(--muted); font-weight: 500; }
+.cmp-key { color: var(--muted); white-space: nowrap; width: 1%; }
+.cmp-diff { color: var(--warn); }
+.cmp-row-diff { background: color-mix(in srgb, var(--warn) 6%, transparent); }
+.cmp-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; }
+.cmp-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cmp-name { color: var(--accent); text-decoration: none; }
+.cmp-name:hover { text-decoration: underline; }
+.cmp-section { margin-bottom: 6px; }
+
+/* Version-drift banner on a prefilled (reproduce) form */
+.prefill-notice { border: 1px solid var(--warn); border-radius: 8px; padding: 8px 10px; margin: 0 0 12px; font-size: 12px; color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+
+/* Project storage dashboard (storageModal.js) */
+.storage-modal { width: 760px; max-height: 80vh; }
+.storage-body { overflow-y: auto; }
+.storage-stats { display: flex; gap: 10px; flex-wrap: wrap; padding: 14px 16px 10px; }
+.storage-stat { border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; min-width: 150px; background: var(--panel); }
+.storage-stat.warn { border-color: var(--warn); }
+.storage-num { font-size: 17px; margin: 2px 0; }
+.storage-rows { padding: 4px 8px; }
+.storage-row { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 8px; cursor: pointer; }
+.storage-row:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.storage-row-main { flex: 1; min-width: 0; }
+.storage-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.storage-bar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 5px; }
+.storage-bar-fill { height: 100%; border-radius: 2px; background: var(--accent); }
+.storage-bar-fill.reclaim { background: var(--warn); }
+.storage-size { width: 76px; text-align: right; flex: none; }
+.storage-files { width: 70px; text-align: right; flex: none; }

@@ -26,6 +26,8 @@ CASES = [
     # jobs
     ("GET", "/api/jobs", 200),
     ("GET", "/api/jobs/nope", 404),
+    # provenance versions (reproduce-run drift warning)
+    ("GET", "/api/system/versions", 200),
     # metrics
     ("GET", "/api/tensorboard", 200),
     ("GET", "/api/metrics/jobs", 200),

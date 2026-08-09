@@ -155,10 +155,17 @@ export function JobDetailView(params) {
       const canResume = job.resumable &&
         (status === "failed" || status === "cancelled" || status === "interrupted");
       const canDiagnose = assistantOk && (status === "failed" || status === "interrupted");
+      const canReport = assistantOk && status === "succeeded";
       head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
         canDiagnose ? h("button", { class: "btn secondary",
           title: "Ask the assistant why this run failed (classifier + model, from the log)",
           onclick: (e) => diagnose(e.currentTarget) }, icon("chat", 15), "Diagnose") : null,
+        canReport ? h("button", { class: "btn secondary",
+          title: "Build a PDF report of this run: measured values and figures, plus the model's discussion (can take a while)",
+          onclick: (e) => report(e.currentTarget) }, icon("fileText", 15), "Report") : null,
+        job.project_id ? h("button", { class: "btn secondary",
+          title: "Compare this run's parameters and environment with another run",
+          onclick: (e) => pickCompare(e.currentTarget) }, icon("grid", 15), "Compare") : null,
         job.has_metrics ? metricsBtn() : null,
         viewable(job) ? viewerBtn() : null,
         canResume ? splitButton(
@@ -166,7 +173,8 @@ export function JobDetailView(params) {
           [{ icon: icon("sliders", 15), label: "Edit & continue", onClick: editContinue }]) : null,
         splitButton(
           { icon: "play", label: "Rerun", title: "Re-launch immediately with the same inputs (a fresh run)", onClick: rerun },
-          [{ icon: icon("copy", 15), label: "Edit & rerun", onClick: editRerun }]),
+          [{ icon: icon("copy", 15), label: "Edit & rerun", onClick: editRerun },
+           { icon: icon("plus", 15), label: "Reproduce as new run", onClick: reproduce }]),
         h("button", { class: "btn ghost", style: { color: "var(--err)" }, onclick: del }, icon("trash", 15), "Delete")));
     }
     renderProgress(running || cancelling);
@@ -200,6 +208,65 @@ export function JobDetailView(params) {
   function editContinue() {
     store.editFrom(job, { resume: true });
     navigate("/projects");
+  }
+
+  // Open the launcher preloaded with this run's parameters as a NEW job (unlike
+  // "Edit & rerun", which replaces this one in place). Warns when the installed
+  // package versions differ from the ones stamped into the run's provenance —
+  // same flags under different code is not the same experiment.
+  async function reproduce() {
+    let notice = "";
+    const stamped = (job.provenance && job.provenance.packages) || null;
+    if (stamped) {
+      try {
+        const now = await api.systemVersions();
+        const diffs = Object.keys(stamped)
+          .filter((k) => now[k] && now[k] !== stamped[k])
+          .map((k) => `${k} ${stamped[k]} → ${now[k]}`);
+        if (diffs.length) notice = "Installed versions differ from this run's: " + diffs.join(", ") +
+          ". The same parameters may not reproduce the same result.";
+      } catch { /* versions unavailable — reproduce silently */ }
+    }
+    store.prefillProgram({
+      program: job.program, values: job.args, gpu: job.gpu,
+      name: (job.name || job.program) + " (repro)",
+      projectId: job.project_id, projectName: job.project_name,
+      bindings: job.bindings, notice,
+    });
+    navigate("/projects");
+  }
+
+  // Pick another run of the same project to diff against (same program first —
+  // that is the "what changed between these two" case the view exists for).
+  async function pickCompare(anchor) {
+    clear(actionErr);
+    let others = [];
+    try { others = (await api.projectJobs(job.project_id)).filter((j) => j.id !== id && j.status !== "saved"); }
+    catch (err) { mount(actionErr, errorBox(err)); return; }
+    if (!others.length) { mount(actionErr, errorBox(new Error("No other runs in this project to compare with."))); return; }
+    others.sort((x, y) => (y.program === job.program) - (x.program === job.program));
+    openContextMenu(anchor, others.slice(0, 25).map((j) => ({
+      label: `${jobDisplayName(j)}${j.program !== job.program ? `  (${j.program})` : ""}`,
+      icon: icon(j.program === job.program ? "copy" : "grid", 15),
+      onClick: () => navigate(`/compare/${id}/${j.id}`),
+    })));
+  }
+
+  // PDF run report. The server builds it synchronously (figures + measured values,
+  // plus the model's discussion when Ollama is up), so this can take a while — the
+  // button shows progress and the PDF lands as a browser download.
+  async function report(btn) {
+    clear(actionErr);
+    btn.disabled = true;
+    btn.lastChild.textContent = "Building…";
+    try {
+      const pdf = await api.runReport(id);
+      const url = URL.createObjectURL(pdf);
+      const a = h("a", { href: url, download: `${jobDisplayName(job)}_report.pdf` });
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    } catch (err) { mount(actionErr, errorBox(err)); }
+    finally { btn.disabled = false; btn.lastChild.textContent = "Report"; }
   }
 
   function viewable(j) {

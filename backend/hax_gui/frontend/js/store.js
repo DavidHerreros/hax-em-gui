@@ -143,10 +143,13 @@ export const store = {
   clearPrefill() { state.prefill = null; }, // consumed by the launcher; no emit
 
   // Open the launcher for `program` preloaded with `values` (an assistant
-  // proposal). No jobId → a NEW job: the user completes any required fields and
-  // launches it themselves. Nothing runs from this call.
-  prefillProgram({ program, values, gpu, name, projectId, projectName }) {
-    state.prefill = { program, values: { ...(values || {}) }, gpu: gpu || "", name: name || "" };
+  // proposal, or "reproduce as new run"). No jobId → a NEW job: the user completes
+  // any required fields and launches it themselves. Nothing runs from this call.
+  // `bindings` keeps inputs fed by another run bound rather than frozen to paths;
+  // `notice` is a warning banner the form shows (e.g. package-version mismatch).
+  prefillProgram({ program, values, gpu, name, projectId, projectName, bindings, notice }) {
+    state.prefill = { program, values: { ...(values || {}) }, gpu: gpu || "", name: name || "",
+                      bindings: bindings || null, notice: notice || "" };
     state.selectedProgram = program;
     state.rightOpen = true;
     state.formNonce++;
