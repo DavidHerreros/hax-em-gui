@@ -10,6 +10,7 @@ import { h, clear, mount } from "../h.js";
 import { poller } from "../poller.js";
 import { setNavGuard } from "../router.js";
 import { icon } from "../icons.js";
+import { confirmModal } from "./confirmModal.js";
 import { api } from "../api.js";
 import { navigate } from "../router.js";
 import { store, getState } from "../store.js";
@@ -567,7 +568,8 @@ export function WorkflowsView() {
     const n = set.size;
     let msg = n > 1 ? `Remove ${n} selected steps from the canvas?` : "Remove this step from the canvas?";
     if (jobIds.length) msg += `\n\nThis also permanently deletes ${jobIds.length} associated job${jobIds.length > 1 ? "s" : ""} — their output folders and logs — and cannot be undone.`;
-    if ((n > 1 || jobIds.length) && !confirm(msg)) return;
+    if ((n > 1 || jobIds.length) && !(await confirmModal({ title: "Remove step(s)?", danger: !!jobIds.length,
+        okText: "Remove", message: msg }))) return;
 
     // keep what we drop, so a step whose job survives can be restored below
     const cutNodes = graph.nodes.filter((nd) => set.has(nd.id));
@@ -884,7 +886,7 @@ export function WorkflowsView() {
     }
     if (edge && !temp) {
       path.style.cursor = "pointer"; path.style.pointerEvents = "stroke";
-      path.addEventListener("click", () => { if (confirm("Remove this connection?")) removeEdge(edge.id); });
+      path.addEventListener("click", async () => { if (await confirmModal({ title: "Remove this connection?", okText: "Remove" })) removeEdge(edge.id); });
     }
     return path;
   }
@@ -1606,7 +1608,8 @@ export function WorkflowsView() {
 
   async function removeWorkflow() {
     if (!wf) return openWorkflow(null);
-    if (!confirm(`Delete workflow "${wf.name}"?`)) return;
+    if (!(await confirmModal({ title: "Delete workflow?", danger: true, okText: "Delete",
+        message: `“${wf.name}” will be removed. The runs it created are kept.` }))) return;
     try { const id = wf.id; await api.deleteWorkflow(id); VIEWPORTS.delete(id); await refreshList(); openWorkflow(null); }
     catch (err) { flash("Delete failed: " + (err.detail || err.message), "err"); }
   }

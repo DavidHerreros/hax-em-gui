@@ -1473,3 +1473,17 @@ body.vwin-dragging iframe { pointer-events: none; }
 
 /* extra (comparison) run chips in the chat attach row */
 .chat-attach-chip.extra { opacity: 0.85; font-size: 12px; }
+
+/* toasts */
+.toast-stack { position: fixed; right: 16px; bottom: 16px; z-index: 200; display: flex; flex-direction: column; gap: 8px; max-width: 380px; }
+.toast { display: flex; align-items: flex-start; gap: 8px; padding: 10px 14px; border-radius: 10px; background: var(--modal-bg, var(--panel)); border: 1px solid var(--border-2); box-shadow: 0 8px 30px var(--shadow); cursor: pointer; animation: pop .18s ease-out; font-size: 13px; }
+.toast.error { border-color: var(--err); }
+.toast.error svg { color: var(--err); flex: none; }
+.toast.success { border-color: var(--ok, #4ade80); }
+.toast.success svg { color: var(--ok, #4ade80); flex: none; }
+.toast.out { opacity: 0; transition: opacity .18s; }
+.toast-msg { overflow-wrap: anywhere; }
+
+/* red confirm button for destructive actions */
+.btn.danger { background: var(--err); border-color: var(--err); color: #fff; }
+.btn.danger:hover { filter: brightness(1.1); }

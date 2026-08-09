@@ -1,6 +1,8 @@
 // Jobs list with light polling. The detail view streams live instead.
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
+import { toastError } from "../toast.js";
+import { confirmModal } from "./confirmModal.js";
 import { api } from "../api.js";
 import { errorBox, skeleton } from "./ui.js";
 import { openContextMenu } from "./contextMenu.js";
@@ -291,12 +293,12 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
       store.prefillProgram({ program: pf.program, values: pf.values, gpu: pf.gpu, name: pf.name,
                              projectId: target.id, projectName: target.name });
     } catch (err) {
-      alert(err && err.detail ? (typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail)) : "Could not copy this run.");
+      toastError(err, "Could not copy this run.");
     }
   }
   async function run() {
     try { await api.startJob(job.id); location.hash = "#/jobs/" + job.id; }
-    catch (err) { alert(err && err.detail ? (typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail)) : "Failed to start job."); }
+    catch (err) { toastError(err, "Failed to start job."); }
   }
   async function rename() {
     const name = await promptModal({ title: "Rename run", label: "Run name", value: job.name || "", placeholder: job.program, okText: "Rename" });
@@ -304,7 +306,8 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
     try { const u = await api.renameJob(job.id, name); job.name = u.name; store.renameViewerForJob(job.id, u.name); if (onRenamed) onRenamed(u); } catch { /* ignore */ }
   }
   async function del() {
-    if (!window.confirm("Delete this job and its run folder (outputs + log)? This cannot be undone.")) return;
+    if (!(await confirmModal({ title: "Delete run?", danger: true, okText: "Delete run",
+        message: "This job and its run folder — outputs and log — will be removed.\nThis cannot be undone." }))) return;
     try { await api.deleteJob(job.id); if (onDeleted) onDeleted(); } catch { /* ignore */ }
   }
   return btn;

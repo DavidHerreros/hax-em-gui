@@ -9,6 +9,8 @@
 // and you see the ongoing answering process — or the finished answer.
 import { h } from "../h.js";
 import { icon } from "../icons.js";
+import { toastError } from "../toast.js";
+import { confirmModal } from "./confirmModal.js";
 import { assistantChat, api } from "../api.js";
 import { renderMarkdown } from "../markdown.js";
 import { store } from "../store.js";
@@ -322,7 +324,7 @@ export function AssistantView() {
     try {
       await api.assistantRunReport(ctrl.attachedRun.job_id, true);
     } catch (e) {
-      window.alert("Report generation failed: " + (e && (e.detail || e.message) || "unknown error"));
+      toastError(e, "Report generation failed.");
     } finally {
       reportBusy = false; renderAttachRow();
     }
@@ -711,7 +713,8 @@ export function AssistantView() {
     try { await api.updateChat(c.id, { title: name.trim() || c.title }); await refreshChats(); } catch { /* ignore */ }
   }
   async function removeChat(c) {
-    if (!window.confirm(`Delete chat "${c.title}"?`)) return;
+    if (!(await confirmModal({ title: "Delete chat?", danger: true, okText: "Delete",
+        message: `“${c.title}” will be removed.` }))) return;
     try {
       await api.deleteChat(c.id);
       if (c.id === ctrl.currentChatId) { ctrl.currentChatId = null; ctrl.history = []; ctrl.liveActions = []; renderConversation(); }

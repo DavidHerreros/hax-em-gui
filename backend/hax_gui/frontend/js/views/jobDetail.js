@@ -3,6 +3,7 @@
 import { h, mount, clear } from "../h.js";
 import { poller } from "../poller.js";
 import { icon } from "../icons.js";
+import { confirmModal } from "./confirmModal.js";
 import { api, subscribeLog } from "../api.js";
 import { navigate, reload } from "../router.js";
 import { store } from "../store.js";
@@ -463,7 +464,8 @@ export function JobDetailView(params) {
   }
 
   async function del() {
-    if (!window.confirm("Delete this job and its run folder (outputs + log)? This cannot be undone.")) return;
+    if (!(await confirmModal({ title: "Delete run?", danger: true, okText: "Delete run",
+        message: "This job and its run folder — outputs and log — will be removed.\nThis cannot be undone." }))) return;
     clear(actionErr);
     try { await api.deleteJob(id); navigate("/jobs"); }
     catch (err) { mount(actionErr, errorBox(err)); }

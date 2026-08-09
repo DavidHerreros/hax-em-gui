@@ -3,6 +3,8 @@
 // three-dot menu can rename or delete the project. Lives inside ProjectsView.
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
+import { toastError } from "../toast.js";
+import { confirmModal } from "./confirmModal.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox, formatSize } from "./ui.js";
@@ -155,7 +157,8 @@ export function ProjectManager() {
   }
 
   async function remove(p) {
-    if (!window.confirm(`Delete project “${p.name}” and ALL of its runs (outputs + logs)?\nThis cannot be undone.`)) return;
+    if (!(await confirmModal({ title: "Delete project?", danger: true, okText: "Delete project",
+        message: `“${p.name}” and ALL of its runs — outputs and logs — will be removed.\nThis cannot be undone.` }))) return;
     try {
       await api.deleteProject(p.id);
       store.closeProject(p.id);
@@ -163,7 +166,7 @@ export function ProjectManager() {
       sig = null;
       renderCards();
     } catch (err) {
-      alert(err && err.detail ? (typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail)) : "Failed to delete project.");
+      toastError(err, "Failed to delete project.");
     }
   }
 
@@ -178,7 +181,7 @@ export function ProjectManager() {
       sig = null;
       await load();
     } catch (err) {
-      alert(err && err.detail ? (typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail)) : "Failed to create project.");
+      toastError(err, "Failed to create project.");
     } finally {
       addBtn.disabled = false;
     }

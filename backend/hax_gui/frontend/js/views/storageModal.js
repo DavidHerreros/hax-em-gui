@@ -4,6 +4,8 @@
 // loop and cached, so reopening is instant and Refresh forces a re-walk.
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
+import { toastError } from "../toast.js";
+import { confirmModal } from "./confirmModal.js";
 import { api } from "../api.js";
 import { navigate } from "../router.js";
 import { errorBox, formatSize } from "./ui.js";
@@ -81,10 +83,11 @@ export function openStorageModal(project) {
       style: { color: active ? "" : "var(--err)" },
       onclick: async (e) => {
         e.stopPropagation();
-        if (!window.confirm(`Delete run “${j.name || j.program}” and its folder (${formatSize(j.bytes)})? This cannot be undone.`)) return;
+        if (!(await confirmModal({ title: "Delete run?", danger: true, okText: "Delete run",
+          message: `“${j.name || j.program}” and its folder (${formatSize(j.bytes)}) will be removed.\nThis cannot be undone.` }))) return;
         del.disabled = true;
         try { await api.deleteJob(j.id); load(true); }
-        catch (err) { del.disabled = false; alert(err && err.message ? err.message : "delete failed"); }
+        catch (err) { del.disabled = false; toastError(err, "Delete failed."); }
       } }, icon("trash", 14));
     return h("div", { class: "storage-row", onclick: () => { close(); navigate(`/jobs/${j.id}`); } },
       h("div", { class: "storage-row-main" },
