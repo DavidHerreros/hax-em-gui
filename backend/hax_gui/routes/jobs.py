@@ -56,6 +56,28 @@ def job_log(job_id: str, max_lines: int | None = None, stream: str = "out") -> d
     return {"lines": manager.tail(job_id, max_lines, stream)}
 
 
+@router.post("/api/jobs/{job_id}/watch", dependencies=[Depends(auth)])
+def watch_job(job_id: str) -> dict[str, Any]:
+    """Watch a running job's loss curve: divergence/rising/plateau alerts land as
+    notifications (once per kind). In-memory — a server restart forgets watches."""
+    from .. import watch
+    if manager.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return watch.watch(job_id)
+
+
+@router.delete("/api/jobs/{job_id}/watch", dependencies=[Depends(auth)])
+def unwatch_job(job_id: str) -> dict[str, Any]:
+    from .. import watch
+    return watch.unwatch(job_id)
+
+
+@router.get("/api/watch", dependencies=[Depends(auth)])
+def watch_list() -> dict[str, Any]:
+    from .. import watch
+    return {"watching": watch.watching()}
+
+
 @router.get("/api/jobs/{job_id}/log/download", dependencies=[Depends(auth)])
 def job_log_download(job_id: str, stream: str = "out"):
     """The raw log file (ANSI and all), for sharing or grepping outside the GUI."""

@@ -91,6 +91,10 @@ export const api = {
   deleteJob: (id) => req(`/api/jobs/${id}`, { method: "DELETE" }),
   // Raw log file as a blob (stream: "out" | "err").
   downloadLog: (id, stream = "out") => blob(`/api/jobs/${id}/log/download?stream=${stream}`),
+  // Watch mode: divergence/rising/plateau alerts on a running run's loss curve.
+  watchJob: (id) => req(`/api/jobs/${id}/watch`, { method: "POST" }),
+  unwatchJob: (id) => req(`/api/jobs/${id}/watch`, { method: "DELETE" }),
+  watchList: () => req("/api/watch"),
   // labels (colored tags on jobs)
   labels: () => req("/api/labels"),
   createLabel: (name, color) => req("/api/labels", { method: "POST", body: JSON.stringify({ name, color: color || null }) }),

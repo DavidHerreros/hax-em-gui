@@ -1497,3 +1497,6 @@ body.vwin-dragging iframe { pointer-events: none; }
 .log-search { width: 180px; padding: 4px 8px; font-size: 12px; }
 .console .tline.thit { background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .console .tline.thit-cur { background: color-mix(in srgb, var(--warn) 28%, transparent); outline: 1px solid var(--warn); }
+
+/* active (toggled-on) secondary button, e.g. Watching */
+.btn.secondary.active { border-color: var(--accent); color: var(--accent); }

@@ -2,6 +2,7 @@
 // when the tab is hidden and permission was granted. Without this a user had to
 // keep the tab open and poll by eye to learn a 12-hour training died.
 import { onJobEvent } from "./events.js";
+import { toast } from "./toast.js";
 
 const TERMINAL = {
   succeeded: "finished",
@@ -33,6 +34,16 @@ export function startNotifications() {
   });
 
   onJobEvent((m) => {
+    if (m.kind === "watch") {
+      toast(m.title, { kind: m.level === "warn" ? "error" : "info", timeout: 12000 });
+      if ("Notification" in window && Notification.permission === "granted") {
+        try {
+          const n = new Notification("hax-em watch", { body: m.title, tag: `watch-${m.job_id}-${m.alert}` });
+          n.onclick = () => { window.focus(); location.hash = `#/jobs/${m.job_id}`; n.close(); };
+        } catch { /* notification API unavailable */ }
+      }
+      return;
+    }
     if (m.kind !== "job" || !(m.status in TERMINAL)) return;
     if (!document.hidden) return;             // visible tab: the list updates in view
     pending += 1;

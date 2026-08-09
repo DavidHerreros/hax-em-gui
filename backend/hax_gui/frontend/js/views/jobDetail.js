@@ -200,6 +200,7 @@ export function JobDetailView(params) {
         h("button", { class: "btn ghost", style: { color: "var(--err)" }, onclick: del }, icon("trash", 15), "Delete")));
     } else if (running && job) {
       head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
+        job.has_metrics ? watchBtn() : null,
         job.has_metrics ? metricsBtn() : null,
         viewable(job) ? viewerBtn() : null,
         h("button", { class: "btn ghost", style: { color: "var(--warn)" }, onclick: (e) => {
@@ -460,6 +461,21 @@ export function JobDetailView(params) {
     finally { if (btn) { btn.disabled = false; btn.lastChild.textContent = orig; } }
   }
   const viewerBtn = () => h("button", { class: "btn secondary", onclick: openViewer, title: "Explore this run's conformational landscape in the embedded WebGL viewer" }, icon("box", 15), "3D viewer");
+
+  // Watch this run's loss curve: divergence / rising / plateau alerts arrive as
+  // notifications. State is server-side and in-memory (a restart forgets it).
+  let watched = false;
+  api.watchList().then((w) => { watched = (w.watching || []).includes(id); renderHead(); }).catch(() => {});
+  const watchBtn = () => h("button", {
+    class: "btn secondary" + (watched ? " active" : ""),
+    title: watched ? "Watching — you'll be notified if the loss diverges, climbs or plateaus. Click to stop."
+                   : "Notify me if this run goes wrong (loss NaN / climbing / plateaued), checked once a minute",
+    onclick: async (e) => {
+      const b = e.currentTarget; b.disabled = true;
+      try { watched ? await api.unwatchJob(id) : await api.watchJob(id); watched = !watched; renderHead(); }
+      catch (err) { mount(actionErr, errorBox(err)); b.disabled = false; }
+    },
+  }, icon("eye", 15), watched ? "Watching" : "Watch");
 
   // Reads the run's event files natively — so it works on a job that is still training.
   const metricsBtn = () => h("button", {
