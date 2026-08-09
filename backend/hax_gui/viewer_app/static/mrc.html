@@ -7,158 +7,219 @@
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
+  <!-- Redesigned layout (user-approved demo, 2026-08): slim top bar with a segmented
+       mode switch, canvas-first stage, and one right rail of task-grouped collapsible
+       sections. Same controls as before, regrouped — the ids the JS wires are kept. -->
   <header class="topbar">
     <div class="brand">
       <span class="dot"></span>
       <strong id="title">Map</strong>
       <span id="meta" class="muted"></span>
+      <span id="sel" class="muted"></span>
+    </div>
+    <div class="seg" id="modeSeg" role="tablist" aria-label="Render mode">
+      <button class="on" data-mode="surface">Surface</button>
+      <button data-mode="volume">Volume</button>
+      <button data-mode="slices">Slices</button>
     </div>
     <div class="topright">
-      <label class="muted">export
-        <select id="dpi" title="Image scale / DPI">
-          <option value="1">1×</option>
-          <option value="2" selected>2×</option>
-          <option value="3">3×</option>
-          <option value="4">4×</option>
-        </select>
-      </label>
-      <label class="muted"><input id="transparent" type="checkbox" /> transparent</label>
       <span id="status" class="status" title="">Loading…</span>
+      <span class="export-wrap">
+        <button id="exportBtn" class="btn">Export ▾</button>
+        <div class="menu" id="exportMenu">
+          <div class="menu-row">
+            <label class="muted">scale
+              <select id="dpi" title="Image scale / DPI">
+                <option value="1">1×</option>
+                <option value="2" selected>2×</option>
+                <option value="3">3×</option>
+                <option value="4">4×</option>
+              </select>
+            </label>
+            <label class="muted"><input id="transparent" type="checkbox" /> transparent</label>
+          </div>
+          <button id="saveMap" title="Save the current view as PNG">Snapshot <span class="k">PNG</span></button>
+          <button id="mrc" title="Download the active map">Active map <span class="k">.mrc</span></button>
+          <button id="exportMesh" title="Export the active map's surface at the current contour (binary STL, in Å)">Surface mesh <span class="k">.stl · Å</span></button>
+        </div>
+      </span>
     </div>
   </header>
 
-  <main class="split">
-    <section class="pane" id="volPane">
-      <div class="pane-head">
-        <div class="pane-title">Map <span id="sel" class="muted"></span></div>
-        <div class="toolbar">
-          <label>render
-            <select id="rendermode">
-              <option value="surface" selected>Surface</option>
-              <option value="mip">Volume · MIP</option>
-              <option value="emission">Volume · glow</option>
-              <option value="slices">Orthogonal slices</option>
-            </select>
-          </label>
-          <label id="lightlbl">light <select id="light"><option value="standard" selected>standard</option><option value="smooth">smooth</option><option value="raytraced">ray traced</option></select></label>
-          <label id="smoothlbl">smooth <input id="smooth" type="range" min="0" max="20" value="6" title="Surface mesh smoothing (Taubin iterations)" /></label>
-          <span id="volctrls" style="display:none">
-            <label>γ <input id="vgamma" type="range" min="0.3" max="3" step="0.1" value="1.4" title="Transfer-function gamma" /></label>
-            <label>bright <input id="vbright" type="range" min="0.2" max="3" step="0.1" value="1.2" title="Brightness / opacity" /></label>
-          </span>
-          <span id="clipctrls">
-            <label>clip
-              <select id="clipAxis" title="Cut the map to a slab along this axis (surface and volume modes)">
-                <option value="" selected>off</option>
-                <option value="0">X</option>
-                <option value="1">Y</option>
-                <option value="2">Z</option>
-              </select>
-            </label>
-            <span id="clipRanges" style="display:none">
+  <main class="stage" id="stage">
+    <div class="canvas-wrap"
+         title="Drag to rotate · drag near the edge to spin in-plane · middle-drag to pan · wheel to zoom">
+      <canvas id="gl"></canvas>
+      <canvas id="gizmo" class="gizmo" width="64" height="64" title="Model axes (X red · Y green · Z blue)"></canvas>
+      <canvas id="glvol" style="display:none"></canvas>
+      <div id="slices" class="slices" style="display:none"></div>
+      <div class="viewchips" title="Standard orientations (keep zoom)">
+        <button id="viewFront" class="vbtn" title="Front view (reset orientation)">F</button>
+        <button id="viewTop" class="vbtn" title="Top view">T</button>
+        <button id="viewSide" class="vbtn" title="Side view">S</button>
+        <button id="reset" class="vbtn" title="Reset view (reframe the map)">⟳</button>
+      </div>
+      <!-- Reopens the rail once collapsed; the rail itself is gone by then. -->
+      <button id="modelsReopen" class="models-reopen" title="Show the control panel" hidden>Controls</button>
+    </div>
+    <div class="rail-resize" id="modelsResize"></div>
+
+    <aside class="models rail" id="models">
+      <div class="models-head">
+        <span class="models-title">Controls</span>
+        <button id="modelsCollapse" class="iconbtn" title="Hide the panel (more canvas)">×</button>
+      </div>
+      <div class="rail-scroll">
+
+        <div class="sec open" data-sec="models" id="secModels" hidden>
+          <button class="sec-h" type="button"><span class="car">▶</span> Models
+            <span class="cnt" id="modelCnt"></span></button>
+          <div class="sec-b">
+            <div class="models-list" id="modelsList"></div>
+            <div class="sec-foot">
+              <button id="modelsAll" class="lnk" title="Show every map">all</button>
+              <button id="modelsNone" class="lnk" title="Hide every map">none</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec open" data-sec="contour" id="secContour">
+          <button class="sec-h" type="button"><span class="car">▶</span> Contour
+            <span class="cnt" id="sigVal"></span></button>
+          <div class="sec-b">
+            <canvas id="hist" class="hist" title="Drag to set the contour level of the active map"></canvas>
+            <div class="crow">
+              <label class="hist-opt" id="linklbl" hidden title="Apply contour changes to every visible map (at the same sigma) instead of only the active one"><input id="linkContour" type="checkbox" /> link maps</label>
+              <label class="hist-opt" title="Hide connected blobs smaller than this many voxels (ChimeraX's hide dust)"><input id="dustOn" type="checkbox" /> hide dust</label>
+              <input id="dustSize" type="number" min="10" max="100000" step="10" value="200" title="Minimum blob size to keep, in voxels" hidden />
+            </div>
+          </div>
+        </div>
+
+        <div class="sec open" data-sec="display" id="secDisplay">
+          <button class="sec-h" type="button"><span class="car">▶</span> Display</button>
+          <div class="sec-b">
+            <div id="dispSurface">
+              <div class="rrow"><span>lighting</span>
+                <select id="light"><option value="standard" selected>standard</option><option value="smooth">smooth</option><option value="raytraced">ray traced</option></select>
+              </div>
+              <div class="rrow"><span>smooth</span>
+                <input id="smooth" type="range" min="0" max="20" value="6" title="Surface mesh smoothing (Taubin iterations)" /></div>
+            </div>
+            <div id="dispVolume" style="display:none">
+              <div class="rrow"><span>style</span>
+                <select id="volStyle" title="MIP shows the densest voxel along each ray; glow accumulates like emission">
+                  <option value="mip" selected>MIP</option>
+                  <option value="emission">glow</option>
+                </select>
+              </div>
+              <div class="rrow"><span>γ</span><input id="vgamma" type="range" min="0.3" max="3" step="0.1" value="1.4" title="Transfer-function gamma" /></div>
+              <div class="rrow"><span>bright</span><input id="vbright" type="range" min="0.2" max="3" step="0.1" value="1.2" title="Brightness / opacity" /></div>
+            </div>
+            <div id="dispSlices" style="display:none">
+              <div class="rrow"><span>colormap</span>
+                <select id="slicemap" title="Slice colormap">
+                  <option value="gray" selected>gray</option>
+                  <option value="viridis">viridis</option>
+                  <option value="magma">magma</option>
+                  <option value="inferno">inferno</option>
+                  <option value="hot">hot</option>
+                </select>
+              </div>
+              <div class="rrow"><span>low</span><input id="slicelo" type="range" min="0" max="1" step="0.01" value="0" title="Contrast — black point" /></div>
+              <div class="rrow"><span>high</span><input id="slicehi" type="range" min="0" max="1" step="0.01" value="1" title="Contrast — white point" /></div>
+              <div class="rrow"><span></span>
+                <label class="hist-opt"><input id="slicecross" type="checkbox" checked /> crosshair</label>
+                <button id="sliceReset" class="btn" title="Reset slice zoom / pan (mouse wheel zooms)">Reset zoom</button>
+              </div>
+            </div>
+            <div class="rrow" id="colorlbl"><span>color</span>
+              <input id="color" type="color" value="#dcdcdc" title="Surface / volume color of the active map" /></div>
+            <div class="rrow"><span>bg</span>
+              <input id="bg" type="color" value="#040610" title="Background color" />
+              <label class="hist-opt" style="margin-left:auto" title="Show the small orientation axes in the corner"><input id="gizmoOn" type="checkbox" checked /> axes</label>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec" data-sec="clip" id="secClip">
+          <button class="sec-h" type="button"><span class="car">▶</span> Clip
+            <span class="cnt" id="clipState">off</span></button>
+          <div class="sec-b">
+            <div class="rrow"><span>axis</span>
+              <span class="chips" id="clipChips" title="Cut the map to a slab along this axis (surface and volume modes)">
+                <button class="chip on" data-ax="">off</button>
+                <button class="chip" data-ax="0">X</button>
+                <button class="chip" data-ax="1">Y</button>
+                <button class="chip" data-ax="2">Z</button>
+              </span>
+            </div>
+            <div class="rrow" id="clipRanges" style="display:none"><span>slab</span>
               <input id="clipLo" type="range" min="0" max="100" value="0" title="Slab start (%)" />
               <input id="clipHi" type="range" min="0" max="100" value="100" title="Slab end (%)" />
-            </span>
-          </span>
-          <span id="slicectrls" style="display:none">
-            <label>map
-              <select id="slicemap" title="Slice colormap">
-                <option value="gray" selected>gray</option>
-                <option value="viridis">viridis</option>
-                <option value="magma">magma</option>
-                <option value="inferno">inferno</option>
-                <option value="hot">hot</option>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec" data-sec="morph" id="morph" hidden>
+          <button class="sec-h" type="button"><span class="car">▶</span> Morph</button>
+          <div class="sec-b">
+            <div class="mseq">
+              <span id="morphSeq" class="morph-seq muted">pick maps in Models →</span>
+            </div>
+            <div class="sec-foot">
+              <button id="morphAll" class="lnk" title="Add every visible map to the morph, in panel order">all visible</button>
+              <button id="morphClear" class="lnk" title="Clear the morph and go back to the maps">clear</button>
+            </div>
+            <div class="rrow"><span>frames</span>
+              <input id="morphFrames" type="number" min="2" max="120" value="24" title="Interpolated frames between each pair of maps" />
+              <label class="hist-opt" title="Contour every frame at the same enclosed mass instead of the same sigma. Averaging two maps lowers the variance, so a fixed sigma makes the surface breathe mid-morph."><input id="morphMass" type="checkbox" checked /> const. mass</label>
+            </div>
+            <div class="rrow"><span>quality</span>
+              <select id="morphQuality" title="Draft prepares in seconds; full is slower to prepare but is what you want in a recording">
+                <option value="draft" selected>draft</option>
+                <option value="full">full</option>
               </select>
-            </label>
-            <label>low <input id="slicelo" type="range" min="0" max="1" step="0.01" value="0" title="Contrast — black point" /></label>
-            <label>high <input id="slicehi" type="range" min="0" max="1" step="0.01" value="1" title="Contrast — white point" /></label>
-            <label><input id="slicecross" type="checkbox" checked /> crosshair</label>
-            <button id="sliceReset" class="btn" title="Reset slice zoom / pan (mouse wheel zooms)">Reset zoom</button>
-          </span>
-          <label id="colorlbl">surface <input id="color" type="color" value="#dcdcdc" title="Surface / volume color" /></label>
-          <label>bg <input id="bg" type="color" value="#040610" title="Background color" /></label>
-          <span class="viewbtns" title="Standard orientations (keeps zoom)">
-            <button id="viewFront" class="btn" title="Front view (reset orientation)">F</button>
-            <button id="viewTop" class="btn" title="Top view">T</button>
-            <button id="viewSide" class="btn" title="Side view">S</button>
-          </span>
-          <label class="hist-opt" title="Show the small orientation axes in the corner"><input id="gizmoOn" type="checkbox" checked /> axes</label>
-          <button id="reset" class="btn">Reset view</button>
-          <button id="saveMap" class="btn" title="Save the current view as PNG">Save PNG</button>
-          <button id="mrc" class="btn" title="Download this map as .mrc">.mrc</button>
-          <button id="exportMesh" class="btn" title="Export the active map's surface at the current contour as a binary STL (in Å)">.stl</button>
-          <button id="pdbBtn" class="btn" title="Overlay a PDB backbone trace (CA/P atoms), placed using the map's voxel size and origin">PDB…</button>
-        </div>
-      </div>
-      <div class="hist-strip" id="histStrip">
-        <span class="hist-label muted">contour</span>
-        <canvas id="hist"></canvas>
-        <label class="hist-opt" id="linklbl" hidden title="Apply contour changes to every visible map (at the same sigma) instead of only the active one"><input id="linkContour" type="checkbox" /> link</label>
-        <label class="hist-opt" title="Hide connected blobs smaller than this many voxels (ChimeraX's hide dust)"><input id="dustOn" type="checkbox" /> dust</label>
-        <input id="dustSize" type="number" min="10" max="100000" step="10" value="200" title="Minimum blob size to keep, in voxels" style="width:64px" hidden />
-      </div>
-      <!-- Canvas + model rail side by side, ChimeraX-style: the rail costs width, which
-           there is plenty of, rather than height, which the map needs. -->
-      <div class="stage" id="stage">
-        <!-- The rim gesture has no cursor of its own (ChimeraX has none either), so the
-             tooltip is the only place it is discoverable. -->
-        <div class="canvas-wrap"
-             title="Drag to rotate · drag near the edge to spin in-plane · middle-drag to pan · wheel to zoom">
-          <canvas id="gl"></canvas>
-          <canvas id="gizmo" class="gizmo" width="64" height="64" title="Model axes (X red · Y green · Z blue)"></canvas>
-          <canvas id="glvol" style="display:none"></canvas>
-          <div id="slices" class="slices" style="display:none"></div>
-          <!-- Reopens the rail once collapsed; the rail itself is gone by then. -->
-          <button id="modelsReopen" class="models-reopen" title="Show the model panel" hidden>Models</button>
-        </div>
-        <div class="rail-resize" id="modelsResize"></div>
-        <!-- Hidden entirely for a single map: a list of one is just noise, and a lone
-             map is what this viewer has always shown. -->
-        <aside class="models" id="models" hidden>
-          <div class="models-head">
-            <span class="models-title">Models</span>
-            <button id="modelsAll" class="lnk" title="Show every map">all</button>
-            <button id="modelsNone" class="lnk" title="Hide every map">none</button>
-            <button id="modelsCollapse" class="iconbtn" title="Hide the model panel">×</button>
+              <label class="hist-opt">fps <input id="morphFps" type="number" min="1" max="60" value="30" /></label>
+            </div>
+            <div class="rrow morph-ctl">
+              <button id="morphPrepare" class="btn" title="Compute the frames">Prepare</button>
+              <button id="morphPlay" class="btn" disabled>▶</button>
+              <input id="morphScrub" type="range" min="0" max="0" value="0" disabled title="Scrub through the morph" />
+            </div>
+            <div class="rrow">
+              <button id="morphRecord" class="btn" disabled title="Play once and save it as a video">● Record</button>
+              <button id="morphExport" class="lnk" disabled title="Download every frame as a full-resolution .mrc (zip) — the density itself, for figures made elsewhere">⇩ .mrc series</button>
+            </div>
           </div>
-          <div class="models-list" id="modelsList"></div>
-          <!-- Map arithmetic: derive a new model from two same-grid maps. -->
-          <div class="models-compute" id="modelsCompute">
-            <select id="computeOp" title="Operation (applied voxel-wise; same grid only)">
-              <option value="diff" selected>A − B</option>
-              <option value="diffpm">A − B ± (gain green / loss red)</option>
-              <option value="sum">A + B</option>
-              <option value="mult">A × B</option>
-            </select>
-            <select id="computeA" title="Map A"></select>
-            <select id="computeB" title="Map B"></select>
-            <button id="computeGo" class="btn" title="Add the result as a new model">=</button>
+        </div>
+
+        <div class="sec open" data-sec="analysis" id="secAnalysis">
+          <button class="sec-h" type="button"><span class="car">▶</span> Analysis</button>
+          <div class="sec-b">
+            <div class="arow" id="modelsCompute" hidden title="Voxel-wise map arithmetic; the result is added as a new model (same grid only)">
+              <select id="computeA" title="Map A"></select>
+              <select id="computeOp" title="Operation">
+                <option value="diff" selected>−</option>
+                <option value="diffpm">− ±</option>
+                <option value="sum">+</option>
+                <option value="mult">×</option>
+              </select>
+              <select id="computeB" title="Map B"></select>
+              <button id="computeGo" class="btn" title="Add the result as a new model">=</button>
+            </div>
+            <div class="arow" id="paintRow" hidden>
+              <button id="paintGo" class="btn grow" title="Colour the surface of A by the local value of A − B: red = density lost, white = unchanged, blue = gained (ChimeraX's color sample)">Paint A − B on surface <span class="divg"></span></button>
+              <button id="paintClear" class="lnk" hidden title="Back to the plain surface colour">clear</button>
+            </div>
+            <div class="arow">
+              <button id="pdbBtn" class="btn grow" title="Overlay a PDB backbone trace (CA/P atoms), placed using the map's voxel size and origin">PDB…</button>
+            </div>
           </div>
-        </aside>
+        </div>
+
       </div>
-      <!-- Morph strip. Below the canvas rather than in the rail: a scrubber wants width,
-           and the rail is deliberately narrow. Shown only when the maps share a grid. -->
-      <div class="morph" id="morph" hidden>
-        <span class="morph-title">Morph</span>
-        <span id="morphSeq" class="morph-seq muted">pick maps in the panel →</span>
-        <button id="morphAll" class="lnk" title="Add every visible map to the morph, in panel order">all visible</button>
-        <label>frames <input id="morphFrames" type="number" min="2" max="120" value="24" title="Interpolated frames between each pair of maps" /></label>
-        <label title="Contour every frame at the same enclosed mass instead of the same sigma. Averaging two maps lowers the variance, so a fixed sigma makes the surface breathe mid-morph."><input id="morphMass" type="checkbox" checked /> constant mass</label>
-        <label>quality
-          <select id="morphQuality" title="Draft prepares in seconds; full is slower to prepare but is what you want in a recording">
-            <option value="draft" selected>draft</option>
-            <option value="full">full</option>
-          </select>
-        </label>
-        <button id="morphPrepare" class="btn" title="Compute the frames">Prepare</button>
-        <button id="morphPlay" class="btn" disabled>▶</button>
-        <input id="morphScrub" type="range" min="0" max="0" value="0" disabled title="Scrub through the morph" />
-        <label>fps <input id="morphFps" type="number" min="1" max="60" value="30" /></label>
-        <button id="morphRecord" class="btn" disabled title="Play once and save it as a video">● Record</button>
-        <button id="morphExport" class="lnk" disabled title="Download every frame as a full-resolution .mrc (zip) — the density itself, for figures made elsewhere">⇩ .mrc series</button>
-        <button id="morphClear" class="lnk" title="Clear the morph and go back to the maps">clear</button>
-      </div>
-    </section>
+    </aside>
   </main>
 
   <script type="module" src="./mrc.js"></script>

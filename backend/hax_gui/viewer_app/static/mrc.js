@@ -15,7 +15,7 @@ import { createRenderer } from "./gl.js";
 import { createVolume } from "./volume.js";
 import { createHistogram } from "./histogram.js";
 import { createSlices } from "./slices.js";
-import { parseGrid, parseMesh } from "./wire.js";
+import { parseColorMesh, parseGrid, parseMesh } from "./wire.js";
 import { latestWins, makeLive } from "./viewerbase.js";
 
 const $ = (id) => document.getElementById(id);
@@ -132,12 +132,16 @@ async function loadInfo() {
   }));
   $("title").textContent = info.title || "Map";
   const multi = models.length > 1;
-  $("models").hidden = !multi;
-  if (multi) { buildModelPanel(); if (!railSetup) { setupRail(); railSetup = true; } fillComputeSelects(); }
-  else $("stage").classList.add("rail-off");
+  // The rail always exists (contour/display/clip live there); only the sections
+  // that need several maps hide for a lone one.
+  $("secModels").hidden = !multi;
+  $("modelsCompute").hidden = !multi;
+  if (multi) { buildModelPanel(); fillComputeSelects(); }
+  if (!railSetup) { setupRail(); railSetup = true; }
   // Maps on different grids cannot be blended voxel-by-voxel, and the backend refuses
-  // to; don't offer a control that can only fail.
+  // to; don't offer controls that can only fail.
   $("morph").hidden = !(multi && info.morph_shape);
+  $("paintRow").hidden = !(multi && info.morph_shape);
   $("linklbl").hidden = !multi;
   if (!$("morph").hidden) updateMorphUI();
   setActive(0);
@@ -163,6 +167,7 @@ async function setActive(i) {
   // active one — otherwise they show the previous map's settings and the next nudge
   // silently applies them to this one.
   $("smooth").value = String(m.smooth);
+  $("sigVal").textContent = m.sigma.toFixed(2) + " σ";
   if (models.length > 1) markActiveRow();
   schedSaveScene();
   await loadHistogram();
@@ -219,6 +224,7 @@ async function surfaceOnce(idx, draft) {
     if (state.render !== "surface") return;   // mode switched while we were waiting
     const mesh = parseMesh(buf);
     renderer.setModelMesh(m.index, mesh.positions, mesh.normals, mesh.indices);
+    if (painted === idx) { painted = null; $("paintClear").hidden = true; }   // plain mesh = paint gone
     renderer.setModelColor(m.index, hexToRgb(m.color));
     renderer.setModelVisible(m.index, m.visible);
     if (!draft) m.surface = m.sigma;
@@ -324,6 +330,7 @@ let linkContour = false;
 function onLevel(level, dragging) {
   const m = active();
   m.sigma = (level - m.mean) / (m.std || 1);
+  $("sigVal").textContent = m.sigma.toFixed(2) + " σ";
   if (state.render === "surface") {
     loadSurface(state.active, !!dragging);   // the active map tracks the drag live
     if (linkContour && !dragging) {
@@ -337,7 +344,17 @@ function onLevel(level, dragging) {
     if (slot >= 0) volRenderer.setSlotThreshold(slot, normThreshold());
     else volRenderer.setThreshold(normThreshold());   // morph / fallback: slot 0
   }
-  if (!dragging) saveMapPref(m);             // release: this is the level you chose
+  if (!dragging) { saveMapPref(m); refreshRowSigmas(); }   // release: this is the level you chose
+}
+
+// Per-row σ readouts in the model panel, refreshed on any settled level change.
+function refreshRowSigmas() {
+  if (models.length <= 1) return;
+  for (const row of $("modelsList").children) {
+    const m = models[Number(row.dataset.index)];
+    const el = row.querySelector(".model-sig");
+    if (m && el) el.textContent = m.sigma.toFixed(2) + "σ";
+  }
 }
 
 // ---- model panel (a resizable right rail, ChimeraX-style) ----------------
@@ -416,6 +433,12 @@ function buildModelPanel() {
     name.textContent = m.name;
     name.title = m.filename;
 
+    // Each map's own contour, at a glance — the panel is where "which level is
+    // which map at?" gets answered.
+    const sig = document.createElement("span");
+    sig.className = "model-sig";
+    sig.textContent = m.sigma.toFixed(2) + "σ";
+
     // Solo: show only this map; click again to bring the others back. The single
     // most-used ChimeraX gesture when comparing many maps.
     const solo = document.createElement("button");
@@ -424,7 +447,7 @@ function buildModelPanel() {
     solo.title = "Show only this map (click again to show all)";
     solo.addEventListener("click", (e) => { e.stopPropagation(); toggleSolo(i); });
 
-    row.append(see, swatch, name, solo);
+    row.append(see, swatch, name, sig, solo);
 
     // Morph membership, and the order it will run in. Click order is the sequence, so
     // the same maps can be morphed forwards, backwards, or out and back, without any
@@ -446,6 +469,11 @@ function buildModelPanel() {
     list.appendChild(row);
   });
   markActiveRow();
+  updateModelCnt();
+}
+
+function updateModelCnt() {
+  $("modelCnt").textContent = `${visibleModels().length}/${models.length}`;
 }
 
 function markActiveRow() {
@@ -466,6 +494,7 @@ function toggleSolo(i) {
   if (state.render === "surface") loadSurfaces();
   else if (inVolumeMode()) loadVolume();     // the composited set changed
   else reportSurface();
+  updateModelCnt();
   schedSaveScene();
 }
 
@@ -478,6 +507,7 @@ function setVisible(i, on) {
   if (on && state.render === "surface") loadSurfaces();
   else if (inVolumeMode()) loadVolume();     // the composited set changed either way
   else reportSurface();
+  updateModelCnt();
   schedSaveScene();
 }
 
@@ -546,7 +576,7 @@ function updateMorphUI() {
   const ok = morphLegs() > 0;
   $("morphSeq").textContent = ok
     ? morph.seq.map((i) => models[i].name.replace(/\.[^.]+$/, "")).join(" → ")
-    : "pick maps in the panel →";
+    : "pick maps in Models above";
   $("morphSeq").classList.toggle("muted", !ok);
   const ready = ok && (state.render !== "surface" || (morph.cache && morph.cacheKey === morphKey()));
   $("morphPrepare").disabled = !ok;
@@ -766,13 +796,19 @@ function setMode(mode) {
   const to = camera3d(mode);
   if (to && to !== from && camera) to.setCamera(camera);
 
-  show($("lightlbl"), isSurface);
-  show($("smoothlbl"), isSurface);
-  show($("volctrls"), isVolume);
-  show($("clipctrls"), isSurface || isVolume);
-  show($("slicectrls"), isSlices);
+  // The segmented switch tracks the mode; volume styles both light the same segment.
+  const seg = isVolume ? "volume" : mode;
+  for (const b of $("modeSeg").querySelectorAll("button")) {
+    b.classList.toggle("on", b.dataset.mode === seg);
+  }
+  if (isVolume) $("volStyle").value = mode;
+  // Contextual controls: only the current mode's rows exist on screen.
+  show($("dispSurface"), isSurface);
+  show($("dispVolume"), isVolume);
+  show($("dispSlices"), isSlices);
   show($("colorlbl"), !isSlices);
-  show($("histStrip"), !isSlices);   // contour is meaningless for raw slices
+  $("secContour").hidden = isSlices;   // contour is meaningless for raw slices
+  $("secClip").hidden = isSlices;      // the slab cuts the 3D views only
 
   if (isSurface) { renderer.render(); loadSurfaces(); }
   else if (isVolume) { volRenderer.setMode(mode === "emission" ? "emission" : "mip"); loadVolume(); }
@@ -784,7 +820,50 @@ function setMode(mode) {
 }
 
 // ---- controls ------------------------------------------------------------
-$("rendermode").addEventListener("change", (e) => setMode(e.target.value));
+// Mode: a segmented switch. "Volume" resolves to whichever style (MIP / glow) the
+// Display section last had, so the segment stays a three-way choice.
+let volStyle = "mip";
+$("modeSeg").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-mode]");
+  if (!btn) return;
+  const seg = btn.dataset.mode;
+  setMode(seg === "volume" ? volStyle : seg);
+});
+$("volStyle").addEventListener("change", (e) => {
+  volStyle = e.target.value === "emission" ? "emission" : "mip";
+  if (state.render === "mip" || state.render === "emission") setMode(volStyle);
+});
+
+// Export menu: the four ways out of the viewer, one dropdown.
+$("exportBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  $("exportMenu").classList.toggle("open");
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#exportMenu")) $("exportMenu").classList.remove("open");
+});
+// Choosing an export closes the menu; changing scale/transparency keeps it open.
+for (const id of ["saveMap", "mrc", "exportMesh"]) {
+  $(id).addEventListener("click", () => $("exportMenu").classList.remove("open"));
+}
+
+// Collapsible sections, open state remembered globally (a workflow preference,
+// not a property of one scene).
+const SEC_KEY = "hax_mrc_sections";
+(function setupSections() {
+  const saved = readJSON(SEC_KEY) || {};
+  for (const sec of document.querySelectorAll("#models .sec")) {
+    const k = sec.dataset.sec;
+    if (k in saved) sec.classList.toggle("open", !!saved[k]);
+    sec.querySelector(".sec-h").addEventListener("click", () => {
+      sec.classList.toggle("open");
+      const cur = readJSON(SEC_KEY) || {};
+      cur[k] = sec.classList.contains("open");
+      writeJSON(SEC_KEY, cur);
+    });
+  }
+})();
+
 $("light").addEventListener("change", (e) => renderer.setLighting(e.target.value));
 $("smooth").addEventListener("input", (e) => {
   active().smooth = +e.target.value;
@@ -852,10 +931,18 @@ $("morphAll").addEventListener("click", () => {
   buildModelPanel();
 });
 $("pdbBtn").addEventListener("click", togglePdb);
-$("clipAxis").addEventListener("change", applyClip);
+$("clipChips").addEventListener("click", (e) => {
+  const chip = e.target.closest(".chip");
+  if (!chip) return;
+  clipAx = chip.dataset.ax;
+  for (const c of $("clipChips").children) c.classList.toggle("on", c === chip);
+  applyClip();
+});
 $("clipLo").addEventListener("input", applyClip);
 $("clipHi").addEventListener("input", applyClip);
 $("computeGo").addEventListener("click", runCompute);
+$("paintGo").addEventListener("click", paintDiff);
+$("paintClear").addEventListener("click", clearPaint);
 
 function setAllVisible(on) {
   models.forEach((m, i) => {
@@ -867,6 +954,7 @@ function setAllVisible(on) {
   if (on && state.render === "surface") loadSurfaces();
   else if (inVolumeMode()) loadVolume();
   else reportSurface();
+  updateModelCnt();
   schedSaveScene();
 }
 
@@ -1014,13 +1102,19 @@ async function exportMesh() {
 }
 
 // ---- clipping (slab along one axis, surface + volume) --------------------
+let clipAx = "";   // "", "0", "1", "2" — driven by the chips in the Clip section
 function applyClip() {
-  const axis = $("clipAxis").value;
+  const axis = clipAx;
   $("clipRanges").style.display = axis === "" ? "none" : "";
-  if (axis === "") { volRenderer.setClip(null, null); renderer.setClip(null, null); return; }
+  if (axis === "") {
+    volRenderer.setClip(null, null); renderer.setClip(null, null);
+    $("clipState").textContent = "off";
+    return;
+  }
   const a = +axis;
   let lo = +$("clipLo").value / 100, hi = +$("clipHi").value / 100;
   if (hi < lo + 0.01) hi = Math.min(1, lo + 0.01);
+  $("clipState").textContent = "XYZ"[a] + ` ${Math.round(lo * 100)}–${Math.round(hi * 100)}%`;
   // Volume renderer clips in texture space [0,1]; the surface renderer in the
   // model-space [-1,1] cube. Same fractions, two coordinate frames.
   const tLo = [0, 0, 0], tHi = [1, 1, 1];
@@ -1067,6 +1161,52 @@ async function runCompute() {
     status(made.pair ? `Added ${made.name} — green = gained, red = lost` : `Added ${made.name}`);
   } catch (err) { status("Compute failed: " + err.message, "err"); }
   finally { btn.disabled = false; }
+}
+
+// ---- paint by difference (ChimeraX's `color sample` on A − B) ------------
+// The surface of A, coloured by the local value of A − B: red where density was
+// lost, near-white where nothing changed, blue where it was gained — the
+// continuous difference-map reading, on one surface instead of two lobes.
+let painted = null;   // list index of the map wearing a painted surface, or null
+
+async function paintDiff() {
+  const a = +$("computeA").value, b = +$("computeB").value;
+  if (a === b) { status("Pick two different maps (A and B above) to paint their difference.", "warn"); return; }
+  const ma = models[a], mb = models[b];
+  if (!ma || !mb) return;
+  const btn = $("paintGo");
+  btn.disabled = true;
+  status(`Painting ${ma.name} by (A − B)…`, "busy");
+  try {
+    const res = await fetch(`./api/paint?m=${ma.index}&other=${mb.index}`
+                            + `&sigma=${ma.sigma.toFixed(3)}&smooth=${ma.smooth}`);
+    if (!res.ok) throw new Error(((await res.json()).detail) || res.statusText);
+    const mesh = parseColorMesh(await res.arrayBuffer());
+    if (!mesh.indices.length) { status("Empty surface at this contour — nothing to paint", "warn"); return; }
+    renderer.setModelMesh(ma.index, mesh.positions, mesh.normals, mesh.indices, mesh.colors);
+    // The painted mesh IS the surface at this sigma — mark it current so the next
+    // loadSurfaces pass does not replace it with a plain one. Any later contour
+    // change refetches plain and thereby clears the paint (see surfaceOnce).
+    ma.surface = ma.sigma;
+    painted = a;
+    $("paintClear").hidden = false;
+    if (state.render !== "surface") setMode("surface");
+    else if (a !== state.active) setActive(a);
+    const r = mesh.prange;
+    status(`${ma.name} painted by (${ma.name.replace(/\.[^.]+$/, "")} − ${mb.name.replace(/\.[^.]+$/, "")})`
+           + ` · range ±${Math.abs(r) >= 0.01 ? r.toFixed(2) : r.toExponential(1)}`
+           + " · red = lost · blue = gained");
+  } catch (err) { status("Paint failed: " + err.message, "err"); }
+  finally { btn.disabled = false; }
+}
+
+function clearPaint() {
+  if (painted === null) return;
+  const i = painted;
+  painted = null;
+  $("paintClear").hidden = true;
+  models[i].surface = null;
+  if (state.render === "surface") surfaceOnce(i, false);
 }
 
 // ---- PDB backbone overlay ------------------------------------------------
