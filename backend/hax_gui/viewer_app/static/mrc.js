@@ -122,15 +122,19 @@ document.addEventListener("visibilitychange", () => { if (document.hidden) saveS
 async function loadInfo() {
   info = await (await fetch("./api/info")).json();
   const prefs = readJSON(MAP_PREFS_KEY) || {};
+  // Reloading the scene (map arithmetic grows it) must not undo the visibility
+  // you set up — carry it over by file; only genuinely new models default to on.
+  const prevVis = new Map(models.map((m) => [m.filename, m.visible]));
   models = info.models.map((m, i) => ({
     ...m,
-    visible: true,
+    visible: prevVis.has(m.filename) ? prevVis.get(m.filename) : true,
     color: (prefs[m.filename] && prefs[m.filename].color) || m.color,
     sigma: (prefs[m.filename] && Number.isFinite(prefs[m.filename].sigma)) ? prefs[m.filename].sigma : 2.5,
     smooth: (prefs[m.filename] && Number.isFinite(prefs[m.filename].smooth)) ? prefs[m.filename].smooth : 6,
     surface: null,     // the sigma the loaded mesh was cut at, so it isn't refetched
   }));
   $("title").textContent = info.title || "Map";
+  for (const m of models) renderer.setModelVisible(m.index, m.visible);
   const multi = models.length > 1;
   // The rail always exists (contour/display/clip live there); only the sections
   // that need several maps hide for a lone one.
@@ -499,6 +503,23 @@ function toggleSolo(i) {
 }
 
 const inVolumeMode = () => state.render === "mip" || state.render === "emission";
+
+// Show exactly this set of maps (list indices) — what compute and paint do with
+// their result: a derived map is what you asked to see, and leaving the inputs
+// on just buries it under them. The panel checkboxes bring anything back.
+function showOnly(indices) {
+  const keep = new Set(indices);
+  models.forEach((m, i) => {
+    m.visible = keep.has(i);
+    renderer.setModelVisible(m.index, m.visible);
+    const row = $("modelsList").children[i];
+    if (row) row.querySelector("input[type=checkbox]").checked = m.visible;
+  });
+  updateModelCnt();
+  if (state.render === "surface") loadSurfaces();
+  else if (inVolumeMode()) loadVolume();
+  schedSaveScene();
+}
 
 function setVisible(i, on) {
   models[i].visible = on;
@@ -1159,8 +1180,8 @@ async function runCompute() {
       setColor(made.pair[0], "#51cf66");
       setColor(made.pair[1], "#ff6b6b");
     }
-    setMode(state.render);
-    setActive(made.index);       // show the result
+    showOnly(made.pair || [made.index]);   // the result alone; the inputs would bury it
+    setActive(made.index);
     status(made.pair ? `Added ${made.name} — green = gained, red = lost` : `Added ${made.name}`);
   } catch (err) { status("Compute failed: " + err.message, "err"); }
   finally { btn.disabled = false; }
@@ -1193,6 +1214,7 @@ async function paintDiff() {
     ma.surface = ma.sigma;
     painted = a;
     $("paintClear").hidden = false;
+    showOnly([a]);               // the painted surface alone — B overlapping it would hide the colours
     if (state.render !== "surface") setMode("surface");
     else if (a !== state.active) setActive(a);
     const r = mesh.prange;
