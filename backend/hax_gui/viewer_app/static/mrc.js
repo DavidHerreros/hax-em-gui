@@ -216,19 +216,31 @@ const dust = { on: false, size: 200 };
 const dustParam = () => (dust.on && dust.size > 1 ? `&dust=${Math.round(dust.size)}` : "");
 
 // Contour one map. Only the map being adjusted is refetched — the others are already on
-// the GPU and their contours have not changed.
+// the GPU and their contours have not changed. A painted map re-paints instead of
+// falling back to a plain mesh: the colouring belongs to the map, not to one level,
+// so contour and smoothing changes keep it (the paint endpoint contours + samples in
+// one pass, so this costs the same as a plain decode). Hide-dust is the one option a
+// painted surface ignores — the paint endpoint has no dust pass.
 async function surfaceOnce(idx, draft) {
   const m = models[idx];
   if (!m) return;
   status(models.length > 1 ? `Contouring ${m.name}…` : "Contouring…", "busy");
   try {
-    const q = `m=${m.index}&sigma=${m.sigma.toFixed(3)}${dustParam()}`
-            + (draft ? `&smooth=${Math.min(m.smooth, DRAFT_SMOOTH)}&size=${draftSize()}` : `&smooth=${m.smooth}`);
-    const buf = await (await fetch(`./api/decode?${q}`)).arrayBuffer();
+    const detail = draft ? `&smooth=${Math.min(m.smooth, DRAFT_SMOOTH)}&size=${draftSize()}`
+                         : `&smooth=${m.smooth}`;
+    let mesh;
+    if (painted && painted.m === idx && models[painted.other]) {
+      const res = await fetch(`./api/paint?m=${m.index}&other=${models[painted.other].index}`
+                              + `&sigma=${m.sigma.toFixed(3)}${detail}`);
+      if (!res.ok) throw new Error(((await res.json()).detail) || res.statusText);
+      mesh = parseColorMesh(await res.arrayBuffer());
+    } else {
+      const buf = await (await fetch(`./api/decode?m=${m.index}&sigma=${m.sigma.toFixed(3)}`
+                                     + `${dustParam()}${detail}`)).arrayBuffer();
+      mesh = parseMesh(buf);
+    }
     if (state.render !== "surface") return;   // mode switched while we were waiting
-    const mesh = parseMesh(buf);
-    renderer.setModelMesh(m.index, mesh.positions, mesh.normals, mesh.indices);
-    if (painted === idx) { painted = null; $("paintClear").hidden = true; }   // plain mesh = paint gone
+    renderer.setModelMesh(m.index, mesh.positions, mesh.normals, mesh.indices, mesh.colors);
     renderer.setModelColor(m.index, hexToRgb(m.color));
     renderer.setModelVisible(m.index, m.visible);
     if (!draft) m.surface = m.sigma;
@@ -1191,7 +1203,7 @@ async function runCompute() {
 // The surface of A, coloured by the local value of A − B: red where density was
 // lost, near-white where nothing changed, blue where it was gained — the
 // continuous difference-map reading, on one surface instead of two lobes.
-let painted = null;   // list index of the map wearing a painted surface, or null
+let painted = null;   // { m, other } list indices while a map wears a painted surface
 
 async function paintDiff() {
   const a = +$("computeA").value, b = +$("computeB").value;
@@ -1209,10 +1221,11 @@ async function paintDiff() {
     if (!mesh.indices.length) { status("Empty surface at this contour — nothing to paint", "warn"); return; }
     renderer.setModelMesh(ma.index, mesh.positions, mesh.normals, mesh.indices, mesh.colors);
     // The painted mesh IS the surface at this sigma — mark it current so the next
-    // loadSurfaces pass does not replace it with a plain one. Any later contour
-    // change refetches plain and thereby clears the paint (see surfaceOnce).
+    // loadSurfaces pass does not refetch it. From here on surfaceOnce re-paints on
+    // every contour/smoothing change; only "clear" (or painting another pair)
+    // returns this map to a plain surface.
     ma.surface = ma.sigma;
-    painted = a;
+    painted = { m: a, other: b };
     $("paintClear").hidden = false;
     showOnly([a]);               // the painted surface alone — B overlapping it would hide the colours
     if (state.render !== "surface") setMode("surface");
@@ -1226,8 +1239,8 @@ async function paintDiff() {
 }
 
 function clearPaint() {
-  if (painted === null) return;
-  const i = painted;
+  if (!painted) return;
+  const i = painted.m;
   painted = null;
   $("paintClear").hidden = true;
   models[i].surface = null;
