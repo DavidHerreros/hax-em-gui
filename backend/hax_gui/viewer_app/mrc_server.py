@@ -295,6 +295,28 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
                                                 prange=prange if prange > 0 else None),
                         media_type="application/octet-stream")
 
+    @app.get("/api/paint/grid")
+    def paint_grid(m: int = Query(...), other: int = Query(...),
+                   size: int = Query(96), prange: float = Query(-1.0)) -> Response:
+        """The difference m − other as a 3D-texture payload on a SYMMETRIC range
+        (vmin = −r, vmax = +r), so the uint8 midpoint is exactly zero difference.
+        The volume ray-marcher renders it signed (red = lost, blue = gained) and
+        the slice view maps it through a diverging colormap — the same reading the
+        painted surface gives, in the other two modes."""
+        ma, mb = scene.get(m), scene.get(other)
+        if ma.vol.shape != mb.vol.shape:
+            raise HTTPException(status_code=400,
+                                detail=f"maps are on different grids: {ma.vol.shape} vs {mb.vol.shape}")
+        ga, step = ma.grid_at(int(max(16, min(256, size))))
+        gb, _ = mb.grid_at(int(max(16, min(256, size))))
+        diff = np.asarray(ga, dtype=np.float32) - gb
+        r = float(prange) if prange > 0 else (3.0 * float(diff.std()) or 1.0)
+        full, off = scene.norm(ma)
+        lo, hi = grid_box(ma.vol.shape, diff.shape, step, full_size=full, offset=off)
+        stats = {"mean": float(diff.mean()), "std": float(diff.std())}
+        return Response(content=_grid_payload(diff, stats, lo, hi, vrange=(-r, r)),
+                        media_type="application/octet-stream")
+
     @app.get("/api/grid")
     def grid(m: int = Query(0), size: int = Query(96)) -> Response:
         """Density as a compact uint8 3D-texture payload (same layout as server.py):
@@ -539,9 +561,13 @@ def _morph_pair(scene: _Scene, a: int, b: int) -> tuple[np.ndarray, np.ndarray]:
     return va, vb
 
 
-def _grid_payload(ds: np.ndarray, stats: dict[str, Any], lo, hi) -> bytes:
-    """Pack a downsampled grid into the binary layout the ray-marcher parses."""
-    vmin, vmax = float(ds.min()), float(ds.max())
+def _grid_payload(ds: np.ndarray, stats: dict[str, Any], lo, hi, vrange=None) -> bytes:
+    """Pack a downsampled grid into the binary layout the ray-marcher parses.
+
+    `vrange` fixes the (vmin, vmax) window instead of using the data's own extrema —
+    difference grids use a symmetric window so uint8 128 lands on zero; values
+    outside it clip, exactly as the painted surface's ramp clips."""
+    vmin, vmax = (float(ds.min()), float(ds.max())) if vrange is None else (float(vrange[0]), float(vrange[1]))
     u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)
     nx, ny, nz = ds.shape[2], ds.shape[1], ds.shape[0]
     header = (

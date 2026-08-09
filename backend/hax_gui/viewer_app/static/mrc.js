@@ -282,9 +282,25 @@ function thrFor(m) {
   return Math.max(0, Math.min(1, (level - g.vmin) / ((g.vmax - g.vmin) || 1)));
 }
 
+// The signed difference grid of the painted pair, cached on the painted state
+// (it dies with "clear"). Symmetric range: uint8 128 = zero difference.
+async function fetchPaintGrid(size) {
+  const url = `./api/paint/grid?m=${models[painted.m].index}&other=${models[painted.other].index}&size=${size}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(((await res.json()).detail) || res.statusText);
+  return parseGrid(await res.arrayBuffer());
+}
+
+// Is the painted difference what this mode should show? Only when the painted map
+// is exactly what is on screen — mixing a signed field into a composite of
+// ordinary maps would be nonsense.
+const paintedAlone = () => !!painted && visibleModels().length === 1 && visibleModels()[0] === models[painted.m];
+
 const volGuard = latestWins();
 async function loadVolume() {
   if (morph.showing) return;     // the morph owns the volume canvas
+  if (paintedAlone()) return loadDiffVolume();
+  volRenderer.setDiverging(false);
   // Every visible map rides in one composited march, each at its own contour and
   // colour; with nothing visible, fall back to the active map so the canvas is
   // never silently empty.
@@ -313,22 +329,53 @@ async function loadVolume() {
   } catch (err) { status("Volume load failed: " + err.message, "err"); }
 }
 
+// Volume rendering of the painted difference: the signed A − B grid ray-marched
+// two-sided — red where density was lost, blue where it was gained, the same
+// reading as the painted surface. The contour threshold does not apply here.
+async function loadDiffVolume() {
+  status("Loading difference volume…", "busy");
+  const tok = volGuard.take();
+  try {
+    if (!painted.gridVol) painted.gridVol = await fetchPaintGrid(96);
+    if (volGuard.stale(tok) || !painted) return;
+    const g = painted.gridVol;
+    volSlots = [painted.m];
+    volRenderer.setVolume(g.nx, g.ny, g.nz, g.data, g.boxLo, g.boxHi);
+    volRenderer.setDiverging(true);
+    status(`Difference volume · ${models[painted.m].name} − ${models[painted.other].name}`
+           + " · red = lost · blue = gained");
+  } catch (err) { status("Difference volume failed: " + err.message, "err"); }
+}
+
 const sliceGuard = latestWins();
 async function loadSlices() {
   const m = active();
-  status("Loading slices…", "busy");
+  const diffMode = !!painted && state.active === painted.m;
+  status(diffMode ? "Loading difference slices…" : "Loading slices…", "busy");
   const tok = sliceGuard.take();
   try {
-    if (!m.gridSlice) m.gridSlice = await fetchGrid(m.index, 192);
-    if (sliceGuard.stale(tok)) return;
+    let g;
+    if (diffMode) {
+      // Slices of the signed A − B grid, on a symmetric range so mid-gray = zero;
+      // force the diverging colormap so red = lost / blue = gained reads at once.
+      if (!painted.gridSlice) painted.gridSlice = await fetchPaintGrid(192);
+      if (sliceGuard.stale(tok) || !painted) return;
+      g = painted.gridSlice;
+      $("slicemap").value = "diverging";
+      slices.setColormap("diverging");
+    } else {
+      if (!m.gridSlice) m.gridSlice = await fetchGrid(m.index, 192);
+      if (sliceGuard.stale(tok)) return;
+      g = m.gridSlice;
+    }
     // Å per *grid* voxel: the slice grid is stride-downsampled, so scale the header
     // voxel size by the stride. Set before the volume so the legend can use it.
-    const g = m.gridSlice;
     const stride = Math.max(1, Math.round(Math.max(...m.shape) / Math.max(g.nx, g.ny, g.nz)));
     slices.setScale(m.voxel_size && m.voxel_size !== 1 ? m.voxel_size * stride : 0);
-    slices.setVolume(m.gridSlice);
-    status(`Slices ${m.gridSlice.nx}×${m.gridSlice.ny}×${m.gridSlice.nz} · ${m.name}`
-           + (models.length > 1 ? " · active map only" : ""));
+    slices.setVolume(g);
+    status(diffMode
+      ? `Difference slices · ${models[painted.m].name} − ${models[painted.other].name} · red = lost · blue = gained`
+      : `Slices ${g.nx}×${g.ny}×${g.nz} · ${m.name}` + (models.length > 1 ? " · active map only" : ""));
   } catch (err) { status("Slice load failed: " + err.message, "err"); }
 }
 
@@ -686,6 +733,8 @@ async function prepareMorph() {
       }
       beginMorph();
       // The morph runs single-slot; give slot 0 the sequence's colour and contour.
+      // A leftover diverging flag from a painted diff would mis-read the maps.
+      volRenderer.setDiverging(false);
       volRenderer.setColor(hexToRgb(models[morph.seq[0]].color));
       volRenderer.setThreshold(thrFor(models[morph.seq[0]]));
       await showMorphFrame(morph.frame);
@@ -1241,10 +1290,12 @@ async function paintDiff() {
 function clearPaint() {
   if (!painted) return;
   const i = painted.m;
-  painted = null;
+  painted = null;                    // cached diff grids die with it
   $("paintClear").hidden = true;
   models[i].surface = null;
   if (state.render === "surface") surfaceOnce(i, false);
+  else if (inVolumeMode()) { volRenderer.setDiverging(false); loadVolume(); }
+  else if (state.render === "slices") loadSlices();
 }
 
 // ---- PDB backbone overlay ------------------------------------------------

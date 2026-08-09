@@ -73,6 +73,15 @@ float density(int i, vec3 mp) {
   return sampleVol(i, p);
 }
 
+// Diverging (signed) grids put ZERO at 0.5 — outside the box or the clip slab the
+// honest value is "no difference", i.e. 0.5, not 0 (0 would read as maximal loss).
+uniform int uDiverging;
+float densityN(vec3 mp) {
+  vec3 p = (mp - uBoxLoA[0]) / (uBoxHiA[0] - uBoxLoA[0]);
+  if (any(lessThan(p, uClipLo)) || any(greaterThan(p, uClipHi))) return 0.5;
+  return sampleVol(0, p);
+}
+
 void main() {
   vec3 ro = uEye;
   vec3 rd = normalize(toWorld(vec3(vUv * 2.0 - 1.0, 1.0)) - ro);
@@ -86,6 +95,44 @@ void main() {
   int steps = uSteps;
   float dt = (tf - tn) / float(steps);
   float t = tn;
+
+  // Signed difference rendering: two projections in one march — how far the diff
+  // reaches above zero (blue, gained) and below it (red, lost). The contour
+  // threshold does not apply (a signed field has no single inside), but gamma and
+  // brightness do. Same hues as the painted surface and the diverging slices.
+  if (uDiverging == 1) {
+    const vec3 DBLUE = vec3(0.25, 0.44, 0.83);
+    const vec3 DRED = vec3(0.83, 0.25, 0.25);
+    if (uMode == 0) {                        // two-sided MIP
+      float mpos = 0.0, mneg = 0.0;
+      for (int s = 0; s < 512; s++) {
+        if (s >= steps) break;
+        float d = densityN(ro + rd * t) * 2.0 - 1.0;
+        mpos = max(mpos, d); mneg = max(mneg, -d);
+        t += dt;
+      }
+      float vp = clamp(pow(clamp(mpos, 0.0, 1.0), uGamma) * uBright, 0.0, 1.0);
+      float vn = clamp(pow(clamp(mneg, 0.0, 1.0), uGamma) * uBright, 0.0, 1.0);
+      vec3 srgb = (1.0 - vp * DBLUE) * (1.0 - vn * DRED);   // screen-blend the two sides
+      outColor = vec4(uBg * (1.0 - vp) * (1.0 - vn) + (1.0 - srgb), 1.0);
+    } else {                                 // two-sided emission
+      vec3 acc = vec3(0.0); float alpha = 0.0;
+      for (int s = 0; s < 512; s++) {
+        if (s >= steps) break;
+        float d = densityN(ro + rd * t) * 2.0 - 1.0;
+        float dp = pow(clamp(d, 0.0, 1.0), uGamma) * uBright;
+        float dn = pow(clamp(-d, 0.0, 1.0), uGamma) * uBright;
+        float ap = clamp(dp * 0.12, 0.0, 1.0) * (1.0 - alpha);
+        acc += ap * DBLUE; alpha += ap;
+        float an = clamp(dn * 0.12, 0.0, 1.0) * (1.0 - alpha);
+        acc += an * DRED; alpha += an;
+        if (alpha >= 0.98) break;
+        t += dt;
+      }
+      outColor = vec4(acc + uBg * (1.0 - alpha), 1.0);
+    }
+    return;
+  }
 
   if (uMode == 0) {                          // per-map maximum-intensity projection
     float mv[${MAXV}];
@@ -146,7 +193,7 @@ export function createVolume(canvas) {
     uGamma = u("uGamma"), uBright = u("uBright"), uMode = u("uMode"), uSteps = u("uSteps"),
     uVolN = [u("uVol0"), u("uVol1"), u("uVol2"), u("uVol3")],
     uVolB = u("uVolB"), uMix = u("uMix"), uCount = u("uCount"),
-    uClipLo = u("uClipLo"), uClipHi = u("uClipHi");
+    uClipLo = u("uClipLo"), uClipHi = u("uClipHi"), uDiverging = u("uDiverging");
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -187,6 +234,7 @@ export function createVolume(canvas) {
   let grid = null;   // { nx, ny, nz } of slot 0; null until one is, which is what the camera tests
   let gridB = null;  // the morph's far end, same shape; null when not morphing
   let mix = 0;       // blend weight in [0,1]; 0 = slot 0 alone
+  let diverging = false;   // slot 0 holds a signed difference grid (zero at u8 midpoint)
 
   // The model-space box everything on screen occupies — the union over the active
   // slots. It bounds the ray march, the camera's pivot probe and the framing rule.
@@ -263,6 +311,7 @@ export function createVolume(canvas) {
     gl.uniform1f(uGamma, gamma); gl.uniform1f(uBright, bright);
     gl.uniform1i(uMode, mode); gl.uniform1i(uSteps, steps);
     gl.uniform1i(uCount, count);
+    gl.uniform1i(uDiverging, diverging ? 1 : 0);
     gl.uniform1f(uMix, gridB ? mix : 0);
     gl.uniform3fv(uClipLo, clipLo); gl.uniform3fv(uClipHi, clipHi);
     // Every sampler stays bound (placeholder textures make the unused ones complete).
@@ -323,6 +372,9 @@ export function createVolume(canvas) {
     // it must stay cheap — which it is, being a few uniform writes and a draw.
     setMix(t) { mix = Math.max(0, Math.min(1, t)); render(); },
     setMode(m) { mode = m === "emission" ? 1 : 0; render(); },
+    // Signed-difference rendering of slot 0 (red = lost, blue = gained). The caller
+    // is responsible for having uploaded a symmetric-range grid (see /api/paint/grid).
+    setDiverging(on) { diverging = !!on; render(); },
     // No pivot invalidation: an image-rendered map pivots on its box, and the contour does
     // not move the box. Same in ChimeraX, where changing the level of a map shown as an
     // image leaves its bounds — and so its centre of rotation — where they were.

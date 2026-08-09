@@ -14,6 +14,9 @@ const CMAPS = {
   magma: [[0, 0, 4], [81, 18, 124], [183, 55, 121], [252, 137, 97], [252, 253, 191]],
   inferno: [[0, 0, 4], [87, 16, 110], [188, 55, 84], [249, 142, 9], [252, 255, 164]],
   hot: [[10, 0, 0], [230, 0, 0], [255, 210, 0], [255, 255, 255]],
+  // Difference maps: red = below zero (lost density), white = zero, blue = above
+  // (gained) — assumes the grid was normalized on a symmetric range so mid = 0.
+  diverging: [[212, 63, 63], [242, 242, 242], [63, 112, 212]],
 };
 
 function makeLUT(name) {
