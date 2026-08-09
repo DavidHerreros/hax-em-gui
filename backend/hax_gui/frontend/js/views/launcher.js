@@ -13,6 +13,12 @@ import { confirmJobCascade } from "./cascadeModal.js";
 
 const CATEGORY_ORDER = ["Preprocessing", "Networks", "Post-processing", "Metrics", "Viewers", "Other"];
 
+// Per-program page on the docs site (mkdocs: docs/programs/<name>.md → /programs/<name>/).
+// Programs without a page yet land on the programs index rather than a 404.
+const DOCS_BASE = "https://davidherreros.github.io/hax-em-docs/";
+const DOCS_MISSING = new Set(["reconsiren_het_only", "reconstruct_motion_corrected"]);
+const docsUrlFor = (name) => DOCS_BASE + "programs/" + (DOCS_MISSING.has(name) ? "" : name + "/");
+
 export function buildLauncher() {
   const content = h("div", { class: "launcher-content" });
   let programsCache = null;
@@ -77,7 +83,11 @@ export function buildLauncher() {
   function renderProgram(name) {
     const head = h("div", { class: "launcher-head" },
       h("button", { class: "btn-icon", style: { border: "none", padding: "0 8px 0 0" }, title: "Back", onclick: () => store.clearProgram() }, icon("arrowLeft", 18)),
-      h("span", { class: "mono", style: { color: "var(--accent)" } }, name));
+      h("span", { class: "mono", style: { color: "var(--accent)" } }, name),
+      h("a", { class: "btn-icon", style: { marginLeft: "auto", border: "none" }, href: docsUrlFor(name),
+               target: "_blank", rel: "noreferrer",
+               title: "Open this program's documentation (parameters explained, examples, workflows)" },
+        icon("book", 16)));
     content.appendChild(head);
     const body = h("div", { class: "launcher-body" });
     content.appendChild(body);
