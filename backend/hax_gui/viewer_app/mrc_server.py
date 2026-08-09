@@ -39,7 +39,8 @@ from fastapi import FastAPI, HTTPException, Query, Response  # noqa: E402
 from fastapi.responses import FileResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
-from meshing import _downsample, grid_box, level_for_mass, level_for_sigma, mesh_at, remove_dust  # noqa: E402
+from meshing import (_downsample, grid_box, level_for_mass, level_for_sigma, mesh_at,  # noqa: E402
+                     painted_mesh_at, remove_dust)
 import wirefmt  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -263,6 +264,35 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
         full, off = scene.norm(model)
         return Response(content=mesh_at(grid, level, smooth=max(0, min(50, smooth)),
                                         step=step, full_size=full, offset=off),
+                        media_type="application/octet-stream")
+
+    @app.get("/api/paint")
+    def paint(
+        m: int = Query(...),           # the map whose surface is contoured
+        other: int = Query(...),       # the map subtracted from it
+        sigma: float = Query(2.5),
+        smooth: int = Query(0),
+        size: int = Query(0),
+        prange: float = Query(-1.0),   # ± range of the ramp; <=0 -> 3× diff std
+    ) -> Response:
+        """Surface of map `m`, coloured by the local value of (m − other) — ChimeraX's
+        `color sample` applied to a difference map. Red = density lost, near-white =
+        unchanged, blue = gained. Same-grid only, like every voxel-wise op here."""
+        ma, mb = scene.get(m), scene.get(other)
+        if ma.vol.shape != mb.vol.shape:
+            raise HTTPException(status_code=400,
+                                detail=f"maps are on different grids: {ma.vol.shape} vs {mb.vol.shape}")
+        grid, step = ma.grid_at(int(size))
+        gb, step_b = mb.grid_at(int(size))
+        if step_b != step:             # same shapes stride identically; belt and braces
+            raise HTTPException(status_code=500, detail="draft strides diverged")
+        diff = grid - gb
+        level = level_for_sigma(grid, sigma)
+        full, off = scene.norm(ma)
+        return Response(content=painted_mesh_at(grid, diff, level,
+                                                smooth=max(0, min(50, smooth)), step=step,
+                                                full_size=full, offset=off,
+                                                prange=prange if prange > 0 else None),
                         media_type="application/octet-stream")
 
     @app.get("/api/grid")

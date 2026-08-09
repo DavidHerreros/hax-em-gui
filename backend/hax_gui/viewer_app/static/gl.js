@@ -89,6 +89,9 @@ const VERT = `#version 300 es
 precision highp float;
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
+// Optional per-vertex colour (surfaces painted by another map). When the attribute
+// array is disabled the generic attribute feeds a constant and uUseVColor gates it off.
+layout(location=2) in vec3 aColor;
 uniform mat4 uProj;
 uniform mat4 uView;
 uniform mat4 uModel;
@@ -96,6 +99,7 @@ out vec3 vNormal;
 out vec3 vViewPos;
 out vec3 vModelPos;
 out vec3 vModelNormal;
+out vec3 vColor;
 void main() {
   vec4 vp = uView * uModel * vec4(aPos, 1.0);
   vViewPos = vp.xyz;
@@ -104,6 +108,7 @@ void main() {
   vNormal = normalize(mat3(uView * uModel) * aNormal);
   vModelPos = aPos;
   vModelNormal = aNormal;
+  vColor = aColor;
   gl_Position = uProj * vp;
 }`;
 
@@ -162,8 +167,10 @@ in vec3 vNormal;
 in vec3 vViewPos;
 in vec3 vModelPos;
 in vec3 vModelNormal;
+in vec3 vColor;
 
 uniform vec3 uColor;
+uniform int uUseVColor;   // 1 = per-vertex colours (painted surface), 0 = uColor
 
 // The lighting_block uniforms, already multiplied by the material reflectivities.
 uniform vec3 uKeyDir;             // camera space, direction the key light shines
@@ -204,7 +211,7 @@ out vec4 frag_color;
 
 void main() {
   if (uClipOn == 1 && (any(lessThan(vModelPos, uClipLo)) || any(greaterThan(vModelPos, uClipHi)))) discard;
-  vec4 fcolor = vec4(uColor, 1.0);
+  vec4 fcolor = vec4(uUseVColor == 1 ? vColor : uColor, 1.0);
 
   // Unit normal, with two-sided lighting.
   float side = gl_FrontFacing ? 1.0 : -1.0;
@@ -290,10 +297,13 @@ export function createRenderer(canvas) {
 
   function makeModel() {
     const m = { vao: gl.createVertexArray(), posBuf: gl.createBuffer(), normBuf: gl.createBuffer(),
-                idxBuf: gl.createBuffer(), count: 0, color: null, visible: true, bounds: null };
+                colBuf: gl.createBuffer(), idxBuf: gl.createBuffer(),
+                count: 0, color: null, visible: true, bounds: null, hasVColor: false };
     gl.bindVertexArray(m.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, m.normBuf); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    // Colour attribute stays disabled until a painted mesh arrives.
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.colBuf); gl.vertexAttribPointer(2, 3, gl.UNSIGNED_BYTE, true, 0, 0);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.idxBuf);
     gl.bindVertexArray(null);
     return m;
@@ -707,9 +717,10 @@ export function createRenderer(canvas) {
       gl.uniform3fv(beauty.u("uClipHi"), clipHi);
     }
 
-    const cLoc = beauty.u("uColor");
+    const cLoc = beauty.u("uColor"), vcLoc = beauty.u("uUseVColor");
     for (const m of drawable()) {
       gl.uniform3fv(cLoc, m.color || color);
+      gl.uniform1i(vcLoc, m.hasVColor ? 1 : 0);
       gl.bindVertexArray(m.vao);
       gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
     }
@@ -766,12 +777,21 @@ export function createRenderer(canvas) {
     return lo ? { lo, hi } : null;
   }
 
-  function setModelMesh(id, positions, normals, indices) {
+  function setModelMesh(id, positions, normals, indices, colors) {
     let m = models.get(id);
     if (!m) models.set(id, (m = makeModel()));
     gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf); gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, m.normBuf); gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.idxBuf); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+    // Optional per-vertex uint8 RGB (painted surfaces). A mesh delivered without
+    // colours turns painting off again — re-contouring clears the paint by design.
+    m.hasVColor = !!(colors && colors.length === positions.length);
+    gl.bindVertexArray(m.vao);
+    if (m.hasVColor) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.colBuf); gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(2);
+    } else gl.disableVertexAttribArray(2);
+    gl.bindVertexArray(null);
     m.count = indices.length;
     m.bounds = indices.length ? aabb(positions) : null;
     orbit.invalidatePivot();   // a new contour is a new front surface

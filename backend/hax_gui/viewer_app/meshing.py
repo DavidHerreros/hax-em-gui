@@ -191,6 +191,28 @@ def mesh_at(vol: np.ndarray, level: float, smooth: int = 0,
     filling the cube on its own and pretending to be the same size. Default None keeps
     the single-map normalization byte-for-byte.
     """
+    verts_vox, normals, faces, level, vmax = _surface_arrays(vol, level, smooth)
+    verts = _normalize_verts(verts_vox, vol.shape, step, full_size, offset)
+
+    header = (
+        wirefmt.header(wirefmt.MESH)
+        + np.array([verts.shape[0], faces.shape[0]], dtype="<i4").tobytes()
+        + np.array([level, enclosed_mass(vol, level) * float(step) ** 3, vmax], dtype="<f4").tobytes()
+    )
+    body = (
+        np.ascontiguousarray(verts, dtype="<f4").tobytes()
+        + np.ascontiguousarray(normals, dtype="<f4").tobytes()
+        + np.ascontiguousarray(faces, dtype="<u4").tobytes()
+    )
+    return header + body
+
+
+def _surface_arrays(vol: np.ndarray, level: float, smooth: int):
+    """Marching cubes + smoothing, up to (but not including) cube normalization.
+
+    Returns vertices still in *voxel* coordinates (spatial x, y, z order), which is
+    the frame anything that wants to sample another grid at the surface needs.
+    """
     from skimage import measure
 
     vmin, vmax = float(vol.min()), float(vol.max())
@@ -216,21 +238,59 @@ def mesh_at(vol: np.ndarray, level: float, smooth: int = 0,
     if smooth and faces.shape[0] > 0:
         verts = _taubin_smooth(verts, faces, smooth)
         normals = _vertex_normals(verts, faces)   # recompute from the relaxed surface
+    return verts, normals, faces, level, vmax
 
-    size = float(full_size if full_size else max(vol.shape))
+
+def _normalize_verts(verts, vol_shape, step: int, full_size, offset) -> np.ndarray:
+    """Voxel coordinates -> the shared [-1,1] model cube (see mesh_at's docstring)."""
+    size = float(full_size if full_size else max(vol_shape))
     # `offset` arrives in numpy axis order (callers derive it from vol.shape);
-    # the vertices were just flipped to spatial order, so flip it to match.
+    # the vertices were flipped to spatial order, so flip it to match.
     off = np.zeros(3, np.float32) if offset is None else np.asarray(offset, np.float32)[::-1]
-    verts = (verts.astype(np.float32) * float(step) + off - size / 2.0) / (size / 2.0)
+    return (verts.astype(np.float32) * float(step) + off - size / 2.0) / (size / 2.0)
 
+
+def painted_mesh_at(vol: np.ndarray, paint: np.ndarray, level: float, smooth: int = 0,
+                    step: int = 1, full_size: int | None = None, offset=None,
+                    prange: float | None = None) -> bytes:
+    """`mesh_at`, but coloured by another grid sampled on the surface — ChimeraX's
+    `color sample`. Packed as CMESH: the MESH layout plus `prange` in the header and
+    a uint8 RGB triple per vertex after the indices.
+
+    `paint` must share `vol`'s grid. Values are mapped through a diverging ramp over
+    ±`prange` (default 3× the paint grid's std): red at −prange, near-white at 0,
+    blue at +prange — the difference-map convention (red = lost, blue = gained) when
+    `paint` is A − B and the surface is A's.
+    """
+    verts_vox, normals, faces, level, vmax = _surface_arrays(vol, level, smooth)
+
+    if prange is None or prange <= 0:
+        prange = 3.0 * float(paint.std()) or 1.0
+    if verts_vox.shape[0]:
+        from scipy.ndimage import map_coordinates
+        # vertices are spatial (x, y, z); the grid is numpy (z, y, x)
+        vals = map_coordinates(paint, [verts_vox[:, 2], verts_vox[:, 1], verts_vox[:, 0]],
+                               order=1, mode="nearest")
+        t = np.clip(vals / prange, -1.0, 1.0)[:, None]
+        neutral = np.array([0.95, 0.95, 0.95])
+        red = np.array([0.83, 0.25, 0.25])     # density lost (paint < 0)
+        blue = np.array([0.25, 0.44, 0.83])    # density gained (paint > 0)
+        rgb = np.where(t < 0, neutral + (-t) * (red - neutral), neutral + t * (blue - neutral))
+        colors = np.clip(rgb * 255.0, 0, 255).astype("<u1")
+    else:
+        colors = np.zeros((0, 3), "<u1")
+
+    verts = _normalize_verts(verts_vox, vol.shape, step, full_size, offset)
     header = (
-        wirefmt.header(wirefmt.MESH)
+        wirefmt.header(wirefmt.CMESH)
         + np.array([verts.shape[0], faces.shape[0]], dtype="<i4").tobytes()
-        + np.array([level, enclosed_mass(vol, level) * float(step) ** 3, vmax], dtype="<f4").tobytes()
+        + np.array([level, enclosed_mass(vol, level) * float(step) ** 3, vmax, prange],
+                   dtype="<f4").tobytes()
     )
     body = (
         np.ascontiguousarray(verts, dtype="<f4").tobytes()
         + np.ascontiguousarray(normals, dtype="<f4").tobytes()
         + np.ascontiguousarray(faces, dtype="<u4").tobytes()
+        + np.ascontiguousarray(colors).tobytes()
     )
     return header + body

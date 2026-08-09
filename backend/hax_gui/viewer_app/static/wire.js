@@ -7,7 +7,7 @@
 // frontend/backend version mismatch — or an HTML error page fetched as
 // arrayBuffer() — was parsed as geometry and rendered as garbage.
 
-export const FMT = { mesh: 1, grid: 2, f32matrix: 3, i32vector: 4, f32vector: 5 };
+export const FMT = { mesh: 1, grid: 2, f32matrix: 3, i32vector: 4, f32vector: 5, cmesh: 6 };
 const MAGIC = 0x48585731; // "HXW1"
 
 export function unwrap(buf, fmt) {
@@ -33,6 +33,23 @@ export function parseMesh(wireBuf) {
   const normals = new Float32Array(buf, off, nverts * 3); off += nverts * 12;
   const indices = new Uint32Array(buf, off, nfaces * 3);
   return { positions, normals, indices, level, mass };
+}
+
+// The MESH layout plus `prange` (the ± range of the diverging colour ramp) in the
+// header and a uint8 RGB triple per vertex after the indices — a surface painted by
+// another map sampled on it (see /api/paint).
+export function parseColorMesh(wireBuf) {
+  const buf = unwrap(wireBuf, FMT.cmesh);
+  const dv = new DataView(buf);
+  const nverts = dv.getInt32(0, true), nfaces = dv.getInt32(4, true);
+  const level = dv.getFloat32(8, true), mass = dv.getFloat32(12, true);
+  const prange = dv.getFloat32(20, true);
+  let off = 24;
+  const positions = new Float32Array(buf, off, nverts * 3); off += nverts * 12;
+  const normals = new Float32Array(buf, off, nverts * 3); off += nverts * 12;
+  const indices = new Uint32Array(buf, off, nfaces * 3); off += nfaces * 12;
+  const colors = new Uint8Array(buf, off, nverts * 3);
+  return { positions, normals, indices, colors, level, mass, prange };
 }
 
 // int32 nx, ny, nz | float32 vmin, vmax, mean, std | float32 boxLo[3], boxHi[3] |

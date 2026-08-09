@@ -17,6 +17,7 @@ GRID = 2        # int32 nx,ny,nz | f32 vmin,vmax,mean,std | f32 boxLo[3],boxHi[3
 F32_MATRIX = 3  # int32 rows,cols | f32 data (C order)
 I32_VECTOR = 4  # int32 n | i32 data
 F32_VECTOR = 5  # int32 n | f32 data
+CMESH = 6       # int32 nverts,nfaces | f32 level,mass,vmax,prange | verts | normals | faces | u8 rgb
 
 
 def header(fmt: int, version: int = 1) -> bytes:
