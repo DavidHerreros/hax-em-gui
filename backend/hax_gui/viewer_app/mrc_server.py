@@ -67,6 +67,16 @@ def _read_scale(path: str) -> tuple[float, list[float]]:
         return (1.0, [0.0, 0.0, 0.0])
 
 
+# Above this size the volume is memory-mapped read-only instead of loaded into
+# RAM: a 512³ float32 map is 512 MB, and several open viewers used to stack those
+# up. Everything downstream (stats, histogram, strided drafts, marching cubes,
+# dust labelling, morph blends) only READS the base array — the operations that
+# need writable data (blends, dust) allocate their own copies. The mrcfile
+# handles are kept alive for the process lifetime; the viewer is per-session.
+_MMAP_BYTES = int(os.environ.get("HAX_VIEWER_MMAP_MB", "512")) * 1024 * 1024
+_OPEN_MMAPS: list[Any] = []
+
+
 def _load_mrc(path: str) -> np.ndarray:
     """Read a volume into a writable float32 3D grid.
 
@@ -79,6 +89,21 @@ def _load_mrc(path: str) -> np.ndarray:
     ImageHandler's habit of rewriting the header of a file it fails to parse
     (deposited maps often live on read-only mounts)."""
     name = Path(path).name.lower()
+    is_mrc_family = name.endswith((".mrc", ".map", ".ccp4"))
+    # Big MRC-convention file: map it instead of reading it. (Gzipped variants
+    # can't be mapped; ImageHandler formats have their own reader below.)
+    if is_mrc_family and os.path.getsize(path) > _MMAP_BYTES:
+        import mrcfile
+
+        m = mrcfile.mmap(path, mode="r", permissive=True)
+        if m.data is None or m.data.ndim not in (3, 4):
+            m.close()
+            raise ValueError(f"{path}: could not read volume data")
+        _OPEN_MMAPS.append(m)                  # the array dies with the handle
+        vol = m.data[0] if m.data.ndim == 4 else m.data
+        if vol.dtype != np.float32:
+            vol = np.asarray(vol, dtype=np.float32)   # non-float map: one real copy
+        return vol
     if name.endswith((".map", ".ccp4", ".map.gz", ".mrc.gz", ".ccp4.gz")):
         import mrcfile
 

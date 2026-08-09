@@ -429,6 +429,7 @@ const morph = {
   timer: null,
   cache: null,       // surface mode: parsed mesh per frame
   cacheKey: "",      // what `cache` was built for; a mismatch means Prepare again
+  loadedPair: "",    // which (a,b) textures are on the GPU; uploads happen per leg, not per frame
   refMass: -1,       // enclosed mass of frame 0, held constant across the morph
   showing: false,    // is the morph on screen (as opposed to the maps)?
 };
@@ -487,8 +488,15 @@ async function showMorphFrame(k) {
   } else {
     const ga = models[a].gridVol, gb = models[b].gridVol;
     if (!ga || !gb) return;
-    volRenderer.setVolume(ga.nx, ga.ny, ga.nz, ga.data, ga.boxLo, ga.boxHi);
-    volRenderer.setVolumeB(gb.nx, gb.ny, gb.nz, gb.data);
+    // Upload the 3D textures only when the frame crosses into a new leg — inside
+    // a leg every frame is the same two textures at a different mix, and
+    // re-uploading both per frame throttled playback to the PCIe bus.
+    const pair = `${a}|${b}`;
+    if (morph.loadedPair !== pair) {
+      volRenderer.setVolume(ga.nx, ga.ny, ga.nz, ga.data, ga.boxLo, ga.boxHi);
+      volRenderer.setVolumeB(gb.nx, gb.ny, gb.nz, gb.data);
+      morph.loadedPair = pair;
+    }
     volRenderer.setMix(t);
   }
 }
@@ -501,6 +509,7 @@ function beginMorph() {
 }
 function stopMorph() {
   pauseMorph();
+  morph.loadedPair = "";   // whatever happens next re-uploads its own textures
   if (!morph.showing) return;
   morph.showing = false;
   renderer.dropModel(MORPH_ID);
