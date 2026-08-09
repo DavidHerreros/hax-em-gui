@@ -4,7 +4,7 @@ git branches, labels, and the in-place server restart."""
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -174,6 +174,14 @@ class SettingsUpdate(BaseModel):
     viewer_gpu: str | None = None
     # Jobs admitted per GPU at once (admission control; 0 disables the queue).
     max_jobs_per_gpu: int | None = None
+    # Where jobs execute: "local" (subprocess on this machine, the default) or
+    # "slurm" (sbatch submission; logs/exit codes flow through the same files).
+    execution_backend: Literal["local", "slurm"] | None = None
+    slurm_partition: str | None = None
+    slurm_gres: str | None = None        # e.g. "gpu:1"
+    slurm_time: str | None = None        # e.g. "24:00:00"
+    slurm_account: str | None = None
+    slurm_extra: str | None = None       # raw sbatch options, one per line
 
 
 @router.get("/api/settings", dependencies=[Depends(auth)])

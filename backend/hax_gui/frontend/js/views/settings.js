@@ -69,11 +69,53 @@ export function SettingsView() {
       sel);
   }
 
+  // Where jobs execute: this machine, or a Slurm cluster. The Slurm fields only
+  // show when that backend is chosen — a single-workstation user never sees them.
+  function backendField(values) {
+    const slurmBox = h("div", { style: { marginTop: "12px" } });
+    const text = (key, label, placeholder, help) => h("div", { class: "field", style: { marginBottom: "10px" } },
+      h("div", { class: "field-label" }, h("span", { class: "flag" }, label), h("span", { class: "ctype" }, "optional")),
+      help ? h("p", { class: "field-help", style: { margin: "0 0 6px" } }, help) : null,
+      h("input", { class: "input", value: values[key], placeholder,
+                   oninput: (e) => (values[key] = e.target.value) }));
+    const syncSlurm = () => { slurmBox.style.display = values.execution_backend === "slurm" ? "" : "none"; };
+    const sel = h("select", { class: "input", style: { maxWidth: "420px" },
+      onchange: (e) => { values.execution_backend = e.target.value; syncSlurm(); } },
+      h("option", { value: "local", selected: values.execution_backend !== "slurm" }, "This machine (subprocess)"),
+      h("option", { value: "slurm", selected: values.execution_backend === "slurm" }, "Slurm cluster (sbatch)"));
+    slurmBox.append(
+      h("p", { class: "field-help", style: { margin: "0 0 10px" } },
+        "Runs are submitted with sbatch; logs stream into the GUI exactly as local runs do, and jobs "
+        + "survive GUI restarts (state lives in the scheduler). The projects root must be on a filesystem "
+        + "shared with the compute nodes. The per-GPU launch queue is bypassed — Slurm schedules."),
+      text("slurm_partition", "partition", "e.g. gpu", ""),
+      text("slurm_gres", "gres", "e.g. gpu:1", "GPUs to request per run."),
+      text("slurm_time", "time limit", "e.g. 48:00:00", ""),
+      text("slurm_account", "account", "", ""),
+      h("div", { class: "field" },
+        h("div", { class: "field-label" }, h("span", { class: "flag" }, "extra sbatch options"), h("span", { class: "ctype" }, "optional")),
+        h("p", { class: "field-help", style: { margin: "0 0 6px" } }, "One option per line, e.g. --mem=64G"),
+        h("textarea", { class: "input", rows: "2", style: { fontFamily: "monospace" },
+                        oninput: (e) => (values.slurm_extra = e.target.value) }, values.slurm_extra)));
+    syncSlurm();
+    return h("div", { class: "card", id: "setting-execution_backend", style: { padding: "22px", marginBottom: "16px" } },
+      h("h2", { class: "section" }, "Job execution"),
+      h("p", { class: "field-help", style: { margin: "0 0 12px" } },
+        "Where launched programs actually run. Applies to new launches; running jobs finish where they started."),
+      sel, slurmBox);
+  }
+
   function form(s, gpus) {
     const values = {
       projects_root: s.projects_root || "",
       ssd_scratch_root: s.ssd_scratch_root || "",
       viewer_gpu: s.viewer_gpu || "",
+      execution_backend: s.execution_backend === "slurm" ? "slurm" : "local",
+      slurm_partition: s.slurm_partition || "",
+      slurm_gres: s.slurm_gres || "",
+      slurm_time: s.slurm_time || "",
+      slurm_account: s.slurm_account || "",
+      slurm_extra: s.slurm_extra || "",
     };
     const status = h("div", { style: { marginTop: "4px" } });
     const saveBtn = h("button", { class: "btn", onclick: save }, icon("check", 18), h("span", null, "Save"));
@@ -85,10 +127,17 @@ export function SettingsView() {
           projects_root: values.projects_root.trim(),
           ssd_scratch_root: values.ssd_scratch_root.trim(),
           viewer_gpu: values.viewer_gpu,
+          execution_backend: values.execution_backend,
+          slurm_partition: values.slurm_partition.trim(),
+          slurm_gres: values.slurm_gres.trim(),
+          slurm_time: values.slurm_time.trim(),
+          slurm_account: values.slurm_account.trim(),
+          slurm_extra: values.slurm_extra,
         });
         const dev = saved.viewer_gpu ? (saved.viewer_gpu === "cpu" ? "CPU" : `GPU ${saved.viewer_gpu}`) : "ask each time";
+        const exec = saved.execution_backend === "slurm" ? "Slurm" : "local";
         mount(status, h("p", { class: "field-help", style: { color: "var(--ok)" } },
-          `Saved. Projects: ${saved.projects_root || "—"} · SSD scratch: ${saved.ssd_scratch_root || "—"} · Viewer: ${dev}`));
+          `Saved. Projects: ${saved.projects_root || "—"} · SSD scratch: ${saved.ssd_scratch_root || "—"} · Viewer: ${dev} · Execution: ${exec}`));
       } catch (err) {
         mount(status, errorBox(err));
       } finally {
@@ -104,6 +153,7 @@ export function SettingsView() {
         "Optional fast-disk scratch space. Each project gets a folder at <ssd>/<project>, shared by all its programs: the particle images are cached there once (per dataset) and reused by every run, instead of each program re-reading the original stack. Leave empty to disable — then SSD scratch paths are simply not passed to programs.",
         values.ssd_scratch_root, (v) => (values.ssd_scratch_root = v)),
       gpuField(gpus, values.viewer_gpu, (v) => (values.viewer_gpu = v)),
+      backendField(values),
       h("div", { style: { marginTop: "4px" } }, saveBtn),
       status);
   }

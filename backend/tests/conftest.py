@@ -34,6 +34,57 @@ _stub.write_text(
 _stub.chmod(0o755)
 os.environ["HAX_PROJECT_MANAGER"] = str(_stub)
 
+# ── fake Slurm scheduler ─────────────────────────────────────────────────────
+# Three tiny scripts emulating the sbatch/squeue/scancel contract hax_gui.slurm
+# relies on: sbatch reads the batch script on stdin, honours its #SBATCH
+# --output/--error lines, runs it in its own session and prints a job id;
+# squeue -j reports RUNNING while that session leader is alive; scancel kills
+# the group (and leaves a marker sacct reports as CANCELLED). The binary names
+# are injected via HAX_GUI_SBATCH etc., read by hax_gui.slurm at import.
+FAKE_SLURM = TMP / "fakeslurm"
+FAKE_SLURM.mkdir(exist_ok=True)
+os.environ["FAKE_SLURM_DIR"] = str(FAKE_SLURM)
+
+_sbatch = TMP / "fake_sbatch.sh"
+_sbatch.write_text(
+    "#!/bin/bash\n"
+    'd="$FAKE_SLURM_DIR"\n'
+    'n=$(( $(ls "$d" 2>/dev/null | grep -c "\\.sh$") + 1 ))\n'
+    's="$d/job_$n.sh"\n'
+    "cat > \"$s\"\n"
+    "out=$(sed -n 's/^#SBATCH --output=//p' \"$s\" | head -1)\n"
+    "err=$(sed -n 's/^#SBATCH --error=//p' \"$s\" | head -1)\n"
+    'setsid bash "$s" >> "${out:-/dev/null}" 2>> "${err:-/dev/null}" &\n'
+    'echo $! > "$d/job_$n.pid"\n'
+    'echo "$n"\n'
+)
+_squeue = TMP / "fake_squeue.sh"
+_squeue.write_text(
+    "#!/bin/bash\n"
+    'while [ $# -gt 0 ]; do case "$1" in -j) id=$2; shift 2;; *) shift;; esac; done\n'
+    'pid=$(cat "$FAKE_SLURM_DIR/job_$id.pid" 2>/dev/null)\n'
+    '[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo RUNNING || exit 1\n'
+)
+_scancel = TMP / "fake_scancel.sh"
+_scancel.write_text(
+    "#!/bin/bash\n"
+    'id="$1"\n'
+    'touch "$FAKE_SLURM_DIR/job_$id.cancelled"\n'
+    'pid=$(cat "$FAKE_SLURM_DIR/job_$id.pid" 2>/dev/null)\n'
+    '[ -n "$pid" ] && kill -TERM -- "-$pid" 2>/dev/null\n'
+    "exit 0\n"
+)
+_sacct = TMP / "fake_sacct.sh"
+_sacct.write_text(
+    "#!/bin/bash\n"
+    'while [ $# -gt 0 ]; do case "$1" in -j) id=$2; shift 2;; *) shift;; esac; done\n'
+    '[ -e "$FAKE_SLURM_DIR/job_$id.cancelled" ] && echo CANCELLED || echo COMPLETED\n'
+)
+for f, var in ((_sbatch, "HAX_GUI_SBATCH"), (_squeue, "HAX_GUI_SQUEUE"),
+               (_scancel, "HAX_GUI_SCANCEL"), (_sacct, "HAX_GUI_SACCT")):
+    f.chmod(0o755)
+    os.environ[var] = str(f)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # backend/
 
 import httpx  # noqa: E402

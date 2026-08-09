@@ -486,7 +486,9 @@ export function JobDetailView(params) {
       job = j; status = j.status;
       cmd.textContent = j.command.join(" ");
       if (j.cwd) wdLine.textContent = "Working directory: " + j.cwd;
-      // Details tab: the provenance stamp (what code produced this run).
+      // Details tab: scheduler identity + the provenance stamp.
+      if (j.slurm_id) paneDetails.appendChild(h("div", { class: "muted small", style: { marginTop: "4px" } },
+        "Slurm job " + j.slurm_id));
       const pkgs = j.provenance && j.provenance.packages;
       if (pkgs) paneDetails.appendChild(h("div", { class: "muted small", style: { marginTop: "4px" } },
         "Recorded versions: " + Object.entries(pkgs).map(([k, v]) => `${k} ${v}`).join(" · ")));

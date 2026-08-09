@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import adapters, db, events, mdpaths, projects, registry, settings_store, usage
+from . import adapters, db, events, mdpaths, projects, registry, settings_store, slurm, usage
 from .command import ValidationError, build_command, strip_obsolete
 from .config import settings
 
@@ -255,7 +255,7 @@ class JobManager:
         # Add columns to pre-existing databases (idempotent).
         for col in ("project_id TEXT", "workdir TEXT", "cwd TEXT", "name TEXT", "bindings TEXT",
                     "pgid INTEGER", "proc_key TEXT", "stale INTEGER NOT NULL DEFAULT 0",
-                    "provenance TEXT"):
+                    "provenance TEXT", "slurm_id TEXT"):
             try:
                 self._db.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -273,11 +273,18 @@ class JobManager:
         """
         assert self._db is not None
         rows = self._db.execute(
-            "SELECT id, pgid, proc_key, status, log_path FROM jobs "
+            "SELECT id, pgid, proc_key, status, log_path, slurm_id FROM jobs "
             "WHERE status IN ('pending','running','cancelling')"
         ).fetchall()
         self._reattach: list[dict[str, Any]] = []
         for r in rows:
+            if r["slurm_id"]:
+                # Scheduled by Slurm: no local process to test — its life is the
+                # cluster's business. reattach() resumes polling; if it finished
+                # while we were down, the poll sees it gone and finalises from
+                # the exit file exactly like the local path.
+                self._reattach.append(dict(r))
+                continue
             pgid = int(r["pgid"] or 0)
             if _group_alive(pgid, r["proc_key"]):
                 self._reattach.append(dict(r))     # outlived us; reattach() resumes it
@@ -304,6 +311,12 @@ class JobManager:
             err_path = self._err_path(out_path)
             # Tail from the current end: the UI replays the history from the file itself
             # (read_log), so re-publishing it over the socket would only duplicate it.
+            if r.get("slurm_id"):
+                asyncio.create_task(self._supervise_slurm(
+                    r["id"], r["slurm_id"], out_path, err_path,
+                    _size(out_path), _size(err_path),
+                ))
+                continue
             asyncio.create_task(self._supervise_detached(
                 r["id"], int(r["pgid"] or 0), r["proc_key"], out_path, err_path,
                 _size(out_path), _size(err_path),
@@ -483,7 +496,7 @@ class JobManager:
             # a merely-saved replacement correctly ends up with neither.
             self._exec(
                 "UPDATE jobs SET program=?, name=?, args=?, gpu=?, command=?, status=?, log_path=?, "
-                "workdir=?, cwd=?, bindings=?, provenance=?, stale=0, return_code=NULL, started_at=NULL, "
+                "workdir=?, cwd=?, bindings=?, provenance=?, stale=0, slurm_id=NULL, return_code=NULL, started_at=NULL, "
                 "finished_at=NULL WHERE id=?",
                 (program, name_val, json.dumps(values), gpu or None, json.dumps(command),
                  status, str(log_path), str(workdir), cwd, bindings_val, provenance_val, replace_job_id),
@@ -538,7 +551,7 @@ class JobManager:
         if job.get("stale"):
             return await self.rerun(job_id)
         self._init_buffers(job_id)
-        self._exec("UPDATE jobs SET status='pending', stale=0, return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
+        self._exec("UPDATE jobs SET status='pending', stale=0, slurm_id=NULL, return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
         await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"))
         return self.get(job_id)
 
@@ -840,7 +853,7 @@ class JobManager:
             raise JobNotResumable(job_id)
         self._prepare_resume(job["program"], job.get("workdir"), job["log_path"])
         self._init_buffers(job_id)
-        self._exec("UPDATE jobs SET status='pending', return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
+        self._exec("UPDATE jobs SET status='pending', slurm_id=NULL, return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
         await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"), append_out=True)
         return self.get(job_id)
 
@@ -936,9 +949,11 @@ class JobManager:
             return True
         job = self.get(job_id)
         device = job.get("gpu") or ""
+        # Slurm-scheduled jobs don't occupy a local GPU, so they never fill a slot
+        # (matters when switching backends while cluster jobs are still running).
         row = self._exec(
             "SELECT COUNT(*) AS n FROM jobs WHERE status IN ('pending','running','cancelling') "
-            "AND COALESCE(gpu,'')=? AND id != ?", (device, job_id), fetch="one")
+            "AND COALESCE(gpu,'')=? AND slurm_id IS NULL AND id != ?", (device, job_id), fetch="one")
         return int(row["n"]) < limit
 
     async def _dispatch_queued(self) -> None:
@@ -956,6 +971,10 @@ class JobManager:
 
     async def _launch(self, job_id: str, command: list[str], log_path: str, cwd: str | None = None,
                       append_out: bool = False, notice: str | None = None) -> None:
+        if slurm.enabled():
+            # Slurm owns scheduling: no local admission queue, no process group.
+            await self._launch_slurm(job_id, command, log_path, cwd, append_out, notice)
+            return
         if not self._admit(job_id):
             # Park it. Everything needed to launch later is already in the row;
             # only the launch niceties (append/notice) need holding on the side.
@@ -1014,11 +1033,109 @@ class JobManager:
         key = _proc_key(proc.pid)
         self._procs[job_id] = proc
         self._exec(
-            "UPDATE jobs SET status='running', pid=?, pgid=?, proc_key=?, started_at=? WHERE id=?",
+            "UPDATE jobs SET status='running', pid=?, pgid=?, proc_key=?, slurm_id=NULL, started_at=? WHERE id=?",
             (proc.pid, proc.pid, key, _now(), job_id),
         )
         self._publish(job_id, {"type": "status", "status": "running", "pid": proc.pid})
         asyncio.create_task(self._supervise(job_id, proc, out_path, err_path, out_off, 0))
+
+    async def _launch_slurm(self, job_id: str, command: list[str], log_path: str,
+                            cwd: str | None = None, append_out: bool = False,
+                            notice: str | None = None) -> None:
+        """Submit the job to Slurm instead of spawning it locally.
+
+        The contract with the rest of the manager is unchanged: the job writes the
+        same stdout/stderr files (sbatch -o/-e), records its exit code to the same
+        exit file, and a supervisor task streams the logs and finalises the row.
+        Only the "process" is different — a Slurm job id instead of a pgid.
+        """
+        out_path, err_path = log_path, self._err_path(log_path)
+        exit_path = _exit_path(log_path)
+        with contextlib.suppress(OSError):
+            os.remove(exit_path)
+        # sbatch opens the logs in append mode (see build_script), so prepare them
+        # here exactly as the local path does: truncate for a fresh run, keep for an
+        # in-place continue; the submission notice leads the file either way.
+        out_off = _size(out_path) if append_out else 0   # before the notice: it streams too
+        try:
+            with open(out_path, "ab" if append_out else "wb") as f:
+                if notice:
+                    f.write(notice.encode())
+            open(err_path, "wb").close()
+        except OSError as exc:
+            self._fail_launch(job_id, exc)
+            return
+
+        job = self.get(job_id) or {}
+        script = slurm.build_script(command, exit_path, out_path, err_path,
+                                    name=f"hax-{job.get('name') or job.get('program') or job_id}",
+                                    cwd=cwd)
+        try:
+            sid = await slurm.submit(script)
+        except slurm.SlurmError as exc:
+            self._fail_launch(job_id, OSError(f"sbatch failed: {exc}"))
+            return
+        # Stays 'pending' until squeue reports RUNNING — in the UI that reads exactly
+        # like Slurm's own PENDING (waiting for resources).
+        self._exec("UPDATE jobs SET status='pending', slurm_id=?, pid=NULL, pgid=NULL, "
+                   "proc_key=NULL WHERE id=?", (sid, job_id))
+        # Into the log FILE (sbatch appends after it), so it survives in the replay
+        # and the /log endpoint; the supervisor's tail streams it to live sockets.
+        with contextlib.suppress(OSError):
+            with open(out_path, "ab") as f:
+                f.write(f"[hax-gui] submitted to Slurm as job {sid}\n".encode())
+        self._publish(job_id, {"type": "status", "status": "pending"})
+        asyncio.create_task(self._supervise_slurm(job_id, sid, out_path, err_path, out_off, 0))
+
+    async def _supervise_slurm(self, job_id: str, slurm_id: str,
+                               out_path: str, err_path: str,
+                               out_off: int, err_off: int) -> None:
+        """Watch a Slurm job: stream its logs, mirror queue→run, finalise when it
+        leaves the queue. Survives server restarts by construction — the state is
+        the cluster's, and reattach() simply starts this loop again."""
+        stop = asyncio.Event()
+        tails = [
+            asyncio.create_task(self._tail(job_id, out_path, "out", out_off, stop)),
+            asyncio.create_task(self._tail(job_id, err_path, "err", err_off, stop)),
+        ]
+        running = False
+        try:
+            while True:
+                try:
+                    state = await slurm.state(slurm_id)
+                except slurm.SlurmError as exc:
+                    # squeue itself unusable (cluster unreachable?): keep the job
+                    # alive and keep trying — declaring it dead would be a lie.
+                    self._publish(job_id, {"type": "chunk", "stream": "err",
+                                           "data": f"[hax-gui] squeue failed: {exc}\n"})
+                    await asyncio.sleep(15.0)
+                    continue
+                if state is None:
+                    break                            # left the queue: finished one way or another
+                if not running and state not in slurm.PENDING_STATES:
+                    running = True
+                    self._exec("UPDATE jobs SET status='running', started_at=? "
+                               "WHERE id=? AND status IN ('pending','running')", (_now(), job_id))
+                    if (self.get(job_id) or {}).get("status") == "running":
+                        self._publish(job_id, {"type": "status", "status": "running"})
+                await asyncio.sleep(3.0)
+        finally:
+            stop.set()
+        await asyncio.gather(*tails, return_exceptions=True)
+        rc = _read_exit(_exit_path(out_path))
+        if rc is None:
+            # Never got to write its exit file: cancelled while queued, killed by the
+            # scheduler (timeout, OOM), or the node died. Accounting knows which.
+            final = await slurm.final_state(slurm_id)
+            if final and final.startswith("CANCELLED"):
+                current = self.get(job_id)
+                if current is not None and current["status"] != "cancelling":
+                    # scancel'd from outside the GUI: mark it cancelled, not interrupted.
+                    self._exec("UPDATE jobs SET status='cancelling' WHERE id=?", (job_id,))
+            elif final:
+                self._publish(job_id, {"type": "chunk", "stream": "err",
+                                       "data": f"[hax-gui] Slurm reports {final}\n"})
+        self._finalize(job_id, rc)
 
     def _fail_launch(self, job_id: str, exc: OSError) -> None:
         self._exec(
@@ -1181,6 +1298,13 @@ class JobManager:
             self._exec("UPDATE jobs SET status='cancelled', finished_at=? WHERE id=?",
                        (_now(), job_id))
             self._publish(job_id, {"type": "status", "status": "cancelled"})
+            return
+        if job.get("slurm_id"):
+            # Scheduled by Slurm: scancel it (queued or running alike) and let the
+            # supervisor's poll observe the disappearance and finalise the row.
+            self._exec("UPDATE jobs SET status='cancelling' WHERE id=?", (job_id,))
+            self._publish(job_id, {"type": "status", "status": "cancelling"})
+            await slurm.cancel(job["slurm_id"])
             return
         pgid, key = int(job.get("pgid") or 0), job.get("proc_key")
         if not _group_alive(pgid, key):

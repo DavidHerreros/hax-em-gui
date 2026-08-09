@@ -354,9 +354,20 @@
           ],
           "flag": "--num_gaussians",
           "required": false,
-          "help": "Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians so that the reproduce the reference volume as well as possible.",
+          "help": "Before training the network, HetSIREN fits a set of Gaussians to the reference volume to recreate it. By default the count is determined automatically: the fit starts deliberately coarse and grows the number of Gaussians until the map it renders correlates with your reference at FSC >= 0.5 across every shell the reference populates, so it lands on the FEWEST Gaussians that cost you no resolution (see --fit_resolution to stop somewhere coarser).\nSet this parameter to pin the count in advance from your own criterium instead (e.g. the number of residues in your protein). When set, HetSIREN fits exactly this many Gaussians and reproduces the reference as well as that count allows.\nNOTE: the count is not free. The Gaussian width is tied to the point spacing (half of it, which is what tiling costs), and the width in turn bounds the resolution the model can carry -- so too few Gaussians is a low-pass filter on everything the network can express, and too many just costs memory in every training step.",
           "default": null,
           "type": "integer"
+        },
+        {
+          "name": "fit_resolution",
+          "flags": [
+            "--fit_resolution"
+          ],
+          "flag": "--fit_resolution",
+          "required": false,
+          "help": "Resolution (in Angstrom) the automatic Gaussian fit has to reproduce, and no more. Left unset (the default) the fit matches the reference out to the reference's OWN limit -- every shell that map actually populates -- which is the safe choice when the reference came from reconstruct_volume, since that map is FSC-denoised and therefore exactly zero past its resolution.\nSet a coarser value to trade resolution for a smaller point cloud: measured across three references the count needed scales as about the square of the resolution you ask for (N ~ d^-1.9), so relaxing the target from 4 to 8 A is roughly a 3.7x smaller cloud, and every per-particle tensor in training shrinks with it. Ignored when --num_gaussians is given.",
+          "default": null,
+          "type": "number"
         },
         {
           "name": "lattice_stride",
@@ -368,6 +379,17 @@
           "help": "Sub-sample the fixed-point lattice by this factor along each axis, keeping 1 / lattice_stride^3 of the sample points. The fixed-point decoder places one point per masked voxel, so the point count grows with the CUBE of the box: a 600 px box is ~13x the points of a 256 px one, and every per-particle tensor in the decode and render chain scales with it. This is the knob that makes a large box affordable (--lattice_stride 2 is an 8x reduction).\nThis trades resolution for memory: the sample spacing bounds the finest density CHANGE the decoder can express, to roughly 2 x lattice_stride x sampling_rate Angstrom. The consensus map is not affected -- it is carried by the reference amplitudes at full box sampling -- so this limits the heterogeneity, not the map you started from. The render width grows with HALF the spacing, which is what tiling costs; strides 1 and 2 therefore render exactly as before. Ignored when the points come from a Gaussian fit (see --num_gaussians), which sets the point count directly.",
           "default": 1,
           "type": "integer"
+        },
+        {
+          "name": "bilinear_scatter",
+          "flags": [
+            "--bilinear_scatter"
+          ],
+          "flag": "--bilinear_scatter",
+          "required": false,
+          "help": "Deposit each fixed-lattice point over its four neighbouring pixels (bilinear) instead of into the single nearest one. This is what gives the render a gradient with respect to the point coordinates, and therefore what lets the pose-refinement head actually learn on the fixed-point path: the nearest-pixel kernel is flat in the pixel index, so the only force it produces pulls a point toward the centre of the pixel it already occupies, and never says that mass belongs in the next one.\nNOTE: costs ~2x the scatter FLOPs and ~1.5x its peak memory at a given point count -- pair it with --lattice_stride 2, whose 8x reduction more than pays for it (and which renders at the same 1 px width as stride 1). Has no effect with --transport_mass, which always scatters bilinearly.",
+          "default": false,
+          "type": "boolean"
         },
         {
           "name": "render_chunk_size",
@@ -743,6 +765,22 @@
           "choices": [
             "mse",
             "frc"
+          ]
+        },
+        {
+          "name": "per_image_contrast",
+          "flags": [
+            "--per_image_contrast"
+          ],
+          "flag": "--per_image_contrast",
+          "required": false,
+          "help": "Fit a gray level per particle inside the reconstruction loss, instead of relying on the single global contrast that --vol pins once before training. The slope is the closed-form least-squares fit of the image on the prediction (two sums per image, no extra decode, ~1%% of a step) and is held fixed by a stop-gradient, which is exact rather than an approximation. Use it when the particle set was merged from more than one acquisition or extraction run: two halves can match in pixel mean and variance and still differ by ~20%% in the particle signal they carry, and that difference is a systematic residual the encoder will happily read out as conformation. relative (recommended) normalizes the slopes by their batch mean, so only the spread across particles is absorbed and the absolute density scale stays pinned. absolute applies the raw slopes, making the loss fully scale-invariant per image - stronger, but the overall amplitude is then unconstrained by the data term, so only use it with --denoising_strength 0 and --occupancy_l1 0. off (default) keeps the previous behaviour. Has no effect with --loss_type frc, which is already contrast invariant.",
+          "default": "off",
+          "type": "enum",
+          "choices": [
+            "off",
+            "relative",
+            "absolute"
           ]
         },
         {
@@ -1123,9 +1161,20 @@
           ],
           "flag": "--num_gaussians",
           "required": false,
-          "help": "Before training the network, Zernike3Deep will try to fit a set of Gaussians in the reference volume to recreate it. The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., the number of residues in your protein), you can set this parameter. When set, the Zernike3Deep will fit this fixed number of Gaussians so that the reproduce the reference volume as well as possible.",
+          "help": "Before training the network, Zernike3Deep fits a set of Gaussians to the reference volume to recreate it. By default the count is determined automatically: the fit searches for the FEWEST Gaussians whose render still reproduces your reference shell by shell (see --fit_resolution).\nSet this parameter to pin the count in advance from your own criterium instead (e.g. the number of residues in your protein). When set, Zernike3Deep fits exactly this many Gaussians and reproduces the reference as well as that count allows.",
           "default": null,
           "type": "integer"
+        },
+        {
+          "name": "fit_resolution",
+          "flags": [
+            "--fit_resolution"
+          ],
+          "flag": "--fit_resolution",
+          "required": false,
+          "help": "Resolution (in Angstrom) the automatic Gaussian fit has to reproduce, and no more. Left unset (the default) the fit matches the reference out to the reference's own limit. Set a coarser value to trade resolution for a smaller point cloud -- measured, the count scales as about the SQUARE of the resolution asked for (N ~ d^-1.9), so relaxing the target from 4 to 8 A is roughly a 3.7x smaller cloud. Ignored when --num_gaussians is given.",
+          "default": null,
+          "type": "number"
         },
         {
           "name": "epochs",
@@ -3461,14 +3510,15 @@
           ],
           "flag": "--ctf_type",
           "required": true,
-          "help": "Whether the images carry a CTF. The reconstruction only needs to know if they do: apply, wiener and precorrect all mean they do (the slices are CTF weighted and the quotient deconvolves them), while None means they do not. NOTE: this must match your data -- weighting CTF-free images by a CTF is not a harmless no-op, it reweights the slices and degrades the map.",
+          "help": "Whether the images carry a CTF, and whether it has already been multiplied into them. apply, wiener and precorrect all mean the images are the raw observations (the slices are CTF weighted here and the quotient deconvolves them), while None means they carry no CTF at all.\nUse premultiplied when whatever extracted the particles already multiplied them by their CTF -- this is the default for RELION's 2D tilt-series stacks and for WarpTools ts_export_particles, which does ImagesFT.Multiply(CTFs) unless asked not to. The slices then go in as they are and only the denominator uses the CTF.\nNOTE: this must match your data. Weighting CTF-free images by a CTF is not a harmless no-op, and multiplying pre-multiplied ones a second time leaves the map modulated by an extra CTF -- low frequencies suppressed and the CTF zeros squared.",
           "default": null,
           "type": "enum",
           "choices": [
             "None",
             "apply",
             "wiener",
-            "precorrect"
+            "precorrect",
+            "premultiplied"
           ]
         },
         {
