@@ -45,8 +45,10 @@
           <span id="volctrls" style="display:none">
             <label>γ <input id="vgamma" type="range" min="0.3" max="3" step="0.1" value="1.4" title="Transfer-function gamma" /></label>
             <label>bright <input id="vbright" type="range" min="0.2" max="3" step="0.1" value="1.2" title="Brightness / opacity" /></label>
+          </span>
+          <span id="clipctrls">
             <label>clip
-              <select id="clipAxis" title="Clip the volume to a slab along this axis">
+              <select id="clipAxis" title="Cut the map to a slab along this axis (surface and volume modes)">
                 <option value="" selected>off</option>
                 <option value="0">X</option>
                 <option value="1">Y</option>
@@ -124,6 +126,7 @@
           <div class="models-compute" id="modelsCompute">
             <select id="computeOp" title="Operation (applied voxel-wise; same grid only)">
               <option value="diff" selected>A − B</option>
+              <option value="diffpm">A − B ± (gain green / loss red)</option>
               <option value="sum">A + B</option>
               <option value="mult">A × B</option>
             </select>
@@ -152,6 +155,7 @@
         <input id="morphScrub" type="range" min="0" max="0" value="0" disabled title="Scrub through the morph" />
         <label>fps <input id="morphFps" type="number" min="1" max="60" value="30" /></label>
         <button id="morphRecord" class="btn" disabled title="Play once and save it as a video">● Record</button>
+        <button id="morphExport" class="lnk" disabled title="Download every frame as a full-resolution .mrc (zip) — the density itself, for figures made elsewhere">⇩ .mrc series</button>
         <button id="morphClear" class="lnk" title="Clear the morph and go back to the maps">clear</button>
       </div>
     </section>

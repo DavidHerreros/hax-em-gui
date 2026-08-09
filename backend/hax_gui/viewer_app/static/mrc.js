@@ -7,10 +7,10 @@
 // With more than one map the ChimeraX arrangement applies: a model panel toggles each
 // map's visibility, every map carries its own colour and its own contour, and one of
 // them is *active* — the one the contour histogram, the colour picker and the .mrc
-// download act on. Surface mode draws them all together. Volume and slice modes show
-// the active map alone: compositing several ray-marched volumes correctly (depth
-// ordering, per-map transfer functions) is a different renderer, not a loop, and
-// showing a plausible-but-wrong overlay would be worse than showing one map honestly.
+// download act on. Surface mode draws them all together; volume mode composites every
+// visible map (up to the renderer's slot count) in one ray march, each at its own
+// contour and colour. Slice mode shows the active map alone — overlaying several
+// slice stacks honestly needs per-map transfer functions it does not have.
 import { createRenderer } from "./gl.js";
 import { createVolume } from "./volume.js";
 import { createHistogram } from "./histogram.js";
@@ -248,19 +248,46 @@ async function loadSurfaces() {
   reportSurface();
 }
 
+// Which model (by list index) each renderer slot holds; live contour/colour changes
+// address slots through this instead of re-uploading textures.
+let volSlots = [];
+
+// The normalized threshold a map's own sigma corresponds to over its own grid range.
+function thrFor(m) {
+  const g = m.gridVol;
+  if (!g) return 0.45;
+  const level = m.mean + m.sigma * (m.std || 1);
+  return Math.max(0, Math.min(1, (level - g.vmin) / ((g.vmax - g.vmin) || 1)));
+}
+
 const volGuard = latestWins();
 async function loadVolume() {
-  const m = active();
+  if (morph.showing) return;     // the morph owns the volume canvas
+  // Every visible map rides in one composited march, each at its own contour and
+  // colour; with nothing visible, fall back to the active map so the canvas is
+  // never silently empty.
+  let show = visibleModels();
+  if (!show.length) show = [active()];
+  const dropped = Math.max(0, show.length - volRenderer.maxSlots);
+  if (dropped) show = show.slice(0, volRenderer.maxSlots);
   status("Loading volume…", "busy");
-  const tok = volGuard.take();   // switching the active map mid-download: newest wins
+  const tok = volGuard.take();   // changing the shown set mid-download: newest wins
   try {
-    if (!m.gridVol) m.gridVol = await fetchGrid(m.index, 96);
-    if (volGuard.stale(tok)) return;
-    volRenderer.setVolume(m.gridVol.nx, m.gridVol.ny, m.gridVol.nz, m.gridVol.data, m.gridVol.boxLo, m.gridVol.boxHi);
-    volRenderer.setColor(hexToRgb(m.color));
-    volRenderer.setThreshold(normThreshold());
-    status(`Volume ${m.gridVol.nx}×${m.gridVol.ny}×${m.gridVol.nz} · ${m.name}`
-           + (models.length > 1 ? " · active map only" : ""));
+    for (const m of show) {
+      if (!m.gridVol) m.gridVol = await fetchGrid(m.index, 96);
+      if (volGuard.stale(tok)) return;
+    }
+    volSlots = show.map((m) => models.indexOf(m));
+    volRenderer.setSlots(show.map((m) => {
+      const g = m.gridVol;
+      return { nx: g.nx, ny: g.ny, nz: g.nz, data: g.data, lo: g.boxLo, hi: g.boxHi,
+               color: hexToRgb(m.color), threshold: thrFor(m) };
+    }));
+    const g0 = show[0].gridVol;
+    status(show.length > 1
+      ? `Volume · ${show.length} maps composited`
+        + (dropped ? ` · ${dropped} hidden (max ${volRenderer.maxSlots})` : "")
+      : `Volume ${g0.nx}×${g0.ny}×${g0.nz} · ${show[0].name}`);
   } catch (err) { status("Volume load failed: " + err.message, "err"); }
 }
 
@@ -306,7 +333,9 @@ function onLevel(level, dragging) {
       loadSurfaces();                        // full pass over the rest on release
     }
   } else if (state.render === "mip" || state.render === "emission") {
-    volRenderer.setThreshold(normThreshold());
+    const slot = volSlots.indexOf(state.active);
+    if (slot >= 0) volRenderer.setSlotThreshold(slot, normThreshold());
+    else volRenderer.setThreshold(normThreshold());   // morph / fallback: slot 0
   }
   if (!dragging) saveMapPref(m);             // release: this is the level you chose
 }
@@ -434,25 +463,30 @@ function toggleSolo(i) {
     if (row) row.querySelector("input[type=checkbox]").checked = m.visible;
   });
   if (!alreadySolo) setActive(i);            // the lone visible map is the one you act on
-  if (state.render === "surface") loadSurfaces(); else reportSurface();
+  if (state.render === "surface") loadSurfaces();
+  else if (inVolumeMode()) loadVolume();     // the composited set changed
+  else reportSurface();
   schedSaveScene();
 }
+
+const inVolumeMode = () => state.render === "mip" || state.render === "emission";
 
 function setVisible(i, on) {
   models[i].visible = on;
   renderer.setModelVisible(models[i].index, on);
   // A map switched on for the first time has no surface yet.
-  if (on && state.render === "surface") loadSurfaces(); else reportSurface();
+  if (on && state.render === "surface") loadSurfaces();
+  else if (inVolumeMode()) loadVolume();     // the composited set changed either way
+  else reportSurface();
   schedSaveScene();
 }
 
 function setColor(i, hex) {
   models[i].color = hex;
   renderer.setModelColor(models[i].index, hexToRgb(hex));
-  if (i === state.active) {
-    $("color").value = hex;
-    volRenderer.setColor(hexToRgb(hex));
-  }
+  if (i === state.active) $("color").value = hex;
+  const slot = volSlots.indexOf(i);
+  if (slot >= 0) volRenderer.setSlotColor(slot, hexToRgb(hex));
   saveMapPref(models[i]);
 }
 
@@ -521,6 +555,8 @@ function updateMorphUI() {
   $("morphPrepare").textContent = state.render === "surface" ? "Prepare" : "Load";
   $("morphPlay").disabled = !ready;
   $("morphRecord").disabled = !ready;
+  // The .mrc export computes its frames server-side, so it only needs a sequence.
+  $("morphExport").disabled = !ok;
   $("morphScrub").disabled = !ready;
   $("morphScrub").max = String(Math.max(0, morphFrames() - 1));
 }
@@ -586,6 +622,9 @@ async function prepareMorph() {
         if (!m.gridVol) m.gridVol = await fetchGrid(m.index, 96);
       }
       beginMorph();
+      // The morph runs single-slot; give slot 0 the sequence's colour and contour.
+      volRenderer.setColor(hexToRgb(models[morph.seq[0]].color));
+      volRenderer.setThreshold(thrFor(models[morph.seq[0]]));
       await showMorphFrame(morph.frame);
       status(`Morph ready · ${morph.seq.length} maps · blended on the GPU`);
       updateMorphUI();
@@ -730,6 +769,7 @@ function setMode(mode) {
   show($("lightlbl"), isSurface);
   show($("smoothlbl"), isSurface);
   show($("volctrls"), isVolume);
+  show($("clipctrls"), isSurface || isVolume);
   show($("slicectrls"), isSlices);
   show($("colorlbl"), !isSlices);
   show($("histStrip"), !isSlices);   // contour is meaningless for raw slices
@@ -779,6 +819,11 @@ $("morphPrepare").addEventListener("click", prepareMorph);
 $("morphPlay").addEventListener("click", () => (morph.playing ? pauseMorph() : playMorph()));
 $("morphScrub").addEventListener("input", (e) => { pauseMorph(); showMorphFrame(+e.target.value); });
 $("morphRecord").addEventListener("click", recordMorph);
+$("morphExport").addEventListener("click", () => {
+  if (!morphLegs()) return;
+  const idx = morph.seq.map((i) => models[i].index).join(",");
+  window.location.href = `./api/morph/export?seq=${idx}&per=${morph.perLeg}`;
+});
 $("morphClear").addEventListener("click", () => { morph.seq = []; morph.cache = null; stopMorph(); updateMorphUI(); buildModelPanel(); });
 $("modelsAll").addEventListener("click", () => setAllVisible(true));
 $("modelsNone").addEventListener("click", () => setAllVisible(false));
@@ -819,7 +864,9 @@ function setAllVisible(on) {
     const row = $("modelsList").children[i];
     if (row) row.querySelector("input[type=checkbox]").checked = on;
   });
-  if (on && state.render === "surface") loadSurfaces(); else reportSurface();
+  if (on && state.render === "surface") loadSurfaces();
+  else if (inVolumeMode()) loadVolume();
+  else reportSurface();
   schedSaveScene();
 }
 
@@ -966,17 +1013,22 @@ async function exportMesh() {
   finally { btn.disabled = false; }
 }
 
-// ---- volume clipping (slab along one axis) -------------------------------
+// ---- clipping (slab along one axis, surface + volume) --------------------
 function applyClip() {
   const axis = $("clipAxis").value;
   $("clipRanges").style.display = axis === "" ? "none" : "";
-  if (axis === "") { volRenderer.setClip(null, null); return; }
+  if (axis === "") { volRenderer.setClip(null, null); renderer.setClip(null, null); return; }
   const a = +axis;
   let lo = +$("clipLo").value / 100, hi = +$("clipHi").value / 100;
   if (hi < lo + 0.01) hi = Math.min(1, lo + 0.01);
-  const clipLo = [0, 0, 0], clipHi = [1, 1, 1];
-  clipLo[a] = lo; clipHi[a] = hi;
-  volRenderer.setClip(clipLo, clipHi);
+  // Volume renderer clips in texture space [0,1]; the surface renderer in the
+  // model-space [-1,1] cube. Same fractions, two coordinate frames.
+  const tLo = [0, 0, 0], tHi = [1, 1, 1];
+  tLo[a] = lo; tHi[a] = hi;
+  volRenderer.setClip(tLo, tHi);
+  const mLo = [-1.001, -1.001, -1.001], mHi = [1.001, 1.001, 1.001];
+  mLo[a] = lo * 2 - 1; mHi[a] = hi * 2 - 1;
+  renderer.setClip(mLo, mHi);
 }
 
 // ---- map arithmetic ------------------------------------------------------
@@ -1003,10 +1055,16 @@ async function runCompute() {
                             { method: "POST" });
     if (!res.ok) throw new Error(((await res.json()).detail) || res.statusText);
     const made = await res.json();
-    await loadInfo();            // the scene grew a model: rebuild panel + selects
+    await loadInfo();            // the scene grew a model (or two): rebuild panel + selects
+    if (made.pair) {
+      // Two-sided difference: the standard colouring — green where A gained
+      // density over B, red where it lost it.
+      setColor(made.pair[0], "#51cf66");
+      setColor(made.pair[1], "#ff6b6b");
+    }
     setMode(state.render);
     setActive(made.index);       // show the result
-    status(`Added ${made.name}`);
+    status(made.pair ? `Added ${made.name} — green = gained, red = lost` : `Added ${made.name}`);
   } catch (err) { status("Compute failed: " + err.message, "err"); }
   finally { btn.disabled = false; }
 }
@@ -1077,9 +1135,21 @@ async function togglePdb() {
       nSeg += segs.length / 6;
     });
     if (!chainIds.length) throw new Error("no traceable backbone found");
-    pdb.loaded = { name: data.name, chainIds };
+    pdb.loaded = { name: data.name, chainIds, path };
     $("pdbBtn").textContent = "PDB ✕";
+    // Fit-in-map: density at the backbone atoms of the ACTIVE map, in σ units.
+    // Advisory only, so a failure (atoms outside the box, etc.) does not block
+    // the overlay — the message explains itself either way.
+    let fitTxt = "";
+    try {
+      const fres = await fetch(`./api/fit?path=${encodeURIComponent(path)}&m=${m.index}`);
+      if (fres.ok) {
+        const f = await fres.json();
+        fitTxt = ` · fit in ${m.name}: ⟨σ⟩ ${f.mean_sigma}, ${Math.round(f.frac_above_1sigma * 100)}% of atoms > 1σ`;
+      } else fitTxt = ` · fit: ${(((await fres.json()).detail) || "unavailable")}`;
+    } catch { /* score is optional */ }
     status(`${data.name} · ${data.chains.length} chain${data.chains.length > 1 ? "s" : ""} · ${nSeg.toLocaleString()} segments`
+           + fitTxt
            + (state.render !== "surface" ? " · shown in Surface mode" : ""));
   } catch (err) { status("PDB overlay failed: " + err.message, "err"); }
 }

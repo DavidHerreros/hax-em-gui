@@ -141,8 +141,16 @@ void main() { outColor = vec4(uColor, 1.0); }`;
 const FRAG_GEOM = `#version 300 es
 precision highp float;
 in vec3 vViewPos;
+in vec3 vModelPos;
+uniform int uClipOn;
+uniform vec3 uClipLo;
+uniform vec3 uClipHi;
 out vec4 outPos;
-void main() { outPos = vec4(vViewPos, 1.0); }`;
+void main() {
+  // Same clip as the beauty pass, so the pivot lands on a surface you can see.
+  if (uClipOn == 1 && (any(lessThan(vModelPos, uClipLo)) || any(greaterThan(vModelPos, uClipHi)))) discard;
+  outPos = vec4(vViewPos, 1.0);
+}`;
 
 // The beauty pass: ChimeraX's fragmentShader.txt, USE_LIGHTING branch, with
 // USE_LIGHTING_NORMALS, USE_SHADOW, USE_MULTISHADOW and USE_DEPTH_CUE all enabled and
@@ -184,9 +192,18 @@ layout(std140) uniform shadow_matrix_block { mat4 uMSXf[${MS_COUNT}]; };
 uniform vec3 uDepthCueColor;
 uniform vec2 uDepthCueRange;
 
+// Model-space clip slab (the [-1,1] cube the maps live in). Fragments outside are
+// discarded — a cutaway, like ChimeraX's per-axis clipping of a surface. Shadows are
+// deliberately NOT clipped: the atlas is cached per geometry, and rebuilding 64 depth
+// passes on every slider tick would make the slab unusable to drag.
+uniform int uClipOn;
+uniform vec3 uClipLo;
+uniform vec3 uClipHi;
+
 out vec4 frag_color;
 
 void main() {
+  if (uClipOn == 1 && (any(lessThan(vModelPos, uClipLo)) || any(greaterThan(vModelPos, uClipHi)))) discard;
   vec4 fcolor = vec4(uColor, 1.0);
 
   // Unit normal, with two-sided lighting.
@@ -303,6 +320,7 @@ export function createRenderer(canvas) {
   let color = [0.863, 0.863, 0.863];   // ChimeraX-style near-white neutral gray
   let bg = [0.016, 0.024, 0.06];
   let light = { ...LIGHTING.standard };
+  let clipLo = null, clipHi = null;    // model-space clip slab; null = no clipping
 
   // ---------------------------------------------------------------------------
   // Shadow maps
@@ -560,6 +578,11 @@ export function createRenderer(canvas) {
     gl.uniformMatrix4fv(geomP.u("uProj"), false, proj);
     gl.uniformMatrix4fv(geomP.u("uView"), false, view);
     gl.uniformMatrix4fv(geomP.u("uModel"), false, model);
+    gl.uniform1i(geomP.u("uClipOn"), clipLo ? 1 : 0);
+    if (clipLo) {
+      gl.uniform3fv(geomP.u("uClipLo"), clipLo);
+      gl.uniform3fv(geomP.u("uClipHi"), clipHi);
+    }
     for (const m of drawable()) {
       gl.bindVertexArray(m.vao);
       gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
@@ -677,6 +700,12 @@ export function createRenderer(canvas) {
     // keeps Lighting.depth_cue_color in step with it.
     gl.uniform3fv(beauty.u("uDepthCueColor"), bg);
     gl.uniform2fv(beauty.u("uDepthCueRange"), depthCueRange(view, model));
+
+    gl.uniform1i(beauty.u("uClipOn"), clipLo ? 1 : 0);
+    if (clipLo) {
+      gl.uniform3fv(beauty.u("uClipLo"), clipLo);
+      gl.uniform3fv(beauty.u("uClipHi"), clipHi);
+    }
 
     const cLoc = beauty.u("uColor");
     for (const m of drawable()) {
@@ -809,6 +838,9 @@ export function createRenderer(canvas) {
     // shading of the far side of the map — as it does in ChimeraX.
     setBackground(rgb) { bg = rgb; render(); },
     setLighting(m) { light = { ...(LIGHTING[m] || LIGHTING.standard) }; render(); },
+    // Model-space clip slab ([-1,1] cube coordinates). Pass nulls to clear. The pivot
+    // probe honours it too, so rotation centres on what is actually visible.
+    setClip(lo, hi) { clipLo = lo ? lo.slice() : null; clipHi = hi ? hi.slice() : null; orbit.invalidatePivot(); render(); },
     resetView() { orbit.reset(); },
     getCamera() { return orbit.getState(); },   // handed to the other renderer on a render-mode switch
     setCamera(cam) { orbit.setState(cam); },
