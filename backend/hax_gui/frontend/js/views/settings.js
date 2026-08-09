@@ -92,11 +92,17 @@ export function SettingsView() {
       text("slurm_gres", "gres", "e.g. gpu:1", "GPUs to request per run."),
       text("slurm_time", "time limit", "e.g. 48:00:00", ""),
       text("slurm_account", "account", "", ""),
-      h("div", { class: "field" },
+      h("div", { class: "field", style: { marginBottom: "10px" } },
         h("div", { class: "field-label" }, h("span", { class: "flag" }, "extra sbatch options"), h("span", { class: "ctype" }, "optional")),
         h("p", { class: "field-help", style: { margin: "0 0 6px" } }, "One option per line, e.g. --mem=64G"),
         h("textarea", { class: "input", rows: "2", style: { fontFamily: "monospace" },
-                        oninput: (e) => (values.slurm_extra = e.target.value) }, values.slurm_extra)));
+                        oninput: (e) => (values.slurm_extra = e.target.value) }, values.slurm_extra)),
+      h("div", { class: "field" },
+        h("div", { class: "field-label" }, h("span", { class: "flag" }, "environment prelude"), h("span", { class: "ctype" }, "optional")),
+        h("p", { class: "field-help", style: { margin: "0 0 6px" } },
+          "Shell lines run on the compute node before hax — e.g. module load cuda, source activate hax."),
+        h("textarea", { class: "input", rows: "3", style: { fontFamily: "monospace" },
+                        oninput: (e) => (values.slurm_prelude = e.target.value) }, values.slurm_prelude)));
     syncSlurm();
     return h("div", { class: "card", id: "setting-execution_backend", style: { padding: "22px", marginBottom: "16px" } },
       h("h2", { class: "section" }, "Job execution"),
@@ -116,6 +122,7 @@ export function SettingsView() {
       slurm_time: s.slurm_time || "",
       slurm_account: s.slurm_account || "",
       slurm_extra: s.slurm_extra || "",
+      slurm_prelude: s.slurm_prelude || "",
     };
     const status = h("div", { style: { marginTop: "4px" } });
     const saveBtn = h("button", { class: "btn", onclick: save }, icon("check", 18), h("span", null, "Save"));
@@ -133,6 +140,7 @@ export function SettingsView() {
           slurm_time: values.slurm_time.trim(),
           slurm_account: values.slurm_account.trim(),
           slurm_extra: values.slurm_extra,
+          slurm_prelude: values.slurm_prelude,
         });
         const dev = saved.viewer_gpu ? (saved.viewer_gpu === "cpu" ? "CPU" : `GPU ${saved.viewer_gpu}`) : "ask each time";
         const exec = saved.execution_backend === "slurm" ? "Slurm" : "local";

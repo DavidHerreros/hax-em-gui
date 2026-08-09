@@ -14,7 +14,8 @@ from conftest import FAKE_SLURM, GATE, wait_for_status
 @pytest.fixture()
 def slurm_backend(client, run):
     r = run(client.put("/api/settings", json={"execution_backend": "slurm",
-                                              "slurm_partition": "gpu", "slurm_gres": "gpu:1"}))
+                                              "slurm_partition": "gpu", "slurm_gres": "gpu:1",
+                                              "slurm_prelude": "echo prelude-ran"}))
     assert r.status_code == 200, r.text
     yield
     r = run(client.put("/api/settings", json={"execution_backend": "local"}))
@@ -37,6 +38,7 @@ def test_slurm_submit_run_and_finish(client, run, project, md_file, slurm_backen
     script = (FAKE_SLURM / f"job_{done['slurm_id']}.sh").read_text()
     assert "#SBATCH --partition=gpu" in script
     assert "#SBATCH --gres=gpu:1" in script
+    assert "echo prelude-ran" in script
     assert "exit.status" in script or "printf" in script
     # Logs streamed through the same files as a local run.
     r = run(client.get(f"/api/jobs/{job['id']}/log"))

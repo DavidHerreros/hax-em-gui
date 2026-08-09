@@ -182,6 +182,7 @@ class SettingsUpdate(BaseModel):
     slurm_time: str | None = None        # e.g. "24:00:00"
     slurm_account: str | None = None
     slurm_extra: str | None = None       # raw sbatch options, one per line
+    slurm_prelude: str | None = None     # shell lines run before hax (module load, conda activate)
 
 
 @router.get("/api/settings", dependencies=[Depends(auth)])

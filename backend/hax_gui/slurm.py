@@ -70,8 +70,13 @@ def build_script(command: list[str], exit_path: str, out_path: str, err_path: st
         extra = extra.strip()
         if extra:
             lines.append(f"#SBATCH {extra}")
+    lines.append("")
+    # Environment prelude: whatever the compute nodes need before hax exists —
+    # `module load cuda`, `source activate hax`, … Verbatim shell lines.
+    prelude = [ln for ln in str(s.get("slurm_prelude") or "").splitlines() if ln.strip()]
+    if prelude:
+        lines += prelude + [""]
     lines += [
-        "",
         "export FORCE_COLOR=1",   # the GUI's terminal renders ANSI; hax colorizes on request
         f'{shlex.join(command)}; rc=$?; printf %s "$rc" > {shlex.quote(exit_path)}; exit $rc',
         "",
