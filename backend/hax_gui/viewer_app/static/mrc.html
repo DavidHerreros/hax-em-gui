@@ -75,6 +75,11 @@
           </span>
           <label id="colorlbl">surface <input id="color" type="color" value="#dcdcdc" title="Surface / volume color" /></label>
           <label>bg <input id="bg" type="color" value="#040610" title="Background color" /></label>
+          <span class="viewbtns" title="Standard orientations (keeps zoom)">
+            <button id="viewFront" class="btn" title="Front view (reset orientation)">F</button>
+            <button id="viewTop" class="btn" title="Top view">T</button>
+            <button id="viewSide" class="btn" title="Side view">S</button>
+          </span>
           <button id="reset" class="btn">Reset view</button>
           <button id="saveMap" class="btn" title="Save the current view as PNG">Save PNG</button>
           <button id="mrc" class="btn" title="Download this map as .mrc">.mrc</button>
@@ -85,6 +90,9 @@
       <div class="hist-strip" id="histStrip">
         <span class="hist-label muted">contour</span>
         <canvas id="hist"></canvas>
+        <label class="hist-opt" id="linklbl" hidden title="Apply contour changes to every visible map (at the same sigma) instead of only the active one"><input id="linkContour" type="checkbox" /> link</label>
+        <label class="hist-opt" title="Hide connected blobs smaller than this many voxels (ChimeraX's hide dust)"><input id="dustOn" type="checkbox" /> dust</label>
+        <input id="dustSize" type="number" min="10" max="100000" step="10" value="200" title="Minimum blob size to keep, in voxels" style="width:64px" hidden />
       </div>
       <!-- Canvas + model rail side by side, ChimeraX-style: the rail costs width, which
            there is plenty of, rather than height, which the map needs. -->
@@ -94,6 +102,7 @@
         <div class="canvas-wrap"
              title="Drag to rotate · drag near the edge to spin in-plane · middle-drag to pan · wheel to zoom">
           <canvas id="gl"></canvas>
+          <canvas id="gizmo" class="gizmo" width="70" height="70" title="Model axes (X red · Y green · Z blue)"></canvas>
           <canvas id="glvol" style="display:none"></canvas>
           <div id="slices" class="slices" style="display:none"></div>
           <!-- Reopens the rail once collapsed; the rail itself is gone by then. -->
@@ -128,6 +137,7 @@
       <div class="morph" id="morph" hidden>
         <span class="morph-title">Morph</span>
         <span id="morphSeq" class="morph-seq muted">pick maps in the panel →</span>
+        <button id="morphAll" class="lnk" title="Add every visible map to the morph, in panel order">all visible</button>
         <label>frames <input id="morphFrames" type="number" min="2" max="120" value="24" title="Interpolated frames between each pair of maps" /></label>
         <label title="Contour every frame at the same enclosed mass instead of the same sigma. Averaging two maps lowers the variance, so a fixed sigma makes the surface breathe mid-morph."><input id="morphMass" type="checkbox" checked /> constant mass</label>
         <label>quality

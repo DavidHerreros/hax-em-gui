@@ -39,7 +39,7 @@ from fastapi import FastAPI, HTTPException, Query, Response  # noqa: E402
 from fastapi.responses import FileResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
-from meshing import _downsample, grid_box, level_for_mass, level_for_sigma, mesh_at  # noqa: E402
+from meshing import _downsample, grid_box, level_for_mass, level_for_sigma, mesh_at, remove_dust  # noqa: E402
 import wirefmt  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -225,11 +225,16 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
         mass: float = Query(-1.0),     # >=0 -> contour at constant enclosed mass
         smooth: int = Query(0),        # Taubin smoothing iterations on the surface
         size: int = Query(0),          # >0 -> draft mesh from a strided grid this big
+        dust: int = Query(0),          # >0 -> hide components smaller than this (full-grid voxels)
     ) -> Response:
         model = scene.get(m)
         grid, step = model.grid_at(int(size))
         level = (level_for_mass(grid, mass / float(step) ** 3) if mass >= 0
                  else level_for_sigma(grid, sigma))
+        if dust > 0:
+            # The threshold is in full-resolution voxels; a strided draft's
+            # components hold step³ fewer of them.
+            grid = remove_dust(grid, level, max(1, int(dust) // step ** 3))
         full, off = scene.norm(model)
         return Response(content=mesh_at(grid, level, smooth=max(0, min(50, smooth)),
                                         step=step, full_size=full, offset=off),

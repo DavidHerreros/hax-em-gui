@@ -91,6 +91,7 @@ async function loadInfo() {
   // Maps on different grids cannot be blended voxel-by-voxel, and the backend refuses
   // to; don't offer a control that can only fail.
   $("morph").hidden = !(multi && info.morph_shape);
+  $("linklbl").hidden = !multi;
   if (!$("morph").hidden) updateMorphUI();
   setActive(0);
   document.title = "Hax — " + (multi ? `${models.length} maps` : models[0].name);
@@ -152,6 +153,11 @@ const draftSize = () => Math.max(64, Math.round((info ? info.full_size : 320) / 
 // and made the surface change character when you let go of the slider. See app.js.
 const DRAFT_SMOOTH = 2;
 
+// ChimeraX's "hide dust": components smaller than dust.size voxels are dropped
+// server-side before marching cubes. Changing it invalidates every cached surface.
+const dust = { on: false, size: 200 };
+const dustParam = () => (dust.on && dust.size > 1 ? `&dust=${Math.round(dust.size)}` : "");
+
 // Contour one map. Only the map being adjusted is refetched — the others are already on
 // the GPU and their contours have not changed.
 async function surfaceOnce(idx, draft) {
@@ -159,7 +165,7 @@ async function surfaceOnce(idx, draft) {
   if (!m) return;
   status(models.length > 1 ? `Contouring ${m.name}…` : "Contouring…", "busy");
   try {
-    const q = `m=${m.index}&sigma=${m.sigma.toFixed(3)}`
+    const q = `m=${m.index}&sigma=${m.sigma.toFixed(3)}${dustParam()}`
             + (draft ? `&smooth=${Math.min(m.smooth, DRAFT_SMOOTH)}&size=${draftSize()}` : `&smooth=${m.smooth}`);
     const buf = await (await fetch(`./api/decode?${q}`)).arrayBuffer();
     if (state.render !== "surface") return;   // mode switched while we were waiting
@@ -236,11 +242,24 @@ function normThreshold() {
   return (hist.level - g.vmin) / ((g.vmax - g.vmin) || 1);
 }
 
+// "link": one contour gesture drives every visible map at the same sigma (each
+// map's own mean/std, so the level is statistically equivalent, not identical).
+let linkContour = false;
+
 function onLevel(level, dragging) {
   const m = active();
   m.sigma = (level - m.mean) / (m.std || 1);
-  if (state.render === "surface") loadSurface(state.active, !!dragging);
-  else if (state.render === "mip" || state.render === "emission") volRenderer.setThreshold(normThreshold());
+  if (state.render === "surface") {
+    loadSurface(state.active, !!dragging);   // the active map tracks the drag live
+    if (linkContour && !dragging) {
+      for (const other of visibleModels()) {
+        if (other !== m) { other.sigma = m.sigma; other.surface = null; }
+      }
+      loadSurfaces();                        // full pass over the rest on release
+    }
+  } else if (state.render === "mip" || state.render === "emission") {
+    volRenderer.setThreshold(normThreshold());
+  }
 }
 
 // ---- model panel (a resizable right rail, ChimeraX-style) ----------------
@@ -319,7 +338,15 @@ function buildModelPanel() {
     name.textContent = m.name;
     name.title = m.filename;
 
-    row.append(see, swatch, name);
+    // Solo: show only this map; click again to bring the others back. The single
+    // most-used ChimeraX gesture when comparing many maps.
+    const solo = document.createElement("button");
+    solo.className = "model-solo";
+    solo.textContent = "S";
+    solo.title = "Show only this map (click again to show all)";
+    solo.addEventListener("click", (e) => { e.stopPropagation(); toggleSolo(i); });
+
+    row.append(see, swatch, name, solo);
 
     // Morph membership, and the order it will run in. Click order is the sequence, so
     // the same maps can be morphed forwards, backwards, or out and back, without any
@@ -347,6 +374,18 @@ function markActiveRow() {
   for (const row of $("modelsList").children) {
     row.classList.toggle("active", Number(row.dataset.index) === state.active);
   }
+}
+
+function toggleSolo(i) {
+  const alreadySolo = models[i].visible && visibleModels().length === 1;
+  models.forEach((m, k) => {
+    m.visible = alreadySolo ? true : k === i;
+    renderer.setModelVisible(m.index, m.visible);
+    const row = $("modelsList").children[k];
+    if (row) row.querySelector("input[type=checkbox]").checked = m.visible;
+  });
+  if (!alreadySolo) setActive(i);            // the lone visible map is the one you act on
+  if (state.render === "surface") loadSurfaces(); else reportSurface();
 }
 
 function setVisible(i, on) {
@@ -681,6 +720,29 @@ $("morphClear").addEventListener("click", () => { morph.seq = []; morph.cache = 
 $("modelsAll").addEventListener("click", () => setAllVisible(true));
 $("modelsNone").addEventListener("click", () => setAllVisible(false));
 $("exportMesh").addEventListener("click", exportMesh);
+$("viewFront").addEventListener("click", () => setStandardView("front"));
+$("viewTop").addEventListener("click", () => setStandardView("top"));
+$("viewSide").addEventListener("click", () => setStandardView("side"));
+$("linkContour").addEventListener("change", (e) => { linkContour = e.target.checked; });
+$("dustOn").addEventListener("change", (e) => {
+  dust.on = e.target.checked;
+  $("dustSize").hidden = !dust.on;
+  for (const m of models) m.surface = null;   // every cached mesh was cut without/with dust
+  if (state.render === "surface") loadSurfaces();
+});
+$("dustSize").addEventListener("change", (e) => {
+  dust.size = Math.max(1, +e.target.value || 200);
+  if (!dust.on) return;
+  for (const m of models) m.surface = null;
+  if (state.render === "surface") loadSurfaces();
+});
+$("morphAll").addEventListener("click", () => {
+  morph.seq = models.map((m, i) => (m.visible ? i : -1)).filter((i) => i >= 0);
+  morph.cache = null;
+  stopMorph();
+  updateMorphUI();
+  buildModelPanel();
+});
 $("pdbBtn").addEventListener("click", togglePdb);
 $("clipAxis").addEventListener("change", applyClip);
 $("clipLo").addEventListener("input", applyClip);
@@ -712,6 +774,59 @@ async function saveMap() {
 }
 
 function hexToRgb(hex) { const n = parseInt(hex.slice(1), 16); return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]; }
+
+// ---- standard orientations + axes gizmo ----------------------------------
+// Column-major rotation matrices: front = identity; top rotates the model +90°
+// about X (its +Y face toward the camera); side −90° about Y (+X face forward).
+const VIEW_R = {
+  front: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+  top:   [1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1],
+  side:  [0, 0, 1, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 1],
+};
+
+function setStandardView(which) {
+  const target = camera3d(state.render);
+  if (!target) return;                       // slices have no 3D camera
+  const cam = target.getCamera();
+  target.setCamera({ ...cam, R: VIEW_R[which].slice(), offset: [0, 0, 0], pivot: [0, 0, 0] });
+}
+
+// Tiny always-on axes indicator, redrawn only when the orientation changes.
+function startGizmo() {
+  const cv = $("gizmo");
+  const ctx = cv.getContext("2d");
+  let lastKey = "";
+  const AXES = [["X", "#ff6b6b", 0], ["Y", "#51cf66", 4], ["Z", "#5c9dff", 8]];
+  function draw(R) {
+    const c = 35, len = 24;
+    ctx.clearRect(0, 0, 70, 70);
+    // Back-to-front so nearer axes draw over farther ones.
+    const order = AXES.map(([lbl, col, o]) => ({ lbl, col, x: R[o], y: R[o + 1], z: R[o + 2] }))
+                      .sort((a, b) => a.z - b.z);
+    for (const a of order) {
+      const dim = 0.55 + 0.45 * (a.z + 1) / 2;
+      ctx.strokeStyle = a.col; ctx.globalAlpha = dim; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(c, c); ctx.lineTo(c + a.x * len, c - a.y * len); ctx.stroke();
+      ctx.fillStyle = a.col;
+      ctx.font = "10px system-ui, sans-serif";
+      ctx.fillText(a.lbl, c + a.x * (len + 4) - 3, c - a.y * (len + 4) + 3);
+    }
+    ctx.globalAlpha = 1;
+  }
+  (function tick() {
+    const target = camera3d(state.render);
+    cv.style.display = target ? "" : "none";
+    if (target) {
+      const R = target.getCamera().R;
+      const key = R[0].toFixed(3) + R[1].toFixed(3) + R[2].toFixed(3)
+                + R[4].toFixed(3) + R[5].toFixed(3) + R[6].toFixed(3)
+                + R[8].toFixed(3) + R[9].toFixed(3) + R[10].toFixed(3);
+      if (key !== lastKey) { lastKey = key; draw(R); }
+    }
+    requestAnimationFrame(tick);
+  })();
+}
+startGizmo();
 
 // ---- mesh export (binary STL, in Å) --------------------------------------
 // The mesh comes back in the shared [-1,1] cube; undo that mapping (see

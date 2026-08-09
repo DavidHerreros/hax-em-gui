@@ -52,6 +52,28 @@ def level_for_mass(vol: np.ndarray, target_mass: float, bins: int = 1 << 16) -> 
     f = 0.0 if m0 == m1 else (m0 - float(target_mass)) / (m0 - m1)
     return float(edges[i - 1] + f * (edges[i] - edges[i - 1]))
 
+def remove_dust(vol: np.ndarray, level: float, min_voxels: int) -> np.ndarray:
+    """ChimeraX's "hide dust": suppress connected components above `level` that
+    are smaller than `min_voxels`, so a noisy contour shows the molecule instead
+    of a blizzard. Returns a copy with the dust pushed just below the level (the
+    original volume is never modified — it is shared and cached)."""
+    if min_voxels <= 1:
+        return vol
+    from scipy import ndimage
+
+    labels, n = ndimage.label(vol >= level)
+    if n <= 1:
+        return vol
+    sizes = np.bincount(labels.ravel())
+    small = np.flatnonzero(sizes < int(min_voxels))
+    small = small[small != 0]                 # 0 is the background, never dust
+    if small.size == 0:
+        return vol                            # every component clears the bar
+    out = vol.copy()
+    out[np.isin(labels, small)] = level - 1e-6 - abs(level) * 1e-3
+    return out
+
+
 def _downsample(vol: np.ndarray, size: int) -> tuple[np.ndarray, int]:
     """Stride-downsample so the largest edge is <= `size` (cheap, dependency-free).
 
