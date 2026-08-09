@@ -35,9 +35,22 @@ try {
   throw err;
 }
 
+// A lost WebGL context (GPU reset, driver update, the tab backgrounded too long)
+// used to leave a silently frozen canvas. There is no rebuilding all the GPU state
+// worth its complexity here — say what happened and offer the one real fix.
+for (const id of ["gl", "glvol"]) {
+  $(id).addEventListener("webglcontextlost", (e) => {
+    e.preventDefault();
+    status("WebGL context lost — reloading the viewer…", "err");
+    setTimeout(() => location.reload(), 800);
+  });
+}
+
 const state = { render: "surface", active: 0 };
 let info = null;        // /api/info
 let models = [];        // per-map view state, parallel to info.models
+let railSetup = false;  // setupRail binds pointer listeners; must run once even though
+                        // loadInfo now reruns after map arithmetic grows the scene
 
 function status(msg, cls = "") {
   const el = $("status"); el.textContent = msg; el.title = msg;
@@ -73,7 +86,7 @@ async function loadInfo() {
   $("title").textContent = info.title || "Map";
   const multi = models.length > 1;
   $("models").hidden = !multi;
-  if (multi) { buildModelPanel(); setupRail(); }
+  if (multi) { buildModelPanel(); if (!railSetup) { setupRail(); railSetup = true; } fillComputeSelects(); }
   else $("stage").classList.add("rail-off");
   // Maps on different grids cannot be blended voxel-by-voxel, and the backend refuses
   // to; don't offer a control that can only fail.
@@ -90,7 +103,13 @@ async function setActive(i) {
   state.active = i;
   const m = active();
   $("sel").textContent = m.name;
-  $("meta").textContent = m.shape.slice().reverse().join("×");
+  // Voxel count, plus the physical size when the header carried a voxel size
+  // (1.0 is the server's "unknown" sentinel — don't dress voxels up as Å).
+  const dims = m.shape.slice().reverse();
+  $("meta").textContent = dims.join("×")
+    + (m.voxel_size && m.voxel_size !== 1
+       ? ` · ${m.voxel_size.toFixed(2)} Å/vox · ${dims.map((n) => (n * m.voxel_size).toFixed(0)).join("×")} Å`
+       : "");
   $("color").value = m.color;
   // Colour and smoothing are per map, so the shared controls have to follow the
   // active one — otherwise they show the previous map's settings and the next nudge
@@ -199,6 +218,11 @@ async function loadSlices() {
   try {
     if (!m.gridSlice) m.gridSlice = await fetchGrid(m.index, 192);
     if (sliceGuard.stale(tok)) return;
+    // Å per *grid* voxel: the slice grid is stride-downsampled, so scale the header
+    // voxel size by the stride. Set before the volume so the legend can use it.
+    const g = m.gridSlice;
+    const stride = Math.max(1, Math.round(Math.max(...m.shape) / Math.max(g.nx, g.ny, g.nz)));
+    slices.setScale(m.voxel_size && m.voxel_size !== 1 ? m.voxel_size * stride : 0);
     slices.setVolume(m.gridSlice);
     status(`Slices ${m.gridSlice.nx}×${m.gridSlice.ny}×${m.gridSlice.nz} · ${m.name}`
            + (models.length > 1 ? " · active map only" : ""));
@@ -656,6 +680,12 @@ $("morphRecord").addEventListener("click", recordMorph);
 $("morphClear").addEventListener("click", () => { morph.seq = []; morph.cache = null; stopMorph(); updateMorphUI(); buildModelPanel(); });
 $("modelsAll").addEventListener("click", () => setAllVisible(true));
 $("modelsNone").addEventListener("click", () => setAllVisible(false));
+$("exportMesh").addEventListener("click", exportMesh);
+$("pdbBtn").addEventListener("click", togglePdb);
+$("clipAxis").addEventListener("change", applyClip);
+$("clipLo").addEventListener("input", applyClip);
+$("clipHi").addEventListener("input", applyClip);
+$("computeGo").addEventListener("click", runCompute);
 
 function setAllVisible(on) {
   models.forEach((m, i) => {
@@ -682,6 +712,153 @@ async function saveMap() {
 }
 
 function hexToRgb(hex) { const n = parseInt(hex.slice(1), 16); return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]; }
+
+// ---- mesh export (binary STL, in Å) --------------------------------------
+// The mesh comes back in the shared [-1,1] cube; undo that mapping (see
+// meshing.mesh_at: model = (voxel*step + off - S/2)/(S/2)) to get voxel
+// coordinates, then Å via the header's voxel size and origin — so the STL lands
+// on the same coordinates the map has in ChimeraX.
+async function exportMesh() {
+  const m = active();
+  const btn = $("exportMesh");
+  btn.disabled = true;
+  status("Building surface for export…", "busy");
+  try {
+    const buf = await (await fetch(`./api/decode?m=${m.index}&sigma=${m.sigma.toFixed(3)}&smooth=${m.smooth}`)).arrayBuffer();
+    const mesh = parseMesh(buf);
+    if (!mesh.indices.length) { status("Empty surface at this contour — nothing to export", "warn"); return; }
+    const S = info.full_size, half = S / 2;
+    const vs = m.voxel_size || 1;
+    // per-axis voxel offsets that centred this map in the common cube, spatial order
+    const off = [(S - m.shape[2]) / 2, (S - m.shape[1]) / 2, (S - m.shape[0]) / 2];
+    const org = m.origin || [0, 0, 0];
+    const p = mesh.positions;
+    const nTri = mesh.indices.length / 3;
+    const out = new DataView(new ArrayBuffer(84 + nTri * 50));
+    new Uint8Array(out.buffer).set(new TextEncoder().encode(`hax-em ${m.name} sigma=${m.sigma.toFixed(2)}`).slice(0, 79), 0);
+    out.setUint32(80, nTri, true);
+    let o = 84;
+    const ang = (i, a) => (p[i * 3 + a] * half + half - off[a]) * vs + org[a];
+    for (let t = 0; t < nTri; t++) {
+      const [i0, i1, i2] = [mesh.indices[t * 3], mesh.indices[t * 3 + 1], mesh.indices[t * 3 + 2]];
+      const v0 = [ang(i0, 0), ang(i0, 1), ang(i0, 2)], v1 = [ang(i1, 0), ang(i1, 1), ang(i1, 2)], v2 = [ang(i2, 0), ang(i2, 1), ang(i2, 2)];
+      const ux = v1[0] - v0[0], uy = v1[1] - v0[1], uz = v1[2] - v0[2];
+      const wx = v2[0] - v0[0], wy = v2[1] - v0[1], wz = v2[2] - v0[2];
+      let nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+      const ln = Math.hypot(nx, ny, nz) || 1; nx /= ln; ny /= ln; nz /= ln;
+      for (const v of [[nx, ny, nz], v0, v1, v2]) {
+        out.setFloat32(o, v[0], true); out.setFloat32(o + 4, v[1], true); out.setFloat32(o + 8, v[2], true);
+        o += 12;
+      }
+      out.setUint16(o, 0, true); o += 2;
+    }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([out.buffer], { type: "model/stl" }));
+    a.download = `${m.name.replace(/\.[^.]+$/, "")}_sigma${m.sigma.toFixed(1)}.stl`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    status(`Exported ${nTri.toLocaleString()} triangles (STL, Å)`);
+  } catch (err) { status("Mesh export failed: " + err.message, "err"); }
+  finally { btn.disabled = false; }
+}
+
+// ---- volume clipping (slab along one axis) -------------------------------
+function applyClip() {
+  const axis = $("clipAxis").value;
+  $("clipRanges").style.display = axis === "" ? "none" : "";
+  if (axis === "") { volRenderer.setClip(null, null); return; }
+  const a = +axis;
+  let lo = +$("clipLo").value / 100, hi = +$("clipHi").value / 100;
+  if (hi < lo + 0.01) hi = Math.min(1, lo + 0.01);
+  const clipLo = [0, 0, 0], clipHi = [1, 1, 1];
+  clipLo[a] = lo; clipHi[a] = hi;
+  volRenderer.setClip(clipLo, clipHi);
+}
+
+// ---- map arithmetic ------------------------------------------------------
+function fillComputeSelects() {
+  for (const id of ["computeA", "computeB"]) {
+    const sel = $(id);
+    sel.textContent = "";
+    models.forEach((m, i) => {
+      const opt = document.createElement("option");
+      opt.value = String(m.index);
+      opt.textContent = m.name.replace(/\.[^.]+$/, "");
+      sel.appendChild(opt);
+    });
+  }
+  if (models.length > 1) $("computeB").selectedIndex = 1;
+}
+
+async function runCompute() {
+  const btn = $("computeGo");
+  btn.disabled = true;
+  status("Computing…", "busy");
+  try {
+    const res = await fetch(`./api/compute?op=${$("computeOp").value}&a=${$("computeA").value}&b=${$("computeB").value}`,
+                            { method: "POST" });
+    if (!res.ok) throw new Error(((await res.json()).detail) || res.statusText);
+    const made = await res.json();
+    await loadInfo();            // the scene grew a model: rebuild panel + selects
+    setMode(state.render);
+    setActive(made.index);       // show the result
+    status(`Added ${made.name}`);
+  } catch (err) { status("Compute failed: " + err.message, "err"); }
+  finally { btn.disabled = false; }
+}
+
+// ---- PDB backbone overlay ------------------------------------------------
+const pdb = { loaded: null };   // { name, chainIds: [] }
+const PDB_COLORS = ["#ffd166", "#7fb3ff", "#8fe08f", "#ff9e7a", "#e79aff", "#6fdccf", "#ff8fa8", "#c8c8c8"];
+
+async function togglePdb() {
+  if (pdb.loaded) {
+    for (const id of pdb.loaded.chainIds) renderer.dropLineModel(id);
+    pdb.loaded = null;
+    $("pdbBtn").textContent = "PDB…";
+    status("PDB overlay removed");
+    return;
+  }
+  const path = window.prompt("Server path of the PDB file to overlay (e.g. /data/model.pdb):");
+  if (!path) return;
+  status("Loading PDB…", "busy");
+  try {
+    const res = await fetch(`./api/pdb?path=${encodeURIComponent(path)}`);
+    if (!res.ok) throw new Error(((await res.json()).detail) || res.statusText);
+    const data = await res.json();
+    // Å -> the shared model cube, via the ACTIVE map's voxel size and origin (that
+    // is the frame a fitted model is deposited in).
+    const m = active();
+    const S = info.full_size, half = S / 2;
+    const vs = m.voxel_size || 1;
+    const off = [(S - m.shape[2]) / 2, (S - m.shape[1]) / 2, (S - m.shape[0]) / 2];
+    const org = m.origin || [0, 0, 0];
+    const toModel = (x, a) => ((x - org[a]) / vs + off[a] - half) / half;
+    const chainIds = [];
+    let nSeg = 0;
+    data.chains.forEach((chain, ci) => {
+      const pts = chain.xyz;
+      const segs = [];
+      for (let i = 0; i + 5 < pts.length; i += 3) {
+        // break the trace at chain gaps (successive CA >6 Å apart is not bonded)
+        const d = Math.hypot(pts[i + 3] - pts[i], pts[i + 4] - pts[i + 1], pts[i + 5] - pts[i + 2]);
+        if (d > 6.0) continue;
+        segs.push(toModel(pts[i], 0), toModel(pts[i + 1], 1), toModel(pts[i + 2], 2),
+                  toModel(pts[i + 3], 0), toModel(pts[i + 4], 1), toModel(pts[i + 5], 2));
+      }
+      if (!segs.length) return;
+      const id = `__pdb_${chain.id}`;
+      renderer.setLineModel(id, new Float32Array(segs), hexToRgb(PDB_COLORS[ci % PDB_COLORS.length]));
+      chainIds.push(id);
+      nSeg += segs.length / 6;
+    });
+    if (!chainIds.length) throw new Error("no traceable backbone found");
+    pdb.loaded = { name: data.name, chainIds };
+    $("pdbBtn").textContent = "PDB ✕";
+    status(`${data.name} · ${data.chains.length} chain${data.chains.length > 1 ? "s" : ""} · ${nSeg.toLocaleString()} segments`
+           + (state.render !== "surface" ? " · shown in Surface mode" : ""));
+  } catch (err) { status("PDB overlay failed: " + err.message, "err"); }
+}
 
 // ---- boot ----------------------------------------------------------------
 (async function boot() {

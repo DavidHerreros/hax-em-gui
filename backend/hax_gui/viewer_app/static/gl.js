@@ -119,6 +119,21 @@ const FRAG_EMPTY = `#version 300 es
 precision highp float;
 void main() {}`;
 
+// Unlit line overlay (PDB backbone traces). Depth-tested against the surfaces so a
+// trace threads through its map instead of floating in front of it.
+const VERT_LINE = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uProj;
+uniform mat4 uView;
+uniform mat4 uModel;
+void main() { gl_Position = uProj * uView * uModel * vec4(aPos, 1.0); }`;
+const FRAG_LINE = `#version 300 es
+precision highp float;
+uniform vec3 uColor;
+out vec4 outColor;
+void main() { outColor = vec4(uColor, 1.0); }`;
+
 // Camera-space position prepass, read back a few pixels at a time to find what is under
 // the centre of the window. That is the only thing the camera needs from the renderer
 // (orbit.js turns it into a ChimeraX `cofr frontCenter` pivot), so it runs on demand —
@@ -243,6 +258,11 @@ export function createRenderer(canvas) {
   const beauty = makeProg(gl, VERT, FRAG_BEAUTY);
   const depthP = makeProg(gl, VERT_DEPTH, FRAG_EMPTY);
   const geomP = floatTargets ? makeProg(gl, VERT, FRAG_GEOM) : null;
+  const lineP = makeProg(gl, VERT_LINE, FRAG_LINE);
+
+  // Line overlays (PDB traces): id -> { vao, buf, count, color }. Drawn unlit after
+  // the beauty pass, depth-tested against the surfaces. GL_LINES pairs, model space.
+  const lineModels = new Map();
 
   // Mesh geometry, one entry per model in the scene. A lone map is just the case where
   // there is one of them, so the single-map path is not a separate code path.
@@ -627,7 +647,7 @@ export function createRenderer(canvas) {
     gl.depthMask(true);
     gl.clearColor(bg[0], bg[1], bg[2], alpha);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (!anyGeometry()) return;
+    if (!anyGeometry()) { drawLines(proj, view, model); return; }
 
     gl.useProgram(beauty.prog);
     gl.uniformMatrix4fv(beauty.u("uProj"), false, proj);
@@ -663,6 +683,22 @@ export function createRenderer(canvas) {
       gl.uniform3fv(cLoc, m.color || color);
       gl.bindVertexArray(m.vao);
       gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+    }
+    gl.bindVertexArray(null);
+    drawLines(proj, view, model);
+  }
+
+  function drawLines(proj, view, model) {
+    if (!lineModels.size) return;
+    gl.useProgram(lineP.prog);
+    gl.uniformMatrix4fv(lineP.u("uProj"), false, proj);
+    gl.uniformMatrix4fv(lineP.u("uView"), false, view);
+    gl.uniformMatrix4fv(lineP.u("uModel"), false, model);
+    for (const m of lineModels.values()) {
+      if (!m.count) continue;
+      gl.uniform3fv(lineP.u("uColor"), m.color);
+      gl.bindVertexArray(m.vao);
+      gl.drawArrays(gl.LINES, 0, m.count);
     }
     gl.bindVertexArray(null);
   }
@@ -732,6 +768,32 @@ export function createRenderer(canvas) {
     // Single-map callers (the landscape viewer) address the one implicit model.
     setMesh: (positions, normals, indices) => setModelMesh(0, positions, normals, indices),
     setModelMesh, dropModel,
+    // Line overlay (GL_LINES vertex pairs in model space). Same id space as nothing
+    // else — line models live in their own map and never collide with mesh ids.
+    setLineModel(id, positions, rgb) {
+      let m = lineModels.get(id);
+      if (!m) {
+        m = { vao: gl.createVertexArray(), buf: gl.createBuffer(), count: 0, color: [1, 1, 1] };
+        gl.bindVertexArray(m.vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, m.buf);
+        gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+        gl.bindVertexArray(null);
+        lineModels.set(id, m);
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.buf);
+      gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+      m.count = positions.length / 3;
+      if (rgb) m.color = rgb;
+      render();
+    },
+    dropLineModel(id) {
+      const m = lineModels.get(id);
+      if (!m) return;
+      gl.deleteVertexArray(m.vao); gl.deleteBuffer(m.buf);
+      lineModels.delete(id);
+      render();
+    },
+    clearLineModels() { for (const id of [...lineModels.keys()]) this.dropLineModel(id); },
     setModelColor(id, rgb) { const m = models.get(id); if (m) { m.color = rgb; render(); } },
     setModelVisible(id, on) {
       const m = models.get(id);

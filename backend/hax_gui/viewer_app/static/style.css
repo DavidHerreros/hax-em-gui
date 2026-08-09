@@ -406,3 +406,8 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .model-ord:hover { color: var(--text); border-color: var(--accent, #2dd4bf); }
 .model-ord.on { border-style: solid; border-color: var(--accent, #2dd4bf);
   background: color-mix(in srgb, var(--accent, #2dd4bf) 18%, transparent); color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* map arithmetic row at the bottom of the models rail */
+.models-compute { display: flex; gap: 4px; padding: 8px; border-top: 1px solid rgba(128,128,128,0.25); align-items: center; }
+.models-compute select { min-width: 0; flex: 1; }
+.models-compute .btn { flex: none; }

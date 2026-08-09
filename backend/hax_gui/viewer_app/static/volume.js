@@ -37,10 +37,16 @@ uniform int uSteps;
 
 vec3 toWorld(vec3 ndc) { vec4 p = uInvVP * vec4(ndc, 1.0); return p.xyz / p.w; }
 
+// Clip slab in texture space [0,1]³ — voxels outside contribute nothing, which is
+// how ChimeraX's per-axis region clipping behaves for image renderings.
+uniform vec3 uClipLo;
+uniform vec3 uClipHi;
+
 // The density at a texture coordinate, blended if a morph is running. Both volumes
 // share a grid (the backend refuses to morph maps that do not), so one coordinate
 // samples both.
 float density(vec3 p) {
+  if (any(lessThan(p, uClipLo)) || any(greaterThan(p, uClipHi))) return 0.0;
   float a = texture(uVol, p).r;
   return uMix > 0.0 ? mix(a, texture(uVolB, p).r, uMix) : a;
 }
@@ -95,7 +101,8 @@ export function createVolume(canvas) {
   const uInvVP = u("uInvVP"), uEye = u("uEye"), uColor = u("uColor"), uBg = u("uBg"),
     uBoxLo = u("uBoxLo"), uBoxHi = u("uBoxHi"),
     uThreshold = u("uThreshold"), uGamma = u("uGamma"), uBright = u("uBright"), uMode = u("uMode"), uSteps = u("uSteps"),
-    uVol = u("uVol"), uVolB = u("uVolB"), uMix = u("uMix");
+    uVol = u("uVol"), uVolB = u("uVolB"), uMix = u("uMix"),
+    uClipLo = u("uClipLo"), uClipHi = u("uClipHi");
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -123,6 +130,7 @@ export function createVolume(canvas) {
   let threshold = 0.45, gamma = 1.4, bright = 1.2, mode = 0, steps = 160;
   let hasTex = false;
   let boxLo = [-1, -1, -1], boxHi = [1, 1, 1];   // model-space cube the grid fills; set per volume so it coincides with the surface mesh
+  let clipLo = [0, 0, 0], clipHi = [1, 1, 1];    // texture-space clip slab; full box = no clipping
   let grid = null;   // { nx, ny, nz } of the uploaded map; null until one is, which is what the camera tests
   let gridB = null;  // the morph's far end, same shape; null when not morphing
   let mix = 0;       // blend weight in [0,1]; 0 = `grid` alone
@@ -193,6 +201,7 @@ export function createVolume(canvas) {
     gl.uniform1f(uThreshold, threshold); gl.uniform1f(uGamma, gamma); gl.uniform1f(uBright, bright);
     gl.uniform1i(uMode, mode); gl.uniform1i(uSteps, steps);
     gl.uniform1f(uMix, gridB ? mix : 0);
+    gl.uniform3fv(uClipLo, clipLo); gl.uniform3fv(uClipHi, clipHi);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, tex); gl.uniform1i(uVol, 0);
     // Always bound, even when not morphing: sampling an incomplete texture unit is
     // undefined behaviour on some drivers even where the branch never reads it.
@@ -236,6 +245,8 @@ export function createVolume(canvas) {
     // image leaves its bounds — and so its centre of rotation — where they were.
     setThreshold(v) { threshold = Math.max(0, Math.min(1, v)); render(); },
     setGamma(g) { gamma = Math.max(0.2, g); render(); },
+    // Per-axis clip slab, texture space [0,1] in (x, y, z) order. Pass nulls to clear.
+    setClip(lo, hi) { clipLo = lo || [0, 0, 0]; clipHi = hi || [1, 1, 1]; render(); },
     setBrightness(b) { bright = Math.max(0.1, b); render(); },
     setColor(rgb) { color = rgb; render(); },
     setBackground(rgb) { bg = rgb; render(); },

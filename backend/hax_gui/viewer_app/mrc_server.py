@@ -287,6 +287,71 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
                                         step=step, full_size=full, offset=off),
                         media_type="application/octet-stream")
 
+    @app.post("/api/compute")
+    def compute(op: str = Query(...), a: int = Query(...), b: int = Query(...)) -> dict:
+        """Map arithmetic: add a derived model (A−B / A+B / A×B) to the scene.
+
+        Same-grid only, like the morph — blending mismatched grids voxel-wise would
+        be silently wrong. The result is written to a real temp .mrc (voxel size
+        stamped from A) so the download button works on it like on any other map.
+        """
+        ma, mb = scene.get(a), scene.get(b)
+        if ma.vol.shape != mb.vol.shape:
+            raise HTTPException(status_code=400,
+                                detail=f"maps are on different grids: {ma.vol.shape} vs {mb.vol.shape}")
+        ops = {"diff": (np.subtract, "−"), "sum": (np.add, "+"), "mult": (np.multiply, "×")}
+        if op not in ops:
+            raise HTTPException(status_code=400, detail=f"unknown op {op!r} (diff/sum/mult)")
+        fn, sym = ops[op]
+        vol = np.ascontiguousarray(fn(ma.vol, mb.vol), dtype=np.float32)
+
+        import tempfile
+        import mrcfile
+        stem = lambda m_: m_.name.rsplit(".", 1)[0]  # noqa: E731
+        name = f"{stem(ma)} {sym} {stem(mb)}.mrc"
+        tmp = tempfile.NamedTemporaryFile(suffix=".mrc", delete=False)
+        with mrcfile.new(tmp.name, overwrite=True) as f:
+            f.set_data(vol)
+            f.voxel_size = ma.voxel_size
+        model = _Model(len(scene.models), Path(tmp.name), vol)
+        model.name = name                      # display name, not the temp path
+        model.voxel_size, model.origin = ma.voxel_size, list(ma.origin)
+        scene.models.append(model)
+        return {"index": model.index, "name": name}
+
+    @app.get("/api/pdb")
+    def pdb(path: str = Query(...)) -> dict:
+        """Backbone trace of a PDB file: CA (protein) / P (nucleic) atoms per chain,
+        in Å. The frontend places it over the maps using voxel size + origin."""
+        p = Path(path).expanduser()
+        if not p.is_file():
+            raise HTTPException(status_code=404, detail=f"not found: {path}")
+        if p.stat().st_size > 200 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="file too large for a PDB")
+        chains: dict[str, list[list[float]]] = {}
+        try:
+            opener = __import__("gzip").open if p.name.endswith(".gz") else open
+            with opener(p, "rt", errors="replace") as f:
+                for line in f:
+                    if not line.startswith(("ATOM  ", "HETATM")):
+                        continue
+                    atom = line[12:16].strip()
+                    if atom not in ("CA", "P"):
+                        continue
+                    if line[16] not in (" ", "A"):     # altloc: keep the first conformer
+                        continue
+                    chain = line[21].strip() or "?"
+                    chains.setdefault(chain, []).append(
+                        [float(line[30:38]), float(line[38:46]), float(line[46:54])])
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=f"could not parse {p.name}: {exc}")
+        if not chains:
+            raise HTTPException(status_code=400,
+                                detail=f"no CA/P atoms in {p.name} — is it a PDB-format file?")
+        return {"name": p.name,
+                "chains": [{"id": cid, "xyz": [c for xyz in pts for c in xyz]}
+                           for cid, pts in chains.items()]}
+
     @app.get("/api/mrc")
     def mrc(m: int = Query(0)) -> FileResponse:
         model = scene.get(m)

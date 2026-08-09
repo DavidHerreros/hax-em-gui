@@ -45,6 +45,18 @@
           <span id="volctrls" style="display:none">
             <label>γ <input id="vgamma" type="range" min="0.3" max="3" step="0.1" value="1.4" title="Transfer-function gamma" /></label>
             <label>bright <input id="vbright" type="range" min="0.2" max="3" step="0.1" value="1.2" title="Brightness / opacity" /></label>
+            <label>clip
+              <select id="clipAxis" title="Clip the volume to a slab along this axis">
+                <option value="" selected>off</option>
+                <option value="0">X</option>
+                <option value="1">Y</option>
+                <option value="2">Z</option>
+              </select>
+            </label>
+            <span id="clipRanges" style="display:none">
+              <input id="clipLo" type="range" min="0" max="100" value="0" title="Slab start (%)" />
+              <input id="clipHi" type="range" min="0" max="100" value="100" title="Slab end (%)" />
+            </span>
           </span>
           <span id="slicectrls" style="display:none">
             <label>map
@@ -66,6 +78,8 @@
           <button id="reset" class="btn">Reset view</button>
           <button id="saveMap" class="btn" title="Save the current view as PNG">Save PNG</button>
           <button id="mrc" class="btn" title="Download this map as .mrc">.mrc</button>
+          <button id="exportMesh" class="btn" title="Export the active map's surface at the current contour as a binary STL (in Å)">.stl</button>
+          <button id="pdbBtn" class="btn" title="Overlay a PDB backbone trace (CA/P atoms), placed using the map's voxel size and origin">PDB…</button>
         </div>
       </div>
       <div class="hist-strip" id="histStrip">
@@ -96,6 +110,17 @@
             <button id="modelsCollapse" class="iconbtn" title="Hide the model panel">×</button>
           </div>
           <div class="models-list" id="modelsList"></div>
+          <!-- Map arithmetic: derive a new model from two same-grid maps. -->
+          <div class="models-compute" id="modelsCompute">
+            <select id="computeOp" title="Operation (applied voxel-wise; same grid only)">
+              <option value="diff" selected>A − B</option>
+              <option value="sum">A + B</option>
+              <option value="mult">A × B</option>
+            </select>
+            <select id="computeA" title="Map A"></select>
+            <select id="computeB" title="Map B"></select>
+            <button id="computeGo" class="btn" title="Add the result as a new model">=</button>
+          </div>
         </aside>
       </div>
       <!-- Morph strip. Below the canvas rather than in the rail: a scrubber wants width,
