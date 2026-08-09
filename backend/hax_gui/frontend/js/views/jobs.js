@@ -243,6 +243,11 @@ export function jobDisplayName(job) {
   return job.name || job.program;
 }
 
+// Two-click compare across the whole list (works across projects and pages):
+// "Select for compare" marks a run, "Compare with <it>" on any other run opens
+// the diff view. One pending mark, module-wide — sweeps are the main customer.
+let comparePick = null;   // { id, label }
+
 // Shared "⋮" options menu for a job row (Open / Rename / Delete).
 export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
   const btn = h("button", {
@@ -258,6 +263,14 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
       { label: "Rename", icon: icon("pencil", 15), onClick: rename },
       { label: "Copy to project…", icon: icon("copy", 15), onClick: copyToProject },
     );
+    if (comparePick && comparePick.id !== job.id) {
+      items.push({ label: `Compare with ${comparePick.label}`, icon: icon("grid", 15),
+        onClick: () => { const other = comparePick.id; comparePick = null; location.hash = `#/compare/${other}/${job.id}`; } });
+    }
+    items.push(comparePick && comparePick.id === job.id
+      ? { label: "Cancel compare", icon: icon("x", 15), onClick: () => { comparePick = null; } }
+      : { label: "Select for compare", icon: icon("grid", 15),
+          onClick: () => { comparePick = { id: job.id, label: jobDisplayName(job) }; } });
     // Straight into the run folder, without going through the detail view first.
     // A saved-but-never-run job has no folder yet.
     if (job.workdir) items.push({ label: "Output folder…", icon: icon("folderOpen", 15), onClick: () => openFileBrowser(job.workdir) });
