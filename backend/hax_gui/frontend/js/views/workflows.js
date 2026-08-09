@@ -112,6 +112,35 @@ export function WorkflowsView() {
   let catalog = [];
   let byName = {};
   let graph = { nodes: [], edges: [], orientation: rememberedOrientation() };
+
+  // ── undo/redo: debounced JSON snapshots of the graph ──────────────────────
+  // Every mutation site sets `dirty` and calls touchHistory(); 400 ms later the
+  // (deduped) state lands on the stack, so a drag collapses to one step.
+  let history = [], histIdx = -1, histTimer = null;
+  const snapshot = () => JSON.stringify({ nodes: graph.nodes, edges: graph.edges });
+  function seedHistory() { clearTimeout(histTimer); history = [snapshot()]; histIdx = 0; }
+  function touchHistory() {
+    clearTimeout(histTimer);
+    histTimer = setTimeout(() => {
+      const snap = snapshot();
+      if (history[histIdx] === snap) return;
+      history = history.slice(0, histIdx + 1);
+      history.push(snap);
+      if (history.length > 100) history.shift();
+      histIdx = history.length - 1;
+    }, 400);
+  }
+  function timeTravel(dir) {
+    clearTimeout(histTimer);                    // a pending push would clobber the jump
+    const to = histIdx + dir;
+    if (to < 0 || to >= history.length) { flash(dir < 0 ? "Nothing to undo." : "Nothing to redo.", "muted"); return; }
+    histIdx = to;
+    const g = JSON.parse(history[histIdx]);
+    graph.nodes = g.nodes; graph.edges = g.edges;
+    selected = null; selectedSet.clear();
+    dirty = true;
+    renderNodes(); renderInspector();
+  }
   let wf = null;            // saved workflow record
   let selected = null;      // primary selected node id (drives the inspector)
   const selectedSet = new Set();   // multi-selection (run / move together)
@@ -140,7 +169,7 @@ export function WorkflowsView() {
   // (steps appended to the live queue); otherwise a Run split button. Queued steps
   // start as soon as their device has a free slot, so several can be running at once.
   const nameInput = h("input", { class: "wf-name", placeholder: "Workflow name", value: "" });
-  nameInput.addEventListener("input", () => { dirty = true; });
+  nameInput.addEventListener("input", () => { dirty = true, touchHistory(); });
   const wfSelect = h("select", { class: "wf-select", title: "Open a saved workflow" });
   wfSelect.addEventListener("change", () => openWorkflow(wfSelect.value || null));
   const statusEl = h("span", { class: "wf-status muted" }, "");
@@ -214,7 +243,7 @@ export function WorkflowsView() {
   }
   function viewMenuItems() {
     const items = [
-      { label: "Tidy — arrange by dependency", icon: icon("sliders", 15), onClick: () => { autoLayout(); dirty = true; } },
+      { label: "Tidy — arrange by dependency", icon: icon("sliders", 15), onClick: () => { autoLayout(); dirty = true, touchHistory(); } },
       { label: horiz() ? "Switch to vertical" : "Switch to horizontal", icon: icon(horiz() ? "chevronRight" : "arrowRight", 15), onClick: toggleOrientation },
       { label: "Center in view", icon: icon("orbit", 15), onClick: centerView },
       { label: minimapOn ? "Hide overview map" : "Show overview map", icon: icon("grid", 15), onClick: toggleMinimap },
@@ -533,7 +562,7 @@ export function WorkflowsView() {
     const id = "n" + (nodeSeq++);
     const node = { id, program, args: {}, gpu: "0", name: "", labels: [], x, y };
     graph.nodes.push(node);
-    selectOnly(id); dirty = true;
+    selectOnly(id); dirty = true, touchHistory();
     renderNodes(); renderInspector();
     return node;
   }
@@ -582,7 +611,7 @@ export function WorkflowsView() {
     graph.edges = graph.edges.filter((e) => !set.has(e.from) && !set.has(e.to));
     for (const id of set) { selectedSet.delete(id); if (runState) delete runState[id]; }
     if (set.has(selected)) selected = selectedSet.size ? [...selectedSet][0] : null;
-    dirty = true; renderNodes(); renderInspector();
+    dirty = true, touchHistory(); renderNodes(); renderInspector();
 
     // delete the backing jobs (best-effort: an active job can't be deleted, so it
     // is reported rather than silently skipped)
@@ -657,7 +686,7 @@ export function WorkflowsView() {
     }
     selectedSet.clear(); for (const id of made) selectedSet.add(id);
     selected = made[made.length - 1];
-    dirty = true; renderNodes(); renderInspector();
+    dirty = true, touchHistory(); renderNodes(); renderInspector();
     flash(made.length === 1 ? "Step duplicated — Save to keep it." : `${made.length} steps duplicated — Save to keep them.`, "muted");
   }
   const isMultiField = (program, field) => (byName[program]?.bindable_multi || []).includes(field);
@@ -674,9 +703,9 @@ export function WorkflowsView() {
     }
     graph.edges.push({ id: "e" + (edgeSeq++), from: fromId, to: toId, field, kind });
     inheritParams(fromId, toId, kind);
-    dirty = true; renderNodes(); renderInspector();
+    dirty = true, touchHistory(); renderNodes(); renderInspector();
   }
-  function removeEdge(id) { graph.edges = graph.edges.filter((e) => e.id !== id); dirty = true; renderNodes(); renderInspector(); }
+  function removeEdge(id) { graph.edges = graph.edges.filter((e) => e.id !== id); dirty = true, touchHistory(); renderNodes(); renderInspector(); }
 
   // When a node's model output feeds another node of the same moded program
   // (train -> predict), copy the source's parameters into the target (mode aside),
@@ -1036,7 +1065,7 @@ export function WorkflowsView() {
       }
       redrawWires();
     } else if (drag && drag.kind === "node") {
-      dirty = true;
+      dirty = true, touchHistory();
     }
     drag = null;
   }
@@ -1065,14 +1094,14 @@ export function WorkflowsView() {
     }
     inspBody.appendChild(h("div", { class: "wf-insp-head" }, h("strong", null, n.program)));
     const nameI = h("input", { class: "wf-field", placeholder: "step name (optional)", value: n.name || "" });
-    nameI.addEventListener("input", () => { n.name = nameI.value; dirty = true; const t = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"] .wf-node-title`); if (t) t.textContent = n.name || n.program; });
+    nameI.addEventListener("input", () => { n.name = nameI.value; dirty = true, touchHistory(); const t = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"] .wf-node-title`); if (t) t.textContent = n.name || n.program; });
     // A step that has already run owns a job, and that job holds the name the Jobs
     // view shows — and the one a project canvas reads back on every load. Renaming
     // only the node would be undone by that re-sync unless the step were run again,
     // so commit the new name to the job as well (same as the label chips below).
     nameI.addEventListener("change", () => commitNodeName(n, nameI.value));
     const gpuI = h("input", { class: "wf-field", placeholder: "GPU (e.g. 0, empty = CPU)", value: n.gpu ?? "0" });
-    gpuI.addEventListener("input", () => { n.gpu = gpuI.value; dirty = true; });
+    gpuI.addEventListener("input", () => { n.gpu = gpuI.value; dirty = true, touchHistory(); });
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "Name", nameI));
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "GPU", gpuI));
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "Labels",
@@ -1080,7 +1109,7 @@ export function WorkflowsView() {
         // Persist to the linked job whether the link is on the node (project
         // canvas) or only in the run mapping (a standalone workflow that has run).
         jobId: n.job_id || (runState && runState[n.id] && runState[n.id].job_id),
-        onChange: () => { dirty = true; const el = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"]`); if (el) renderNodes(); },
+        onChange: () => { dirty = true, touchHistory(); const el = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"]`); if (el) renderNodes(); },
       })));
 
     const schema = schemaCache[n.program];
@@ -1097,7 +1126,7 @@ export function WorkflowsView() {
         const numeric = f.type === "integer" || f.type === "number";
         if (v === "" || v == null) delete n.args[name];
         else n.args[name] = numeric && v !== "" ? Number(v) : v;
-        dirty = true;
+        dirty = true, touchHistory();
       },
       // A wired input is fed by the graph, so it shows its source(s) instead of
       // an editable control.
@@ -1136,7 +1165,7 @@ export function WorkflowsView() {
   async function toggleOrientation() {
     graph.orientation = horiz() ? "vertical" : "horizontal";
     rememberOrientation(graph.orientation);
-    autoLayout(); dirty = true;
+    autoLayout(); dirty = true, touchHistory();
     if (wf) await save();
   }
 
@@ -1448,7 +1477,7 @@ export function WorkflowsView() {
       let y = refs.length ? Math.min(...refs.map((n) => n.y)) : 40;
       for (const n of unknown) { n.x = x1 + 80; n.y = y; y += nodeHeight(n) + 26; }
     }
-    dirty = true; renderNodes(); centerView();
+    dirty = true, touchHistory(); renderNodes(); centerView();
     flash(unknown.length ? `Restored the pinned layout; placed ${unknown.length} new node(s) alongside it.` : "Restored the pinned layout.", "muted");
   }
 
@@ -1534,6 +1563,7 @@ export function WorkflowsView() {
   // Adopt a server graph into local state (keeping the id counters ahead).
   function adoptGraph(g) {
     graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || graph.orientation || rememberedOrientation(), savedLayout: g.savedLayout || null };
+    seedHistory();
     nodeSeq = Math.max(1, ...graph.nodes.map((n) => +(n.id.replace(/\D/g, "")) || 0)) + 1;
     edgeSeq = Math.max(1, ...graph.edges.map((e) => +((e.id || "").replace(/\D/g, "")) || 0)) + 1;
   }
@@ -1578,7 +1608,7 @@ export function WorkflowsView() {
     if (graph.nodes.length) rememberViewport();
     selectedSet.clear();
     if (!id) {
-      wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; nameInput.value = "";
+      wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; nameInput.value = ""; seedHistory();
       wfSelect.value = ""; rememberWorkflow(null);
       renderNodes(); restoreViewport("");
       renderInspector(); syncActions(); flash("New workflow.", "muted"); return;
@@ -1619,7 +1649,13 @@ export function WorkflowsView() {
   function onKey(e) {
     const t = e.target;
     if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+      e.preventDefault();
+      timeTravel(e.shiftKey ? 1 : -1);
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
+      e.preventDefault();
+      timeTravel(1);
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
       e.preventDefault();
       duplicateNodes([...selectedSet]);
     } else if ((e.key === "Delete" || e.key === "Backspace") && selectedSet.size) {
