@@ -27,7 +27,8 @@ const ctrl = {
   currentChatId: null,     // persisted chat id (null = unsaved new chat)
   currentChatProject: "",  // project_id of the active chat (scopes the run picker)
   newChatProject: "",      // project_id for the next new chat
-  attachedRun: null,       // {job_id,label,has_*} attached-run context
+  attachedRun: null,       // {job_id,label,has_*} attached-run context (primary: full artifacts)
+  extraRuns: [],           // up to 2 more runs: measured facts + parameter diff only
   grounded: true,
   // live turn state (an in-flight answer)
   streaming: false,
@@ -96,6 +97,7 @@ function sendMessage(text) {
   ctrl.liveError = null;
   const payload = { messages: ctrl.history, grounded: ctrl.grounded, turn: ctrl.turn };
   if (ctrl.attachedRun) payload.run_job_id = ctrl.attachedRun.job_id;
+  if (ctrl.extraRuns.length) payload.extra_run_job_ids = ctrl.extraRuns.map((r) => r.job_id);
   ensureSocket().send(payload);
   if (ctrl.hooks) ctrl.hooks.onSend();
 }
@@ -278,6 +280,18 @@ export function AssistantView() {
         reportBtn,
         h("button", { class: "chat-item-btn", title: "Detach run", onclick: detachRun }, icon("x", 14)));
       attachRow.appendChild(chip);
+      // Extra runs (cross-run reasoning): facts + parameter diff, no artifacts.
+      ctrl.extraRuns.forEach((er, i) => {
+        attachRow.appendChild(h("div", { class: "chat-attach-chip extra", title: "Compared against the primary run: the model sees its measured facts and the flags that differ" },
+          icon("grid", 13),
+          h("span", { class: "chat-attach-name" }, er.label),
+          h("button", { class: "chat-item-btn", title: "Detach", onclick: () => { ctrl.extraRuns.splice(i, 1); renderAttachRow(); } }, icon("x", 13))));
+      });
+      if (ctrl.extraRuns.length < 2) {
+        attachRow.appendChild(h("button", { class: "chat-attach-btn",
+          title: "Attach another run to compare against — the model gets its measured facts and the parameter differences",
+          onclick: openRunPicker }, icon("plus", 13), "Compare with…"));
+      }
       return;
     }
     attachRow.appendChild(h("span", { class: "muted chat-attach-lead" }, icon("paperclip", 13), "Run"));
@@ -288,12 +302,20 @@ export function AssistantView() {
     }, icon("paperclip", 13), "Attach a run…"));
   }
   async function attachJob(id) {
-    if (!id) { ctrl.attachedRun = null; renderAttachRow(); return; }
-    try { ctrl.attachedRun = await api.assistantRunPreview(id); }
-    catch { ctrl.attachedRun = { job_id: id, label: "run", has_metrics: false, has_latents: false, has_volumes: false }; }
+    if (!id) { ctrl.attachedRun = null; ctrl.extraRuns = []; renderAttachRow(); return; }
+    let preview;
+    try { preview = await api.assistantRunPreview(id); }
+    catch { preview = { job_id: id, label: "run", has_metrics: false, has_latents: false, has_volumes: false }; }
+    if (ctrl.attachedRun && ctrl.attachedRun.job_id !== id) {
+      // A second/third pick becomes a comparison run rather than replacing the primary.
+      if (!ctrl.extraRuns.some((r) => r.job_id === id) && ctrl.extraRuns.length < 2) ctrl.extraRuns.push(preview);
+    } else {
+      ctrl.attachedRun = preview;
+    }
     renderAttachRow();
   }
-  function detachRun() { ctrl.attachedRun = null; renderAttachRow(); }
+  // Detaching the primary promotes the first comparison run (its artifacts load next turn).
+  function detachRun() { ctrl.attachedRun = ctrl.extraRuns.shift() || null; renderAttachRow(); }
   async function downloadReport() {
     if (!ctrl.attachedRun || reportBusy) return;
     reportBusy = true; renderAttachRow();
@@ -662,6 +684,7 @@ export function AssistantView() {
       ctrl.currentChatId = c.id;
       ctrl.currentChatProject = c.project_id || "";
       ctrl.attachedRun = null;
+      ctrl.extraRuns = [];
       ctrl.liveActions = [];
       ctrl.history = Array.isArray(c.messages) ? c.messages.slice() : [];
       renderConversation();
@@ -674,6 +697,7 @@ export function AssistantView() {
     ctrl.currentChatId = null;
     ctrl.currentChatProject = ctrl.newChatProject || "";
     ctrl.attachedRun = null;
+    ctrl.extraRuns = [];
     ctrl.liveActions = [];
     ctrl.history = [];
     renderConversation();

@@ -256,6 +256,11 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                 if job is not None:
                     run = _resolve_run_artifacts(job)
                     run["job_id"] = run_job_id   # so a proposed action can target it
+            # Extra attached runs (cross-run reasoning): they contribute measured
+            # facts + a parameter diff against the primary, not full artifacts —
+            # the primary stays the run whose landscape/metrics the session loads.
+            extra_jobs = [j for j in (manager.get(i) for i in (req.get("extra_run_job_ids") or [])[:2])
+                          if j is not None and j["id"] != run_job_id]
             allow_actions = assistant_actions.actions_enabled()
 
             # Run the blocking LLM stream off the event loop, funnel events back.
@@ -265,7 +270,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             cancel = threading.Event()
 
             def _worker(messages=messages, grounded=grounded, run=run, job=job if run_job_id else None,
-                        allow_actions=allow_actions, cancel=cancel, out=out) -> None:
+                        extra_jobs=extra_jobs, allow_actions=allow_actions, cancel=cancel, out=out) -> None:
                 # EVERYTHING inside the try, including building the generator:
                 # session construction (docs index load, embedder init) can
                 # raise, and with it outside the try neither ("error") nor the
@@ -280,6 +285,14 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                             run["facts"] = _run_facts(job)
                         except Exception:  # noqa: BLE001 - facts are optional
                             pass
+                        # Cross-run grounding: each extra run adds its own measured
+                        # facts and a deterministic parameter diff vs the primary,
+                        # so "why did run B beat run A" is answered from data.
+                        for ej in extra_jobs:
+                            try:
+                                run["facts"] = (run.get("facts") or "") + "\n\n" + _extra_run_facts(job, ej)
+                            except Exception:  # noqa: BLE001
+                                pass
                     gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run,
                                                          allow_actions=allow_actions)
                     for ev in gen:
@@ -406,10 +419,12 @@ def delete_chat(cid: str) -> dict[str, Any]:
 
 
 
-def _run_facts(job: dict[str, Any]) -> str:
+def _run_facts(job: dict[str, Any], include_gpus: bool = True) -> str:
     """Measured facts about the attached run's data and this machine's GPUs,
     for the model to ground parameter advice in (P6.2). Deterministic and
-    cheap: metadata heads and MRC headers only, plus one nvidia-smi query."""
+    cheap: metadata heads and MRC headers only, plus one nvidia-smi query.
+    `include_gpus=False` for extra attached runs — the GPUs are machine-global
+    and repeating them per run is noise."""
     lines: list[str] = []
     args = job.get("args") or {}
     for field in ("md", "vol", "mask"):
@@ -428,13 +443,35 @@ def _run_facts(job: dict[str, Any]) -> str:
         if "columns" in facts:
             bits.append(f"columns={','.join(facts['columns'][:12])}")
         lines.append("  ".join(bits))
-    for g in gpus_mod.list_gpus():
-        used, total = g.get("memory_used_mb"), g.get("memory_total_mb")
-        free = (total - used) if (used is not None and total is not None) else None
-        lines.append(f"GPU {g.get('index')}: {g.get('name')}"
-                     + (f", {free} MB free of {total} MB" if free is not None else ""))
+    if include_gpus:
+        for g in gpus_mod.list_gpus():
+            used, total = g.get("memory_used_mb"), g.get("memory_total_mb")
+            free = (total - used) if (used is not None and total is not None) else None
+            lines.append(f"GPU {g.get('index')}: {g.get('name')}"
+                         + (f", {free} MB free of {total} MB" if free is not None else ""))
     if job.get("gpu"):
         lines.append(f"This run is pinned to GPU {job['gpu']}.")
+    return "\n".join(lines)
+
+
+def _extra_run_facts(primary: dict[str, Any], other: dict[str, Any]) -> str:
+    """Cross-run grounding block for an additionally attached run: its identity
+    and outcome, the flags on which it differs from the primary run (the
+    question multi-attach exists to answer), and its own measured data facts."""
+    label = other.get("name") or other["program"]
+    lines = [f"=== ALSO ATTACHED RUN: {label} ({other['program']}, status {other['status']}"
+             + (f", exit {other['return_code']}" if other.get("return_code") is not None else "") + ") ==="]
+    pa, pb = primary.get("args") or {}, other.get("args") or {}
+    diffs = [f"--{k}: {pa.get(k, '(unset)')} vs {pb.get(k, '(unset)')}"
+             for k in sorted(set(pa) | set(pb)) if str(pa.get(k)) != str(pb.get(k))]
+    lines.append("Parameter differences vs the primary run: "
+                 + ("; ".join(diffs[:25]) if diffs else "none — identical arguments."))
+    pkgs = (other.get("provenance") or {}).get("packages")
+    if pkgs:
+        lines.append("Recorded versions: " + ", ".join(f"{k} {v}" for k, v in pkgs.items()))
+    facts = _run_facts(other, include_gpus=False)
+    if facts:
+        lines.append(facts)
     return "\n".join(lines)
 
 

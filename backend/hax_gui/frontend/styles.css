@@ -1470,3 +1470,6 @@ body.vwin-dragging iframe { pointer-events: none; }
 
 /* job-detail page tabs: small count badge on the Files tab */
 .tab-count { display: inline-block; min-width: 16px; padding: 0 4px; margin-left: 6px; border-radius: 8px; background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); font-size: 10px; text-align: center; line-height: 16px; }
+
+/* extra (comparison) run chips in the chat attach row */
+.chat-attach-chip.extra { opacity: 0.85; font-size: 12px; }
