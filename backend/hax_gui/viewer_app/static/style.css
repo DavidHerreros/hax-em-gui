@@ -236,7 +236,9 @@ input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid v
 .hist-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; flex-shrink: 0; }
 /* min-width:0 lets the canvas shrink below its intrinsic 300px width; without it
    the flex item forces the pane wider than the window (horizontal scrollbar). */
-#hist { flex: 1; width: 0; min-width: 0; height: 42px; cursor: ew-resize; }
+/* Scoped to the strip: the map viewer's rail histogram (canvas.hist in mrc.html)
+   sizes itself with the .hist class, and this id rule's width:0 was zeroing it. */
+.hist-strip #hist { flex: 1; width: 0; min-width: 0; height: 42px; cursor: ew-resize; }
 
 /* ── morph bar ── */
 .morph-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-height: 44px; padding: 6px 12px; border-top: 1px solid var(--border); background: var(--panel); flex-shrink: 0; font-size: 13px; }

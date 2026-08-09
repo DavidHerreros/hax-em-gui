@@ -860,6 +860,9 @@ const SEC_KEY = "hax_mrc_sections";
       const cur = readJSON(SEC_KEY) || {};
       cur[k] = sec.classList.contains("open");
       writeJSON(SEC_KEY, cur);
+      // Canvases inside (the contour histogram) size themselves from their client
+      // box, which was 0 while collapsed — give them a layout pass to redraw.
+      if (cur[k]) window.dispatchEvent(new Event("resize"));
     });
   }
 })();
