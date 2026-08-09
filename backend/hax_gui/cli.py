@@ -218,32 +218,57 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_unmanaged(host: str, port: int, prefix: str) -> None:
+    """Say plainly that a server hax-gui does not own is answering on the port.
+
+    A server launched by hand (``uvicorn …``, an IDE, an old shell) never enters
+    the state file, so ``stop`` cannot reach it — and reporting "stopped" while
+    the GUI still answers reads as a broken stop. Name the situation and how to
+    resolve it instead."""
+    url = f"http://{_connect_host(host)}:{port}"
+    print(_warn(prefix) + f" at {url} — it was started outside " + _bold("hax-gui start") +
+          " (e.g. `uvicorn` by hand), so hax-gui does not know its pid.")
+    print("Find and stop it with: " + _bold(f"ss -tlnp | grep ':{port} '") +
+          "  then kill that pid; " + _bold("hax-gui start") + " will manage the next one.")
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     running = _running()
     if not running:
+        # Nothing on record — but is the port still serving? Claiming "not
+        # running" while the GUI answers is exactly the confusing case.
+        if _health(DEFAULT_HOST, DEFAULT_PORT):
+            _warn_unmanaged(DEFAULT_HOST, DEFAULT_PORT, "No server on record, but one is answering")
+            return 1
         print(_warn("hax-gui is not running."))
         return 0
     pid = running["pid"]
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        _clear_state()
-        print(_warn("hax-gui is not running."))
-        return 0
-
-    # Wait for a graceful exit, then force-kill.
-    for _ in range(40):   # ~10s
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.25)
-    else:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        pid = None
+    if pid is not None:
+        # Wait for a graceful exit, then force-kill.
+        for _ in range(40):   # ~10s
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.25)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     _clear_state()
-    print(_ok("hax-gui stopped.") + f" (pid {pid})")
+    # The tracked server is gone; make sure nothing ELSE kept the address before
+    # declaring victory (an unmanaged twin holding the port was reported as a
+    # successful stop, with the GUI still reachable in the browser).
+    host, port = running.get("host", DEFAULT_HOST), running.get("port", DEFAULT_PORT)
+    time.sleep(0.3)   # let the dying server actually release the socket
+    if _health(host, port):
+        _warn_unmanaged(host, port, f"Stopped pid {running['pid']}, but another server still answers")
+        return 1
+    print(_ok("hax-gui stopped.") + (f" (pid {pid})" if pid is not None else ""))
     return 0
 
 
@@ -264,6 +289,10 @@ def cmd_restart(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     running = _running()
     if not running:
+        if _health(DEFAULT_HOST, DEFAULT_PORT):
+            print(_warn("● hax-gui has no server on record, but one is answering."))
+            _warn_unmanaged(DEFAULT_HOST, DEFAULT_PORT, "Unmanaged server")
+            return 1
         print(_err("● hax-gui is not running."))
         print("Start it with " + _bold("hax-gui start") + ".")
         return 1
