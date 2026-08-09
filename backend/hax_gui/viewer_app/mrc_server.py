@@ -317,6 +317,52 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
                                         step=step, full_size=full, offset=off),
                         media_type="application/octet-stream")
 
+    @app.get("/api/morph/export")
+    def morph_export(seq: str = Query(...), per: int = Query(24)) -> FileResponse:
+        """Every frame of a morph as real full-resolution ``.mrc`` files, zipped.
+
+        For figures and analyses made outside the GUI: the in-app recording is a
+        webm of the rendered view, whereas this is the density itself, one map per
+        frame, on the maps' own grid with the voxel size stamped.
+        """
+        try:
+            idx = [int(s) for s in seq.split(",") if s.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="seq must be comma-separated model indices")
+        if len(idx) < 2:
+            raise HTTPException(status_code=400, detail="a morph needs at least two maps")
+        mods = [scene.get(i) for i in idx]
+        if len({m.vol.shape for m in mods}) != 1:
+            raise HTTPException(status_code=400, detail="cannot morph maps on different grids")
+        per = int(max(2, min(120, per)))
+        n = (len(mods) - 1) * per + 1
+        if n * mods[0].vol.nbytes > 2 * 1024 ** 3:
+            raise HTTPException(status_code=400,
+                                detail=f"{n} frames of this box would exceed 2 GB — reduce frames per leg")
+
+        import tempfile
+        import zipfile
+
+        import mrcfile
+
+        pad = max(3, len(str(n - 1)))
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        frame = tempfile.NamedTemporaryFile(suffix=".mrc", delete=False)
+        try:
+            with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as z:
+                for k in range(n):
+                    leg = min(k // per, len(mods) - 2)
+                    t = (k - leg * per) / per
+                    blend = np.ascontiguousarray(
+                        (1.0 - t) * mods[leg].vol + t * mods[leg + 1].vol, dtype=np.float32)
+                    with mrcfile.new(frame.name, overwrite=True) as f:
+                        f.set_data(blend)
+                        f.voxel_size = mods[0].voxel_size
+                    z.write(frame.name, arcname=f"morph_{k:0{pad}d}.mrc")
+        finally:
+            os.unlink(frame.name)
+        return FileResponse(tmp.name, media_type="application/zip", filename="morph_frames.zip")
+
     @app.post("/api/compute")
     def compute(op: str = Query(...), a: int = Query(...), b: int = Query(...)) -> dict:
         """Map arithmetic: add a derived model (A−B / A+B / A×B) to the scene.
@@ -329,58 +375,61 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
         if ma.vol.shape != mb.vol.shape:
             raise HTTPException(status_code=400,
                                 detail=f"maps are on different grids: {ma.vol.shape} vs {mb.vol.shape}")
+        stem = lambda m_: m_.name.rsplit(".", 1)[0]  # noqa: E731
+        if op == "diffpm":
+            # Two-sided difference: the (+) model is the density A gained over B, the
+            # (−) model the density it lost (i.e. B − A). Each is an ordinary map
+            # contoured at a positive level, which is exactly the green/red pair a
+            # difference-map figure uses — the frontend colours them accordingly.
+            plus = _add_derived(scene, ma.vol - mb.vol, f"{stem(ma)} − {stem(mb)} (+).mrc", ma)
+            minus = _add_derived(scene, mb.vol - ma.vol, f"{stem(ma)} − {stem(mb)} (−).mrc", ma)
+            return {"index": plus.index, "name": plus.name, "pair": [plus.index, minus.index]}
         ops = {"diff": (np.subtract, "−"), "sum": (np.add, "+"), "mult": (np.multiply, "×")}
         if op not in ops:
-            raise HTTPException(status_code=400, detail=f"unknown op {op!r} (diff/sum/mult)")
+            raise HTTPException(status_code=400, detail=f"unknown op {op!r} (diff/diffpm/sum/mult)")
         fn, sym = ops[op]
-        vol = np.ascontiguousarray(fn(ma.vol, mb.vol), dtype=np.float32)
-
-        import tempfile
-        import mrcfile
-        stem = lambda m_: m_.name.rsplit(".", 1)[0]  # noqa: E731
-        name = f"{stem(ma)} {sym} {stem(mb)}.mrc"
-        tmp = tempfile.NamedTemporaryFile(suffix=".mrc", delete=False)
-        with mrcfile.new(tmp.name, overwrite=True) as f:
-            f.set_data(vol)
-            f.voxel_size = ma.voxel_size
-        model = _Model(len(scene.models), Path(tmp.name), vol)
-        model.name = name                      # display name, not the temp path
-        model.voxel_size, model.origin = ma.voxel_size, list(ma.origin)
-        scene.models.append(model)
-        return {"index": model.index, "name": name}
+        model = _add_derived(scene, fn(ma.vol, mb.vol), f"{stem(ma)} {sym} {stem(mb)}.mrc", ma)
+        return {"index": model.index, "name": model.name}
 
     @app.get("/api/pdb")
     def pdb(path: str = Query(...)) -> dict:
         """Backbone trace of a PDB file: CA (protein) / P (nucleic) atoms per chain,
         in Å. The frontend places it over the maps using voxel size + origin."""
-        p = Path(path).expanduser()
-        if not p.is_file():
-            raise HTTPException(status_code=404, detail=f"not found: {path}")
-        if p.stat().st_size > 200 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="file too large for a PDB")
-        chains: dict[str, list[list[float]]] = {}
-        try:
-            opener = __import__("gzip").open if p.name.endswith(".gz") else open
-            with opener(p, "rt", errors="replace") as f:
-                for line in f:
-                    if not line.startswith(("ATOM  ", "HETATM")):
-                        continue
-                    atom = line[12:16].strip()
-                    if atom not in ("CA", "P"):
-                        continue
-                    if line[16] not in (" ", "A"):     # altloc: keep the first conformer
-                        continue
-                    chain = line[21].strip() or "?"
-                    chains.setdefault(chain, []).append(
-                        [float(line[30:38]), float(line[38:46]), float(line[46:54])])
-        except (ValueError, OSError) as exc:
-            raise HTTPException(status_code=400, detail=f"could not parse {p.name}: {exc}")
-        if not chains:
-            raise HTTPException(status_code=400,
-                                detail=f"no CA/P atoms in {p.name} — is it a PDB-format file?")
+        p, chains = _read_backbone(path)
         return {"name": p.name,
                 "chains": [{"id": cid, "xyz": [c for xyz in pts for c in xyz]}
                            for cid, pts in chains.items()]}
+
+    @app.get("/api/fit")
+    def fit(path: str = Query(...), m: int = Query(0)) -> dict:
+        """How well the model sits in the map: the density (in σ units) sampled at
+        each backbone atom. A cheap, honest sanity number — mean σ well above 0
+        and most atoms above 1σ means the fit is at least plausible; it is not a
+        cross-correlation refinement score and does not pretend to be."""
+        model = scene.get(m)
+        _, chains = _read_backbone(path)
+        xyz = np.array([pt for pts in chains.values() for pt in pts], dtype=np.float64)
+        vs = model.voxel_size or 1.0
+        org = np.asarray(model.origin, dtype=np.float64)
+        # Å -> voxel indices; the volume is (z, y, x) so the sample coordinates flip.
+        vox = (xyz - org[None, :]) / vs
+        from scipy.ndimage import map_coordinates
+        vals = map_coordinates(model.vol, [vox[:, 2], vox[:, 1], vox[:, 0]],
+                               order=1, mode="constant", cval=np.nan)
+        inside = np.isfinite(vals)
+        n_in = int(inside.sum())
+        if n_in == 0:
+            raise HTTPException(status_code=400,
+                                detail="no atoms fall inside this map — wrong map, or the "
+                                       "model is in a different coordinate frame")
+        sig = (vals[inside] - model.stats["mean"]) / (model.stats["std"] or 1.0)
+        return {
+            "n_atoms": int(len(xyz)),
+            "n_inside": n_in,
+            "mean_sigma": round(float(sig.mean()), 2),
+            "median_sigma": round(float(np.median(sig)), 2),
+            "frac_above_1sigma": round(float((sig > 1.0).mean()), 3),
+        }
 
     @app.get("/api/mrc")
     def mrc(m: int = Query(0)) -> FileResponse:
@@ -397,6 +446,57 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
     if STATIC.is_dir():
         app.mount("/", StaticFiles(directory=str(STATIC), html=False), name="static")
     return app
+
+
+def _read_backbone(path: str) -> tuple[Path, dict[str, list[list[float]]]]:
+    """CA/P atoms per chain from a PDB file, in Å — shared by the overlay and the
+    fit score so the two always agree on which atoms they mean."""
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail=f"not found: {path}")
+    if p.stat().st_size > 200 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="file too large for a PDB")
+    chains: dict[str, list[list[float]]] = {}
+    try:
+        opener = __import__("gzip").open if p.name.endswith(".gz") else open
+        with opener(p, "rt", errors="replace") as f:
+            for line in f:
+                if not line.startswith(("ATOM  ", "HETATM")):
+                    continue
+                atom = line[12:16].strip()
+                if atom not in ("CA", "P"):
+                    continue
+                if line[16] not in (" ", "A"):     # altloc: keep the first conformer
+                    continue
+                chain = line[21].strip() or "?"
+                chains.setdefault(chain, []).append(
+                    [float(line[30:38]), float(line[38:46]), float(line[46:54])])
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=f"could not parse {p.name}: {exc}")
+    if not chains:
+        raise HTTPException(status_code=400,
+                            detail=f"no CA/P atoms in {p.name} — is it a PDB-format file?")
+    return p, chains
+
+
+def _add_derived(scene: _Scene, vol: np.ndarray, name: str, like: _Model) -> _Model:
+    """Append a computed grid as a new model, backed by a real temp .mrc so the
+    download button works on it like on any loaded map. Scale is inherited from
+    the map it was derived from."""
+    import tempfile
+
+    import mrcfile
+
+    vol = np.ascontiguousarray(vol, dtype=np.float32)
+    tmp = tempfile.NamedTemporaryFile(suffix=".mrc", delete=False)
+    with mrcfile.new(tmp.name, overwrite=True) as f:
+        f.set_data(vol)
+        f.voxel_size = like.voxel_size
+    model = _Model(len(scene.models), Path(tmp.name), vol)
+    model.name = name                      # display name, not the temp path
+    model.voxel_size, model.origin = like.voxel_size, list(like.origin)
+    scene.models.append(model)
+    return model
 
 
 def _morph_pair(scene: _Scene, a: int, b: int) -> tuple[np.ndarray, np.ndarray]:
