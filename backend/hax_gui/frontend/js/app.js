@@ -11,6 +11,7 @@ import { startNotifications } from "./notify.js";
 import { loadProgramGroups } from "./programGroups.js";
 import { poller } from "./poller.js";
 import { mountViewerWindow } from "./views/viewerWindow.js";
+import { initPalette } from "./commandPalette.js";
 import { promptModal } from "./views/promptModal.js";
 import { HomeView } from "./views/home.js";
 import { ProjectsView } from "./views/projects.js";
@@ -169,3 +170,4 @@ poller(async () => {
 }, 10000);
 loadProgramGroups();   // derive program groupings (moded / predict-latents) from the backend
 mountViewerWindow();   // floating window that hosts all opened viewers as tabs
+initPalette();         // Ctrl-K / Cmd-K: jump to any view, program, project or run
