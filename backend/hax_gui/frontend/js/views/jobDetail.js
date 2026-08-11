@@ -122,8 +122,45 @@ export function JobDetailView(params) {
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
     } catch (err) { mount(actionErr, errorBox(err)); }
   }
+
+  // ── load full log: the WS snapshot / windowed read caps at 16 MB, this fetches
+  // the whole file for whichever stream is showing. Only shown once that stream's
+  // been flagged truncated (via the snapshot's `truncated`/`sizes` maps).
+  const truncated = { out: false, err: false };
+  const sizes = { out: 0, err: 0 };
+  const loadFullBtn = h("button", { class: "btn small", style: { display: "none" },
+    onclick: loadFullLog }, "Load full log");
+  function updateLoadFullBtn() {
+    if (truncated[activeStream]) {
+      loadFullBtn.style.display = "";
+      loadFullBtn.disabled = false;
+      loadFullBtn.textContent = `Load full log (${Math.round(sizes[activeStream] / 1e6)} MB)`;
+    } else {
+      loadFullBtn.style.display = "none";
+    }
+  }
+  async function loadFullLog() {
+    const stream = activeStream;
+    loadFullBtn.disabled = true;
+    loadFullBtn.textContent = "Loading…";
+    try {
+      const text = await api.jobLogFull(id, stream);
+      // For a still-running job a live chunk can arrive between the byte-size
+      // snapshot and this fetch and land in both the buffer replay and this full
+      // read — a duplicated line right at the boundary is accepted, not fixed.
+      const term = stream === "err" ? termErr : termOut;
+      term.reset();
+      term.write(text);
+      truncated[stream] = false;
+      updateLoadFullBtn();
+    } catch (err) {
+      loadFullBtn.disabled = false;
+      updateLoadFullBtn();
+      mount(actionErr, errorBox(err));
+    }
+  }
   const consoleTabs = h("div", { class: "tabbar console-tabs" }, tabOut, tabErr,
-    h("span", { class: "ml-auto" }), searchIn, hitCount,
+    h("span", { class: "ml-auto" }), loadFullBtn, searchIn, hitCount,
     h("button", { class: "btn-icon", title: "Download the raw log file of the current stream",
                   onclick: downloadLog }, icon("save", 14)));
 
@@ -171,6 +208,7 @@ export function JobDetailView(params) {
     tabErr.classList.toggle("active", s === "err");
     if (s === "err") tabErr.classList.remove("has-err");   // seen — clear the dot
     if (searchIn.value.trim()) runSearch();                // search follows the visible stream
+    updateLoadFullBtn();
   }
   // Flag the stderr tab when it gets output while it isn't the one on screen.
   function markErr(text) { if (text && activeStream !== "err") tabErr.classList.add("has-err"); }
@@ -613,6 +651,11 @@ export function JobDetailView(params) {
         const s = m.streams || {};
         if (s.out) termOut.write(s.out);
         if (s.err) { termErr.write(s.err); markErr(s.err); }
+        truncated.out = !!(m.truncated && m.truncated.out);
+        truncated.err = !!(m.truncated && m.truncated.err);
+        sizes.out = (m.sizes && m.sizes.out) || 0;
+        sizes.err = (m.sizes && m.sizes.err) || 0;
+        updateLoadFullBtn();
         renderHead(); loadOutputs(); updatePolling();
       }
       else if (m.type === "chunk") {

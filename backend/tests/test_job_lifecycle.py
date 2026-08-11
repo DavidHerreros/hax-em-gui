@@ -29,6 +29,16 @@ def test_create_launch_and_finish(client, run, project, md_file):
     assert any("stub:" in line for line in r.json()["lines"])
 
 
+def test_log_full(client, run, project, md_file):
+    job = _create(client, run, project, md_file)
+    wait_for_status(client, run, job["id"], {"succeeded", "failed", "interrupted"})
+    r = run(client.get(f"/api/jobs/{job['id']}/log/full", params={"stream": "out"}))
+    assert r.status_code == 200
+    assert "stub:" in r.text
+    r = run(client.get("/api/jobs/does-not-exist/log/full"))
+    assert r.status_code == 404
+
+
 def test_missing_required_arg_is_422(client, run, project):
     r = run(client.post(f"/api/projects/{project['id']}/jobs",
                         json={"program": "estimate_latent_covariances", "args": {}, "launch": False}))

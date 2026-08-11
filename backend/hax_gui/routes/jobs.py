@@ -93,6 +93,16 @@ def job_log_download(job_id: str, stream: str = "out"):
                         filename=f"{stem}_{job_id}.{'err' if stream == 'err' else 'out'}.log")
 
 
+@router.get("/api/jobs/{job_id}/log/full", dependencies=[Depends(auth)])
+def job_log_full(job_id: str, stream: str = "out"):
+    """The whole persisted log for one stream, uncapped — for a file too big for the
+    windowed read in job_log_ws's snapshot."""
+    from fastapi.responses import PlainTextResponse
+    if manager.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return PlainTextResponse(manager.read_log(job_id, stream, cap=None, raw_cap=None))
+
+
 class JobRename(BaseModel):
     name: str | None = None
 
@@ -259,9 +269,12 @@ async def job_log_ws(websocket: WebSocket, job_id: str) -> None:
         # One snapshot carrying both streams' full replay, so the UI seeds its
         # stdout / stderr tabs; live chunks that follow are tagged per stream.
         def _snapshot() -> dict[str, Any]:
+            info = {s: manager.log_info(job_id, s) for s in ("out", "err")}
             return {"type": "snapshot", "status": job["status"],
                     "streams": {"out": manager.read_log(job_id, "out", upto=cut.get("out")),
-                                "err": manager.read_log(job_id, "err", upto=cut.get("err"))}}
+                                "err": manager.read_log(job_id, "err", upto=cut.get("err"))},
+                    "truncated": {s: info[s]["truncated"] for s in info},
+                    "sizes": {s: info[s]["size"] for s in info}}
 
         if not job["active"]:
             # Finished job: replay the full log and close — nothing more will stream.

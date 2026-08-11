@@ -43,6 +43,18 @@ async function blob(path, init = {}) {
   return res.blob();
 }
 
+// Same as `req`, for endpoints that answer with plain text rather than JSON.
+async function text(path, init = {}) {
+  const token = getToken();
+  const res = await fetch(path, { ...init, headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  if (!res.ok) {
+    let detail;
+    try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
+    throw new ApiError(res.status, detail);
+  }
+  return res.text();
+}
+
 export const api = {
   health: () => req("/api/health"),
   programs: () => req("/api/programs"),
@@ -70,6 +82,9 @@ export const api = {
   jobs: () => req("/api/jobs"),
   job: (id) => req(`/api/jobs/${id}`),
   jobLog: (id) => req(`/api/jobs/${id}/log`),
+  // Whole persisted log for one stream, uncapped — for a file too big for the
+  // windowed read the WS snapshot ships by default.
+  jobLogFull: (id, stream = "out") => text(`/api/jobs/${id}/log/full?stream=${stream}`),
   renameJob: (id, name) => req(`/api/jobs/${id}`, { method: "PUT", body: JSON.stringify({ name }) }),
   startJob: (id) => req(`/api/jobs/${id}/start`, { method: "POST" }),
   cancelJob: (id) => req(`/api/jobs/${id}/cancel`, { method: "POST" }),

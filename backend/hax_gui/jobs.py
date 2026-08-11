@@ -50,6 +50,10 @@ from .config import settings
 # reconstruct progress lines exactly.
 LIVE_BUFFER_CHARS = 256_000
 
+# Default window read from the end of a persisted log file (see read_log); the GUI
+# offers a "load full log" action once a file exceeds this.
+LOG_RAW_CAP = 16_000_000
+
 # Statuses a job can still move out of on its own. 'cancelling' belongs here: the
 # process group has been signalled but nothing is final until the supervisor reaps it
 # and writes 'cancelled'. Leaving it out made the log WS treat a cancelling job as
@@ -1459,8 +1463,8 @@ class JobManager:
         """
         return dict(self._tail_pos.get(job_id, {}))
 
-    def read_log(self, job_id: str, stream: str = "out", cap: int = 4_000_000,
-                 raw_cap: int = 16_000_000, upto: int | None = None) -> str:
+    def read_log(self, job_id: str, stream: str = "out", cap: int | None = 4_000_000,
+                 raw_cap: int | None = LOG_RAW_CAP, upto: int | None = None) -> str:
         """Persisted log for one stream ("out"/"err"), tqdm frames collapsed.
 
         The in-memory buffer is only a recent tail, so reopening a job (running or
@@ -1468,7 +1472,8 @@ class JobManager:
         ``raw_cap`` bytes from the end (a truncation notice marks anything beyond),
         collapse repeated ``\\r`` progress frames to their final state, then cap the
         result to ``cap`` characters — so early lines survive even when a run has
-        written megabytes of progress output.
+        written megabytes of progress output. Pass ``cap=None``/``raw_cap=None`` for
+        an unbounded read of the whole file (no seek-window, no truncation notice).
 
         ``upto`` stops the read at that byte offset (the tailer's published
         position): a live subscriber gets everything past it as queued chunks, so
@@ -1486,17 +1491,31 @@ class JobManager:
             end = p.stat().st_size
             if upto is not None:
                 end = min(end, upto)
-            start = max(0, end - raw_cap)
+            start = 0 if raw_cap is None else max(0, end - raw_cap)
             truncated = start > 0
             with open(p, "rb") as f:
                 f.seek(start)
                 data = f.read(end - start)
         except OSError:
             return "".join(self._buffers.get(job_id, {}).get(stream, ()))
-        text = _collapse_progress(data.decode("utf-8", errors="replace"))[-cap:]
+        text = _collapse_progress(data.decode("utf-8", errors="replace"))
+        if cap is not None:
+            text = text[-cap:]
         if truncated:
             text = f"[hax-gui] log truncated: showing the last {raw_cap // 1_000_000} MB\n" + text
         return text
+
+    def log_info(self, job_id: str, stream: str = "out") -> dict[str, Any]:
+        """Byte size of the persisted log file and whether it exceeds the truncated-read window."""
+        job = self.get(job_id)
+        if not job:
+            return {"size": 0, "truncated": False}
+        log_path = job["log_path"] if stream == "out" else self._err_path(job["log_path"])
+        try:
+            size = Path(log_path).stat().st_size
+        except OSError:
+            size = 0
+        return {"size": size, "truncated": size > LOG_RAW_CAP}
 
     def _publish(self, job_id: str, message: dict[str, Any]) -> None:
         for queue in self._subscribers.get(job_id, set()):
