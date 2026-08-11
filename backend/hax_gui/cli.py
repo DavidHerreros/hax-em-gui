@@ -166,7 +166,13 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(_err(f"Port {port} on {host} is already in use") + " by another process. Pick a free --port.")
         return 1
 
-    cmd = [sys.executable, "-m", "uvicorn", "hax_gui.app:app", "--host", host, "--port", str(port)]
+    cmd = [sys.executable, "-m", "uvicorn", "hax_gui.app:app", "--host", host, "--port", str(port),
+           # On SIGTERM, uvicorn normally waits for open connections to drain before
+           # running lifespan shutdown — but our WS handlers (log stream, /ws/events)
+           # only exit when app.state.shutdown is set, which lifespan shutdown itself
+           # does. With a browser tab attached that's a circular wait that never
+           # resolves on its own; this cap lets uvicorn cancel the handlers and proceed.
+           "--timeout-graceful-shutdown", "3"]
     if args.reload:
         cmd.append("--reload")
 
