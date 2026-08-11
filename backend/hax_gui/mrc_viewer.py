@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 
 from . import children, viewer_logs
+from .staleness import sources_mtime
 
 # The viewer backend ships inside the package: hax_gui/viewer_app/mrc_server.py
 _SERVER = Path(__file__).resolve().parent / "viewer_app" / "mrc_server.py"
@@ -91,8 +92,14 @@ class MrcViewerManager:
         async with self._spawn_locks.setdefault(key, asyncio.Lock()):
             existing = self._by_path.get(key)
             if existing and existing["proc"].poll() is None:
-                existing["title"] = title
-                return self._public(existing)
+                if sources_mtime() > existing["created"]:
+                    # An editable-install edit to hax/hax_gui must not be masked by a
+                    # parked viewer process still holding the old module: stop it and
+                    # fall through to spawning a fresh one.
+                    self.stop(existing["id"])
+                else:
+                    existing["title"] = title
+                    return self._public(existing)
 
             vid = secrets.token_urlsafe(9)
             viewer_logs.prune("mrcviewer")
@@ -112,7 +119,7 @@ class MrcViewerManager:
                 children.register("mrcviewer", proc.pid)
                 instance = {"id": vid, "port": port, "mrcs": [str(p) for p in paths],
                             "key": key, "title": title, "proc": proc, "log": str(log),
-                            "last_seen": time.time()}
+                            "last_seen": time.time(), "created": time.time()}
                 try:
                     await self._wait_ready(instance)
                     break

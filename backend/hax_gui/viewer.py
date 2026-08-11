@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from . import children, viewer_logs
+from .staleness import sources_mtime
 
 # The viewer backend ships inside the package: hax_gui/viewer_app/server.py
 _SERVER = Path(__file__).resolve().parent / "viewer_app" / "server.py"
@@ -94,8 +95,14 @@ class ViewerManager:
         async with self._spawn_locks.setdefault(key, asyncio.Lock()):
             existing = self._by_key.get(key)
             if existing and existing["proc"].poll() is None:
-                existing["title"] = title
-                return self._public(existing)
+                if sources_mtime() > existing["created"]:
+                    # An editable-install edit to hax/hax_gui must not be masked by a
+                    # parked viewer process still holding the old module: stop it and
+                    # fall through to spawning a fresh one.
+                    self.stop(existing["id"])
+                else:
+                    existing["title"] = title
+                    return self._public(existing)
 
             vid = secrets.token_urlsafe(9)
             viewer_logs.prune("viewer")
@@ -124,7 +131,7 @@ class ViewerManager:
                 children.register("viewer", proc.pid)
                 instance = {"id": vid, "port": port, "latents": str(lat), "reload": str(ckpt),
                             "title": title, "gpu": gpu or "", "key": key, "proc": proc,
-                            "log": str(log), "last_seen": time.time()}
+                            "log": str(log), "last_seen": time.time(), "created": time.time()}
                 try:
                     await self._wait_ready(instance)
                     break

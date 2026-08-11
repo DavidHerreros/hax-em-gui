@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import httpx
@@ -24,6 +28,7 @@ from . import assistant as assistant_bridge
 from . import chats as chat_store
 from . import children
 from . import ollama as ollama_manager_mod
+from . import registry, staleness
 from .config import settings
 from .jobs import manager
 from .labels import manager as label_manager
@@ -150,6 +155,45 @@ async def _on_startup(app: FastAPI) -> None:
     # embeddings for the life of the process.
     app.state.ollama = {"managed": False}
     app.state.assistant_warmup = asyncio.create_task(_warm_assistant(app))
+    _check_schema_staleness()
+
+
+def _check_schema_staleness() -> None:
+    """Regenerate the cached program-schemas (see registry.py) when the ``hax``
+    sources on disk are newer than the cache file — an editable-install edit
+    that would otherwise only show up in the launcher forms after a manual
+    ``hax-gui schemas`` or a full restart.
+
+    Regeneration imports JAX (via introspect.extract_all), so it must never run
+    in this process — it runs in a subprocess with CUDA hidden, off a daemon
+    thread so it can't block startup or the event loop either.
+    """
+    cache = settings.schema_cache
+    if not cache.exists():
+        return   # nothing cached yet: registry's own fallback chain handles it
+    try:
+        cache_mtime = cache.stat().st_mtime
+    except OSError:
+        return
+    if staleness.hax_sources_mtime() <= cache_mtime:
+        return
+
+    def _run() -> None:
+        print("[hax-gui] hax sources changed since the cached schemas were generated "
+              "— regenerating in the background…", flush=True)
+        try:
+            subprocess.run(
+                [sys.executable, "-c", "from hax_gui import genschemas; genschemas.regenerate()"],
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"},
+                timeout=600, check=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - never crash startup / this thread
+            print(f"[hax-gui] schema regeneration failed: {exc!r}", flush=True)
+            return
+        registry.refresh()   # drop the in-memory cache so the next form load re-reads it
+        print("[hax-gui] schema regeneration finished.", flush=True)
+
+    threading.Thread(target=_run, daemon=True, name="hax-gui-schema-regen").start()
 
 
 async def _warm_assistant(app: FastAPI) -> None:
