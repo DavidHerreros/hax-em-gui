@@ -76,6 +76,17 @@ function makeThemeToggle() {
 
 function labelSpan(text) { return h("span", { class: "side-label" }, text); }
 
+// Shared by the sidebar "Access token" button and the startup auth gate below:
+// prompt for a token, store it and reload if one was entered, do nothing on cancel.
+// Resolves false iff the user cancelled (the caller never sees true — a reload follows).
+async function promptForToken(message) {
+  const t = await promptModal({ title: "Access token", okText: "Apply", label: message, value: getToken() });
+  if (t === null) return false;
+  setToken(t);
+  location.reload();
+  return true;
+}
+
 function buildSidebar() {
   const navLinks = NAV.map((n) => h("a", { href: "#" + n.path, "data-path": n.path, class: "side-item" }, icon(n.icon), labelSpan(n.label)));
 
@@ -83,12 +94,9 @@ function buildSidebar() {
   subscribe(() => collapseBtn.replaceChildren(icon(getState().leftCollapsed ? "chevronRight" : "chevronLeft", 18)));
 
   const settingsLink = h("a", { href: "#/settings", "data-path": "/settings", class: "side-item" }, icon("gear"), labelSpan("Settings"));
-  const tokenBtn = h("button", { class: "side-item", onclick: async () => {
-    const t = await promptModal({ title: "Access token", okText: "Apply",
-                                  label: "Bearer token for this server (leave empty if it has none):",
-                                  value: getToken() });
-    if (t !== null) { setToken(t); location.reload(); }
-  } }, icon("cpu"), labelSpan("Access token"));
+  const tokenBtn = h("button", { class: "side-item",
+    onclick: () => promptForToken("Bearer token for this server (leave empty if it has none):"),
+  }, icon("cpu"), labelSpan("Access token"));
   const docsLink = h("a", { href: DOCS_URL, target: "_blank", rel: "noreferrer", class: "side-item docs" }, icon("book"), labelSpan("Documentation"));
 
   const sidebar = h("aside", { class: "sidebar" },
@@ -157,6 +165,36 @@ startRouter();
 startUpdates();
 startNotifications();   // /ws/events → title badge + browser Notification
 probeAssistant();
+
+// ---- startup auth gate --------------------------------------------------
+// The old failure mode: a public server needs a token, but the first the user
+// hears of it is an "Unauthorized" error box when they open some view. Instead,
+// probe /api/auth/check right away and prompt for the token up front — before
+// any view has a chance to render an auth error.
+const authBar = h("div", { class: "auth-bar", hidden: true },
+                  "This server requires an access token — the API will refuse everything until one is set.",
+                  h("button", { class: "btn small", onclick: () => promptForToken(authPromptMessage()) }, "Set token"));
+document.body.appendChild(authBar);
+
+function authPromptMessage() {
+  const prefix = getToken() ? "The stored access token was rejected. " : "";
+  return prefix + "This server requires an access token. It was printed in the terminal where the "
+    + "server was started (hax-gui start), and is stored in the token file on the server host. Paste it here:";
+}
+
+(async () => {
+  try {
+    const h2 = await api.health();
+    if (!h2.auth_required) return;   // open server: no gate, no extra request
+    await api.authCheck();
+  } catch (err) {
+    // Network failures / non-401 errors are none of this gate's business — the
+    // offline bar below already covers a backend that isn't reachable at all.
+    if (!(err instanceof ApiError) || err.status !== 401) return;
+    const applied = await promptForToken(authPromptMessage());
+    if (!applied) authBar.hidden = false;   // cancelled: leave a persistent way back in
+  }
+})();
 
 // ---- backend-gone indicator -------------------------------------------------
 // A fetch that *throws* is a network failure (server down / unreachable); any

@@ -16,6 +16,7 @@ CASES = [
     ("GET", "/api/branches", 200),
     ("GET", "/api/labels", 200),
     ("GET", "/api/files", 200),
+    ("GET", "/api/auth/check", 200),
     # assistant (+ chats: plain data, present without the assistant)
     ("GET", "/api/assistant/status", 200),
     ("GET", "/api/ollama/status", 200),
@@ -55,3 +56,36 @@ def test_every_route_module_answers(client, run):
 def test_unknown_host_rejected(client, run):
     r = run(client.get("/api/health", headers={"host": "evil.example.com"}))
     assert r.status_code == 421   # DNS-rebinding guard (loopback bind)
+
+
+def test_health_reports_auth_required_and_check_agrees(client, run):
+    """The GUI's startup auth gate (app.js) reads `auth_required` off /api/health
+    before deciding whether to probe /api/auth/check at all — the test server is
+    open (no HAX_GUI_TOKEN), so both must agree that no token is needed."""
+    r = run(client.get("/api/health"))
+    assert r.status_code == 200
+    assert r.json()["auth_required"] is False
+    r = run(client.get("/api/auth/check"))
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+
+def test_auth_check_401_when_token_configured(client, run):
+    """Flip settings.auth_token on the shared singleton for the duration of this
+    test (no fixture for a token-configured server exists yet — this is the
+    lightest way to cover the 401 path without spinning up a second app)."""
+    from hax_gui.config import settings
+
+    settings.auth_token = "s3cret"
+    try:
+        r = run(client.get("/api/health"))
+        assert r.status_code == 200
+        assert r.json()["auth_required"] is True
+
+        r = run(client.get("/api/auth/check"))
+        assert r.status_code == 401
+
+        r = run(client.get("/api/auth/check", headers={"Authorization": "Bearer s3cret"}))
+        assert r.status_code == 200
+    finally:
+        settings.auth_token = ""

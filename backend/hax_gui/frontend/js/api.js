@@ -57,6 +57,7 @@ async function text(path, init = {}) {
 
 export const api = {
   health: () => req("/api/health"),
+  authCheck: () => req("/api/auth/check"),
   programs: () => req("/api/programs"),
   program: (name) => req(`/api/programs/${name}`),
   gpus: () => req("/api/gpus"),

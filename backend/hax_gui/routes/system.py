@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from .. import adapters, branches, gpus, groups, registry, settings_store
 from .. import files as filebrowser
 from ..branches import BranchError
+from ..config import settings
 from ..jobs import manager
 from ..labels import manager as label_manager
 from ..updater import UpdateBlocked, UpdateBusy, updater
@@ -22,7 +23,14 @@ router = APIRouter()
 
 @router.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "programs": len(registry.all_programs()), "schema_errors": registry.errors()}
+    return {"status": "ok", "programs": len(registry.all_programs()), "schema_errors": registry.errors(),
+            "auth_required": bool(settings.auth_token)}
+
+
+@router.get("/api/auth/check", dependencies=[Depends(auth)])
+def auth_check() -> dict[str, Any]:
+    """200 iff the presented token is valid (or the server is open) — the GUI's startup probe."""
+    return {"ok": True}
 
 @router.get("/api/programs", dependencies=[Depends(auth)])
 def programs() -> list[dict[str, Any]]:
