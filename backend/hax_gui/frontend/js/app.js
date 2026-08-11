@@ -77,14 +77,31 @@ function makeThemeToggle() {
 function labelSpan(text) { return h("span", { class: "side-label" }, text); }
 
 // Shared by the sidebar "Access token" button and the startup auth gate below:
-// prompt for a token, store it and reload if one was entered, do nothing on cancel.
-// Resolves false iff the user cancelled (the caller never sees true — a reload follows).
+// prompt for a token, validate it against the server before committing (a user
+// who pastes a token from the wrong machine used to get stuck in a silent
+// paste → reload → modal-reappears loop), then store it and reload. Resolves
+// false iff the user cancelled (the caller never sees true — a reload follows).
 async function promptForToken(message) {
-  const t = await promptModal({ title: "Access token", okText: "Apply", label: message, value: getToken() });
-  if (t === null) return false;
-  setToken(t);
-  location.reload();
-  return true;
+  let label = message;
+  let prefill = getToken();
+  for (;;) {
+    const t = await promptModal({ title: "Access token", okText: "Apply", label, value: prefill });
+    if (t === null) return false;
+    const status = await api.authCheckWith(t);
+    if (status === 401) {
+      // Re-prompt in place, with what they typed still in the box, instead of
+      // storing a token we already know is wrong.
+      label = "That token was rejected by the server. " + message;
+      prefill = t;
+      continue;
+    }
+    // status 0 (network failure) or anything else (200, or a 404 from an older
+    // server without this endpoint) — apply it. Backend-down is the offline
+    // bar's business, not this gate's.
+    setToken(t);
+    location.reload();
+    return true;
+  }
 }
 
 function buildSidebar() {
@@ -179,7 +196,8 @@ document.body.appendChild(authBar);
 function authPromptMessage() {
   const prefix = getToken() ? "The stored access token was rejected. " : "";
   return prefix + "This server requires an access token. It was printed in the terminal where the "
-    + "server was started (hax-gui start), and is stored in the token file on the server host. Paste it here:";
+    + "server was started (hax-gui start) and is stored in the token file on that machine — the "
+    + "machine running the server, not the one running your browser. Paste it here:";
 }
 
 (async () => {

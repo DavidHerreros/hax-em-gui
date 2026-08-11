@@ -58,6 +58,15 @@ async function text(path, init = {}) {
 export const api = {
   health: () => req("/api/health"),
   authCheck: () => req("/api/auth/check"),
+  // Probe /api/auth/check with a candidate token (not the stored one) so the
+  // prompt can reject a bad paste before committing it — returns the HTTP status,
+  // or 0 on network failure.
+  authCheckWith: async (t) => {
+    try {
+      const res = await fetch("/api/auth/check", { headers: t ? { Authorization: `Bearer ${t}` } : {} });
+      return res.status;
+    } catch { return 0; }
+  },
   programs: () => req("/api/programs"),
   program: (name) => req(`/api/programs/${name}`),
   gpus: () => req("/api/gpus"),
