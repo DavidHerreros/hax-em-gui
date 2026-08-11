@@ -359,17 +359,17 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
 .back:hover { color: var(--text); }
 
 /* ---- jobs ---- */
-.job-row { display: flex; align-items: center; gap: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 12px 16px; margin-bottom: 8px; transition: border-color .15s; animation: fade-in .25s ease-out both; }
+/* Two-line card: line 1 is the identity row, line 2 a muted dot-separated detail
+   strip, and a running run's progress bar is pinned to the card's own bottom edge
+   (position: relative here is what lets .jr-bar anchor to it). */
+.job-row { display: block; position: relative; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 12px 16px 13px; margin-bottom: 8px; transition: border-color .15s; animation: fade-in .25s ease-out both; }
 .job-row:hover { border-color: var(--active-ring); }
 /* Suppress the row entrance animation on background refreshes (list rebuilds),
    so adding a label / a status change doesn't re-animate the whole list and jump. */
 .no-anim .job-row, .no-anim .exec-row { animation: none; }
-/* Same shrink discipline as the project page's rows (see .exec-row): only the text
-   columns give way, and not past a readable stub. */
-.job-row > * { flex-shrink: 0; }
-.job-row .prog { font-family: "JetBrains Mono", monospace; color: var(--accent); flex: 0 1 auto; max-width: 260px; min-width: 5.5em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.job-row .jid { font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--faint); }
-.job-row .time { margin-left: auto; font-size: 12px; color: var(--faint); }
+.job-row .jr-line1 { display: flex; align-items: center; gap: 10px; }
+/* Name now owns line 1's free width and only ellipsizes when genuinely out of room. */
+.job-row .prog { font-family: "JetBrains Mono", monospace; color: var(--accent); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The duration rides along with the timestamp; dimmer, so the row still reads as one time. */
 .time-dur { opacity: .75; }
 .time, .exec-time, .run-time { white-space: nowrap; }
@@ -389,6 +389,19 @@ h2.section { font-size: 11px; font-weight: 600; text-transform: uppercase; lette
    were re-made underneath it afterwards (see cascade.py). */
 .badge.stale { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 35%, transparent); padding: 3px 8px; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+/* Two badges now share line 1 with a full name; the shared 4px/10px pill is too wide there. */
+.job-row .badge { padding: 2px 8px; }
+.jr-when { font-size: 12px; color: var(--faint); white-space: nowrap; flex: none; font-variant-numeric: tabular-nums; }
+/* Gap between line-1 items already separates the menu button from the time. */
+.job-row .row-menu { margin-left: 0; }
+/* Line 2: a muted detail strip, its segments dot-separated. Chips render after the
+   segments and carry their own styling, so they are deliberately not .jr-seg. */
+.job-row .jr-line2 { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.jr-seg::after { content: "·"; margin-left: 8px; color: var(--border-2); }
+.jr-seg:last-of-type::after { content: none; }
+/* A running run's progress bar rides the card's own bottom edge, not the timestamp's. */
+.job-row .jr-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--border); }
+.job-row .jr-fill { height: 100%; background: var(--accent); transition: width .6s ease; }
 
 /* ---- progress line ---- */
 .progress { height: 4px; border-radius: 999px; background: var(--border); overflow: hidden; margin: 16px 0; }
@@ -859,7 +872,7 @@ body.vwin-dragging iframe { pointer-events: none; }
 /* ===== custom run names + per-row options menu ===== */
 .row-menu { background: none; border: none; color: var(--faint); padding: 4px; border-radius: 6px; display: inline-flex; align-items: center; margin-left: 8px; flex-shrink: 0; }
 .row-menu:hover { color: var(--text); background: var(--hover); }
-.job-row .prog-sub { font-size: 12px; color: var(--faint); flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-row .prog-sub { font-size: 12px; color: var(--faint); flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
 /* The row's title. Truncates, but never below a readable stub — a name crushed to one
    letter identifies nothing, so the folder gives way first (see .exec-folder). */
 .exec-name { font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; min-width: 5.5em; flex: 0 1 auto; }
@@ -1490,11 +1503,6 @@ body.vwin-dragging iframe { pointer-events: none; }
 /* red confirm button for destructive actions */
 .btn.danger { background: var(--err); border-color: var(--err); color: #fff; }
 .btn.danger:hover { filter: brightness(1.1); }
-
-/* inline job progress (jobs list rows) */
-.jp { display: inline-flex; align-items: center; gap: 6px; }
-.jp-bar { width: 72px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; display: inline-block; }
-.jp-fill { display: block; height: 100%; border-radius: 3px; background: var(--accent); transition: width .6s ease; }
 
 /* log search */
 .log-search { width: 180px; padding: 4px 8px; font-size: 12px; }

@@ -90,18 +90,29 @@ export function fmtEta(s) {
   return `~${Math.round(hr / 24)}d left`;
 }
 
-// Inline progress for a running run: epoch, a small bar, percent, ETA. Parsed
-// server-side from the log tail (jobs.job_progress); null hides it entirely.
-export function jobProgressEl(job) {
-  const p = job && job.progress;
-  if (!p) return null;
-  const eta = fmtEta(p.eta_s);
-  const label = p.epochs ? `Epoch ${p.epoch}/${p.epochs}` : null;
-  return h("span", { class: "jp", title: (label ? label + " · " : "") + `${p.pct}%` + (eta ? " · " + eta : "") },
-    label ? h("span", { class: "muted small" }, label) : null,
-    h("span", { class: "jp-bar" }, h("span", { class: "jp-fill", style: { width: `${Math.max(2, p.pct)}%` } })),
-    h("span", { class: "muted small mono" }, `${Math.round(p.pct)}%`),
-    eta ? h("span", { class: "muted small" }, eta) : null);
+// Coarse "how long ago" for the jobs-list card, deliberately imprecise like fmtEta:
+// a live clock next to a 3s poll would tick out of sync with the row's actual age.
+export function relTime(stamp) {
+  if (!stamp) return null;
+  const s = (Date.now() - new Date(stamp)) / 1000;
+  if (s < 90) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m}m ago`;
+  const hr = Math.round(m / 60);
+  if (hr < 48) return `${hr}h ago`;
+  const d = Math.round(hr / 24);
+  if (d < 14) return `${d}d ago`;
+  return new Date(stamp).toLocaleDateString();
+}
+
+// Line-1 right-hand time for the jobs-list card: relative, with the same full-history
+// tooltip as jobTimeEl. "finished" drops its own label since the relative stamp alone
+// already reads as past tense.
+export function jobRelTimeEl(job) {
+  const { label, stamp } = jobTime(job);
+  const rel = relTime(stamp);
+  return h("span", { class: "jr-when", title: jobTimeTitle(job) },
+    rel ? (label === "finished" ? rel : `${label} ${rel}`) : "—");
 }
 
 // The one-line form used in every run list: "finished 25/07/2026, 14:32:10 · 2h 14m".
@@ -265,8 +276,10 @@ export function jobsSignature(jobs) {
   // the next time something else about the list moved.
   // Whole-percent progress is in the signature so a training run's bar advances
   // on the poll, without sub-percent noise rebuilding the list constantly.
+  // The card's line 1 now prints a relative time ("2h ago"); it has to be in here too,
+  // or a poll that changes nothing else lets that label go stale until something else moves.
   return jobs.map((j) => `${j.id}:${j.status}:${j.stale ? "s" : ""}:${j.name || ""}:` +
-                         `${j.progress ? Math.round(j.progress.pct) : ""}`).join("|");
+                         `${j.progress ? Math.round(j.progress.pct) : ""}:${relTime(jobTime(j).stamp)}`).join("|");
 }
 
 // What to show as a run's title: its custom name, falling back to the program.
@@ -350,18 +363,32 @@ export function gpuLabel(gpu) {
 
 function row(job, i, hooks) {
   const title = h("span", { class: "prog" }, jobDisplayName(job));
-  const a = h(
-    "a",
-    { class: "job-row", href: "#/jobs/" + job.id, style: { animationDelay: `${Math.min(i, 30) * 0.02}s` } },
+  const line1 = h("div", { class: "jr-line1" },
     badge(job.status),
     staleBadge(job),
     title,
-    job.name ? h("span", { class: "prog-sub mono" }, job.program) : null,
-    jobLabelChips(job, { editable: true, max: 2 }),
-    jobProgressEl(job),
-    gpuLabel(job.gpu) ? h("span", { class: "muted", style: { fontSize: "12px" } }, gpuLabel(job.gpu)) : null,
-    jobTimeEl(job),
-    jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); hooks?.afterLocalRename?.(); }, onDeleted: () => a.remove() })
+    jobRelTimeEl(job),
+    jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); hooks?.afterLocalRename?.(); }, onDeleted: () => a.remove() }));
+
+  const dur = jobDuration(job);
+  const p = job.progress;
+  const progressText = p ? [p.epochs ? `Epoch ${p.epoch}/${p.epochs}` : null, `${Math.round(p.pct)}%`, fmtEta(p.eta_s)]
+    .filter(Boolean).join(" · ") : null;
+  const segs = [
+    job.name ? h("span", { class: "jr-seg prog-sub mono" }, job.program) : null,
+    gpuLabel(job.gpu) ? h("span", { class: "jr-seg" }, gpuLabel(job.gpu)) : null,
+    dur ? h("span", { class: "jr-seg" }, dur) : null,
+    progressText ? h("span", { class: "jr-seg" }, progressText) : null,
+  ].filter(Boolean);
+  if ((job.labels || []).length) segs.push(jobLabelChips(job, { max: 3 }));
+  const line2 = segs.length ? h("div", { class: "jr-line2" }, ...segs) : null;
+
+  const a = h(
+    "a",
+    { class: "job-row", href: "#/jobs/" + job.id, style: { animationDelay: `${Math.min(i, 30) * 0.02}s` } },
+    line1,
+    line2,
+    p ? h("div", { class: "jr-bar" }, h("div", { class: "jr-fill", style: { width: Math.max(2, p.pct) + "%" } })) : null
   );
   return a;
 }
