@@ -1444,6 +1444,9 @@ body.vwin-dragging iframe { pointer-events: none; }
   color: var(--warn); border: 1px solid var(--warn);
   padding: 6px 10px 6px 14px; border-radius: 8px; font-size: 13px; z-index: 300;
 }
+/* display: flex above beats the UA's [hidden] { display: none } — restore it, or
+   the bar shows permanently on every auth-requiring server, valid token or not. */
+.auth-bar[hidden] { display: none; }
 
 /* "Diagnose this failure" panel (jobDetail) */
 .diag-panel { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: var(--panel); }
