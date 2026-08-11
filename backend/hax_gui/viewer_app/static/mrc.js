@@ -919,7 +919,20 @@ $("volStyle").addEventListener("change", (e) => {
 // Export menu: the four ways out of the viewer, one dropdown.
 $("exportBtn").addEventListener("click", (e) => {
   e.stopPropagation();
-  $("exportMenu").classList.toggle("open");
+  const menu = $("exportMenu");
+  menu.classList.toggle("open");
+  if (menu.classList.contains("open")) {
+    // Bound it against where the button actually sits — the hosting window can be a
+    // tiny floating pane, so the right-anchored menu can run past either edge.
+    menu.style.right = "";
+    menu.style.maxHeight = "";
+    const r = menu.getBoundingClientRect();
+    if (r.left < 8) {
+      const shift = Math.min(8 - r.left, window.innerWidth - 8 - r.right);
+      menu.style.right = (-shift) + "px";
+    }
+    menu.style.maxHeight = Math.max(120, window.innerHeight - r.top - 10) + "px";
+  }
 });
 document.addEventListener("click", (e) => {
   if (!e.target.closest("#exportMenu")) $("exportMenu").classList.remove("open");
@@ -1020,6 +1033,10 @@ $("clipChips").addEventListener("click", (e) => {
   const chip = e.target.closest(".chip");
   if (!chip) return;
   clipAx = chip.dataset.ax;
+  // Clicking "view" re-aims the cut at the current line of sight, including when it is
+  // already the selected chip — that re-aim is the only way to move a plane that is
+  // deliberately welded to the model once captured.
+  if (clipAx === "v") captureViewNormal();
   for (const c of $("clipChips").children) c.classList.toggle("on", c === chip);
   applyClip();
 });
@@ -1186,28 +1203,57 @@ async function exportMesh() {
   finally { btn.disabled = false; }
 }
 
-// ---- clipping (slab along one axis, surface + volume) --------------------
-let clipAx = "";   // "", "0", "1", "2" — driven by the chips in the Clip section
+// ---- clipping (slab along one direction, surface + volume) ---------------
+let clipAx = "";        // "", "0", "1", "2", "v" — driven by the chips in the Clip section
+let clipViewN = null;   // model-space normal captured the last time "view" was clicked
+
+// The line of sight, in the coordinates the meshes and grids are held in. orbit.js keeps
+// the eye on world +Z looking down -Z and hangs the rotation on the model, so the model-
+// space view direction is Rᵀ·[0,0,-1] = [-R[2], -R[6], -R[10]] (the same expression
+// orbit's own axisRay uses). It points away from the camera, so dot(p, n) grows with
+// depth and the "lo" slider is always the plane nearer the viewer.
+//
+// Capturing it freezes the plane into the model: rotate afterwards and the cut turns with
+// the map, which is the whole point of cutting "along the view" rather than dragging a
+// screen-aligned plane. Re-click the chip to re-aim it at where you are looking now.
+function captureViewNormal() {
+  const R = (state.render === "surface" ? renderer : volRenderer).getCamera().R;
+  const v = [-R[2], -R[6], -R[10]];
+  const len = Math.hypot(v[0], v[1], v[2]) || 1;
+  clipViewN = [v[0] / len, v[1] / len, v[2] / len];
+}
+
 function applyClip() {
   const axis = clipAx;
   $("clipRanges").style.display = axis === "" ? "none" : "";
   if (axis === "") {
-    volRenderer.setClip(null, null); renderer.setClip(null, null);
+    volRenderer.setClip(null, 0, 0); renderer.setClip(null, 0, 0);
     $("clipState").textContent = "off";
     return;
   }
-  const a = +axis;
+  let n, support;
+  if (axis === "v") {
+    if (!clipViewN) captureViewNormal();
+    n = clipViewN;
+    // How far the [-1,1] cube reaches along n — its support function, |nx|+|ny|+|nz|.
+    // Sweeping the slider over ±that is what makes the ends of the range clear the model
+    // whichever way the plane is tilted, exactly as ±1 does for a coordinate axis.
+    support = Math.abs(n[0]) + Math.abs(n[1]) + Math.abs(n[2]);
+  } else {
+    n = [0, 0, 0]; n[+axis] = 1; support = 1;
+  }
   let lo = +$("clipLo").value / 100, hi = +$("clipHi").value / 100;
   if (hi < lo + 0.01) hi = Math.min(1, lo + 0.01);
-  $("clipState").textContent = "XYZ"[a] + ` ${Math.round(lo * 100)}–${Math.round(hi * 100)}%`;
-  // Volume renderer clips in texture space [0,1]; the surface renderer in the
-  // model-space [-1,1] cube. Same fractions, two coordinate frames.
-  const tLo = [0, 0, 0], tHi = [1, 1, 1];
-  tLo[a] = lo; tHi[a] = hi;
-  volRenderer.setClip(tLo, tHi);
-  const mLo = [-1.001, -1.001, -1.001], mHi = [1.001, 1.001, 1.001];
-  mLo[a] = lo * 2 - 1; mHi[a] = hi * 2 - 1;
-  renderer.setClip(mLo, mHi);
+  $("clipState").textContent = (axis === "v" ? "view" : "XYZ"[+axis])
+    + ` ${Math.round(lo * 100)}–${Math.round(hi * 100)}%`;
+  // Both renderers cut against the same model-space plane pair now, so they get the same
+  // numbers. A slider parked at an end is pushed a hair past the cube so the outermost
+  // vertices and voxels are not shaved off by rounding.
+  let d0 = support * (2 * lo - 1), d1 = support * (2 * hi - 1);
+  if (lo <= 0) d0 -= 0.002 * support;
+  if (hi >= 1) d1 += 0.002 * support;
+  renderer.setClip(n, d0, d1);
+  volRenderer.setClip(n, d0, d1);
 }
 
 // ---- map arithmetic ------------------------------------------------------

@@ -50,10 +50,16 @@ uniform float uBright;
 uniform int uMode;          // 0 = MIP, 1 = emission/absorption
 uniform int uSteps;
 
-// Clip slab in each slot's texture space [0,1]³ — voxels outside contribute nothing,
-// which is how ChimeraX's per-axis region clipping behaves for image renderings.
-uniform vec3 uClipLo;
-uniform vec3 uClipHi;
+// Clip slab, the same model-space plane pair the surface renderer cuts with: keep the
+// samples whose signed distance along the unit normal uClipN lands inside uClipRange,
+// everything else contributes nothing. That is how ChimeraX's region clipping behaves
+// for image renderings, generalised off the coordinate axes. Because the planes live in
+// model space rather than in each slot's texture space, a multi-map scene now cuts every
+// map on one plane instead of at the same fraction of each map's own box — which is the
+// point, since the surfaces have always cut that way.
+uniform int uClipOn;
+uniform vec3 uClipN;
+uniform vec2 uClipRange;
 
 vec3 toWorld(vec3 ndc) { vec4 p = uInvVP * vec4(ndc, 1.0); return p.xyz / p.w; }
 
@@ -69,7 +75,11 @@ float sampleVol(int i, vec3 p) {
 // zero inside the clipped-away region.
 float density(int i, vec3 mp) {
   vec3 p = (mp - uBoxLoA[i]) / (uBoxHiA[i] - uBoxLoA[i]);
-  if (any(lessThan(p, uClipLo)) || any(greaterThan(p, uClipHi))) return 0.0;
+  if (any(lessThan(p, vec3(0.0))) || any(greaterThan(p, vec3(1.0)))) return 0.0;
+  if (uClipOn == 1) {
+    float d = dot(mp, uClipN);
+    if (d < uClipRange.x || d > uClipRange.y) return 0.0;
+  }
   return sampleVol(i, p);
 }
 
@@ -78,7 +88,11 @@ float density(int i, vec3 mp) {
 uniform int uDiverging;
 float densityN(vec3 mp) {
   vec3 p = (mp - uBoxLoA[0]) / (uBoxHiA[0] - uBoxLoA[0]);
-  if (any(lessThan(p, uClipLo)) || any(greaterThan(p, uClipHi))) return 0.5;
+  if (any(lessThan(p, vec3(0.0))) || any(greaterThan(p, vec3(1.0)))) return 0.5;
+  if (uClipOn == 1) {
+    float d = dot(mp, uClipN);
+    if (d < uClipRange.x || d > uClipRange.y) return 0.5;
+  }
   return sampleVol(0, p);
 }
 
@@ -193,7 +207,7 @@ export function createVolume(canvas) {
     uGamma = u("uGamma"), uBright = u("uBright"), uMode = u("uMode"), uSteps = u("uSteps"),
     uVolN = [u("uVol0"), u("uVol1"), u("uVol2"), u("uVol3")],
     uVolB = u("uVolB"), uMix = u("uMix"), uCount = u("uCount"),
-    uClipLo = u("uClipLo"), uClipHi = u("uClipHi"), uDiverging = u("uDiverging");
+    uClipOn = u("uClipOn"), uClipN = u("uClipN"), uClipRange = u("uClipRange"), uDiverging = u("uDiverging");
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -230,7 +244,9 @@ export function createVolume(canvas) {
   const slotBoxHi = Array.from({ length: MAXV }, () => [1, 1, 1]);
   const slotThr = new Float32Array(MAXV).fill(0.45);
   const slotCol = Array.from({ length: MAXV }, () => [0.784, 0.784, 0.784]);
-  let clipLo = [0, 0, 0], clipHi = [1, 1, 1];    // texture-space clip slab; full box = no clipping
+  // Model-space clip slab, shared with the surface renderer: keep clipRange[0] <=
+  // dot(p, clipN) <= clipRange[1]. A null normal is no clipping at all.
+  let clipN = null, clipRange = [0, 0];
   let grid = null;   // { nx, ny, nz } of slot 0; null until one is, which is what the camera tests
   let gridB = null;  // the morph's far end, same shape; null when not morphing
   let mix = 0;       // blend weight in [0,1]; 0 = slot 0 alone
@@ -313,7 +329,8 @@ export function createVolume(canvas) {
     gl.uniform1i(uCount, count);
     gl.uniform1i(uDiverging, diverging ? 1 : 0);
     gl.uniform1f(uMix, gridB ? mix : 0);
-    gl.uniform3fv(uClipLo, clipLo); gl.uniform3fv(uClipHi, clipHi);
+    gl.uniform1i(uClipOn, clipN ? 1 : 0);
+    if (clipN) { gl.uniform3fv(uClipN, clipN); gl.uniform2fv(uClipRange, clipRange); }
     // Every sampler stays bound (placeholder textures make the unused ones complete).
     for (let i = 0; i < MAXV; i++) {
       gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_3D, slotTex[i]); gl.uniform1i(uVolN[i], i);
@@ -381,8 +398,10 @@ export function createVolume(canvas) {
     setThreshold(v) { slotThr[0] = Math.max(0, Math.min(1, v)); render(); },
     setSlotThreshold(i, v) { if (i >= 0 && i < MAXV) { slotThr[i] = Math.max(0, Math.min(1, v)); render(); } },
     setGamma(g) { gamma = Math.max(0.2, g); render(); },
-    // Per-axis clip slab, texture space [0,1] in (x, y, z) order. Pass nulls to clear.
-    setClip(lo, hi) { clipLo = lo || [0, 0, 0]; clipHi = hi || [1, 1, 1]; render(); },
+    // Clip slab: keep lo <= dot(p, n) <= hi, with `n` a unit normal in the model-space
+    // [-1,1] cube — the same call the surface renderer takes, so one cut serves both
+    // render modes. Pass a null normal to clear.
+    setClip(n, lo, hi) { clipN = n ? [n[0], n[1], n[2]] : null; clipRange = [lo, hi]; render(); },
     setBrightness(b) { bright = Math.max(0.1, b); render(); },
     setColor(rgb) { slotCol[0] = rgb.slice(); render(); },
     setSlotColor(i, rgb) { if (i >= 0 && i < MAXV) { slotCol[i] = rgb.slice(); render(); } },

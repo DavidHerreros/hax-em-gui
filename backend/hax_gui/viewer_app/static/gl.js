@@ -113,16 +113,32 @@ void main() {
 }`;
 
 // Depth-only pass, used for both shadow maps. No colour attachment is bound, so the
-// fragment stage exists only to satisfy the linker.
+// fragment stage writes nothing — it exists only to apply the clip slab, which it must,
+// or geometry the beauty pass has cut away would go on casting shadows onto the interior
+// the cut just revealed. Both shadow passes render with model-space view matrices, so
+// aPos is already the coordinate the slab is expressed in.
 const VERT_DEPTH = `#version 300 es
 precision highp float;
 layout(location=0) in vec3 aPos;
 uniform mat4 uProj;
 uniform mat4 uView;
-void main() { gl_Position = uProj * uView * vec4(aPos, 1.0); }`;
-const FRAG_EMPTY = `#version 300 es
+out vec3 vModelPos;
+void main() {
+  vModelPos = aPos;
+  gl_Position = uProj * uView * vec4(aPos, 1.0);
+}`;
+const FRAG_DEPTH = `#version 300 es
 precision highp float;
-void main() {}`;
+in vec3 vModelPos;
+uniform int uClipOn;
+uniform vec3 uClipN;
+uniform vec2 uClipRange;
+void main() {
+  if (uClipOn == 1) {
+    float d = dot(vModelPos, uClipN);
+    if (d < uClipRange.x || d > uClipRange.y) discard;
+  }
+}`;
 
 // Unlit line overlay (PDB backbone traces). Depth-tested against the surfaces so a
 // trace threads through its map instead of floating in front of it.
@@ -148,12 +164,15 @@ precision highp float;
 in vec3 vViewPos;
 in vec3 vModelPos;
 uniform int uClipOn;
-uniform vec3 uClipLo;
-uniform vec3 uClipHi;
+uniform vec3 uClipN;
+uniform vec2 uClipRange;
 out vec4 outPos;
 void main() {
   // Same clip as the beauty pass, so the pivot lands on a surface you can see.
-  if (uClipOn == 1 && (any(lessThan(vModelPos, uClipLo)) || any(greaterThan(vModelPos, uClipHi)))) discard;
+  if (uClipOn == 1) {
+    float d = dot(vModelPos, uClipN);
+    if (d < uClipRange.x || d > uClipRange.y) discard;
+  }
   outPos = vec4(vViewPos, 1.0);
 }`;
 
@@ -199,18 +218,25 @@ layout(std140) uniform shadow_matrix_block { mat4 uMSXf[${MS_COUNT}]; };
 uniform vec3 uDepthCueColor;
 uniform vec2 uDepthCueRange;
 
-// Model-space clip slab (the [-1,1] cube the maps live in). Fragments outside are
-// discarded — a cutaway, like ChimeraX's per-axis clipping of a surface. Shadows are
-// deliberately NOT clipped: the atlas is cached per geometry, and rebuilding 64 depth
-// passes on every slider tick would make the slab unusable to drag.
+// Model-space clip slab: a pair of parallel planes with unit normal uClipN, keeping the
+// fragments whose signed distance along it lands inside uClipRange. Clipping to a
+// coordinate axis is the case where the normal is a coordinate axis, like ChimeraX's
+// per-axis clipping of a surface; an arbitrary normal is what the viewer's "view" cut
+// uses. The shadow passes apply the same slab, so a cutaway is lit like an exterior
+// rather than sitting in the shadow of the geometry it removed — but the 64-pass ambient
+// atlas only catches up on a debounce (see setClip), since rebuilding it on every slider
+// tick would make the slab unusable to drag. The one-pass key shadow keeps up live.
 uniform int uClipOn;
-uniform vec3 uClipLo;
-uniform vec3 uClipHi;
+uniform vec3 uClipN;
+uniform vec2 uClipRange;
 
 out vec4 frag_color;
 
 void main() {
-  if (uClipOn == 1 && (any(lessThan(vModelPos, uClipLo)) || any(greaterThan(vModelPos, uClipHi)))) discard;
+  if (uClipOn == 1) {
+    float clipD = dot(vModelPos, uClipN);
+    if (clipD < uClipRange.x || clipD > uClipRange.y) discard;
+  }
   vec4 fcolor = vec4(uUseVColor == 1 ? vColor : uColor, 1.0);
 
   // Unit normal, with two-sided lighting.
@@ -280,7 +306,7 @@ export function createRenderer(canvas) {
   const floatTargets = !!gl.getExtension("EXT_color_buffer_float");
 
   const beauty = makeProg(gl, VERT, FRAG_BEAUTY);
-  const depthP = makeProg(gl, VERT_DEPTH, FRAG_EMPTY);
+  const depthP = makeProg(gl, VERT_DEPTH, FRAG_DEPTH);
   const geomP = floatTargets ? makeProg(gl, VERT, FRAG_GEOM) : null;
   const lineP = makeProg(gl, VERT_LINE, FRAG_LINE);
 
@@ -330,7 +356,19 @@ export function createRenderer(canvas) {
   let color = [0.863, 0.863, 0.863];   // ChimeraX-style near-white neutral gray
   let bg = [0.016, 0.024, 0.06];
   let light = { ...LIGHTING.standard };
-  let clipLo = null, clipHi = null;    // model-space clip slab; null = no clipping
+  // Model-space clip slab: keep the fragments with clipRange[0] <= dot(p, clipN) <= clipRange[1].
+  // A null normal is no clipping at all.
+  let clipN = null, clipRange = [0, 0];
+  let clipSettle = 0;                  // the pending "rebuild the ambient atlas" timer
+
+  // Every program that honours the slab reads the same three uniforms, and all of them
+  // have to be written whenever the program is bound — the depth passes included.
+  function uploadClip(p) {
+    gl.uniform1i(p.u("uClipOn"), clipN ? 1 : 0);
+    if (!clipN) return;
+    gl.uniform3fv(p.u("uClipN"), clipN);
+    gl.uniform2fv(p.u("uClipRange"), clipRange);
+  }
 
   // ---------------------------------------------------------------------------
   // Shadow maps
@@ -448,6 +486,7 @@ export function createRenderer(canvas) {
     gl.useProgram(depthP.prog);
     gl.uniformMatrix4fv(depthP.u("uProj"), false, proj);
     gl.uniformMatrix4fv(depthP.u("uView"), false, view);
+    uploadClip(depthP);
     for (const m of drawable()) {
       gl.bindVertexArray(m.vao);
       gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
@@ -521,11 +560,14 @@ export function createRenderer(canvas) {
       mv[4] * KEY_DIR[0] + mv[5] * KEY_DIR[1] + mv[6] * KEY_DIR[2],
       mv[8] * KEY_DIR[0] + mv[9] * KEY_DIR[1] + mv[10] * KEY_DIR[2],
     ];
-    // Only the model-space light direction and the geometry can change what this map
-    // holds, so a redraw that changed neither (a recolour, a resize, a zoom, a pan — the
-    // last two move the camera without turning the model) reuses it. Rotation does change
-    // it, which is inherent: a camera-fixed light sweeps over the model as it turns.
-    const key = `${geomGen}|${ld[0].toFixed(6)},${ld[1].toFixed(6)},${ld[2].toFixed(6)}`;
+    // Only the model-space light direction, the geometry and the clip slab can change what
+    // this map holds, so a redraw that changed none of them (a recolour, a resize, a zoom,
+    // a pan — the last two move the camera without turning the model) reuses it. Rotation
+    // does change it, which is inherent: a camera-fixed light sweeps over the model as it
+    // turns. Dragging the slab changes it too, and unlike the 64-pass ambient atlas one
+    // extra depth pass per tick is cheap enough to just pay.
+    const clipKey = clipN ? `${clipN.join()}/${clipRange.join()}` : "-";
+    const key = `${geomGen}|${ld[0].toFixed(6)},${ld[1].toFixed(6)},${ld[2].toFixed(6)}|${clipKey}`;
     if (key === shadowKey && shadowXf) return;
 
     const t = shadowTransforms(ld, bs.center, bs.radius, SHADOW_DEPTH_BIAS);
@@ -588,11 +630,7 @@ export function createRenderer(canvas) {
     gl.uniformMatrix4fv(geomP.u("uProj"), false, proj);
     gl.uniformMatrix4fv(geomP.u("uView"), false, view);
     gl.uniformMatrix4fv(geomP.u("uModel"), false, model);
-    gl.uniform1i(geomP.u("uClipOn"), clipLo ? 1 : 0);
-    if (clipLo) {
-      gl.uniform3fv(geomP.u("uClipLo"), clipLo);
-      gl.uniform3fv(geomP.u("uClipHi"), clipHi);
-    }
+    uploadClip(geomP);
     for (const m of drawable()) {
       gl.bindVertexArray(m.vao);
       gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
@@ -711,11 +749,7 @@ export function createRenderer(canvas) {
     gl.uniform3fv(beauty.u("uDepthCueColor"), bg);
     gl.uniform2fv(beauty.u("uDepthCueRange"), depthCueRange(view, model));
 
-    gl.uniform1i(beauty.u("uClipOn"), clipLo ? 1 : 0);
-    if (clipLo) {
-      gl.uniform3fv(beauty.u("uClipLo"), clipLo);
-      gl.uniform3fv(beauty.u("uClipHi"), clipHi);
-    }
+    uploadClip(beauty);
 
     const cLoc = beauty.u("uColor"), vcLoc = beauty.u("uUseVColor");
     for (const m of drawable()) {
@@ -858,9 +892,22 @@ export function createRenderer(canvas) {
     // shading of the far side of the map — as it does in ChimeraX.
     setBackground(rgb) { bg = rgb; render(); },
     setLighting(m) { light = { ...(LIGHTING[m] || LIGHTING.standard) }; render(); },
-    // Model-space clip slab ([-1,1] cube coordinates). Pass nulls to clear. The pivot
-    // probe honours it too, so rotation centres on what is actually visible.
-    setClip(lo, hi) { clipLo = lo ? lo.slice() : null; clipHi = hi ? hi.slice() : null; orbit.invalidatePivot(); render(); },
+    // Model-space clip slab: keep lo <= dot(p, n) <= hi, with `n` a unit normal in the
+    // [-1,1] cube coordinates. Pass a null normal to clear. The pivot probe honours it
+    // too, so rotation centres on what is actually visible.
+    //
+    // The ambient atlas is 64 depth passes, far too many to redo per slider tick, so it
+    // is left standing (a freshly revealed interior stays dark for a moment) and rebuilt
+    // once the slab has been still for a beat. Clearing the clip takes the same route:
+    // the standing atlas was built cut, and has to be rebuilt whole.
+    setClip(n, lo, hi) {
+      clipN = n ? [n[0], n[1], n[2]] : null;
+      clipRange = [lo, hi];
+      orbit.invalidatePivot();
+      clearTimeout(clipSettle);
+      clipSettle = setTimeout(() => { msReady = false; render(); }, 150);
+      render();
+    },
     resetView() { orbit.reset(); },
     getCamera() { return orbit.getState(); },   // handed to the other renderer on a render-mode switch
     setCamera(cam) { orbit.setState(cam); },
