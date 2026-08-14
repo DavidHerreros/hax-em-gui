@@ -62,8 +62,9 @@ export function rememberWorkflowToOpen(id) {
 const NODE_W = 196;     // node width (px)
 const HEADER_H = 34;    // node header height
 const ROW_H = 26;       // per-input-port row height
-const CONTENT_W = 4000; // scrollable canvas content size (matches the wires SVG)
-const CONTENT_H = 3000;
+const MIN_CONTENT_W = 4000; // minimum canvas size; the content grows to keep margin beyond the graph
+const MIN_CONTENT_H = 3000;
+const GROW_PAD = 800;   // margin kept past the outermost node so there's always room to drag/wire
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 // Concrete status colors for the overview map. Canvas 2D takes only resolved colors,
@@ -317,14 +318,18 @@ export function WorkflowsView() {
       h("button", { class: "wf-pane-collapse", title: "Hide programs", onclick: () => setPalette(false) }, icon("chevronLeft", 16))),
     paletteInner);
 
-  // The content (wires + nodes) lives in a fixed CONTENT_W×CONTENT_H layer that is
+  // The content (wires + nodes) lives in a contentW×contentH layer that is
   // CSS-scaled by `zoom`; a sizer of the scaled size gives the scroll container its
-  // extent. Node coords stay in content units — only the view scales.
+  // extent. Node coords stay in content units — only the view scales. contentW/H
+  // start at the minimums and grow (see fitContent below) as nodes are dragged or
+  // placed near the edge, so the usable area is effectively unlimited rightward/
+  // downward while the origin stays anchored at 0 (existing clamps already enforce that).
   let zoom = 1;
+  let contentW = MIN_CONTENT_W, contentH = MIN_CONTENT_H;
   const ZOOM_MIN = 0.2, ZOOM_MAX = 2.5;
-  const svg = svgEl("svg", { class: "wf-wires", width: String(CONTENT_W), height: String(CONTENT_H) });
+  const svg = svgEl("svg", { class: "wf-wires", width: String(contentW), height: String(contentH) });
   const nodesLayer = h("div", { class: "wf-nodes" });
-  const contentLayer = h("div", { class: "wf-content", style: { width: CONTENT_W + "px", height: CONTENT_H + "px" } }, svg, nodesLayer);
+  const contentLayer = h("div", { class: "wf-content", style: { width: contentW + "px", height: contentH + "px" } }, svg, nodesLayer);
   const sizer = h("div", { class: "wf-sizer" }, contentLayer);
   const canvas = h("div", { class: "wf-canvas" }, sizer);
   // ── overview panel ──
@@ -349,10 +354,25 @@ export function WorkflowsView() {
   contentLayer.appendChild(marqueeEl);
 
   function applyZoom() {
-    sizer.style.width = CONTENT_W * zoom + "px";
-    sizer.style.height = CONTENT_H * zoom + "px";
+    sizer.style.width = contentW * zoom + "px";
+    sizer.style.height = contentH * zoom + "px";
     contentLayer.style.transform = `scale(${zoom})`;
     updateZoomLabel();
+  }
+  // Grow the canvas to keep GROW_PAD of margin past the outermost node — only ever
+  // grows (never shrinks) so a drag/wire gesture in flight never has the floor pulled
+  // out from under it; a page reload is what resets an over-grown canvas back down.
+  function fitContent() {
+    const b = graphBBox();
+    const needW = Math.max(contentW, MIN_CONTENT_W, (b ? b.x1 : 0) + GROW_PAD);
+    const needH = Math.max(contentH, MIN_CONTENT_H, (b ? b.y1 : 0) + GROW_PAD);
+    if (needW === contentW && needH === contentH) return;
+    contentW = needW; contentH = needH;
+    svg.setAttribute("width", String(contentW));
+    svg.setAttribute("height", String(contentH));
+    contentLayer.style.width = contentW + "px";
+    contentLayer.style.height = contentH + "px";
+    applyZoom();
   }
   function updateZoomLabel() { zoomLabel.textContent = Math.round(zoom * 100) + "%"; }
   // Zoom to `next`, keeping the content point under (mx,my) (canvas-local px) fixed.
@@ -827,6 +847,7 @@ export function WorkflowsView() {
       nodesLayer.appendChild(el);
     }
     redrawWires(null, focus);
+    fitContent();     // size the canvas to whatever was just loaded/laid out
     drawMinimap();
     syncActions();   // the action cluster follows the selection and the run state
   }
@@ -1015,6 +1036,11 @@ export function WorkflowsView() {
         const el = nodesLayer.querySelector(`.wf-node[data-node="${node.id}"]`);
         if (el) { el.style.left = node.x + "px"; el.style.top = node.y + "px"; }
       }
+      // Grow the canvas as the drag approaches the edge, so a node dragged toward
+      // the right/bottom never runs out of content to be dropped onto or wired
+      // past — cheap (one bbox walk of the node array) with an early-out in
+      // fitContent() itself when nothing actually changed.
+      fitContent();
       // Ports are computed from node data (outPort/inPort), so only the wires
       // and the minimap need repainting — the old full renderNodes() rebuilt
       // every node element at pointer-event rate, which made dragging a
@@ -1193,9 +1219,11 @@ export function WorkflowsView() {
     // room to pan on every side, then center the viewport on it
     const b = graphBBox();
     if (b) {
-      const offx = Math.round(CONTENT_W / 2 - b.cx), offy = Math.round(CONTENT_H / 2 - b.cy);
+      const offx = Math.round(contentW / 2 - b.cx), offy = Math.round(contentH / 2 - b.cy);
       for (const n of graph.nodes) { n.x = Math.max(0, n.x + offx); n.y = Math.max(0, n.y + offy); }
     }
+    // renderNodes() calls fitContent() at its end, resizing the canvas to the
+    // positions just assigned — before centerView(), so its clamps see the new extent.
     renderNodes();
     centerView();
   }
@@ -1232,8 +1260,8 @@ export function WorkflowsView() {
   // content is scaled by `zoom`, so content coords map to scroll via *zoom).
   function centerView() {
     const b = graphBBox(); if (!b) return;
-    canvas.scrollLeft = Math.max(0, Math.min(CONTENT_W * zoom - canvas.clientWidth, b.cx * zoom - canvas.clientWidth / 2));
-    canvas.scrollTop = Math.max(0, Math.min(CONTENT_H * zoom - canvas.clientHeight, b.cy * zoom - canvas.clientHeight / 2));
+    canvas.scrollLeft = Math.max(0, Math.min(contentW * zoom - canvas.clientWidth, b.cx * zoom - canvas.clientWidth / 2));
+    canvas.scrollTop = Math.max(0, Math.min(contentH * zoom - canvas.clientHeight, b.cy * zoom - canvas.clientHeight / 2));
     drawMinimap();
   }
   function toggleMinimap() { minimapOn = !minimapOn; minimap.classList.toggle("hidden", !minimapOn); drawMinimap(); }
@@ -1245,8 +1273,8 @@ export function WorkflowsView() {
   }
   // Centre the viewport on a content-space point, clamped to the scrollable extent.
   function scrollToContent(cx, cy) {
-    canvas.scrollLeft = Math.max(0, Math.min(CONTENT_W * zoom - canvas.clientWidth, cx * zoom - canvas.clientWidth / 2));
-    canvas.scrollTop = Math.max(0, Math.min(CONTENT_H * zoom - canvas.clientHeight, cy * zoom - canvas.clientHeight / 2));
+    canvas.scrollLeft = Math.max(0, Math.min(contentW * zoom - canvas.clientWidth, cx * zoom - canvas.clientWidth / 2));
+    canvas.scrollTop = Math.max(0, Math.min(contentH * zoom - canvas.clientHeight, cy * zoom - canvas.clientHeight / 2));
     drawMinimap();
   }
 
