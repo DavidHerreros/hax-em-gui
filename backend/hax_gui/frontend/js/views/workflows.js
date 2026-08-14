@@ -1030,6 +1030,11 @@ export function WorkflowsView() {
     const p = canvasPoint(e);
     if (drag.kind === "node") {
       const ddx = p.x - drag.ox, ddy = p.y - drag.oy;
+      // Same 3px threshold as the pan gesture: a plain click on a node (to select
+      // or inspect it) must not count as a move — it used to mark the workflow
+      // dirty, which is what made leaving ask about changes that were never made.
+      if (!drag.moved && Math.abs(ddx) + Math.abs(ddy) <= 3) return;
+      drag.moved = true;
       for (const s of drag.start) {
         const node = nodeById(s.id); if (!node) continue;
         node.x = Math.max(0, s.x + ddx); node.y = Math.max(0, s.y + ddy);
@@ -1090,7 +1095,7 @@ export function WorkflowsView() {
         }
       }
       redrawWires();
-    } else if (drag && drag.kind === "node") {
+    } else if (drag && drag.kind === "node" && drag.moved) {
       dirty = true, touchHistory();
     }
     drag = null;
@@ -1637,6 +1642,7 @@ export function WorkflowsView() {
     selectedSet.clear();
     if (!id) {
       wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; nameInput.value = ""; seedHistory();
+      dirty = false;          // a fresh canvas has nothing to lose yet
       wfSelect.value = ""; rememberWorkflow(null);
       renderNodes(); restoreViewport("");
       renderInspector(); syncActions(); flash("New workflow.", "muted"); return;
@@ -1645,6 +1651,9 @@ export function WorkflowsView() {
       wf = await api.workflow(id);
       adoptGraph(wf.graph || {});
       runState = wf.run_state || null; selected = null; nameInput.value = wf.name || ""; wfSelect.value = wf.id;
+      // What was just loaded IS the saved state — without this reset, a dirty flag
+      // from the previous canvas followed you into a workflow you never touched.
+      dirty = false;
       rememberWorkflow(wf.id);
       // freshly imported / never-laid-out graphs have all-zero coords — tidy once
       if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
