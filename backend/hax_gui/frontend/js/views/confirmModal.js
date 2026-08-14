@@ -1,7 +1,7 @@
 // In-app confirmation modal replacing window.confirm(): styled like the rest of
 // the GUI, Escape cancels, Enter confirms, danger actions get a red button.
-// Returns a Promise<boolean>. (router.js keeps window.confirm — its nav guard
-// must decide synchronously inside the hashchange handler.)
+// Returns a Promise<boolean>. Also used by router.js's nav guard, which reverts
+// the hash and asks asynchronously (see the comment there).
 import { h } from "../h.js";
 import { icon } from "../icons.js";
 

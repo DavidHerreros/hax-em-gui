@@ -172,7 +172,10 @@ export function WorkflowsView() {
   const nameInput = h("input", { class: "wf-name", placeholder: "Workflow name", value: "" });
   nameInput.addEventListener("input", () => { dirty = true, touchHistory(); });
   const wfSelect = h("select", { class: "wf-select", title: "Open a saved workflow" });
-  wfSelect.addEventListener("change", () => openWorkflow(wfSelect.value || null));
+  wfSelect.addEventListener("change", async () => {
+    if (!(await confirmDiscard())) { wfSelect.value = wf.id; return; }
+    openWorkflow(wfSelect.value || null);
+  });
   const statusEl = h("span", { class: "wf-status muted" }, "");
   const zoomLabel = h("button", { class: "btn small wf-zoom", title: "Reset zoom to 100%", onclick: resetZoom }, "100%");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
@@ -200,7 +203,7 @@ export function WorkflowsView() {
   // Menus are built on open, so they always read the current workflow / layout state.
   function wfMenuItems() {
     const items = [
-      { label: "New workflow", icon: icon("plus", 15), onClick: () => openWorkflow(null) },
+      { label: "New workflow", icon: icon("plus", 15), onClick: async () => { if (await confirmDiscard()) openWorkflow(null); } },
       { label: "Open project as workflow", icon: icon("box", 15), onClick: openProject },
     ];
     if (!(wf && wf.project_id)) items.push({ label: "Save as project", icon: icon("save", 15), onClick: saveAsProject });
@@ -1709,6 +1712,13 @@ export function WorkflowsView() {
   // reloading the tab asks via beforeunload. Both key off the same dirty flag.
   const unsavedMsg = () => (dirty && wf ? "This workflow has unsaved changes — leave and discard them?" : null);
   setNavGuard(unsavedMsg);
+  // Same guard, for discarding in place (dropdown switch / New workflow) rather than
+  // navigating away — router.js's guard only fires on a route change, not on these.
+  async function confirmDiscard() {
+    if (!(dirty && wf)) return true;
+    return confirmModal({ title: "Unsaved changes", message: "This workflow has unsaved changes — discard them?",
+                          okText: "Discard", cancelText: "Keep editing", danger: true });
+  }
   const onBeforeUnload = (e) => { if (unsavedMsg()) { e.preventDefault(); e.returnValue = ""; } };
   window.addEventListener("beforeunload", onBeforeUnload);
   return { el: root, cleanup: () => { rememberViewport(); stopPolling(); document.removeEventListener("keydown", onKey); window.removeEventListener("beforeunload", onBeforeUnload); } };
