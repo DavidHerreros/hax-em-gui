@@ -484,7 +484,13 @@ void main() {
     // A cut face across a locally flat region has no gradient worth normalising; face the
     // viewer instead of shading from noise.
     if (dot(n, n) < 0.5) n = -rd;
-    if (dot(n, rd) > 0.0) n = -n;              // two-sided, as gl.js is via gl_FrontFacing
+    // NO view-based flip here, deliberately. A density gradient already points outward —
+    // unlike a mesh triangle, an isosurface has no winding for gl_FrontFacing to fix — and a
+    // flip conditioned on the view ray was the one view-dependent term in the whole shading:
+    // just past a silhouette limb the true outward normal is *slightly* back-facing, so the
+    // flip turned it into the body, the cone origin landed inside the surface, and every
+    // cone died — a black rim exactly along the limb, and patches that flipped dark and
+    // bright as the perpendicularity band swept the surface while orbiting.
     vec3 Ifrag = isoShade(hitSlot, hp, n, rd, vox);
     // Depth cue, applied for every preset because gl.js applies it for every preset: the
     // far side of the map fades into the background, and without it the surface reads flat.
