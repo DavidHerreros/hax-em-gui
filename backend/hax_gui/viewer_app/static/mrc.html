@@ -20,6 +20,7 @@
     <div class="seg" id="modeSeg" role="tablist" aria-label="Render mode">
       <button class="on" data-mode="surface">Surface</button>
       <button data-mode="volume">Volume</button>
+      <button data-mode="iso">Iso</button>
       <button data-mode="slices">Slices</button>
     </div>
     <div class="topright">
@@ -99,9 +100,9 @@
         <div class="sec open" data-sec="display" id="secDisplay">
           <button class="sec-h" type="button"><span class="car">▶</span> Display</button>
           <div class="sec-b">
-            <!-- Lighting sits outside dispSurface: the shaded-iso volume style is lit by
-                 the same three presets, so the row has to survive a switch into volume
-                 mode. setMode decides when it is on screen. -->
+            <!-- Lighting and smoothing are shared by the two SHADED modes — surface and iso —
+                 so they are not inside either mode's own block; setMode decides when each row
+                 is on screen. The rows below dispVolume belong to MIP/glow alone. -->
             <div class="rrow" id="lightRow"><span>lighting</span>
               <select id="light"><option value="standard" selected>standard</option><option value="smooth">smooth</option><option value="raytraced">ray traced</option></select>
             </div>
@@ -111,16 +112,17 @@
               <input id="occgain" type="range" min="2" max="24" step="0.5" value="8"
                      title="How readily density counts as opaque to the ambient shadows: higher is darker and crisper, lower is softer and brighter" />
             </div>
-            <div id="dispSurface">
-              <div class="rrow"><span>smooth</span>
-                <input id="smooth" type="range" min="0" max="20" value="6" title="Surface mesh smoothing (Taubin iterations)" /></div>
-            </div>
+            <!-- Taubin iterations on the surface mesh, a Gaussian on the field the iso march
+                 hits: the same idea in both, so the same slider. Hidden in iso where the
+                 renderer cannot blur (see hasSmoothing). -->
+            <div class="rrow" id="smoothRow"><span>smooth</span>
+              <input id="smooth" type="range" min="0" max="20" value="6"
+                     title="Surface: mesh smoothing (Taubin iterations). Iso: Gaussian smoothing of the density field the ray hits, in voxels" /></div>
             <div id="dispVolume" style="display:none">
               <div class="rrow"><span>style</span>
-                <select id="volStyle" title="MIP shows the densest voxel along each ray; glow accumulates like emission; shaded iso ray-casts the contour surface, lit like the surface view">
+                <select id="volStyle" title="MIP shows the densest voxel along each ray; glow accumulates like emission">
                   <option value="mip" selected>MIP</option>
                   <option value="emission">glow</option>
-                  <option value="iso">shaded iso</option>
                 </select>
               </div>
               <div class="rrow"><span>γ</span><input id="vgamma" type="range" min="0.3" max="3" step="0.1" value="1.4" title="Transfer-function gamma" /></div>

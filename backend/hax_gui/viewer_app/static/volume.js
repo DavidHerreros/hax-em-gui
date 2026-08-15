@@ -614,6 +614,36 @@ void main() {
   outColor = vec4(clamp((v - thr) * uGain / max(1.0 - thr, 1e-3), 0.0, 1.0), 0.0, 0.0, 1.0);
 }`;
 
+// Separable Gaussian over the density field, one axis per pass, layer by layer through the
+// same render-to-3D-texture machinery the opacity bake uses.
+//
+// This is iso's answer to the surface view's Taubin slider. It smooths the field the march
+// hits, so it smooths BOTH the geometry (where the contour crossing lands) and the normals
+// (the central difference is taken on the smoothed field), which is what the crispy,
+// pixelated look was: an isosurface cut straight through voxel-resolution noise. Nine taps is
+// enough for the sigmas this is useful at (up to ~2.5 voxels, where the outermost tap is
+// still the dominant truncation), and the sampler's CLAMP_TO_EDGE gives the edge behaviour.
+const BLUR_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler3D uSrc;
+uniform float uZ;         // (z + 0.5) / nz: the layer being written
+uniform vec3 uStep;       // one texel along the axis being blurred, in texture coords
+uniform float uTaps[9];   // normalised weights, uTaps[4] is the centre
+uniform int uRadius;      // 1..4; taps beyond it are zero and are not read
+void main() {
+  vec3 p = vec3(vUv, uZ);
+  float s = uTaps[4] * textureLod(uSrc, p, 0.0).r;
+  for (int k = 1; k < 5; k++) {
+    if (k > uRadius) break;
+    s += uTaps[4 - k] * textureLod(uSrc, p - uStep * float(k), 0.0).r;
+    s += uTaps[4 + k] * textureLod(uSrc, p + uStep * float(k), 0.0).r;
+  }
+  outColor = vec4(s, 0.0, 0.0, 1.0);
+}`;
+
 export function createVolume(canvas) {
   const gl = canvas.getContext("webgl2", { antialias: false, depth: false, preserveDrawingBuffer: true, premultipliedAlpha: false });
   if (!gl) throw new Error("WebGL2 is not available in this browser.");
@@ -637,6 +667,11 @@ export function createVolume(canvas) {
     return ok;
   })();
 
+  // Rendering INTO an R16F texture — which the field blur does — needs the colour-buffer
+  // extension; merely allocating one (hasF16) does not. Keep the two apart: a context without
+  // the extension still gets 16-bit grids, just unsmoothed.
+  const hasSmoothing = hasF16 && !!gl.getExtension("EXT_color_buffer_float");
+
   const prog = link(gl, VERT, FRAG);
   const u = (n) => gl.getUniformLocation(prog, n);
   const uInvVP = u("uInvVP"), uEye = u("uEye"), uBg = u("uBg"),
@@ -655,6 +690,14 @@ export function createVolume(canvas) {
   const bu = (n) => gl.getUniformLocation(bakeProg, n);
   const bSrc = bu("uSrc"), bZ = bu("uZ"), bThr = bu("uThr"), bGain = bu("uGain");
   const opacFbo = gl.createFramebuffer();
+
+  // The field blur's program and its two ping-pong scratch volumes, built only where the
+  // context can render into R16F.
+  const blurProg = hasSmoothing ? link(gl, VERT, BLUR_FRAG) : null;
+  const lu = (n) => gl.getUniformLocation(blurProg, n);
+  const kSrc = blurProg && lu("uSrc"), kZ = blurProg && lu("uZ"), kStep = blurProg && lu("uStep"),
+    kTaps = blurProg && lu("uTaps"), kRadius = blurProg && lu("uRadius");
+  let scratch = null, scratchDim = null;
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -702,6 +745,12 @@ export function createVolume(canvas) {
   const slotDim = Array.from({ length: MAXV }, () => [64, 64, 64]);
   let lightMode = 0;             // iso lighting preset; the other modes ignore it
   let occGain = 8.0;             // iso occlusion hardness; baked into the opacity pyramid
+  // The caller's own arrays, kept by reference (never copied — mrc.js/app.js already hold
+  // these as their grid cache, so this costs nothing) so the field blur can always start
+  // again from the unsmoothed data instead of blurring an already-blurred texture.
+  const slotSrc = Array.from({ length: MAXV }, () => null);
+  let srcB = null;
+  let smoothSigma = 0;           // iso field smoothing, in voxels; 0 = the raw grid
   // Model-space clip slab, shared with the surface renderer: keep clipRange[0] <=
   // dot(p, clipN) <= clipRange[1]. A null normal is no clipping at all.
   let clipN = null, clipRange = [0, 0];
@@ -900,10 +949,82 @@ export function createVolume(canvas) {
     gl.generateMipmap(gl.TEXTURE_3D);
   }
 
+  // Gaussian weights for a sigma in voxels: 9 taps, centre at index 4, normalised so the
+  // filter preserves the mean (an un-normalised kernel would shift the whole field against
+  // the contour and appear to move the surface).
+  function blurTaps(sigma) {
+    const r = Math.max(1, Math.min(4, Math.ceil(3 * sigma)));
+    const w = new Float32Array(9);
+    let sum = 0;
+    for (let k = -r; k <= r; k++) { const v = Math.exp(-(k * k) / (2 * sigma * sigma)); w[4 + k] = v; sum += v; }
+    for (let i = 0; i < 9; i++) w[i] /= sum;
+    return { w, r };
+  }
+
+  function ensureScratch(dim) {
+    const key = dim.join("x");
+    if (scratchDim === key && scratch) return;
+    if (scratch) for (const t of scratch) gl.deleteTexture(t);
+    scratch = [makeVolTex(false), makeVolTex(false)];
+    for (const t of scratch) {
+      gl.bindTexture(gl.TEXTURE_3D, t);
+      gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, dim[0], dim[1], dim[2], 0, gl.RED, gl.HALF_FLOAT, null);
+    }
+    scratchDim = key;
+  }
+
+  // One separable pass: src -> dst along `step`, layer by layer.
+  function blurPass(srcTex, dstTex, dim, step, taps) {
+    const [nx, ny, nz] = dim;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, opacFbo);
+    gl.useProgram(blurProg);
+    gl.viewport(0, 0, nx, ny);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, srcTex);
+    gl.uniform1i(kSrc, 0);
+    gl.uniform3fv(kStep, step);
+    gl.uniform1fv(kTaps, taps.w); gl.uniform1i(kRadius, taps.r);
+    gl.bindVertexArray(vao);
+    for (let z = 0; z < nz; z++) {
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, dstTex, 0, z);
+      gl.uniform1f(kZ, (z + 0.5) / nz);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    gl.bindVertexArray(null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  // Three passes, ping-ponging tex -> scratch0 -> scratch1 -> tex, so the result lands back in
+  // the texture everything else already samples and no pass ever reads what it is writing.
+  function blurField(tex, dim, sigma) {
+    ensureScratch(dim);
+    const taps = blurTaps(sigma);
+    const [nx, ny, nz] = dim;
+    blurPass(tex, scratch[0], dim, [1 / nx, 0, 0], taps);
+    blurPass(scratch[0], scratch[1], dim, [0, 1 / ny, 0], taps);
+    blurPass(scratch[1], tex, dim, [0, 0, 1 / nz], taps);
+  }
+
+  // Re-upload a slot from the array the caller gave us and blur it, or leave it raw. Only
+  // float16 grids are ever blurred: a uint8 grid belongs to MIP/glow/slices (or the 8-bit iso
+  // fallback, where the client-side de-banding blur has already been applied) and rendering
+  // into R8 would quantise every pass.
+  function blurIfNeeded(tex, nx, ny, nz, data) {
+    if (smoothSigma > 0 && hasSmoothing && data instanceof Uint16Array) blurField(tex, [nx, ny, nz], smoothSigma);
+  }
+  function reload(tex, src) {
+    if (!src || !(src.data instanceof Uint16Array)) return;
+    upload(tex, src.nx, src.ny, src.nz, src.data);
+    blurIfNeeded(tex, src.nx, src.ny, src.nz, src.data);
+  }
+  function reloadAll() {
+    for (let i = 0; i < count; i++) reload(slotTex[i], slotSrc[i]);
+    if (gridB) reload(texB, srcB);
+  }
+
   // The pyramid is only ever needed by iso, so it is baked lazily: anything that invalidates
   // it just says so, and the next draw in iso mode pays for it. Switching into iso therefore
   // costs one bake and switching styles otherwise costs nothing.
-  let opacDirty = true, opacTimer = null;
+  let opacDirty = true, opacTimer = null, smoothTimer = null;
   function bakeAll() {
     for (let i = 0; i < count; i++) bakeOpacity(slotTex[i], opacTex[i], slotDim[i], slotThr[i]);
     if (gridB) bakeOpacity(texB, opacTexB, dimB, slotThr[0]);
@@ -924,6 +1045,8 @@ export function createVolume(canvas) {
 
   function setVolume(nx, ny, nz, u8, lo, hi) {
     upload(slotTex[0], nx, ny, nz, u8);
+    slotSrc[0] = { data: u8, nx, ny, nz };   // kept by reference; see slotSrc
+    blurIfNeeded(slotTex[0], nx, ny, nz, u8);
     grid = { nx, ny, nz };
     slotDim[0] = [nx, ny, nz];
     count = 1;
@@ -939,6 +1062,8 @@ export function createVolume(canvas) {
     for (let i = 0; i < n; i++) {
       const s = slots[i];
       upload(slotTex[i], s.nx, s.ny, s.nz, s.data);
+      slotSrc[i] = { data: s.data, nx: s.nx, ny: s.ny, nz: s.nz };
+      blurIfNeeded(slotTex[i], s.nx, s.ny, s.nz, s.data);
       slotDim[i] = [s.nx, s.ny, s.nz];
       if (s.lo && s.hi) { slotBoxLo[i] = s.lo.slice(); slotBoxHi[i] = s.hi.slice(); }
       if (s.color) slotCol[i] = s.color.slice();
@@ -958,14 +1083,20 @@ export function createVolume(canvas) {
     // before they choose what to fetch: iso takes a native-resolution 16-bit grid where this
     // is true, and the 8-bit + client-side-blur path where it is not.
     hasF16,
+    // Whether the field blur below can run at all: it renders into R16F, which needs the
+    // colour-buffer extension even though allocating an R16F texture does not. Controllers
+    // hide the smoothing control when this is false rather than offering a dead slider.
+    hasSmoothing,
     // How many maps a composited scene can hold; the controller reports truncation.
     maxSlots: MAXV,
     // The far end of a morph. Pass null to stop morphing and go back to one volume. The
     // camera is untouched either way: the two ends share a grid, so they share the box the
     // pivot is derived from.
     setVolumeB(nx, ny, nz, u8) {
-      if (!u8) { gridB = null; dimB = null; mix = 0; invalidateOpacity(true); render(); return; }
+      if (!u8) { gridB = null; dimB = null; srcB = null; mix = 0; invalidateOpacity(true); render(); return; }
       upload(texB, nx, ny, nz, u8);
+      srcB = { data: u8, nx, ny, nz };
+      blurIfNeeded(texB, nx, ny, nz, u8);
       gridB = { nx, ny, nz };
       dimB = [nx, ny, nz];
       invalidateOpacity(true);
@@ -984,6 +1115,24 @@ export function createVolume(canvas) {
     // on the map — a tight contour on a well-resolved map wants less than a loose one on a
     // noisy map — so it is exposed rather than guessed at once.
     setOcclusionGain(v) { occGain = Math.max(1, Math.min(32, v)); invalidateOpacity(false); },
+    // Gaussian smoothing of the density field, in voxels — iso's counterpart to the surface
+    // view's Taubin slider, and like it a property of how the geometry is drawn rather than of
+    // the data. Each change restarts from the caller's untouched array (slotSrc), so sigma is
+    // absolute rather than cumulative, and the opacity pyramid is rebuilt from the smoothed
+    // field afterwards. Debounced, so a drag stays interactive. A no-op without hasSmoothing.
+    setSmoothing(sigmaVoxels) {
+      if (!hasSmoothing) return;
+      const s = Math.max(0, Math.min(2.5, sigmaVoxels || 0));
+      if (s === smoothSigma) return;
+      smoothSigma = s;
+      if (smoothTimer) clearTimeout(smoothTimer);
+      smoothTimer = setTimeout(() => {
+        smoothTimer = null;
+        reloadAll();               // re-upload raw, then blur: the blur is never applied twice
+        invalidateOpacity(true);   // the pyramid describes the field as it was before
+        render();
+      }, 150);
+    },
     // Signed-difference rendering of slot 0 (red = lost, blue = gained). The caller
     // is responsible for having uploaded a symmetric-range grid (see /api/paint/grid).
     setDiverging(on) { diverging = !!on; render(); },

@@ -171,6 +171,9 @@ async function setActive(i) {
   // active one — otherwise they show the previous map's settings and the next nudge
   // silently applies them to this one.
   $("smooth").value = String(m.smooth);
+  // The slider is shared with iso's field smoothing, so a map switch that moves it has to
+  // move the renderer with it — otherwise the control and the picture disagree.
+  if (state.render === "iso") volRenderer.setSmoothing(ISO_SIGMA_PER_STEP * m.smooth);
   $("sigVal").textContent = m.sigma.toFixed(2) + " σ";
   if (models.length > 1) markActiveRow();
   schedSaveScene();
@@ -906,6 +909,11 @@ function setMode(mode) {
   state.render = mode;
   const isSurface = mode === "surface";
   const isVolume = isVolumeStyle(mode);
+  // Iso is its own top-level segment now, and the only volume style that is not ray-integrated:
+  // the γ / brightness / style rows do nothing to a shaded surface, so they belong to the other
+  // two alone.
+  const isIso = mode === "iso";
+  const isRayVol = isVolume && !isIso;
   const isSlices = mode === "slices";
 
   show($("gl"), isSurface);
@@ -915,19 +923,21 @@ function setMode(mode) {
   const to = camera3d(mode);
   if (to && to !== from && camera) to.setCamera(camera);
 
-  // The segmented switch tracks the mode; volume styles both light the same segment.
-  const seg = isVolume ? "volume" : mode;
+  // The segmented switch tracks the mode; MIP and glow share the "volume" segment, iso has
+  // its own.
+  const seg = isRayVol ? "volume" : mode;
   for (const b of $("modeSeg").querySelectorAll("button")) {
     b.classList.toggle("on", b.dataset.mode === seg);
   }
-  if (isVolume) $("volStyle").value = mode;
+  if (isRayVol) $("volStyle").value = mode;   // the select holds mip/emission only
   // Contextual controls: only the current mode's rows exist on screen.
-  show($("dispSurface"), isSurface);
-  // Lighting drives the surface renderer and the shaded-iso volume style alike, so its row
-  // belongs to both modes and to neither of the other two volume styles.
-  show($("lightRow"), isSurface || mode === "iso");
+  // Lighting drives the surface renderer and the shaded-iso mode alike, so its row belongs to
+  // both and to neither of the ray-integrated styles. Smoothing likewise — Taubin on the mesh,
+  // a Gaussian on the field — but only where the renderer can actually blur (see hasSmoothing).
+  show($("lightRow"), isSurface || isIso);
+  show($("smoothRow"), isSurface || (isIso && volRenderer.hasSmoothing));
   showOccRow(mode);
-  show($("dispVolume"), isVolume);
+  show($("dispVolume"), isRayVol);
   show($("dispSlices"), isSlices);
   show($("colorlbl"), !isSlices);
   $("secContour").hidden = isSlices;   // contour is meaningless for raw slices
@@ -936,9 +946,13 @@ function setMode(mode) {
   if (isSurface) { renderer.render(); loadSurfaces(); }
   else if (isVolume) {
     volRenderer.setMode(mode);
-    // Iso is shaded, so it needs the lighting preset the select is sitting on — it may have
-    // been changed while a surface was on screen, or restored from a previous session.
-    if (mode === "iso") volRenderer.setLighting($("light").value);
+    // Iso is shaded, so it needs the lighting preset and the smoothing the sliders are sitting
+    // on — either may have been changed while a surface was on screen, or restored from a
+    // previous session.
+    if (isIso) {
+      volRenderer.setLighting($("light").value);
+      volRenderer.setSmoothing(ISO_SIGMA_PER_STEP * +$("smooth").value);
+    }
     loadVolume();
   }
   else { loadSlices(); }
@@ -959,8 +973,10 @@ $("modeSeg").addEventListener("click", (e) => {
   setMode(seg === "volume" ? volStyle : seg);
 });
 $("volStyle").addEventListener("change", (e) => {
-  volStyle = isVolumeStyle(e.target.value) ? e.target.value : "mip";
-  if (inVolumeMode()) setMode(volStyle);
+  volStyle = e.target.value === "emission" ? "emission" : "mip";
+  // Only re-enter if one of the two styles this select owns is on screen: iso is a segment of
+  // its own now, and switching it out from under a hidden select would be a surprise.
+  if (state.render === "mip" || state.render === "emission") setMode(volStyle);
 });
 
 // Export menu: the four ways out of the viewer, one dropdown.
@@ -1022,7 +1038,15 @@ $("light").addEventListener("change", (e) => {
   showOccRow(state.render);          // the preset decides whether occlusion is adjustable
 });
 $("occgain").addEventListener("input", (e) => volRenderer.setOcclusionGain(+e.target.value));
+// Slider steps -> Gaussian sigma in voxels for iso. 0.15 per step puts the 0-20 slider on
+// 0..3 voxels (the renderer clamps at 2.5), which lands the default 6 at ~0.9 voxels — about
+// where the field stops looking pixelated without the surface starting to melt. A taste
+// constant, like the Taubin count it shares the slider with.
+const ISO_SIGMA_PER_STEP = 0.15;
 $("smooth").addEventListener("input", (e) => {
+  // In iso the slider smooths the density field the march hits (and so its gradients); the
+  // map's own Taubin setting is left alone, since no mesh is being cut here.
+  if (state.render === "iso") { volRenderer.setSmoothing(ISO_SIGMA_PER_STEP * +e.target.value); return; }
   active().smooth = +e.target.value;
   active().surface = null;                     // the cached mesh was cut at the old smoothing
   if (state.render === "surface") loadSurface(state.active, false);
