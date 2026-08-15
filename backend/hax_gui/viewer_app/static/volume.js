@@ -203,11 +203,16 @@ float boxFar(vec3 o, vec3 d) {
 // march towards the light and kill the key term on the first occupied sample. Twice the
 // primary step, because a shadow's edge tolerates an error the silhouette does not, and
 // the ray is started off the surface or step one would shadow the point against itself.
-float isoShadow(vec3 p, vec3 n, float dt) {
+// Every length here is in VOXELS of the map, never in units of the primary step dt: dt is
+// (tf - tn) / steps and so changes with the view direction, and a binary visibility test
+// scaled by it flips answers from frame to frame as you orbit — which is exactly what made
+// the surface flash while rotating. The primary march stays on dt (it has to span whatever
+// segment this pixel's ray covers); everything downstream of the hit is view-independent.
+float isoShadow(vec3 p, vec3 n, float vox) {
   vec3 L = -uKeyDir;                    // uKeyDir is where the light shines, not where it is
-  vec3 o = p + n * dt * 1.5;
+  vec3 o = p + n * vox;
   float tf = boxFar(o, L);
-  float st = dt * 2.0;
+  float st = vox * 1.5;
   for (int s = 1; s < 256; s++) {
     float t = st * float(s);
     if (t > tf) break;
@@ -229,9 +234,9 @@ float isoShadow(vec3 p, vec3 n, float dt) {
 //
 // Half the directions face away from the surface and are skipped before their ray is cast,
 // so the real cost is ~8 coarse rays at hit pixels only.
-float isoMultishadow(vec3 p, vec3 n, float dt) {
-  vec3 o = p + n * dt * 1.5;      // off the surface, or every ray shadows the point on itself
-  float st = dt * 3.0;            // coarse: an ambient term tolerates a missed thin wall
+float isoMultishadow(vec3 p, vec3 n, float vox) {
+  vec3 o = p + n * vox;           // off the surface, or every ray shadows the point on itself
+  float st = vox * 1.5;           // coarse: an ambient term tolerates a missed thin wall
   float sh = 0.0;
   for (int i = 0; i < ${MS_COUNT}; i++) {
     float w = max(-dot(n, MSDIR[i]), 0.0);
@@ -239,7 +244,7 @@ float isoMultishadow(vec3 p, vec3 n, float dt) {
     vec3 L = -MSDIR[i];           // towards the light
     float tf = boxFar(o, L);
     float vis = 1.0;
-    for (int t = 1; t < 48; t++) {
+    for (int t = 1; t < 128; t++) {      // 128 * 1.5 voxels clears the diagonal of a 256^3 box
       float tt = st * float(t);
       if (tt > tf) break;
       if (isoOccupied(o + L * tt)) { vis = 0.0; break; }
@@ -254,7 +259,7 @@ float isoMultishadow(vec3 p, vec3 n, float dt) {
 // drawn as a mesh, or switching modes would look like a change of material. rd is the
 // unit eye-to-point direction, gl.js's v1 — every vector here is model space, and the
 // model transform is rigid, so the dot products are the camera-space ones.
-vec3 isoShade(int i, vec3 p, vec3 n, vec3 rd, float dt) {
+vec3 isoShade(int i, vec3 p, vec3 n, vec3 rd, float vox) {
   float lkey  = uLightMode == 1 ? 0.0 : (uLightMode == 2 ? 0.7 : 1.0);
   float lfill = uLightMode == 1 ? 0.0 : (uLightMode == 2 ? 0.3 : 0.5);
   float lamb  = uLightMode == 1 ? 1.5 : (uLightMode == 2 ? 0.8 : 0.4);
@@ -262,8 +267,8 @@ vec3 isoShade(int i, vec3 p, vec3 n, vec3 rd, float dt) {
   float ff = max(-dot(n, uFillDir), 0.0);
   vec3 R = normalize(reflect(uKeyDir, n));
   float sf = pow(max(-dot(R, rd), 0.0), 30.0);      // MATERIAL.exponent
-  float shadow = uLightMode == 2 ? isoShadow(p, n, dt) : 1.0;
-  float amb = uLightMode == 0 ? 1.0 : isoMultishadow(p, n, dt);
+  float shadow = uLightMode == 2 ? isoShadow(p, n, vox) : 1.0;
+  float amb = uLightMode == 0 ? 1.0 : isoMultishadow(p, n, vox);
   vec3 base = uColA[i];
   vec3 Iamb = base * (0.8 * lamb) * amb;                                  // MATERIAL.ambient
   vec3 Idiff = base * (0.8 * lkey * kf * shadow + 0.8 * lfill * ff);      // MATERIAL.diffuse
@@ -368,7 +373,16 @@ void main() {
     float tp = tn;
     int hitSlot = -1;
     float tHit = 0.0;
+    // A ray that enters the box already inside a map never crosses anything — prev starts
+    // above the contour — and used to fall through to the background, which is why
+    // silhouettes broke into holes where the surface meets the box face and why moving the
+    // camera close punched the map open. Entering inside IS a hit, on the entry face.
+    for (int i = 0; i < ${MAXV}; i++) {
+      if (i >= uCount) break;
+      if (prev[i] >= max(uThrA[i], 1e-4) && hitSlot < 0) { hitSlot = i; tHit = tn; }
+    }
     for (int s = 1; s < 512; s++) {
+      if (hitSlot >= 0) break;
       if (s > steps) break;
       float tc = tn + dt * float(s);
       vec3 mp = ro + rd * tc;
@@ -396,11 +410,15 @@ void main() {
     if (hitSlot < 0) { outColor = vec4(uBg, 1.0); return; }
     vec3 hp = ro + rd * tHit;
     vec3 n = isoNormal(hitSlot, hp);
+    // The voxel diagonal of the map that was hit, in model units: the one length scale the
+    // shading helpers are allowed to use (see isoShadow).
+    vec3 vv = uVoxA[hitSlot] * (uBoxHiA[hitSlot] - uBoxLoA[hitSlot]);
+    float vox = max(length(vv), 1e-6);
     // A cut face across a locally flat region has no gradient worth normalising; face the
     // viewer instead of shading from noise.
     if (dot(n, n) < 0.5) n = -rd;
     if (dot(n, rd) > 0.0) n = -n;              // two-sided, as gl.js is via gl_FrontFacing
-    vec3 Ifrag = isoShade(hitSlot, hp, n, rd, dt);
+    vec3 Ifrag = isoShade(hitSlot, hp, n, rd, vox);
     // Depth cue, applied for every preset because gl.js applies it for every preset: the
     // far side of the map fades into the background, and without it the surface reads flat.
     // -(row2 . hp + row2.w) is the camera-space axial distance of the hit (the camera looks
@@ -425,6 +443,84 @@ void main() {
     outColor = vec4(acc + uBg * (1.0 - alpha), 1.0);
   }
 }`;
+
+// Separable 5-tap Gaussian (sigma ~0.8 voxel) over a uint8 grid, clamped at the edges.
+//
+// For iso mode only, and deliberately AFTER quantisation. The grids arrive as uint8, so a
+// smoothly varying density becomes a staircase of 1/255 plateaus: an isosurface cut through
+// a plateau terraces, and the central-difference normal inside one flips sign on rounding
+// noise — the faceted look with scattered dark patches. Averaging here manufactures the
+// intermediate values 8 bits cannot hold, which is precisely what smoothing on the server
+// before quantisation could not do. The mesh view gets the same effect for free: it is
+// contoured from float32 and then Taubin-smoothed.
+//
+// Flat typed-array passes with an explicit 5-term inner sum: three passes over 256^3 is
+// ~50M taps, tens of milliseconds, and it runs once per grid (callers tag the result).
+// The taps of a sigma ~0.8 voxel Gaussian, normalised: the textbook numbers below sum to
+// 1.0207, and an un-normalised kernel applied on three axes would brighten the whole map by
+// 6% — visible as the contour appearing to move when iso mode smooths and the other styles
+// do not.
+const G5 = (() => {
+  const w = [0.06136, 0.24477, 0.40842, 0.24477, 0.06136];
+  const t = w.reduce((a, b) => a + b, 0);
+  return w.map((v) => v / t);
+})();
+
+export function smoothGrid(data, nx, ny, nz) {
+  const n = nx * ny * nz, plane = nx * ny;
+  let src = new Float32Array(n);
+  for (let i = 0; i < n; i++) src[i] = data[i];
+  let dst = new Float32Array(n);
+  const cl = (v, hi) => (v < 0 ? 0 : v > hi ? hi : v);
+
+  // x: the taps are one element apart, so this axis is walked scalar. The two-wide border is
+  // split out of the loop to keep the clamp out of the interior's inner sum.
+  for (let base = 0; base < n; base += nx) {
+    for (let i = 0; i < nx; i++) {
+      if (i >= 2 && i < nx - 2) {
+        const j = base + i;
+        dst[j] = G5[0] * src[j - 2] + G5[1] * src[j - 1] + G5[2] * src[j] + G5[3] * src[j + 1] + G5[4] * src[j + 2];
+      } else {
+        dst[base + i] = G5[0] * src[base + cl(i - 2, nx - 1)] + G5[1] * src[base + cl(i - 1, nx - 1)]
+          + G5[2] * src[base + i] + G5[3] * src[base + cl(i + 1, nx - 1)] + G5[4] * src[base + cl(i + 2, nx - 1)];
+      }
+    }
+  }
+  let t = src; src = dst; dst = t;
+
+  // y and z: the taps are a row (or a plane) apart, so combine whole contiguous x-rows —
+  // five streaming reads per output row instead of five strided reads per element. At 256³
+  // that is the difference between a cache miss per tap and none.
+  for (let z = 0; z < nz; z++) {
+    for (let y = 0; y < ny; y++) {
+      const out = z * plane + y * nx;
+      const r0 = z * plane + cl(y - 2, ny - 1) * nx, r1 = z * plane + cl(y - 1, ny - 1) * nx,
+        r2 = z * plane + y * nx, r3 = z * plane + cl(y + 1, ny - 1) * nx, r4 = z * plane + cl(y + 2, ny - 1) * nx;
+      for (let x = 0; x < nx; x++) {
+        dst[out + x] = G5[0] * src[r0 + x] + G5[1] * src[r1 + x] + G5[2] * src[r2 + x]
+          + G5[3] * src[r3 + x] + G5[4] * src[r4 + x];
+      }
+    }
+  }
+  t = src; src = dst; dst = t;
+
+  for (let z = 0; z < nz; z++) {
+    const p0 = cl(z - 2, nz - 1) * plane, p1 = cl(z - 1, nz - 1) * plane, p2 = z * plane,
+      p3 = cl(z + 1, nz - 1) * plane, p4 = cl(z + 2, nz - 1) * plane;
+    for (let i = 0; i < plane; i++) {
+      dst[p2 + i] = G5[0] * src[p0 + i] + G5[1] * src[p1 + i] + G5[2] * src[p2 + i]
+        + G5[3] * src[p3 + i] + G5[4] * src[p4 + i];
+    }
+  }
+  src = dst;
+
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const v = Math.round(src[i]);
+    out[i] = v < 0 ? 0 : v > 255 ? 255 : v;
+  }
+  return out;
+}
 
 export function createVolume(canvas) {
   const gl = canvas.getContext("webgl2", { antialias: false, depth: false, preserveDrawingBuffer: true, premultipliedAlpha: false });

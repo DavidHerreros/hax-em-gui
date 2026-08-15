@@ -12,7 +12,7 @@
 // contour and colour. Slice mode shows the active map alone — overlaying several
 // slice stacks honestly needs per-map transfer functions it does not have.
 import { createRenderer } from "./gl.js";
-import { createVolume } from "./volume.js";
+import { createVolume, smoothGrid } from "./volume.js";
 import { createHistogram } from "./histogram.js";
 import { createSlices } from "./slices.js";
 import { parseColorMesh, parseGrid, parseMesh } from "./wire.js";
@@ -194,13 +194,22 @@ async function fetchGrid(m, size) {
 
 // Volume-mode grid resolution, per style. MIP and glow integrate along the ray, so 96³ is
 // already smooth; an isosurface shows every voxel of the grid it was cut from and at 96³
-// comes out visibly blobby, so it pays for the bigger download (the backend caps at 256).
-const volGridSize = () => (state.render === "iso" ? 224 : 96);
-// The cached grid is only reusable at the size the current style wants.
+// comes out visibly blobby, so it pays for the bigger download (256 is the backend's cap).
+const ISO_GRID = 256;
+const volGridSize = () => (state.render === "iso" ? ISO_GRID : 96);
+// The cached grid is only reusable at the size the current style wants. Iso grids are also
+// de-banded once, in place, before they ever reach the GPU (see smoothGrid): the uint8
+// plateaus that MIP and glow integrate away are what terrace an isosurface. The tag stops a
+// cached grid from being smoothed a second time, which would soften it for good.
 async function volGrid(m) {
   const want = volGridSize();
   if (!m.gridVol || m.gridVol.size !== want) m.gridVol = await fetchGrid(m.index, want);
-  return m.gridVol;
+  const g = m.gridVol;
+  if (want === ISO_GRID && !g.smoothed) {
+    g.data = smoothGrid(g.data, g.nx, g.ny, g.nz);
+    g.smoothed = true;
+  }
+  return g;
 }
 
 // One contour costs a full marching-cubes pass over the whole volume plus a multi-MB mesh

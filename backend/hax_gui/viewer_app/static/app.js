@@ -1,7 +1,7 @@
 // Landscape explorer + volume viewer orchestration. Relative URLs (works behind
 // the /viewer/<id>/ proxy). Zero dependencies.
 import { createRenderer } from "./gl.js";
-import { createVolume } from "./volume.js";
+import { createVolume, smoothGrid } from "./volume.js";
 import { createScatter, clusterColor } from "./scatter.js";
 import { createCloud } from "./cloud.js";
 import { createHistogram } from "./histogram.js";
@@ -1878,7 +1878,19 @@ function loadLandSlices() {
 // Grid resolution for the ray-marcher, per style: an isosurface shows every voxel of the
 // grid it was cut from, and 96³ — smooth enough for MIP and glow, which integrate along the
 // ray — comes out blobby. Volume payloads are cached by URL, so the size is part of the key.
-const volGridSize = () => (state.render === "iso" ? 224 : 96);
+const ISO_GRID = 256;
+const volGridSize = () => (state.render === "iso" ? ISO_GRID : 96);
+
+// Iso shades the grid itself, so it gets the uint8 plateaus smoothed out of it before upload
+// — MIP and glow integrate along the ray and never see them, and the slice view wants the
+// raw values. Tagged so a cached frame payload is smoothed once and only once.
+function isoSmooth(g) {
+  if (state.render === "iso" && !g.smoothed) {
+    g.data = smoothGrid(g.data, g.nx, g.ny, g.nz);
+    g.smoothed = true;
+  }
+  return g;
+}
 
 function normThreshold() {
   if (!curVolMeta) return 0.45;
@@ -1893,7 +1905,7 @@ async function loadVolume(index) {
   try {
     const res = await fetch(`./api/grid?index=${index}&size=${volGridSize()}`);
     if (!res.ok) throw new Error(await res.text());
-    const g = parseGrid(await res.arrayBuffer());
+    const g = isoSmooth(parseGrid(await res.arrayBuffer()));
     if (token !== decodeToken) return;
     curVolMeta = g;
     volRenderer.setVolume(g.nx, g.ny, g.nz, g.data, g.boxLo, g.boxHi);
@@ -2193,7 +2205,7 @@ function decodeFrame(i, draft) {
   if (flight) return flight;
   const p = (async () => {
     const buf = await (await fetch(req.url)).arrayBuffer();
-    const payload = req.surface ? parseMesh(buf) : parseGrid(buf);
+    const payload = req.surface ? parseMesh(buf) : isoSmooth(parseGrid(buf));
     const bytes = req.surface
       ? payload.positions.byteLength + payload.normals.byteLength + payload.indices.byteLength
       : payload.data.byteLength;
