@@ -27,29 +27,24 @@ const KEY_DIR = normalize([0.577, -0.577, -0.577]);
 const FILL_DIR = normalize([-0.2, -0.2, -0.959]);
 const LIGHT_MODES = { standard: 0, smooth: 1, raytraced: 2 };
 
-// gl.js's "multishadow" ambient light, cut down to a size a per-fragment ray march can
-// afford: gl.js renders 64 depth maps from uniformly distributed directions and sums their
-// visibility with a cosine weight; here the same sum is evaluated with occlusion rays from
-// 16 directions. Sixteen is enough because the weight is cosine and the term is ambient —
-// what matters is the *broad* gradient (deep in a pocket sees little of the sphere, an
-// exposed face sees half of it), which is exactly what a local AO cone could not produce.
-// The directions are a Fibonacci spiral over the whole sphere, generated once and baked
-// into the shader source, and they live in MODEL space like gl.js's atlas, so the shading
-// stays welded to the map while you orbit instead of swimming with the camera.
+// gl.js's "multishadow" ambient light, evaluated with cones instead of shadow maps.
 //
-// 32 of them, halving the gradation gap to gl.js's 64: with too few directions the ambient
-// term is a coarse quantisation of the sphere, and a surface that should shade gradually
-// steps instead. Everything downstream (the baked array, the loop bound, the 0.25*N
-// normalisation) is derived from this one number.
+// The DIRECTIONS are gl.js's, verbatim: ChimeraX's geometry.sphere.sphere_points(64), the
+// Bauer spiral (gl.js lines 421-429, MS_COUNT at line 72). Transcribed rather than improved
+// on purpose — with the same 64 directions, whatever ripple the finite set leaves is the
+// SAME ripple the mesh view has, so the two views agree exactly instead of each being
+// independently reasonable. They live in MODEL space like gl.js's atlas, so the shading
+// stays welded to the map while you orbit instead of swimming with the camera.
+const MS_COUNT = 64;
 const MS_DIRS = (() => {
-  const n = 32, ga = Math.PI * (3 - Math.sqrt(5)), out = [];
-  for (let i = 0; i < n; i++) {
-    const z = 1 - (2 * i + 1) / n, r = Math.sqrt(Math.max(0, 1 - z * z)), a = ga * i;
-    out.push([r * Math.cos(a), r * Math.sin(a), z]);
+  const p = [], snp = Math.sqrt(MS_COUNT * Math.PI);
+  for (let i = 0; i < MS_COUNT; i++) {
+    const phi = Math.acos(-1 + (2 * i + 1) / MS_COUNT);
+    const theta = snp * phi, s = Math.sin(phi);
+    p.push([s * Math.cos(theta), s * Math.sin(theta), Math.cos(phi)]);
   }
-  return out;
+  return p;
 })();
-const MS_COUNT = MS_DIRS.length;
 const msGLSL = `const vec3 MSDIR[${MS_COUNT}] = vec3[${MS_COUNT}](`
   + MS_DIRS.map((d) => `vec3(${d.map((v) => v.toFixed(6)).join(", ")})`).join(", ") + ");";
 
@@ -78,6 +73,13 @@ uniform sampler3D uVol1;
 uniform sampler3D uVol2;
 uniform sampler3D uVol3;
 uniform sampler3D uVolB;    // morph partner of slot 0; only sampled while mixing
+// The opacity pyramid: one mipmapped R8 volume per slot holding the OPACITY the cone tracer
+// composites, baked from the density grid and the contour (see bakeOpacity in the JS).
+uniform sampler3D uOpac0;
+uniform sampler3D uOpac1;
+uniform sampler3D uOpac2;
+uniform sampler3D uOpac3;
+uniform sampler3D uOpacB;  // morph partner of slot 0's opacity
 uniform float uMix;
 uniform int uCount;
 uniform mat4 uInvVP;
@@ -101,7 +103,7 @@ uniform int uSteps;
 // happens in model space, and the lights are fixed to the camera as in gl.js, so the
 // rotation has to be undone once per frame rather than per fragment.
 uniform vec3 uVoxA[${MAXV}];
-uniform float uMaxLodA[${MAXV}];   // last mip level of each slot's grid: floor(log2(max dim))
+uniform float uMaxLodA[${MAXV}];   // last level of each slot's opacity pyramid: floor(log2(max dim))
 uniform int uLightMode;     // 0 = standard, 1 = smooth, 2 = ray traced
 uniform vec3 uKeyDir;       // model space, direction the key light shines
 uniform vec3 uFillDir;
@@ -126,25 +128,16 @@ uniform vec2 uClipRange;
 
 vec3 toWorld(vec3 ndc) { vec4 p = uInvVP * vec4(ndc, 1.0); return p.xyz / p.w; }
 
-// The volumes carry a mipmap chain now (iso's cone tracing walks it), which means the
-// MIN filter is LINEAR_MIPMAP_LINEAR and a bare texture() would pick a level from screen-space
-// derivatives — a ray march has no meaningful ones, and at silhouettes they explode, so every
-// ordinary sample is pinned to level 0 with textureLod. Only the cone tracer chooses a level,
-// and it computes it from the cone's radius rather than from derivatives.
+// Every density sample is pinned to level 0 with textureLod: a ray march has no meaningful
+// screen-space derivatives for a bare texture() to pick a level from, and at silhouettes they
+// explode. The density textures carry no mip chain at all now — the pyramid the cone tracer
+// walks is the separate opacity volume — but textureLod(…, 0.0) is what a non-mipmapped
+// LINEAR texture wants anyway, so this stays exactly as it was.
 float sampleVol(int i, vec3 p) {
   if (i == 0) { float a = textureLod(uVol0, p, 0.0).r; return uMix > 0.0 ? mix(a, textureLod(uVolB, p, 0.0).r, uMix) : a; }
   if (i == 1) return textureLod(uVol1, p, 0.0).r;
   if (i == 2) return textureLod(uVol2, p, 0.0).r;
   return textureLod(uVol3, p, 0.0).r;
-}
-
-// Same slot chain at an explicit mip level. Slot 0 keeps blending with the morph partner:
-// a morphing map has to occlude and shadow as the blend it is showing, not as its near end.
-float sampleVolLod(int i, vec3 p, float lod) {
-  if (i == 0) { float a = textureLod(uVol0, p, lod).r; return uMix > 0.0 ? mix(a, textureLod(uVolB, p, lod).r, uMix) : a; }
-  if (i == 1) return textureLod(uVol1, p, lod).r;
-  if (i == 2) return textureLod(uVol2, p, lod).r;
-  return textureLod(uVol3, p, lod).r;
 }
 
 // Density of slot i at a model-space point: zero outside its own box (the sampler's
@@ -160,17 +153,28 @@ float density(int i, vec3 mp) {
   return sampleVol(i, p);
 }
 
-// density() at an explicit mip level — the box test and the clip slab are unchanged, so a
-// cone sample outside the map or inside the cut contributes nothing, exactly as a primary
-// sample would.
-float densityLod(int i, vec3 mp, float lod) {
+// Opacity of slot i at an explicit mip level. Slot 0 blends with the morph partner's
+// pyramid: a blend of opacities is exact at either end of a morph and a good approximation
+// between, and it is the only way the ambient term can follow a GPU-side morph at all.
+float sampleOpac(int i, vec3 p, float lod) {
+  if (i == 0) { float a = textureLod(uOpac0, p, lod).r; return uMix > 0.0 ? mix(a, textureLod(uOpacB, p, lod).r, uMix) : a; }
+  if (i == 1) return textureLod(uOpac1, p, lod).r;
+  if (i == 2) return textureLod(uOpac2, p, lod).r;
+  return textureLod(uOpac3, p, lod).r;
+}
+
+// The same box test and clip slab density() applies, so a cone sample outside the map or
+// inside the cut contributes nothing. The pyramid itself is clip-agnostic — baking it per
+// slab position would rebuild it on every tick of the clip slider — so the slab is applied
+// here, at sample time.
+float opacity(int i, vec3 mp, float lod) {
   vec3 p = (mp - uBoxLoA[i]) / (uBoxHiA[i] - uBoxLoA[i]);
   if (any(lessThan(p, vec3(0.0))) || any(greaterThan(p, vec3(1.0)))) return 0.0;
   if (uClipOn == 1) {
     float d = dot(mp, uClipN);
     if (d < uClipRange.x || d > uClipRange.y) return 0.0;
   }
-  return sampleVolLod(i, p, lod);
+  return sampleOpac(i, p, lod);
 }
 
 // Diverging (signed) grids put ZERO at 0.5 — outside the box or the clip slab the
@@ -220,13 +224,6 @@ float boxFar(vec3 o, vec3 d) {
   return min(min(tmax.x, tmax.y), tmax.z);
 }
 
-// How opaque density has to be counted as: a voxel a little over the contour is solid, and a
-// mip level that averaged it with its empty neighbours must still read as solid or a thin
-// wall stops casting shadow. THE calibration knob for the whole shaded look — higher makes
-// occlusion crisper and darker, lower makes it softer and brighter — which is why it is a
-// uniform on a slider rather than a constant: what it should be depends on the map.
-uniform float uOccGain;
-
 // Visibility along a CONE, the estimator that replaced binary occlusion rays.
 //
 // Binary rays were the wrong tool and it showed: a ray steps over thin features, a grazing
@@ -236,6 +233,13 @@ uniform float uOccGain;
 // including grazing self-occlusion, and that partiality is the entire look. A cone widens
 // with distance and reads the map at the mip level matching its radius, so one sample covers
 // everything inside it: an occluder that a ray would thread past still dims it.
+//
+// What the cone reads is OPACITY, not density, and that distinction is the whole of the form
+// shading. Mip-averaging a DENSITY grid averages sparse mass — an arm with space around it —
+// down below the contour, so a threshold applied afterwards returned "empty" and distant mass
+// never occluded anything: contact cracks appeared (fine mips still resolved touching walls)
+// while every exposed face clipped to white. Thresholding FIRST and mip-averaging the result
+// gives true solid-voxel coverage, which is exactly the quantity a cone should composite.
 //
 // Samples march geometrically (each covers the gap the last one left), and the accumulated
 // visibility multiplies, so the far end of the cone matters less than the near end — as it
@@ -257,12 +261,10 @@ float coneVis(vec3 o, vec3 L, float vox, float tanHalf, float growth, float t0, 
     float lod = log2(max(tanHalf * t / voxEdge, 1.0));
     float occ = 0.0;
     // Every active map occludes: in a composited scene one map casts ambient shadow on
-    // another exactly as two halves of one map do.
+    // another exactly as two halves of one map do. One texture read per map per sample.
     for (int j = 0; j < ${MAXV}; j++) {
       if (j >= uCount) break;
-      float thrJ = max(uThrA[j], 1e-4);
-      float v = densityLod(j, sp, clamp(lod, 0.0, uMaxLodA[j]));
-      occ += clamp((v - thrJ) * uOccGain / max(1.0 - thrJ, 1e-3), 0.0, 1.0);
+      occ += opacity(j, sp, clamp(lod, 0.0, uMaxLodA[j]));
     }
     vis *= 1.0 - clamp(occ, 0.0, 1.0);
     if (vis < 0.03) break;
@@ -297,29 +299,26 @@ float isoShadow(vec3 p, vec3 n, float vox) {
 // dark-in-the-pockets gradient the mesh view has: an occluder a whole domain away still
 // blocks a direction, which no small-radius sampling could notice.
 //
-// Wide cones, because they have to cover the sphere between them: tan(half-angle) 0.577 is 30°,
+// Wide cones, because 64 of them have to cover the sphere: tan(half-angle) 0.577 is 30°,
 // and eleven geometric samples from 0.75 voxels out reach ~151 voxels — about 60% of a 256
 // box, so the far side of a molecule darkens the near side the way gl.js's whole-scene
 // shadow maps do, while the first sample still lands close enough to catch a touching wall.
 // (Seven samples starting 1.5 voxels out reached only ~36 voxels and skipped the contact
 // entirely, which is why the ambient term stayed bright and the crevices stayed flat.)
 // Half the directions face away from the surface and are skipped before their cone is traced,
-// so the real cost is ~16 cones of <=11 samples at hit pixels only.
+// so the real cost is ~32 cones of <=11 samples — about 350 single-texture-read samples at
+// hit pixels only, and each sample is now one read instead of a read plus threshold algebra.
 float isoMultishadow(vec3 p, vec3 n, float vox) {
   vec3 o = p + n * vox;
-  float sh = 0.0, wsum = 0.0;
+  float sh = 0.0;
   for (int i = 0; i < ${MS_COUNT}; i++) {
     float w = max(-dot(n, MSDIR[i]), 0.0);
     if (w <= 0.0) continue;
     sh += w * coneVis(o, -MSDIR[i], vox, 0.577, 1.7, vox * 0.75, 11);
-    wsum += w;
   }
-  // gl.js divides by the constant 0.25*N — the expectation of wsum — which its 64 directions
-  // approach closely enough. At the direction count affordable here that constant leaves a
-  // ripple in the unoccluded ambient (±7% at 16 directions, ±3% at 32) which reads as faint
-  // mottling on smooth faces, so normalise by the actual weight sum instead: the same
-  // quantity both estimate, without the sample noise.
-  return sh / max(wsum, 1e-4);
+  // gl.js's constant normalisation, not a self-normalising weight sum: with gl.js's own 64
+  // directions the residual ripple is gl.js's ripple, and matching it is the point.
+  return sh / (0.25 * float(${MS_COUNT}));
 }
 
 // ChimeraX's lighting equation (gl.js's fragment shader), with the preset intensities and
@@ -590,29 +589,43 @@ export function smoothGrid(data, nx, ny, nz) {
   return out;
 }
 
+// The opacity bake: one full-screen triangle per z layer of a slot's grid, turning density
+// into the opacity the cone tracer composites. It is a separate program because it renders
+// into a texture layer rather than to the screen, and it runs once per grid (or once per
+// contour/gain change, debounced) rather than once per frame.
+const BAKE_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler3D uSrc;
+uniform float uZ;      // (z + 0.5) / nz: the layer being written, in texture coords
+uniform float uThr;    // this slot's normalized contour
+uniform float uGain;   // how readily density over the contour counts as fully opaque
+void main() {
+  float v = textureLod(uSrc, vec3(vUv, uZ), 0.0).r;
+  float thr = max(uThr, 1e-4);
+  outColor = vec4(clamp((v - thr) * uGain / max(1.0 - thr, 1e-3), 0.0, 1.0), 0.0, 0.0, 1.0);
+}`;
+
 export function createVolume(canvas) {
   const gl = canvas.getContext("webgl2", { antialias: false, depth: false, preserveDrawingBuffer: true, premultipliedAlpha: false });
   if (!gl) throw new Error("WebGL2 is not available in this browser.");
 
   // Can this context hold the grids as R16F?
   //
-  // Iso shades the grid itself, so 8-bit quantisation is visible as terracing and as
-  // gradient noise, and the client-side blur that hides it also eats real features. A
-  // float16 grid has neither problem. Two things have to hold: half-float textures must be
-  // filterable (core in WebGL2) and R16F must be colour-renderable, which is what
-  // generateMipmap needs and what the extension below provides — iso's cone tracing reads
-  // the mip chain, so a texture with no chain is not usable for it. The extension being
-  // advertised is not quite proof, so the capability is probed for real: build a 1-voxel
-  // R16F texture, mipmap it, and believe the result only if the driver raised nothing.
-  // Callers read this back as `hasF16` and fetch 8-bit grids when it is false.
+  // Iso shades the grid itself, so 8-bit quantisation shows up as terracing and as gradient
+  // noise, and the client-side blur that hides it also eats real features; a float16 grid has
+  // neither problem. All that is needed is that R16F can be allocated and filtered, both core
+  // WebGL2 — the mip chain the cone tracer walks belongs to the separate opacity volume,
+  // which is R8, so no colour-buffer-float extension is involved any more. Probed rather than
+  // assumed: allocate one voxel and believe it only if the driver raised nothing. Callers read
+  // this back as `hasF16` and fetch 8-bit grids when it is false.
   const hasF16 = (() => {
-    if (!gl.getExtension("EXT_color_buffer_float") && !gl.getExtension("EXT_color_buffer_half_float")) return false;
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_3D, t);
-    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
     while (gl.getError() !== gl.NO_ERROR) { /* start from a clean error state */ }
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, 1, 1, 1, 0, gl.RED, gl.HALF_FLOAT, new Uint16Array(1));
-    gl.generateMipmap(gl.TEXTURE_3D);
     const ok = gl.getError() === gl.NO_ERROR;
     gl.bindTexture(gl.TEXTURE_3D, null); gl.deleteTexture(t);
     return ok;
@@ -629,7 +642,13 @@ export function createVolume(canvas) {
     uClipOn = u("uClipOn"), uClipN = u("uClipN"), uClipRange = u("uClipRange"), uDiverging = u("uDiverging"),
     uVoxA = u("uVoxA"), uLightMode = u("uLightMode"), uKeyDirL = u("uKeyDir"), uFillDirL = u("uFillDir"),
     uDepthRow = u("uDepthRow"), uDepthRange = u("uDepthRange"), uMaxLodA = u("uMaxLodA"),
-    uOccGain = u("uOccGain");
+    uOpacN = [u("uOpac0"), u("uOpac1"), u("uOpac2"), u("uOpac3")], uOpacB = u("uOpacB");
+
+  // The opacity bake's own program, sharing the full-screen VERT.
+  const bakeProg = link(gl, VERT, BAKE_FRAG);
+  const bu = (n) => gl.getUniformLocation(bakeProg, n);
+  const bSrc = bu("uSrc"), bZ = bu("uZ"), bThr = bu("uThr"), bGain = bu("uGain");
+  const opacFbo = gl.createFramebuffer();
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -640,12 +659,13 @@ export function createVolume(canvas) {
   gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
   gl.bindVertexArray(null);
 
-  function makeVolTex() {
+  // `mip` is what separates the two families of 3D texture here: the density grids are
+  // sampled at level 0 only and carry no chain, while the opacity volumes exist to BE a
+  // pyramid — that is the whole point of them.
+  function makeVolTex(mip = false) {
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_3D, t);
-    // Mipmapped minification: iso's cone tracing reads the map at the level matching each
-    // cone's radius. Every other sample path pins level 0 with textureLod (see sampleVol).
-    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -653,11 +673,13 @@ export function createVolume(canvas) {
     // A 1-voxel placeholder makes the texture complete from birth: unused slots are
     // still bound (sampling an incomplete unit is undefined behaviour on some drivers).
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, 1, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
-    gl.generateMipmap(gl.TEXTURE_3D);   // ...and mipmap-complete, now that the MIN filter wants levels
+    if (mip) gl.generateMipmap(gl.TEXTURE_3D);   // ...and mipmap-complete, since the MIN filter wants levels
     return t;
   }
-  const slotTex = Array.from({ length: MAXV }, makeVolTex);
-  const texB = makeVolTex();     // the morph's far end; only sampled while mixing
+  const slotTex = Array.from({ length: MAXV }, () => makeVolTex(false));
+  const texB = makeVolTex(false);     // the morph's far end; only sampled while mixing
+  const opacTex = Array.from({ length: MAXV }, () => makeVolTex(true));
+  const opacTexB = makeVolTex(true);  // the morph partner's opacity, blended by uMix
 
   let bg = [0.016, 0.024, 0.06];
   let gamma = 1.4, bright = 1.2, mode = 0, steps = 160;
@@ -673,12 +695,13 @@ export function createVolume(canvas) {
   // of the grid it is actually shading. The placeholder texture is 1³ until a real upload.
   const slotDim = Array.from({ length: MAXV }, () => [64, 64, 64]);
   let lightMode = 0;             // iso lighting preset; the other modes ignore it
-  let occGain = 8.0;             // iso occlusion hardness; see uOccGain in the shader
+  let occGain = 8.0;             // iso occlusion hardness; baked into the opacity pyramid
   // Model-space clip slab, shared with the surface renderer: keep clipRange[0] <=
   // dot(p, clipN) <= clipRange[1]. A null normal is no clipping at all.
   let clipN = null, clipRange = [0, 0];
   let grid = null;   // { nx, ny, nz } of slot 0; null until one is, which is what the camera tests
   let gridB = null;  // the morph's far end, same shape; null when not morphing
+  let dimB = null;   // its dims, so its opacity pyramid can be baked at the same size
   let mix = 0;       // blend weight in [0,1]; 0 = slot 0 alone
   let diverging = false;   // slot 0 holds a signed difference grid (zero at u8 midpoint)
 
@@ -753,6 +776,9 @@ export function createVolume(canvas) {
     return [near + (far - near) * DEPTH_CUE_START, near + (far - near) * DEPTH_CUE_END];
   }
   function drawScene(alpha = 1) {
+    // Before anything touches the viewport or the framebuffer: the bake owns both while it
+    // runs, and hands them back unbound.
+    ensureOpacity();
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.clearColor(bg[0], bg[1], bg[2], alpha);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -790,7 +816,6 @@ export function createVolume(canvas) {
     gl.uniform3fv(uVoxA, flat3(slotDim.map((d) => [1 / Math.max(1, d[0]), 1 / Math.max(1, d[1]), 1 / Math.max(1, d[2])])));
     gl.uniform1fv(uMaxLodA, new Float32Array(slotDim.map((d) => Math.floor(Math.log2(Math.max(2, d[0], d[1], d[2]))))));
     gl.uniform1i(uLightMode, lightMode);
-    gl.uniform1f(uOccGain, occGain);
     gl.uniform3fv(uKeyDirL, toModelDir(KEY_DIR)); gl.uniform3fv(uFillDirL, toModelDir(FILL_DIR));
     // Third row of view·M (column-major: elements 2, 6, 10, 14) — the shader dots it with a
     // model-space hit to get the camera-space depth the cue fades on.
@@ -806,13 +831,21 @@ export function createVolume(canvas) {
       gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_3D, slotTex[i]); gl.uniform1i(uVolN[i], i);
     }
     gl.activeTexture(gl.TEXTURE0 + MAXV); gl.bindTexture(gl.TEXTURE_3D, gridB ? texB : slotTex[0]); gl.uniform1i(uVolB, MAXV);
+    // The opacity pyramid rides on the units above the density grids; iso is the only mode
+    // that reads it, but every unit stays bound and complete for the others' sake.
+    for (let i = 0; i < MAXV; i++) {
+      const un = MAXV + 1 + i;
+      gl.activeTexture(gl.TEXTURE0 + un); gl.bindTexture(gl.TEXTURE_3D, opacTex[i]); gl.uniform1i(uOpacN[i], un);
+    }
+    gl.activeTexture(gl.TEXTURE0 + 2 * MAXV + 1);
+    gl.bindTexture(gl.TEXTURE_3D, gridB ? opacTexB : opacTex[0]); gl.uniform1i(uOpacB, 2 * MAXV + 1);
     gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null);
   }
   function render() { resize(); drawScene(1); }
 
-  // Every upload path — setVolume, setSlots and the morph's setVolumeB — goes through here,
-  // so every texture on screen carries a full chain. Building it costs one pass over a third
-  // more texels than the upload itself, once per map.
+  // Every upload path — setVolume, setSlots and the morph's setVolumeB — goes through here.
+  // No mip chain: the density grid is only ever read at level 0 (the pyramid the cone tracer
+  // walks is the opacity volume baked from it, which is a different texture entirely).
   //
   // The element type picks the storage: a Uint16Array is a float16 grid (parseGrid hands the
   // raw half bits straight through, which is what HALF_FLOAT wants), anything else is the
@@ -824,14 +857,71 @@ export function createVolume(canvas) {
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     if (half) gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, nx, ny, nz, 0, gl.RED, gl.HALF_FLOAT, data);
     else gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, nx, ny, nz, 0, gl.RED, gl.UNSIGNED_BYTE, data);
+  }
+
+  // ---- the opacity pyramid ------------------------------------------------------------
+  //
+  // Bake one slot's density grid into its opacity volume, then mip it. Layer by layer,
+  // because a 3D texture is written through the framebuffer one z slice at a time — nz draws
+  // of one triangle each, which at 256³ is 256 trivial draws and lands in a few milliseconds.
+  //
+  // The pyramid, not the density grid, is what the cones read: mip-averaging density and
+  // thresholding afterwards loses sparse mass entirely (see coneVis), while thresholding
+  // first and averaging the result is true solid-voxel coverage at every level.
+  function bakeOpacity(srcTex, dstTex, dim, thr) {
+    if (!dim) return;
+    const [nx, ny, nz] = dim;
+    gl.bindTexture(gl.TEXTURE_3D, dstTex);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, nx, ny, nz, 0, gl.RED, gl.UNSIGNED_BYTE, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, opacFbo);
+    gl.useProgram(bakeProg);
+    gl.viewport(0, 0, nx, ny);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, srcTex);
+    gl.uniform1i(bSrc, 0);
+    gl.uniform1f(bThr, thr); gl.uniform1f(bGain, occGain);
+    gl.bindVertexArray(vao);
+    for (let z = 0; z < nz; z++) {
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, dstTex, 0, z);
+      gl.uniform1f(bZ, (z + 0.5) / nz);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    // Leave the GL exactly as drawScene expects to find it: no framebuffer, no vertex array.
+    // Everything else drawScene sets for itself every frame (program, viewport, every texture
+    // unit), so this is the whole restore.
+    gl.bindVertexArray(null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_3D, dstTex);
     gl.generateMipmap(gl.TEXTURE_3D);
   }
+
+  // The pyramid is only ever needed by iso, so it is baked lazily: anything that invalidates
+  // it just says so, and the next draw in iso mode pays for it. Switching into iso therefore
+  // costs one bake and switching styles otherwise costs nothing.
+  let opacDirty = true, opacTimer = null;
+  function bakeAll() {
+    for (let i = 0; i < count; i++) bakeOpacity(slotTex[i], opacTex[i], slotDim[i], slotThr[i]);
+    if (gridB) bakeOpacity(texB, opacTexB, dimB, slotThr[0]);
+    opacDirty = false;
+  }
+  // `now` = a new grid: there is nothing usable to keep, so mark it and let the next draw
+  // rebuild. Otherwise (contour, occlusion gain) the pyramid on the GPU is merely slightly
+  // wrong, so hold it for 150 ms and keep drawing with it — the same trade gl.js makes when
+  // it debounces its ambient atlas against the clip slider, and what lets these be sliders
+  // at all. The isosurface itself follows the contour instantly either way: the primary
+  // march reads density, never the pyramid.
+  function invalidateOpacity(now) {
+    if (opacTimer) { clearTimeout(opacTimer); opacTimer = null; }
+    if (now) { opacDirty = true; return; }
+    opacTimer = setTimeout(() => { opacTimer = null; opacDirty = true; render(); }, 150);
+  }
+  function ensureOpacity() { if (mode === 2 && opacDirty && hasTex) bakeAll(); }
 
   function setVolume(nx, ny, nz, u8, lo, hi) {
     upload(slotTex[0], nx, ny, nz, u8);
     grid = { nx, ny, nz };
     slotDim[0] = [nx, ny, nz];
     count = 1;
+    invalidateOpacity(true);        // a new grid: the pyramid describes the old one
     if (lo && hi) { slotBoxLo[0] = lo.slice(); slotBoxHi[0] = hi.slice(); }   // the cube the surface mesh uses, so the two modes coincide
     hasTex = true; orbit.invalidatePivot(); render();           // a new map is a new box to pivot on
   }
@@ -850,6 +940,7 @@ export function createVolume(canvas) {
     }
     grid = { nx: slots[0].nx, ny: slots[0].ny, nz: slots[0].nz };
     count = n;
+    invalidateOpacity(true);
     hasTex = true; orbit.invalidatePivot(); render();
   }
 
@@ -867,9 +958,11 @@ export function createVolume(canvas) {
     // camera is untouched either way: the two ends share a grid, so they share the box the
     // pivot is derived from.
     setVolumeB(nx, ny, nz, u8) {
-      if (!u8) { gridB = null; mix = 0; render(); return; }
+      if (!u8) { gridB = null; dimB = null; mix = 0; invalidateOpacity(true); render(); return; }
       upload(texB, nx, ny, nz, u8);
       gridB = { nx, ny, nz };
+      dimB = [nx, ny, nz];
+      invalidateOpacity(true);
       render();
     },
     // Blend weight, 0 = the near map, 1 = the far one. Called every animation frame, so
@@ -879,18 +972,20 @@ export function createVolume(canvas) {
     // Iso lighting preset, the same three names gl.js takes, so one control can drive
     // both renderers and the two views stay lit alike. Ignored by MIP and glow.
     setLighting(name) { lightMode = LIGHT_MODES[name] !== undefined ? LIGHT_MODES[name] : 0; render(); },
-    // How hard the ambient and shadow cones count density as opaque (uOccGain). The right
-    // value depends on the map — a tight contour on a well-resolved map wants less than a
-    // loose one on a noisy map — so it is exposed rather than guessed at once.
-    setOcclusionGain(v) { occGain = Math.max(1, Math.min(32, v)); render(); },
+    // How hard the cones count density as opaque. It is baked into the opacity pyramid
+    // rather than applied per sample, so a change schedules a rebuild (debounced, so dragging
+    // the slider stays interactive and lands ~150 ms after you stop). The right value depends
+    // on the map — a tight contour on a well-resolved map wants less than a loose one on a
+    // noisy map — so it is exposed rather than guessed at once.
+    setOcclusionGain(v) { occGain = Math.max(1, Math.min(32, v)); invalidateOpacity(false); },
     // Signed-difference rendering of slot 0 (red = lost, blue = gained). The caller
     // is responsible for having uploaded a symmetric-range grid (see /api/paint/grid).
     setDiverging(on) { diverging = !!on; render(); },
     // No pivot invalidation: an image-rendered map pivots on its box, and the contour does
     // not move the box. Same in ChimeraX, where changing the level of a map shown as an
     // image leaves its bounds — and so its centre of rotation — where they were.
-    setThreshold(v) { slotThr[0] = Math.max(0, Math.min(1, v)); render(); },
-    setSlotThreshold(i, v) { if (i >= 0 && i < MAXV) { slotThr[i] = Math.max(0, Math.min(1, v)); render(); } },
+    setThreshold(v) { slotThr[0] = Math.max(0, Math.min(1, v)); invalidateOpacity(false); render(); },
+    setSlotThreshold(i, v) { if (i >= 0 && i < MAXV) { slotThr[i] = Math.max(0, Math.min(1, v)); invalidateOpacity(false); render(); } },
     setGamma(g) { gamma = Math.max(0.2, g); render(); },
     // Clip slab: keep lo <= dot(p, n) <= hi, with `n` a unit normal in the model-space
     // [-1,1] cube — the same call the surface renderer takes, so one cut serves both
