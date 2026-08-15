@@ -318,15 +318,21 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
                         media_type="application/octet-stream")
 
     @app.get("/api/grid")
-    def grid(m: int = Query(0), size: int = Query(96)) -> Response:
+    def grid(m: int = Query(0), size: int = Query(96), bits: int = Query(8)) -> Response:
         """Density as a compact uint8 3D-texture payload (same layout as server.py):
         int32 nx, ny, nz, then float32 vmin, vmax, mean, std, then float32 boxLo[3],
-        boxHi[3] (the model-space cube the grid occupies), then nx*ny*nz uint8."""
+        boxHi[3] (the model-space cube the grid occupies), then nx*ny*nz uint8.
+
+        `bits=16` returns the same thing with float16 samples under the GRID16 tag, and
+        raises the size cap to 384 so the shaded-isosurface mode can ask for the map at its
+        native resolution (a `size` at or above the box strides by 1, i.e. no downsampling
+        at all). Everything else keeps the uint8 payload and the 256 cap."""
         model = scene.get(m)
-        ds, step = _downsample(model.vol, int(max(16, min(256, size))))
+        cap = 384 if int(bits) == 16 else 256
+        ds, step = _downsample(model.vol, int(max(16, min(cap, size))))
         full, off = scene.norm(model)
         lo, hi = grid_box(model.vol.shape, ds.shape, step, full_size=full, offset=off)
-        return Response(content=_grid_payload(ds, model.stats, lo, hi),
+        return Response(content=_grid_payload(ds, model.stats, lo, hi, bits=bits),
                         media_type="application/octet-stream")
 
     @app.get("/api/morph/grid")
@@ -561,22 +567,35 @@ def _morph_pair(scene: _Scene, a: int, b: int) -> tuple[np.ndarray, np.ndarray]:
     return va, vb
 
 
-def _grid_payload(ds: np.ndarray, stats: dict[str, Any], lo, hi, vrange=None) -> bytes:
+def _grid_payload(ds: np.ndarray, stats: dict[str, Any], lo, hi, vrange=None,
+                  bits: int = 8) -> bytes:
     """Pack a downsampled grid into the binary layout the ray-marcher parses.
 
     `vrange` fixes the (vmin, vmax) window instead of using the data's own extrema —
     difference grids use a symmetric window so uint8 128 lands on zero; values
-    outside it clip, exactly as the painted surface's ramp clips."""
+    outside it clip, exactly as the painted surface's ramp clips.
+
+    `bits=16` swaps the uint8 samples for IEEE float16 under a different wire tag
+    (wirefmt.GRID16). Same header, same 0..1 normalization, same everything else: only the
+    shaded-isosurface mode asks for it, because it is the only mode that shades the grid
+    rather than integrating along it. The uint8 branch is byte-for-byte what it always was."""
     vmin, vmax = (float(ds.min()), float(ds.max())) if vrange is None else (float(vrange[0]), float(vrange[1]))
-    u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)
     nx, ny, nz = ds.shape[2], ds.shape[1], ds.shape[0]
+    if int(bits) == 16:
+        data = np.ascontiguousarray(
+            np.clip((ds - vmin) / (vmax - vmin + 1e-9), 0.0, 1.0), dtype="<f2")
+        tag = wirefmt.GRID16
+    else:
+        data = np.ascontiguousarray(
+            np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8))
+        tag = wirefmt.GRID
     header = (
-        wirefmt.header(wirefmt.GRID)
+        wirefmt.header(tag)
         + np.array([nx, ny, nz], dtype="<i4").tobytes()
         + np.array([vmin, vmax, stats["mean"], stats["std"]], dtype="<f4").tobytes()
         + np.array(list(lo) + list(hi), dtype="<f4").tobytes()
     )
-    return header + np.ascontiguousarray(u8).tobytes()
+    return header + data.tobytes()
 
 
 def main() -> None:

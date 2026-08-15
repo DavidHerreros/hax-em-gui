@@ -185,27 +185,40 @@ async function loadHistogram() {
   hist.setData(h, h.mean + m.sigma * h.std);
 }
 
-async function fetchGrid(m, size) {
-  const buf = await (await fetch(`./api/grid?m=${m}&size=${size}`)).arrayBuffer();
-  const g = parseGrid(buf);
-  g.size = size;   // the cached grid has to remember what it was cut at (see volGridSize)
+async function fetchGrid(m, size, bits = 8) {
+  const url = `./api/grid?m=${m}&size=${size}` + (bits === 16 ? "&bits=16" : "");
+  const g = parseGrid(await (await fetch(url)).arrayBuffer());
+  g.size = size;   // the cached grid has to remember what it was cut at (see volWant)
   return g;
 }
 
-// Volume-mode grid resolution, per style. MIP and glow integrate along the ray, so 96³ is
-// already smooth; an isosurface shows every voxel of the grid it was cut from and at 96³
-// comes out visibly blobby, so it pays for the bigger download (256 is the backend's cap).
-const ISO_GRID = 256;
-const volGridSize = () => (state.render === "iso" ? ISO_GRID : 96);
-// The cached grid is only reusable at the size the current style wants. Iso grids are also
-// de-banded once, in place, before they ever reach the GPU (see smoothGrid): the uint8
-// plateaus that MIP and glow integrate away are what terrace an isosurface. The tag stops a
-// cached grid from being smoothed a second time, which would soften it for good.
+// What the current render style wants out of /api/grid.
+//
+// MIP and glow integrate along the ray: 96³ uint8 is already smooth for them, and it always
+// was. An isosurface instead *shades* the grid, so both its resolution and its quantisation
+// are visible — 96³ is blobby, and 8-bit plateaus terrace it. Where the renderer can hold
+// float16 textures, iso therefore takes the map at its native box (capped at 384) in 16 bits
+// and shades it as it is. Where it cannot, it falls back to exactly what it did before:
+// 256³ uint8 with the de-banding blur (which costs real features — it exists only to hide
+// the quantisation, so 16-bit grids must NOT go through it).
+const ISO_GRID_U8 = 256;      // fallback: as fine as the uint8 payload is worth taking
+const ISO_MAX = 384;          // backend cap for 16-bit requests
+function volWant(m) {
+  if (state.render !== "iso") return { size: 96, bits: 8 };
+  if (!volRenderer.hasF16) return { size: ISO_GRID_U8, bits: 8 };
+  return { size: Math.min(ISO_MAX, Math.max(...m.shape)), bits: 16 };
+}
+// The cached grid is reusable only if it is the payload the current style wants — same size
+// AND same sample type. The smoothing tag stops a uint8 grid from being blurred twice, which
+// would soften it for good.
 async function volGrid(m) {
-  const want = volGridSize();
-  if (!m.gridVol || m.gridVol.size !== want) m.gridVol = await fetchGrid(m.index, want);
+  const want = volWant(m);
+  const cached = m.gridVol;
+  if (!cached || cached.size !== want.size || !!cached.f16 !== (want.bits === 16)) {
+    m.gridVol = await fetchGrid(m.index, want.size, want.bits);
+  }
   const g = m.gridVol;
-  if (want === ISO_GRID && !g.smoothed) {
+  if (state.render === "iso" && !g.f16 && !g.smoothed) {
     g.data = smoothGrid(g.data, g.nx, g.ny, g.nz);
     g.smoothed = true;
   }

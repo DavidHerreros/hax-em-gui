@@ -631,13 +631,21 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         index2: int = Query(-1),
         t: float = Query(0.0),
         size: int = Query(96),       # max grid edge of the streamed texture
+        bits: int = Query(8),        # 16 -> float16 samples under the GRID16 tag
     ) -> Response:
         """Decoded density as a compact uint8 3D-texture payload for ray-marching.
 
         Layout: int32 nx, ny, nz (texture width/height/depth, x fastest), then
         float32 vmin, vmax, mean, std, then float32 boxLo[3], boxHi[3] (the model-space
         cube the grid occupies, matching the surface mesh), then nx*ny*nz uint8 voxels
-        (C order)."""
+        (C order).
+
+        `bits=16` keeps that header and swaps the samples for IEEE float16 on the same
+        0..1 normalization, tagged wirefmt.GRID16, and raises the size cap from 160 to 384
+        so the shaded-isosurface mode can have the decode at its native box (a size at or
+        above the box decodes with stride 1). Only that mode asks for it: MIP, glow and the
+        slice view integrate along the ray and cannot see uint8 banding, so they keep the
+        payload a quarter the size."""
         if index < 0 or index >= decoder.total:
             raise _out_of_range(index)
         # -1 is how the client asks for a single state, so it stays the one value that
@@ -653,14 +661,22 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         # what a morph frame costs in the ray-marched render modes.
         with _DECODE_SLOTS:
             try:
-                ds, step = _draft_grid(index, other, t, int(max(16, min(160, size))))
+                cap = 384 if int(bits) == 16 else 160
+                ds, step = _draft_grid(index, other, t, int(max(16, min(cap, size))))
             except HTTPException:
                 raise
             except Exception as exc:  # noqa: BLE001
                 _log_exc("decode failed")
                 raise HTTPException(status_code=500, detail=f"decode failed: {exc}")
         vmin, vmax = float(ds.min()), float(ds.max())
-        u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)
+        if int(bits) == 16:
+            data = np.ascontiguousarray(
+                np.clip((ds - vmin) / (vmax - vmin + 1e-9), 0.0, 1.0), dtype="<f2")
+            tag = wirefmt.GRID16
+        else:
+            data = np.ascontiguousarray(
+                np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8))
+            tag = wirefmt.GRID
         # numpy C order has the last axis varying fastest -> that is the texture x.
         nx, ny, nz = ds.shape[2], ds.shape[1], ds.shape[0]
         full = decoder.box or max(ds.shape) * step
@@ -668,12 +684,12 @@ def build_app(decoder: Decoder, title: str = "Conformational landscape",
         # the full volume's — and taking them here keeps the full array out of the request.
         lo, hi = grid_box((full, full, full), ds.shape, step)
         header = (
-            wirefmt.header(wirefmt.GRID)
+            wirefmt.header(tag)
             + np.array([nx, ny, nz], dtype="<i4").tobytes()
             + np.array([vmin, vmax, float(ds.mean()), float(ds.std())], dtype="<f4").tobytes()
             + np.array(lo + hi, dtype="<f4").tobytes()
         )
-        return Response(content=header + np.ascontiguousarray(u8).tobytes(), media_type="application/octet-stream")
+        return Response(content=header + data.tobytes(), media_type="application/octet-stream")
 
     @app.post("/api/segments")
     def segments(body: PathSpec) -> dict:

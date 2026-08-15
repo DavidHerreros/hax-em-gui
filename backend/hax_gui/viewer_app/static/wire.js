@@ -7,7 +7,7 @@
 // frontend/backend version mismatch — or an HTML error page fetched as
 // arrayBuffer() — was parsed as geometry and rendered as garbage.
 
-export const FMT = { mesh: 1, grid: 2, f32matrix: 3, i32vector: 4, f32vector: 5, cmesh: 6 };
+export const FMT = { mesh: 1, grid: 2, f32matrix: 3, i32vector: 4, f32vector: 5, cmesh: 6, grid16: 7 };
 const MAGIC = 0x48585731; // "HXW1"
 
 export function unwrap(buf, fmt) {
@@ -53,14 +53,22 @@ export function parseColorMesh(wireBuf) {
 }
 
 // int32 nx, ny, nz | float32 vmin, vmax, mean, std | float32 boxLo[3], boxHi[3] |
-// uint8 data[nx*ny*nz].
+// uint8 data[nx*ny*nz] — or, under the grid16 tag, float16 data on the same 0..1
+// normalization (see wirefmt.GRID16). The two are one parser because they are one payload
+// with one header; only `data` differs, and `f16` says which the caller got. A float16
+// array comes back as raw Uint16 bits: that is exactly what WebGL2 wants for HALF_FLOAT,
+// and JS has no half-precision typed array to widen it into anyway.
 export function parseGrid(wireBuf) {
-  const buf = unwrap(wireBuf, FMT.grid);
+  // Peek at the tag before unwrapping, so one call site parses either payload. A buffer too
+  // short to hold a prelude is left to unwrap, which is where the readable error lives.
+  const f16 = wireBuf.byteLength >= 8 && new DataView(wireBuf).getUint8(4) === FMT.grid16;
+  const buf = unwrap(wireBuf, f16 ? FMT.grid16 : FMT.grid);
   const dv = new DataView(buf);
   const nx = dv.getInt32(0, true), ny = dv.getInt32(4, true), nz = dv.getInt32(8, true);
   const vmin = dv.getFloat32(12, true), vmax = dv.getFloat32(16, true), mean = dv.getFloat32(20, true), std = dv.getFloat32(24, true);
   const boxLo = [dv.getFloat32(28, true), dv.getFloat32(32, true), dv.getFloat32(36, true)];
   const boxHi = [dv.getFloat32(40, true), dv.getFloat32(44, true), dv.getFloat32(48, true)];
-  const data = new Uint8Array(buf, 52, nx * ny * nz);
-  return { nx, ny, nz, vmin, vmax, mean, std, boxLo, boxHi, data };
+  const n = nx * ny * nz;
+  const data = f16 ? new Uint16Array(buf, 52, n) : new Uint8Array(buf, 52, n);
+  return { nx, ny, nz, vmin, vmax, mean, std, boxLo, boxHi, data, f16 };
 }

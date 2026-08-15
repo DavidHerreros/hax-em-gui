@@ -1878,14 +1878,24 @@ function loadLandSlices() {
 // Grid resolution for the ray-marcher, per style: an isosurface shows every voxel of the
 // grid it was cut from, and 96³ — smooth enough for MIP and glow, which integrate along the
 // ray — comes out blobby. Volume payloads are cached by URL, so the size is part of the key.
-const ISO_GRID = 256;
-const volGridSize = () => (state.render === "iso" ? ISO_GRID : 96);
+// The /api/grid query for the current render style. MIP, glow and the slice frames keep the
+// 96³ uint8 payload they always had. Iso shades the grid rather than integrating along it,
+// so it asks for float16 at the decoder's native box where the renderer can hold it (the
+// backend clamps `size` to the box, so 384 means "native, no downsampling"), and falls back
+// to 256³ uint8 + the de-banding blur where it cannot. The query string is part of the frame
+// cache key, so a style switch never reuses the wrong payload.
+const ISO_GRID_U8 = 256, ISO_MAX = 384;
+const isoF16 = () => !!(volRenderer && volRenderer.hasF16);
+function volQuery() {
+  if (state.render !== "iso") return "&size=96";
+  return isoF16() ? `&size=${ISO_MAX}&bits=16` : `&size=${ISO_GRID_U8}`;
+}
 
-// Iso shades the grid itself, so it gets the uint8 plateaus smoothed out of it before upload
-// — MIP and glow integrate along the ray and never see them, and the slice view wants the
-// raw values. Tagged so a cached frame payload is smoothed once and only once.
+// The blur exists only to hide 8-bit banding, so a float16 grid must never see it: it would
+// throw away exactly the fine features 16 bits were fetched for. Tagged so a cached frame
+// payload is smoothed once and only once.
 function isoSmooth(g) {
-  if (state.render === "iso" && !g.smoothed) {
+  if (state.render === "iso" && !g.f16 && !g.smoothed) {
     g.data = smoothGrid(g.data, g.nx, g.ny, g.nz);
     g.smoothed = true;
   }
@@ -1903,7 +1913,7 @@ async function loadVolume(index) {
   const token = ++decodeToken;
   status("Loading volume…", "busy");
   try {
-    const res = await fetch(`./api/grid?index=${index}&size=${volGridSize()}`);
+    const res = await fetch(`./api/grid?index=${index}${volQuery()}`);
     if (!res.ok) throw new Error(await res.text());
     const g = isoSmooth(parseGrid(await res.arrayBuffer()));
     if (token !== decodeToken) return;
@@ -2186,7 +2196,7 @@ function frameRequest(i, draft) {
     const q = at + (draft ? `&smooth=${draftSmooth()}&size=${PLAY_GRID}` : `&smooth=${state.smooth}`) + level;
     return { surface: true, url: `./api/decode?${q}`, key: `s|${q}` };
   }
-  const q = `${at}&size=${volGridSize()}`;
+  const q = `${at}${volQuery()}`;
   return { surface: false, url: `./api/grid?${q}`, key: `v|${q}` };
 }
 

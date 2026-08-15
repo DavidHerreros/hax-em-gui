@@ -287,7 +287,10 @@ float isoShadow(vec3 p, vec3 n, float vox) {
 // blocks a direction, which no small-radius sampling could notice.
 //
 // Wide cones, because 16 of them have to cover the sphere: tan(half-angle) 0.577 is 30°,
-// and seven geometric samples reach ~36 voxels, far enough for one domain to shade another.
+// and ten geometric samples reach ~176 voxels — about 70% of a 256 box, so the far side of
+// a molecule finally darkens the near side the way gl.js's whole-scene shadow maps do.
+// (Seven samples reached only ~36 voxels, which is why the ambient term stayed too bright:
+// nothing beyond the local neighbourhood could occlude anything.)
 // Half the directions face away from the surface and are skipped before their cone is
 // traced, so the real cost is ~8 cones of <=7 samples at hit pixels only.
 float isoMultishadow(vec3 p, vec3 n, float vox) {
@@ -296,7 +299,7 @@ float isoMultishadow(vec3 p, vec3 n, float vox) {
   for (int i = 0; i < ${MS_COUNT}; i++) {
     float w = max(-dot(n, MSDIR[i]), 0.0);
     if (w <= 0.0) continue;
-    sh += w * coneVis(o, -MSDIR[i], vox, 0.577, 1.7, 7);
+    sh += w * coneVis(o, -MSDIR[i], vox, 0.577, 1.7, 10);
     wsum += w;
   }
   // gl.js divides by the constant 0.25*N — the expectation of wsum — which its 64 directions
@@ -578,6 +581,30 @@ export function createVolume(canvas) {
   const gl = canvas.getContext("webgl2", { antialias: false, depth: false, preserveDrawingBuffer: true, premultipliedAlpha: false });
   if (!gl) throw new Error("WebGL2 is not available in this browser.");
 
+  // Can this context hold the grids as R16F?
+  //
+  // Iso shades the grid itself, so 8-bit quantisation is visible as terracing and as
+  // gradient noise, and the client-side blur that hides it also eats real features. A
+  // float16 grid has neither problem. Two things have to hold: half-float textures must be
+  // filterable (core in WebGL2) and R16F must be colour-renderable, which is what
+  // generateMipmap needs and what the extension below provides — iso's cone tracing reads
+  // the mip chain, so a texture with no chain is not usable for it. The extension being
+  // advertised is not quite proof, so the capability is probed for real: build a 1-voxel
+  // R16F texture, mipmap it, and believe the result only if the driver raised nothing.
+  // Callers read this back as `hasF16` and fetch 8-bit grids when it is false.
+  const hasF16 = (() => {
+    if (!gl.getExtension("EXT_color_buffer_float") && !gl.getExtension("EXT_color_buffer_half_float")) return false;
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_3D, t);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    while (gl.getError() !== gl.NO_ERROR) { /* start from a clean error state */ }
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, 1, 1, 1, 0, gl.RED, gl.HALF_FLOAT, new Uint16Array(1));
+    gl.generateMipmap(gl.TEXTURE_3D);
+    const ok = gl.getError() === gl.NO_ERROR;
+    gl.bindTexture(gl.TEXTURE_3D, null); gl.deleteTexture(t);
+    return ok;
+  })();
+
   const prog = link(gl, VERT, FRAG);
   const u = (n) => gl.getUniformLocation(prog, n);
   const uInvVP = u("uInvVP"), uEye = u("uEye"), uBg = u("uBg"),
@@ -770,10 +797,17 @@ export function createVolume(canvas) {
   // Every upload path — setVolume, setSlots and the morph's setVolumeB — goes through here,
   // so every texture on screen carries a full chain. Building it costs one pass over a third
   // more texels than the upload itself, once per map.
-  function upload(target, nx, ny, nz, u8) {
+  //
+  // The element type picks the storage: a Uint16Array is a float16 grid (parseGrid hands the
+  // raw half bits straight through, which is what HALF_FLOAT wants), anything else is the
+  // uint8 grid every other mode uses. Both normalise to 0..1 on sampling, so nothing
+  // downstream — thresholds, gamma, the shader — can tell which one it got.
+  function upload(target, nx, ny, nz, data) {
+    const half = data instanceof Uint16Array;
     gl.bindTexture(gl.TEXTURE_3D, target);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, nx, ny, nz, 0, gl.RED, gl.UNSIGNED_BYTE, u8);
+    if (half) gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, nx, ny, nz, 0, gl.RED, gl.HALF_FLOAT, data);
+    else gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, nx, ny, nz, 0, gl.RED, gl.UNSIGNED_BYTE, data);
     gl.generateMipmap(gl.TEXTURE_3D);
   }
 
@@ -807,6 +841,10 @@ export function createVolume(canvas) {
 
   return {
     setVolume, setSlots, render,
+    // Whether this context can hold float16 grids (see the probe above). The controllers ask
+    // before they choose what to fetch: iso takes a native-resolution 16-bit grid where this
+    // is true, and the 8-bit + client-side-blur path where it is not.
+    hasF16,
     // How many maps a composited scene can hold; the controller reports truncation.
     maxSlots: MAXV,
     // The far end of a morph. Pass null to stop morphing and go back to one volume. The
