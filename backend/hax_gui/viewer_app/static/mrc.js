@@ -216,6 +216,23 @@ function volWant(m, cap) {
   if (!volRenderer.hasF16) return { size: ISO_GRID_U8, bits: 8 };
   return { size: Math.min(cap || ISO_MAX, Math.max(...m.shape)), bits: 16 };
 }
+// A 128³ stand-in, fetched only for a map that has no grid at all yet: ~4 MB and a fraction of
+// a second, against ~65 MB and several seconds for a native one. It lives in its OWN field, so
+// the cache-by-size logic above, the identity skip in the renderer and the morph pool are all
+// completely unaware of it; it is dropped the moment the real grid lands.
+const ISO_DRAFT = 128;
+async function volDraft(m) {
+  if (m.gridVolDraft) return m.gridVolDraft;
+  m.gridVolDraft = volRenderer.hasF16 ? await fetchGrid(m.index, ISO_DRAFT, 16)
+                                      : await fetchGrid(m.index, 96, 8);
+  return m.gridVolDraft;
+}
+// Is the cached grid the payload the current style wants — same size AND same sample type?
+function volGridReady(m) {
+  const w = volWant(m);
+  return !!m.gridVol && m.gridVol.size === w.size && !!m.gridVol.f16 === (w.bits === 16);
+}
+
 // The cached grid is reusable only if it is the payload the current style wants — same size
 // AND same sample type. The smoothing tag stops a uint8 grid from being blurred twice, which
 // would soften it for good.
@@ -300,15 +317,37 @@ function reportSurface() {
     : `Surface · σ ${active().sigma.toFixed(2)}`);
 }
 
-// Contour every visible map that has not been contoured yet (on open, and whenever a
-// map is switched back on). Sequential: each is a full marching-cubes pass server-side,
-// and firing twenty at once would just queue them behind each other with less feedback.
+// Newest-run-wins for the two-pass contouring below: the refine pass is long enough that a
+// visibility change can easily land in the middle of it, and a stale run must not go on
+// pushing meshes for a set of maps that is no longer on screen.
+const surfGuard = latestWins();
+
+// Contour every visible map that has not been contoured yet (on open, and whenever a map is
+// switched back on) — DRAFT FIRST, then refine.
+//
+// Both passes are sequential, because each request is a marching-cubes pass server-side and
+// firing twenty at once just queues them behind each other with less feedback. The split is
+// what fixes the wait: a full pass is ~750 ms and ~21 MB per map at a 320³ box, so ten maps
+// meant many seconds of "Contouring…" with an unchanged canvas, while a draft is ~80 ms and
+// ~4 MB. After the first pass every map is on screen; the second replaces each draft in place
+// (the server scales drafts into the same cube, which is what makes them refine without
+// jumping — the contour drag has relied on that since it was written).
+//
+// Only the full mesh stamps m.surface, so an interrupted refine simply retries next time.
 async function loadSurfaces() {
   if (morph.showing) return;   // the maps are hidden; the morph owns the scene
-  for (const m of visibleModels()) {
-    if (m.surface === m.sigma) continue;
+  const todo = visibleModels().filter((m) => m.surface !== m.sigma);
+  if (!todo.length) { reportSurface(); return; }
+  const tok = surfGuard.take();
+  const live = () => state.render === "surface" && !surfGuard.stale(tok);
+  for (const m of todo) {                       // pass 1: something on screen, fast
+    await surfaceOnce(models.indexOf(m), true);
+    if (!live()) return;
+  }
+  for (const m of todo) {                       // pass 2: the real thing, in place
+    if (m.surface === m.sigma) continue;        // a live single-map load got there first
     await surfaceOnce(models.indexOf(m), false);
-    if (state.render !== "surface") return;
+    if (!live()) return;
   }
   reportSurface();
 }
@@ -324,9 +363,10 @@ async function loadSurfaces() {
 // identity check (same array, same dims, same blur) hit, and the toggle costs nothing.
 let volSlots = [];
 
-// The normalized threshold a map's own sigma corresponds to over its own grid range.
-function thrFor(m) {
-  const g = m.gridVol;
+// The normalized threshold a map's own sigma corresponds to over its own grid range. The
+// grid is a parameter because a map on screen as a draft must be contoured against the
+// DRAFT's range, not against a grid it does not have yet.
+function thrFor(m, g = m.gridVol) {
   if (!g) return 0.45;
   const level = m.mean + m.sigma * (m.std || 1);
   return Math.max(0, Math.min(1, (level - g.vmin) / ((g.vmax - g.vmin) || 1)));
@@ -379,21 +419,48 @@ async function loadVolume() {
   if (dropped) show = show.slice(0, volRenderer.maxSlots);
   status("Loading volume…", "busy");
   const tok = volGuard.take();   // changing the shown set mid-download: newest wins
-  try {
-    for (const m of show) {
-      await volGrid(m);
-      if (volGuard.stale(tok)) return;
-    }
+  // Push whatever each map currently has — its real grid if it has arrived, otherwise its
+  // draft. Sticky slots plus the renderer's identity check mean a map whose grid did not
+  // change costs nothing here, so this is cheap to call repeatedly as the fetches land.
+  const pushSlots = () => {
     volSlots = assignSlots(show.map((m) => models.indexOf(m)));
     // Indexed by slot, with holes: an empty slot is `null`, not a shorter array, so the maps
     // that stayed keep their textures.
     volRenderer.setSlots(volSlots.map((mi) => {
       if (mi < 0) return null;
-      const m = models[mi], g = m.gridVol;
+      const m = models[mi], g = m.gridVol || m.gridVolDraft;
+      if (!g) return null;
       return { nx: g.nx, ny: g.ny, nz: g.nz, data: g.data, lo: g.boxLo, hi: g.boxHi,
-               color: hexToRgb(m.color), threshold: thrFor(m) };
+               color: hexToRgb(m.color), threshold: thrFor(m, g) };
     }));
-    const g0 = show[0].gridVol;
+  };
+  try {
+    const need = show.filter((m) => !volGridReady(m));
+    // Draft pass, iso only: a map with nothing to show at all gets a 128³ stand-in first, so
+    // ten maps appear in about a second between them instead of after every native grid has
+    // crossed the network. MIP and glow fetch 96³ anyway — a draft would be the same request.
+    if (state.render === "iso") {
+      const blank = need.filter((m) => !m.gridVol);
+      for (let i = 0; i < blank.length; i++) {
+        status(`Loading volume… draft ${i + 1}/${blank.length}`, "busy");
+        await volDraft(blank[i]);
+        if (volGuard.stale(tok)) return;
+      }
+      if (blank.length) pushSlots();
+    }
+    // Then the real grids, one at a time, each pushed as it arrives: the wait is visible as
+    // maps sharpening one by one rather than as a status line.
+    for (let i = 0; i < need.length; i++) {
+      const m = need[i];
+      status(need.length > 1 ? `Loading volume… ${i + 1}/${need.length}` : "Loading volume…", "busy");
+      await volGrid(m);
+      if (volGuard.stale(tok)) return;
+      delete m.gridVolDraft;      // the real thing is resident; ~4 MB of stand-in is dead weight
+      pushSlots();
+    }
+    if (!need.length) pushSlots();
+    const g0 = show[0].gridVol || show[0].gridVolDraft;
+    if (!g0) return;
     status(show.length > 1
       ? `Volume · ${show.length} maps composited`
         + (dropped ? ` · ${dropped} hidden (max ${volRenderer.maxSlots})` : "")
@@ -525,7 +592,7 @@ function levelForMass(above, target) {
 
 // contour level (absolute) -> ray-marcher threshold in [0,1] over the grid range
 function normThreshold() {
-  const g = active().gridVol;
+  const g = active().gridVol || active().gridVolDraft;   // a draft on screen is still contourable
   if (!g) return 0.45;
   return (hist.level - g.vmin) / ((g.vmax - g.vmin) || 1);
 }
