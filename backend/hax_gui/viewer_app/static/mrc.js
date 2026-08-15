@@ -926,6 +926,7 @@ function setMode(mode) {
   // Lighting drives the surface renderer and the shaded-iso volume style alike, so its row
   // belongs to both modes and to neither of the other two volume styles.
   show($("lightRow"), isSurface || mode === "iso");
+  showOccRow(mode);
   show($("dispVolume"), isVolume);
   show($("dispSlices"), isSlices);
   show($("colorlbl"), !isSlices);
@@ -1008,8 +1009,19 @@ const SEC_KEY = "hax_mrc_sections";
   }
 })();
 
+// The occlusion slider only means something where there are ambient shadows: the shaded-iso
+// style under the two presets that cast them. Standard is flat ambient, so it hides the row.
+function showOccRow(mode) {
+  const lit = $("light").value;
+  show($("occRow"), mode === "iso" && (lit === "smooth" || lit === "raytraced"));
+}
 // One lighting choice for both shaded views: the mesh surface and the ray-cast iso.
-$("light").addEventListener("change", (e) => { renderer.setLighting(e.target.value); volRenderer.setLighting(e.target.value); });
+$("light").addEventListener("change", (e) => {
+  renderer.setLighting(e.target.value);
+  volRenderer.setLighting(e.target.value);
+  showOccRow(state.render);          // the preset decides whether occlusion is adjustable
+});
+$("occgain").addEventListener("input", (e) => volRenderer.setOcclusionGain(+e.target.value));
 $("smooth").addEventListener("input", (e) => {
   active().smooth = +e.target.value;
   active().surface = null;                     // the cached mesh was cut at the old smoothing

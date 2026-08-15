@@ -36,8 +36,13 @@ const LIGHT_MODES = { standard: 0, smooth: 1, raytraced: 2 };
 // The directions are a Fibonacci spiral over the whole sphere, generated once and baked
 // into the shader source, and they live in MODEL space like gl.js's atlas, so the shading
 // stays welded to the map while you orbit instead of swimming with the camera.
+//
+// 32 of them, halving the gradation gap to gl.js's 64: with too few directions the ambient
+// term is a coarse quantisation of the sphere, and a surface that should shade gradually
+// steps instead. Everything downstream (the baked array, the loop bound, the 0.25*N
+// normalisation) is derived from this one number.
 const MS_DIRS = (() => {
-  const n = 16, ga = Math.PI * (3 - Math.sqrt(5)), out = [];
+  const n = 32, ga = Math.PI * (3 - Math.sqrt(5)), out = [];
   for (let i = 0; i < n; i++) {
     const z = 1 - (2 * i + 1) / n, r = Math.sqrt(Math.max(0, 1 - z * z)), a = ga * i;
     out.push([r * Math.cos(a), r * Math.sin(a), z]);
@@ -218,8 +223,9 @@ float boxFar(vec3 o, vec3 d) {
 // How opaque density has to be counted as: a voxel a little over the contour is solid, and a
 // mip level that averaged it with its empty neighbours must still read as solid or a thin
 // wall stops casting shadow. THE calibration knob for the whole shaded look — higher makes
-// occlusion crisper and darker, lower makes it softer and brighter.
-const float OCC_GAIN = 8.0;
+// occlusion crisper and darker, lower makes it softer and brighter — which is why it is a
+// uniform on a slider rather than a constant: what it should be depends on the map.
+uniform float uOccGain;
 
 // Visibility along a CONE, the estimator that replaced binary occlusion rays.
 //
@@ -234,11 +240,16 @@ const float OCC_GAIN = 8.0;
 // Samples march geometrically (each covers the gap the last one left), and the accumulated
 // visibility multiplies, so the far end of the cone matters less than the near end — as it
 // should, being both further away and coarser.
-float coneVis(vec3 o, vec3 L, float vox, float tanHalf, float growth, int nsamp) {
+// t0 is where the first sample sits. It is a parameter because the two users want opposite
+// things from it: a key shadow starts clear of the surface (a near sample would shadow the
+// point against its own bump), while the ambient term must start close enough to catch the
+// wall on the other side of a crevice — that immediate-neighbour contact is the fine dark
+// detail gl.js gets for free from shadow maps, and starting far out is what smoothed it away.
+float coneVis(vec3 o, vec3 L, float vox, float tanHalf, float growth, float t0, int nsamp) {
   float voxEdge = max(vox / 1.7320508, 1e-6);   // voxel diagonal -> voxel edge
   float tf = boxFar(o, L);
   float vis = 1.0;
-  float t = vox * 1.5;
+  float t = t0;
   for (int k = 0; k < 12; k++) {
     if (k >= nsamp) break;
     if (t > tf) break;
@@ -251,7 +262,7 @@ float coneVis(vec3 o, vec3 L, float vox, float tanHalf, float growth, int nsamp)
       if (j >= uCount) break;
       float thrJ = max(uThrA[j], 1e-4);
       float v = densityLod(j, sp, clamp(lod, 0.0, uMaxLodA[j]));
-      occ += clamp((v - thrJ) * OCC_GAIN / max(1.0 - thrJ, 1e-3), 0.0, 1.0);
+      occ += clamp((v - thrJ) * uOccGain / max(1.0 - thrJ, 1e-3), 0.0, 1.0);
     }
     vis *= 1.0 - clamp(occ, 0.0, 1.0);
     if (vis < 0.03) break;
@@ -272,7 +283,7 @@ float coneVis(vec3 o, vec3 L, float vox, float tanHalf, float growth, int nsamp)
 // pixel's ray covers); everything downstream of the hit is view-independent.
 float isoShadow(vec3 p, vec3 n, float vox) {
   vec3 o = p + n * vox;                 // off the surface, or the cone shadows it on itself
-  return coneVis(o, -uKeyDir, vox, 0.07, 1.45, 12);
+  return coneVis(o, -uKeyDir, vox, 0.07, 1.45, vox * 1.5, 12);
 }
 
 // The ambient term, as gl.js computes it: NOT local ambient occlusion, but the
@@ -286,26 +297,28 @@ float isoShadow(vec3 p, vec3 n, float vox) {
 // dark-in-the-pockets gradient the mesh view has: an occluder a whole domain away still
 // blocks a direction, which no small-radius sampling could notice.
 //
-// Wide cones, because 16 of them have to cover the sphere: tan(half-angle) 0.577 is 30°,
-// and ten geometric samples reach ~176 voxels — about 70% of a 256 box, so the far side of
-// a molecule finally darkens the near side the way gl.js's whole-scene shadow maps do.
-// (Seven samples reached only ~36 voxels, which is why the ambient term stayed too bright:
-// nothing beyond the local neighbourhood could occlude anything.)
-// Half the directions face away from the surface and are skipped before their cone is
-// traced, so the real cost is ~8 cones of <=7 samples at hit pixels only.
+// Wide cones, because they have to cover the sphere between them: tan(half-angle) 0.577 is 30°,
+// and eleven geometric samples from 0.75 voxels out reach ~151 voxels — about 60% of a 256
+// box, so the far side of a molecule darkens the near side the way gl.js's whole-scene
+// shadow maps do, while the first sample still lands close enough to catch a touching wall.
+// (Seven samples starting 1.5 voxels out reached only ~36 voxels and skipped the contact
+// entirely, which is why the ambient term stayed bright and the crevices stayed flat.)
+// Half the directions face away from the surface and are skipped before their cone is traced,
+// so the real cost is ~16 cones of <=11 samples at hit pixels only.
 float isoMultishadow(vec3 p, vec3 n, float vox) {
   vec3 o = p + n * vox;
   float sh = 0.0, wsum = 0.0;
   for (int i = 0; i < ${MS_COUNT}; i++) {
     float w = max(-dot(n, MSDIR[i]), 0.0);
     if (w <= 0.0) continue;
-    sh += w * coneVis(o, -MSDIR[i], vox, 0.577, 1.7, 10);
+    sh += w * coneVis(o, -MSDIR[i], vox, 0.577, 1.7, vox * 0.75, 11);
     wsum += w;
   }
   // gl.js divides by the constant 0.25*N — the expectation of wsum — which its 64 directions
-  // approach closely enough. At 16 directions that constant leaves a ±7% ripple in the
-  // unoccluded ambient that reads as faint mottling on smooth faces, so normalise by the
-  // actual weight sum instead: the same quantity both estimate, without the sample noise.
+  // approach closely enough. At the direction count affordable here that constant leaves a
+  // ripple in the unoccluded ambient (±7% at 16 directions, ±3% at 32) which reads as faint
+  // mottling on smooth faces, so normalise by the actual weight sum instead: the same
+  // quantity both estimate, without the sample noise.
   return sh / max(wsum, 1e-4);
 }
 
@@ -615,7 +628,8 @@ export function createVolume(canvas) {
     uVolB = u("uVolB"), uMix = u("uMix"), uCount = u("uCount"),
     uClipOn = u("uClipOn"), uClipN = u("uClipN"), uClipRange = u("uClipRange"), uDiverging = u("uDiverging"),
     uVoxA = u("uVoxA"), uLightMode = u("uLightMode"), uKeyDirL = u("uKeyDir"), uFillDirL = u("uFillDir"),
-    uDepthRow = u("uDepthRow"), uDepthRange = u("uDepthRange"), uMaxLodA = u("uMaxLodA");
+    uDepthRow = u("uDepthRow"), uDepthRange = u("uDepthRange"), uMaxLodA = u("uMaxLodA"),
+    uOccGain = u("uOccGain");
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -659,6 +673,7 @@ export function createVolume(canvas) {
   // of the grid it is actually shading. The placeholder texture is 1³ until a real upload.
   const slotDim = Array.from({ length: MAXV }, () => [64, 64, 64]);
   let lightMode = 0;             // iso lighting preset; the other modes ignore it
+  let occGain = 8.0;             // iso occlusion hardness; see uOccGain in the shader
   // Model-space clip slab, shared with the surface renderer: keep clipRange[0] <=
   // dot(p, clipN) <= clipRange[1]. A null normal is no clipping at all.
   let clipN = null, clipRange = [0, 0];
@@ -775,6 +790,7 @@ export function createVolume(canvas) {
     gl.uniform3fv(uVoxA, flat3(slotDim.map((d) => [1 / Math.max(1, d[0]), 1 / Math.max(1, d[1]), 1 / Math.max(1, d[2])])));
     gl.uniform1fv(uMaxLodA, new Float32Array(slotDim.map((d) => Math.floor(Math.log2(Math.max(2, d[0], d[1], d[2]))))));
     gl.uniform1i(uLightMode, lightMode);
+    gl.uniform1f(uOccGain, occGain);
     gl.uniform3fv(uKeyDirL, toModelDir(KEY_DIR)); gl.uniform3fv(uFillDirL, toModelDir(FILL_DIR));
     // Third row of view·M (column-major: elements 2, 6, 10, 14) — the shader dots it with a
     // model-space hit to get the camera-space depth the cue fades on.
@@ -863,6 +879,10 @@ export function createVolume(canvas) {
     // Iso lighting preset, the same three names gl.js takes, so one control can drive
     // both renderers and the two views stay lit alike. Ignored by MIP and glow.
     setLighting(name) { lightMode = LIGHT_MODES[name] !== undefined ? LIGHT_MODES[name] : 0; render(); },
+    // How hard the ambient and shadow cones count density as opaque (uOccGain). The right
+    // value depends on the map — a tight contour on a well-resolved map wants less than a
+    // loose one on a noisy map — so it is exposed rather than guessed at once.
+    setOcclusionGain(v) { occGain = Math.max(1, Math.min(32, v)); render(); },
     // Signed-difference rendering of slot 0 (red = lost, blue = gained). The caller
     // is responsible for having uploaded a symmetric-range grid (see /api/paint/grid).
     setDiverging(on) { diverging = !!on; render(); },

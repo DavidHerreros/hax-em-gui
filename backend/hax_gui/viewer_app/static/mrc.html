@@ -105,6 +105,12 @@
             <div class="rrow" id="lightRow"><span>lighting</span>
               <select id="light"><option value="standard" selected>standard</option><option value="smooth">smooth</option><option value="raytraced">ray traced</option></select>
             </div>
+            <!-- Only the shaded-iso style has ambient shadows to harden, and only the two
+                 presets that use them; setMode and the lighting handler decide when it shows. -->
+            <div class="rrow" id="occRow" style="display:none"><span>occlusion</span>
+              <input id="occgain" type="range" min="2" max="24" step="0.5" value="8"
+                     title="How readily density counts as opaque to the ambient shadows: higher is darker and crisper, lower is softer and brighter" />
+            </div>
             <div id="dispSurface">
               <div class="rrow"><span>smooth</span>
                 <input id="smooth" type="range" min="0" max="20" value="6" title="Surface mesh smoothing (Taubin iterations)" /></div>
