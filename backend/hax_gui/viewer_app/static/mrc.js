@@ -308,8 +308,15 @@ async function loadSurfaces() {
   reportSurface();
 }
 
-// Which model (by list index) each renderer slot holds; live contour/colour changes
-// address slots through this instead of re-uploading textures.
+// Which model (by list index) each renderer slot holds, INDEXED BY SLOT: volSlots[s] is the
+// model in slot s, or -1 for an empty slot. Live contour/colour changes address slots through
+// this instead of re-uploading textures.
+//
+// Slot assignment is sticky. It used to be `show.map(...)`, which repacked the slots in
+// visibility order, so hiding one map of three moved the other two into different slots and
+// forced a full re-upload (and re-blur, and re-bake) of maps that had not changed at all —
+// seconds of work to toggle a checkbox. Keeping a map where it already is makes the renderer's
+// identity check (same array, same dims, same blur) hit, and the toggle costs nothing.
 let volSlots = [];
 
 // The normalized threshold a map's own sigma corresponds to over its own grid range.
@@ -334,6 +341,25 @@ async function fetchPaintGrid(size) {
 // ordinary maps would be nonsense.
 const paintedAlone = () => !!painted && visibleModels().length === 1 && visibleModels()[0] === models[painted.m];
 
+// Place the maps that should be on screen into renderer slots, keeping every map that is
+// already resident exactly where it is and filling the gaps with the newcomers. Returns an
+// array of length maxSlots holding model indices, -1 where empty.
+function assignSlots(want) {
+  const n = volRenderer.maxSlots;
+  const next = new Array(n).fill(-1);
+  for (let sIdx = 0; sIdx < n; sIdx++) {
+    const cur = volSlots[sIdx];
+    if (cur >= 0 && want.includes(cur)) next[sIdx] = cur;   // still wanted: do not move it
+  }
+  for (const mi of want) {
+    if (next.includes(mi)) continue;
+    const free = next.indexOf(-1);
+    if (free < 0) break;                                     // more maps than slots (caller capped it)
+    next[free] = mi;
+  }
+  return next;
+}
+
 const volGuard = latestWins();
 async function loadVolume() {
   if (morph.showing) return;     // the morph owns the volume canvas
@@ -353,9 +379,12 @@ async function loadVolume() {
       await volGrid(m);
       if (volGuard.stale(tok)) return;
     }
-    volSlots = show.map((m) => models.indexOf(m));
-    volRenderer.setSlots(show.map((m) => {
-      const g = m.gridVol;
+    volSlots = assignSlots(show.map((m) => models.indexOf(m)));
+    // Indexed by slot, with holes: an empty slot is `null`, not a shorter array, so the maps
+    // that stayed keep their textures.
+    volRenderer.setSlots(volSlots.map((mi) => {
+      if (mi < 0) return null;
+      const m = models[mi], g = m.gridVol;
       return { nx: g.nx, ny: g.ny, nz: g.nz, data: g.data, lo: g.boxLo, hi: g.boxHi,
                color: hexToRgb(m.color), threshold: thrFor(m) };
     }));
@@ -377,7 +406,7 @@ async function loadDiffVolume() {
     if (!painted.gridVol) painted.gridVol = await fetchPaintGrid(96);
     if (volGuard.stale(tok) || !painted) return;
     const g = painted.gridVol;
-    volSlots = [painted.m];
+    volSlots = [painted.m];      // setVolume drives slot 0 alone; the rest are inactive
     volRenderer.setVolume(g.nx, g.ny, g.nz, g.data, g.boxLo, g.boxHi);
     volRenderer.setDiverging(true);
     status(`Difference volume · ${models[painted.m].name} − ${models[painted.other].name}`

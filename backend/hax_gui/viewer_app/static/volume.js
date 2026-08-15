@@ -27,6 +27,12 @@ const KEY_DIR = normalize([0.577, -0.577, -0.577]);
 const FILL_DIR = normalize([-0.2, -0.2, -0.959]);
 const LIGHT_MODES = { standard: 0, smooth: 1, raytraced: 2 };
 
+// Motion quality (iso only): how far the backing store shrinks while the camera moves, how
+// long after the last camera event a frame still counts as "moving", and when the one
+// full-resolution redraw fires after the drag ends. The snap has to outlast the window, or
+// it would redraw while still counting as motion and never come back sharp.
+const MOTION_SCALE = 0.6, MOTION_WINDOW_MS = 200, MOTION_SNAP_MS = 220;
+
 // gl.js's "multishadow" ambient light, evaluated with cones instead of shadow maps.
 //
 // The DIRECTIONS are gl.js's, verbatim: ChimeraX's geometry.sphere.sphere_points(64), the
@@ -81,7 +87,12 @@ uniform sampler3D uOpac2;
 uniform sampler3D uOpac3;
 uniform sampler3D uOpacB;  // morph partner of slot 0's opacity
 uniform float uMix;
-uniform int uCount;
+uniform int uCount;         // how many slots are active (the single-map MIP still cares)
+// Which slots are active, as a mask rather than a count: slots are STICKY now — hiding the
+// middle map of three leaves the other two in the slots (and so in the textures) they were
+// already uploaded to, which is what makes a visibility toggle cost nothing. That leaves
+// holes, so iteration is "skip the inactive" instead of "stop at uCount".
+uniform int uActA[${MAXV}];
 uniform mat4 uInvVP;
 uniform vec3 uEye;
 uniform vec3 uBg;
@@ -263,7 +274,7 @@ float coneVis(vec3 o, vec3 L, float vox, float tanHalf, float growth, float t0, 
     // Every active map occludes: in a composited scene one map casts ambient shadow on
     // another exactly as two halves of one map do. One texture read per map per sample.
     for (int j = 0; j < ${MAXV}; j++) {
-      if (j >= uCount) break;
+      if (uActA[j] == 0) continue;
       occ += opacity(j, sp, clamp(lod, 0.0, uMaxLodA[j]));
     }
     vis *= 1.0 - clamp(occ, 0.0, 1.0);
@@ -405,14 +416,18 @@ void main() {
       if (s >= steps) break;
       vec3 mp = ro + rd * t;
       for (int i = 0; i < ${MAXV}; i++) {
-        if (i >= uCount) break;
+        if (uActA[i] == 0) continue;
         float v = clamp((density(i, mp) - uThrA[i]) / max(1.0 - uThrA[i], 1e-3), 0.0, 1.0);
         mv[i] = max(mv[i], v);
       }
       t += dt;
     }
     if (uCount == 1) {                       // the classic single-map grayscale MIP
-      float v = pow(mv[0], uGamma) * uBright;
+      // The lone active map is not necessarily slot 0: sticky slots leave holes, so hiding
+      // two of three maps can leave the survivor in slot 2. Find it, or this renders black.
+      int a0 = 0;
+      for (int i = 0; i < ${MAXV}; i++) { if (uActA[i] == 1) { a0 = i; break; } }
+      float v = pow(mv[a0], uGamma) * uBright;
       outColor = vec4(mix(uBg, vec3(1.0), clamp(v, 0.0, 1.0)), 1.0);
       return;
     }
@@ -421,7 +436,7 @@ void main() {
     vec3 srgb = vec3(1.0);
     float cover = 1.0;
     for (int i = 0; i < ${MAXV}; i++) {
-      if (i >= uCount) break;
+      if (uActA[i] == 0) continue;
       float v = clamp(pow(mv[i], uGamma) * uBright, 0.0, 1.0);
       srgb *= (1.0 - v * uColA[i]);
       cover *= (1.0 - v);
@@ -434,7 +449,7 @@ void main() {
     float prev[${MAXV}];
     for (int i = 0; i < ${MAXV}; i++) prev[i] = 0.0;
     for (int i = 0; i < ${MAXV}; i++) {
-      if (i >= uCount) break;
+      if (uActA[i] == 0) continue;
       prev[i] = density(i, ro + rd * tn);
     }
     float tp = tn;
@@ -445,7 +460,7 @@ void main() {
     // silhouettes broke into holes where the surface meets the box face and why moving the
     // camera close punched the map open. Entering inside IS a hit, on the entry face.
     for (int i = 0; i < ${MAXV}; i++) {
-      if (i >= uCount) break;
+      if (uActA[i] == 0) continue;
       if (prev[i] >= max(uThrA[i], 1e-4) && hitSlot < 0) { hitSlot = i; tHit = tn; }
     }
     for (int s = 1; s < 512; s++) {
@@ -456,7 +471,7 @@ void main() {
       float best = 1e30;
       int bi = -1;
       for (int i = 0; i < ${MAXV}; i++) {
-        if (i >= uCount) break;
+        if (uActA[i] == 0) continue;
         float v = density(i, mp);
         float thr = max(uThrA[i], 1e-4);   // a contour dragged to zero has no crossing at all
         if (prev[i] < thr && v >= thr) {
@@ -505,7 +520,7 @@ void main() {
       if (s >= steps) break;
       vec3 mp = ro + rd * t;
       for (int i = 0; i < ${MAXV}; i++) {
-        if (i >= uCount) break;
+        if (uActA[i] == 0) continue;
         float d = pow(clamp((density(i, mp) - uThrA[i]) / max(1.0 - uThrA[i], 1e-3), 0.0, 1.0), uGamma) * uBright;
         float a = clamp(d * 0.12, 0.0, 1.0) * (1.0 - alpha);
         acc += a * uColA[i]; alpha += a;
@@ -679,7 +694,7 @@ export function createVolume(canvas) {
     uBoxLoA = u("uBoxLoA"), uBoxHiA = u("uBoxHiA"), uThrA = u("uThrA"), uColA = u("uColA"),
     uGamma = u("uGamma"), uBright = u("uBright"), uMode = u("uMode"), uSteps = u("uSteps"),
     uVolN = [u("uVol0"), u("uVol1"), u("uVol2"), u("uVol3")],
-    uVolB = u("uVolB"), uMix = u("uMix"), uCount = u("uCount"),
+    uVolB = u("uVolB"), uMix = u("uMix"), uCount = u("uCount"), uActA = u("uActA"),
     uClipOn = u("uClipOn"), uClipN = u("uClipN"), uClipRange = u("uClipRange"), uDiverging = u("uDiverging"),
     uVoxA = u("uVoxA"), uLightMode = u("uLightMode"), uKeyDirL = u("uKeyDir"), uFillDirL = u("uFillDir"),
     uDepthRow = u("uDepthRow"), uDepthRange = u("uDepthRange"), uMaxLodA = u("uMaxLodA"),
@@ -733,7 +748,10 @@ export function createVolume(canvas) {
   let bg = [0.016, 0.024, 0.06];
   let gamma = 1.4, bright = 1.2, mode = 0, steps = 160;
   let hasTex = false;
-  let count = 1;
+  let count = 1;                 // number of ACTIVE slots (the single-map MIP branch reads it)
+  // Which slots are live. Sticky assignment (the controller keeps a map in the slot it already
+  // occupies) means the active set can have holes, and a hole is not the same as "the end".
+  const slotOn = Array.from({ length: MAXV }, (_, i) => i === 0);
   // Per-slot state, flat-packed on upload. Slot 0's defaults are the values the
   // single-map viewer has always used.
   const slotBoxLo = Array.from({ length: MAXV }, () => [-1, -1, -1]);
@@ -764,7 +782,8 @@ export function createVolume(canvas) {
   // slots. It bounds the ray march, the camera's pivot probe and the framing rule.
   function unionBox() {
     const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < MAXV; i++) {
+      if (!slotOn[i]) continue;
       for (let a = 0; a < 3; a++) {
         lo[a] = Math.min(lo[a], slotBoxLo[i][a]);
         hi[a] = Math.max(hi[a], slotBoxHi[i][a]);
@@ -802,11 +821,48 @@ export function createVolume(canvas) {
 
   // 1.41 = the height this view has always shown (old camera: 3.4·tan(22.5°)), so the map
   // keeps its size and its registration with the surface view across a render-mode switch.
-  const orbit = createOrbit(canvas, () => render(), null,
-    { fitRadius: 1.41, probeDepth: centreDepth, modelBounds: displayedBounds });
+  // The orbit's redraw, with a timestamp on the way through. Nothing else: it must stay a
+  // pure passthrough, or it would fight the orbit's own event loop. The stamp is what
+  // resize() reads to decide whether the camera is being moved right now (see below), and
+  // the timer is the one redraw that restores full resolution once the drag stops.
+  let lastInteract = 0, motionTimer = null;
+  const orbit = createOrbit(canvas, () => {
+    lastInteract = performance.now();
+    if (motionTimer) clearTimeout(motionTimer);
+    motionTimer = setTimeout(() => { motionTimer = null; render(); }, MOTION_SNAP_MS);
+    render();
+  }, null, { fitRadius: 1.41, probeDepth: centreDepth, modelBounds: displayedBounds });
 
+  // How many samples the primary march takes in iso mode.
+  //
+  // 160 steps across a box holding a 320³ grid is a sample every two voxels, so a thin wall
+  // can fall between two samples — and whether it does depends on the view direction, which
+  // is exactly the blinking that showed up while rotating. Sampling a little finer than the
+  // grid (1.25 samples per voxel of the largest active grid) makes the crossing detector see
+  // every feature the grid can represent. MIP and glow keep the flat 160: they integrate, so
+  // a missed sample dims a pixel instead of erasing a surface.
+  //
+  // The cost is far below the ratio suggests: iso stops at its first crossing, so only rays
+  // that miss the map entirely run the full count, and those exit the box early anyway.
+  function isoSteps() {
+    let m = 0;
+    for (let i = 0; i < MAXV; i++) if (slotOn[i]) m = Math.max(m, slotDim[i][0], slotDim[i][1], slotDim[i][2]);
+    return Math.max(160, Math.min(512, Math.ceil(1.25 * m)));   // 512 is the shader's loop cap
+  }
+
+  // Motion quality, as ChimeraX has it: while the camera is actually being moved, iso draws
+  // into a smaller backing store and lets the browser scale it up to the same CSS box. Only
+  // the resolution drops — every light, shadow and cone stays exactly as it is, so the
+  // picture does not change character mid-drag, it just gets softer for the duration.
+  // Confined to iso because it is the only mode heavy enough to need it.
+  //
+  // snapshot() sizes the canvas itself and calls drawScene directly, so exports are never
+  // reduced. A morph recording drives setMix, not the orbit, so lastInteract stays old and
+  // captureStream records at full resolution too.
   function resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const full = Math.min(window.devicePixelRatio || 1, 2);
+    const moving = mode === 2 && (performance.now() - lastInteract) < MOTION_WINDOW_MS;
+    const dpr = moving ? full * MOTION_SCALE : full;
     const w = Math.max(1, Math.floor(canvas.clientWidth * dpr)), h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   }
@@ -867,7 +923,7 @@ export function createVolume(canvas) {
     gl.uniform3fv(uBoxLoA, flat3(slotBoxLo)); gl.uniform3fv(uBoxHiA, flat3(slotBoxHi));
     gl.uniform1fv(uThrA, slotThr); gl.uniform3fv(uColA, flat3(slotCol));
     gl.uniform1f(uGamma, gamma); gl.uniform1f(uBright, bright);
-    gl.uniform1i(uMode, mode); gl.uniform1i(uSteps, steps);
+    gl.uniform1i(uMode, mode); gl.uniform1i(uSteps, mode === 2 ? isoSteps() : steps);
     gl.uniform3fv(uVoxA, flat3(slotDim.map((d) => [1 / Math.max(1, d[0]), 1 / Math.max(1, d[1]), 1 / Math.max(1, d[2])])));
     gl.uniform1fv(uMaxLodA, new Float32Array(slotDim.map((d) => Math.floor(Math.log2(Math.max(2, d[0], d[1], d[2]))))));
     gl.uniform1i(uLightMode, lightMode);
@@ -877,6 +933,7 @@ export function createVolume(canvas) {
     gl.uniform4fv(uDepthRow, [mv[2], mv[6], mv[10], mv[14]]);
     gl.uniform2fv(uDepthRange, depthCueRange(mv, ub));
     gl.uniform1i(uCount, count);
+    gl.uniform1iv(uActA, new Int32Array(slotOn.map((on) => (on ? 1 : 0))));
     gl.uniform1i(uDiverging, diverging ? 1 : 0);
     gl.uniform1f(uMix, gridB ? mix : 0);
     gl.uniform1i(uClipOn, clipN ? 1 : 0);
@@ -1008,27 +1065,55 @@ export function createVolume(canvas) {
   // float16 grids are ever blurred: a uint8 grid belongs to MIP/glow/slices (or the 8-bit iso
   // fallback, where the client-side de-banding blur has already been applied) and rendering
   // into R8 would quantise every pass.
+  // The sigma a given array is actually rendered with: a uint8 grid is never blurred, so its
+  // "applied sigma" is always 0 and a smoothing change must not force it to re-upload.
+  const sigmaFor = (data) => (hasSmoothing && data instanceof Uint16Array ? smoothSigma : 0);
   function blurIfNeeded(tex, nx, ny, nz, data) {
     if (smoothSigma > 0 && hasSmoothing && data instanceof Uint16Array) blurField(tex, [nx, ny, nz], smoothSigma);
+  }
+  // Is what this slot's texture already holds exactly what is being asked for? The retained
+  // array reference is the honest test — it is the very array that was uploaded — and the
+  // recorded sigma catches the case where the same data now wants a different blur.
+  function slotHolds(src, nx, ny, nz, data) {
+    return !!src && src.data === data && src.nx === nx && src.ny === ny && src.nz === nz
+      && src.sigma === sigmaFor(data);
   }
   function reload(tex, src) {
     if (!src || !(src.data instanceof Uint16Array)) return;
     upload(tex, src.nx, src.ny, src.nz, src.data);
     blurIfNeeded(tex, src.nx, src.ny, src.nz, src.data);
+    src.sigma = sigmaFor(src.data);
   }
   function reloadAll() {
-    for (let i = 0; i < count; i++) reload(slotTex[i], slotSrc[i]);
+    for (let i = 0; i < MAXV; i++) if (slotOn[i]) reload(slotTex[i], slotSrc[i]);
     if (gridB) reload(texB, srcB);
   }
 
   // The pyramid is only ever needed by iso, so it is baked lazily: anything that invalidates
   // it just says so, and the next draw in iso mode pays for it. Switching into iso therefore
   // costs one bake and switching styles otherwise costs nothing.
-  let opacDirty = true, opacTimer = null, smoothTimer = null;
+  // Dirtiness is per slot, because the work it stands for is per slot: re-baking three
+  // pyramids because one map's contour moved is most of what made a visibility toggle or a
+  // contour drag cost seconds. "B" is the morph partner, which has its own texture and so its
+  // own dirty bit.
+  const opacDirtyA = Array.from({ length: MAXV }, () => true);
+  let opacDirtyB = true, opacTimer = null, smoothTimer = null, pendingDirty = null;
+  function markDirty(which) {
+    if (which === "all") { opacDirtyA.fill(true); opacDirtyB = true; }
+    else if (which === "B") opacDirtyB = true;
+    else opacDirtyA[which] = true;
+  }
+  function anyDirty() {
+    for (let i = 0; i < MAXV; i++) if (slotOn[i] && opacDirtyA[i]) return true;
+    return !!(gridB && opacDirtyB);
+  }
   function bakeAll() {
-    for (let i = 0; i < count; i++) bakeOpacity(slotTex[i], opacTex[i], slotDim[i], slotThr[i]);
-    if (gridB) bakeOpacity(texB, opacTexB, dimB, slotThr[0]);
-    opacDirty = false;
+    for (let i = 0; i < MAXV; i++) {
+      if (!slotOn[i] || !opacDirtyA[i]) continue;
+      bakeOpacity(slotTex[i], opacTex[i], slotDim[i], slotThr[i]);
+      opacDirtyA[i] = false;
+    }
+    if (gridB && opacDirtyB) { bakeOpacity(texB, opacTexB, dimB, slotThr[0]); opacDirtyB = false; }
   }
   // `now` = a new grid: there is nothing usable to keep, so mark it and let the next draw
   // rebuild. Otherwise (contour, occlusion gain) the pyramid on the GPU is merely slightly
@@ -1036,42 +1121,69 @@ export function createVolume(canvas) {
   // it debounces its ambient atlas against the clip slider, and what lets these be sliders
   // at all. The isosurface itself follows the contour instantly either way: the primary
   // march reads density, never the pyramid.
-  function invalidateOpacity(now) {
-    if (opacTimer) { clearTimeout(opacTimer); opacTimer = null; }
-    if (now) { opacDirty = true; return; }
-    opacTimer = setTimeout(() => { opacTimer = null; opacDirty = true; render(); }, 150);
+  function invalidateOpacity(now, which) {
+    if (now) { markDirty(which); return; }
+    (pendingDirty || (pendingDirty = new Set())).add(which);
+    if (opacTimer) clearTimeout(opacTimer);
+    opacTimer = setTimeout(() => {
+      opacTimer = null;
+      for (const w of pendingDirty) markDirty(w);
+      pendingDirty = null;
+      render();
+    }, 150);
   }
-  function ensureOpacity() { if (mode === 2 && opacDirty && hasTex) bakeAll(); }
+  function ensureOpacity() { if (mode === 2 && hasTex && anyDirty()) bakeAll(); }
 
   function setVolume(nx, ny, nz, u8, lo, hi) {
-    upload(slotTex[0], nx, ny, nz, u8);
-    slotSrc[0] = { data: u8, nx, ny, nz };   // kept by reference; see slotSrc
-    blurIfNeeded(slotTex[0], nx, ny, nz, u8);
+    // Same array, same dims, same blur? Then the texture already holds it — re-uploading a
+    // 65 MB grid (and re-blurring, and re-baking its pyramid) to arrive at what is already
+    // there is most of what made these calls cost seconds.
+    if (!slotHolds(slotSrc[0], nx, ny, nz, u8)) {
+      upload(slotTex[0], nx, ny, nz, u8);
+      slotSrc[0] = { data: u8, nx, ny, nz, sigma: sigmaFor(u8) };   // kept by reference; see slotSrc
+      blurIfNeeded(slotTex[0], nx, ny, nz, u8);
+      invalidateOpacity(true, 0);   // a new grid: the pyramid describes the old one
+    }
     grid = { nx, ny, nz };
     slotDim[0] = [nx, ny, nz];
     count = 1;
-    invalidateOpacity(true);        // a new grid: the pyramid describes the old one
+    slotOn.fill(false); slotOn[0] = true;
     if (lo && hi) { slotBoxLo[0] = lo.slice(); slotBoxHi[0] = hi.slice(); }   // the cube the surface mesh uses, so the two modes coincide
     hasTex = true; orbit.invalidatePivot(); render();           // a new map is a new box to pivot on
   }
 
-  // Several maps in one scene: each slot is {nx, ny, nz, data, lo, hi, color, threshold}.
+  // Several maps in one scene. `slots` is indexed BY SLOT: entry i is what slot i should
+  // hold, and a null/absent entry means that slot is off. The caller therefore controls slot
+  // identity — it keeps a map where it already is — and only the slots that actually changed
+  // pay for an upload, a blur and a pyramid.
   function setSlots(slots) {
     const n = Math.min(slots.length, MAXV);
     if (!n) return;
-    for (let i = 0; i < n; i++) {
-      const s = slots[i];
-      upload(slotTex[i], s.nx, s.ny, s.nz, s.data);
-      slotSrc[i] = { data: s.data, nx: s.nx, ny: s.ny, nz: s.nz };
-      blurIfNeeded(slotTex[i], s.nx, s.ny, s.nz, s.data);
+    let first = -1;
+    for (let i = 0; i < MAXV; i++) {
+      const s = i < n ? slots[i] : null;
+      slotOn[i] = !!s;
+      if (!s) continue;
+      if (first < 0) first = i;
+      if (!slotHolds(slotSrc[i], s.nx, s.ny, s.nz, s.data)) {
+        upload(slotTex[i], s.nx, s.ny, s.nz, s.data);
+        slotSrc[i] = { data: s.data, nx: s.nx, ny: s.ny, nz: s.nz, sigma: sigmaFor(s.data) };
+        blurIfNeeded(slotTex[i], s.nx, s.ny, s.nz, s.data);
+        invalidateOpacity(true, i);
+      }
       slotDim[i] = [s.nx, s.ny, s.nz];
       if (s.lo && s.hi) { slotBoxLo[i] = s.lo.slice(); slotBoxHi[i] = s.hi.slice(); }
       if (s.color) slotCol[i] = s.color.slice();
-      if (Number.isFinite(s.threshold)) slotThr[i] = Math.max(0, Math.min(1, s.threshold));
+      if (Number.isFinite(s.threshold)) {
+        // Compare the CLAMPED value, or a threshold outside [0,1] would look different from
+        // what was stored on every call and re-bake the pyramid for ever.
+        const t = Math.max(0, Math.min(1, s.threshold));
+        if (t !== slotThr[i]) { slotThr[i] = t; invalidateOpacity(true, i); }   // baked into the pyramid
+      }
     }
-    grid = { nx: slots[0].nx, ny: slots[0].ny, nz: slots[0].nz };
-    count = n;
-    invalidateOpacity(true);
+    if (first < 0) return;
+    grid = { nx: slots[first].nx, ny: slots[first].ny, nz: slots[first].nz };
+    count = slotOn.filter(Boolean).length;
     hasTex = true; orbit.invalidatePivot(); render();
   }
 
@@ -1093,13 +1205,15 @@ export function createVolume(canvas) {
     // camera is untouched either way: the two ends share a grid, so they share the box the
     // pivot is derived from.
     setVolumeB(nx, ny, nz, u8) {
-      if (!u8) { gridB = null; dimB = null; srcB = null; mix = 0; invalidateOpacity(true); render(); return; }
-      upload(texB, nx, ny, nz, u8);
-      srcB = { data: u8, nx, ny, nz };
-      blurIfNeeded(texB, nx, ny, nz, u8);
+      if (!u8) { gridB = null; dimB = null; srcB = null; mix = 0; render(); return; }
+      if (!slotHolds(srcB, nx, ny, nz, u8)) {
+        upload(texB, nx, ny, nz, u8);
+        srcB = { data: u8, nx, ny, nz, sigma: sigmaFor(u8) };
+        blurIfNeeded(texB, nx, ny, nz, u8);
+        invalidateOpacity(true, "B");
+      }
       gridB = { nx, ny, nz };
       dimB = [nx, ny, nz];
-      invalidateOpacity(true);
       render();
     },
     // Blend weight, 0 = the near map, 1 = the far one. Called every animation frame, so
@@ -1114,7 +1228,9 @@ export function createVolume(canvas) {
     // the slider stays interactive and lands ~150 ms after you stop). The right value depends
     // on the map — a tight contour on a well-resolved map wants less than a loose one on a
     // noisy map — so it is exposed rather than guessed at once.
-    setOcclusionGain(v) { occGain = Math.max(1, Math.min(32, v)); invalidateOpacity(false); },
+    // Baked into every pyramid, so every pyramid is stale — unlike a contour, which belongs
+    // to one slot.
+    setOcclusionGain(v) { occGain = Math.max(1, Math.min(32, v)); invalidateOpacity(false, "all"); },
     // Gaussian smoothing of the density field, in voxels — iso's counterpart to the surface
     // view's Taubin slider, and like it a property of how the geometry is drawn rather than of
     // the data. Each change restarts from the caller's untouched array (slotSrc), so sigma is
@@ -1128,8 +1244,8 @@ export function createVolume(canvas) {
       if (smoothTimer) clearTimeout(smoothTimer);
       smoothTimer = setTimeout(() => {
         smoothTimer = null;
-        reloadAll();               // re-upload raw, then blur: the blur is never applied twice
-        invalidateOpacity(true);   // the pyramid describes the field as it was before
+        reloadAll();                    // re-upload raw, then blur: never applied twice
+        invalidateOpacity(true, "all");  // every pyramid describes the field as it was before
         render();
       }, 150);
     },
@@ -1139,8 +1255,8 @@ export function createVolume(canvas) {
     // No pivot invalidation: an image-rendered map pivots on its box, and the contour does
     // not move the box. Same in ChimeraX, where changing the level of a map shown as an
     // image leaves its bounds — and so its centre of rotation — where they were.
-    setThreshold(v) { slotThr[0] = Math.max(0, Math.min(1, v)); invalidateOpacity(false); render(); },
-    setSlotThreshold(i, v) { if (i >= 0 && i < MAXV) { slotThr[i] = Math.max(0, Math.min(1, v)); invalidateOpacity(false); render(); } },
+    setThreshold(v) { slotThr[0] = Math.max(0, Math.min(1, v)); invalidateOpacity(false, 0); render(); },
+    setSlotThreshold(i, v) { if (i >= 0 && i < MAXV) { slotThr[i] = Math.max(0, Math.min(1, v)); invalidateOpacity(false, i); render(); } },
     setGamma(g) { gamma = Math.max(0.2, g); render(); },
     // Clip slab: keep lo <= dot(p, n) <= hi, with `n` a unit normal in the model-space
     // [-1,1] cube — the same call the surface renderer takes, so one cut serves both
