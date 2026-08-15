@@ -11,10 +11,21 @@
 // Slot 0 additionally carries the morph partner (uVolB + uMix): a morph is a linear
 // blend of two densities, and blending on the GPU rather than uploading a texture per
 // frame is what makes playback run at screen rate.
-import { projection, lookAt, multiply, invert, mulVec4 } from "./mat4.js";
+import { projection, lookAt, multiply, invert, mulVec4, normalize } from "./mat4.js";
 import { createOrbit } from "./orbit.js";
 
 const MAXV = 4;
+
+// Iso mode's lights, copied from gl.js so a shaded isosurface and a marching-cubes
+// surface of the same map are lit identically — the point of the mode is that you can
+// switch to it without the map appearing to change material. These are ChimeraX's
+// Material defaults and its camera-space light directions (the direction each light
+// *shines*, hence the minus signs in the shader), and the three presets are ChimeraX's
+// simple / soft / full. `move_lights_with_camera` is why the directions are camera-space
+// constants that drawScene carries back into model space every frame.
+const KEY_DIR = normalize([0.577, -0.577, -0.577]);
+const FILL_DIR = normalize([-0.2, -0.2, -0.959]);
+const LIGHT_MODES = { standard: 0, smooth: 1, raytraced: 2 };
 
 const VERT = `#version 300 es
 precision highp float;
@@ -47,8 +58,19 @@ uniform float uThrA[${MAXV}];    // per-slot 0..1 normalized contour
 uniform vec3 uColA[${MAXV}];
 uniform float uGamma;
 uniform float uBright;
-uniform int uMode;          // 0 = MIP, 1 = emission/absorption
+uniform int uMode;          // 0 = MIP, 1 = emission/absorption, 2 = shaded isosurface
 uniform int uSteps;
+
+// Iso mode. uVoxA is one texel of each slot's grid in NORMALIZED texture units (1/nx …),
+// which is the step the central-difference gradient is taken over — a fixed model-space
+// epsilon would straddle several voxels on a coarse grid and less than one on a fine one.
+// The light directions arrive already rotated into model space (see drawScene): the march
+// happens in model space, and the lights are fixed to the camera as in gl.js, so the
+// rotation has to be undone once per frame rather than per fragment.
+uniform vec3 uVoxA[${MAXV}];
+uniform int uLightMode;     // 0 = standard, 1 = smooth, 2 = ray traced
+uniform vec3 uKeyDir;       // model space, direction the key light shines
+uniform vec3 uFillDir;
 
 // Clip slab, the same model-space plane pair the surface renderer cuts with: keep the
 // samples whose signed distance along the unit normal uClipN lands inside uClipRange,
@@ -94,6 +116,103 @@ float densityN(vec3 mp) {
     if (d < uClipRange.x || d > uClipRange.y) return 0.5;
   }
   return sampleVol(0, p);
+}
+
+// ---- iso mode helpers -----------------------------------------------------
+
+// Outward unit normal of slot i's isosurface at a model-space point: the central-difference
+// density gradient, negated because density falls off *outwards*. Each offset is one texel
+// of that slot's grid converted to model units, so the chain rule that carries a
+// texture-space gradient into model space — divide each component by the box extent — is
+// already paid by measuring the difference over that model-space distance. Anisotropic
+// boxes and non-cubic grids therefore come out right, which a gradient taken in normalized
+// texture space and used as-is would not. Sampling goes through density(), so slot 0's
+// normals follow the morph blend and the clip slab cuts normals as well as geometry.
+vec3 isoNormal(int i, vec3 mp) {
+  vec3 h = max(uVoxA[i] * (uBoxHiA[i] - uBoxLoA[i]), vec3(1e-6));
+  float dx = density(i, mp + vec3(h.x, 0.0, 0.0)) - density(i, mp - vec3(h.x, 0.0, 0.0));
+  float dy = density(i, mp + vec3(0.0, h.y, 0.0)) - density(i, mp - vec3(0.0, h.y, 0.0));
+  float dz = density(i, mp + vec3(0.0, 0.0, h.z)) - density(i, mp - vec3(0.0, 0.0, h.z));
+  vec3 g = vec3(dx, dy, dz) / (2.0 * h);
+  float len = length(g);
+  return len < 1e-8 ? vec3(0.0) : -g / len;    // zero-length: the caller falls back
+}
+
+// Is any slot's interior here? Shadow and occlusion rays only need "something opaque is
+// in the way", not which map it belongs to.
+bool isoOccupied(vec3 mp) {
+  for (int i = 0; i < ${MAXV}; i++) {
+    if (i >= uCount) break;
+    // The floor keeps a contour dragged to zero from declaring empty space solid — outside
+    // the box and outside the clip slab density() returns exactly 0.
+    if (density(i, mp) >= max(uThrA[i], 1e-4)) return true;
+  }
+  return false;
+}
+
+// Where a ray leaves the union box — the length a secondary ray can usefully march.
+float boxFar(vec3 o, vec3 d) {
+  vec3 inv = 1.0 / d;
+  vec3 t0 = (uBoxLo - o) * inv, t1 = (uBoxHi - o) * inv;
+  vec3 tmax = max(t0, t1);
+  return min(min(tmax.x, tmax.y), tmax.z);
+}
+
+// Key-light shadow for the ray-traced preset, standing in for gl.js's 2048² shadow map:
+// march towards the light and kill the key term on the first occupied sample. Twice the
+// primary step, because a shadow's edge tolerates an error the silhouette does not, and
+// the ray is started off the surface or step one would shadow the point against itself.
+float isoShadow(vec3 p, vec3 n, float dt) {
+  vec3 L = -uKeyDir;                    // uKeyDir is where the light shines, not where it is
+  vec3 o = p + n * dt * 1.5;
+  float tf = boxFar(o, L);
+  float st = dt * 2.0;
+  for (int s = 1; s < 256; s++) {
+    float t = st * float(s);
+    if (t > tf) break;
+    if (isoOccupied(o + L * t)) return 0.0;
+  }
+  return 1.0;
+}
+
+// Cheap local ambient occlusion for the two presets whose look depends on it: gl.js gets
+// this from 64 real shadow maps, which is out of reach inside a per-fragment ray march, so
+// sample a narrow cone around the normal at two radii and darken the ambient term by the
+// fraction that lands inside matter. It reproduces creases and pockets, not a whole domain
+// shadowing its neighbour — deliberately subtle rather than wrong at a large scale.
+float isoAO(vec3 p, vec3 n, float dt) {
+  vec3 up = abs(n.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+  vec3 tx = normalize(cross(up, n)), ty = cross(n, tx);
+  float occ = 0.0;
+  for (int k = 0; k < 6; k++) {
+    float a = 6.2831853 * float(k) / 6.0;
+    vec3 d = normalize(n + 0.9 * (cos(a) * tx + sin(a) * ty));
+    if (isoOccupied(p + d * (3.0 * dt))) occ += 1.0;
+    if (isoOccupied(p + d * (7.0 * dt))) occ += 1.0;
+  }
+  return occ / 12.0;
+}
+
+// ChimeraX's lighting equation (gl.js's fragment shader), with the preset intensities and
+// the Material reflectivities inlined: an isosurface drawn here has to match the same map
+// drawn as a mesh, or switching modes would look like a change of material. rd is the
+// unit eye-to-point direction, gl.js's v1 — every vector here is model space, and the
+// model transform is rigid, so the dot products are the camera-space ones.
+vec3 isoShade(int i, vec3 p, vec3 n, vec3 rd, float dt) {
+  float lkey  = uLightMode == 1 ? 0.0 : (uLightMode == 2 ? 0.7 : 1.0);
+  float lfill = uLightMode == 1 ? 0.0 : (uLightMode == 2 ? 0.3 : 0.5);
+  float lamb  = uLightMode == 1 ? 1.5 : (uLightMode == 2 ? 0.8 : 0.4);
+  float kf = max(-dot(n, uKeyDir), 0.0);
+  float ff = max(-dot(n, uFillDir), 0.0);
+  vec3 R = normalize(reflect(uKeyDir, n));
+  float sf = pow(max(-dot(R, rd), 0.0), 30.0);      // MATERIAL.exponent
+  float shadow = uLightMode == 2 ? isoShadow(p, n, dt) : 1.0;
+  float amb = uLightMode == 0 ? 1.0 : 1.0 - 0.75 * isoAO(p, n, dt);
+  vec3 base = uColA[i];
+  vec3 Iamb = base * (0.8 * lamb) * amb;                                  // MATERIAL.ambient
+  vec3 Idiff = base * (0.8 * lkey * kf * shadow + 0.8 * lfill * ff);      // MATERIAL.diffuse
+  vec3 Ispec = vec3(0.3 * lkey * sf * shadow);                            // MATERIAL.specular
+  return Iamb + Idiff + Ispec;
 }
 
 void main() {
@@ -177,6 +296,52 @@ void main() {
       cover *= (1.0 - v);
     }
     outColor = vec4(uBg * cover + (1.0 - srgb), 1.0);
+  } else if (uMode == 2) {                   // shaded isosurface
+    // March until some slot's density crosses its contour from below, then bisect and
+    // shade that point opaquely. Stopping at the first hit is what makes iso cheaper than
+    // MIP or emission, both of which must always run the whole segment.
+    float prev[${MAXV}];
+    for (int i = 0; i < ${MAXV}; i++) prev[i] = 0.0;
+    for (int i = 0; i < ${MAXV}; i++) {
+      if (i >= uCount) break;
+      prev[i] = density(i, ro + rd * tn);
+    }
+    float tp = tn;
+    int hitSlot = -1;
+    float tHit = 0.0;
+    for (int s = 1; s < 512; s++) {
+      if (s > steps) break;
+      float tc = tn + dt * float(s);
+      vec3 mp = ro + rd * tc;
+      float best = 1e30;
+      int bi = -1;
+      for (int i = 0; i < ${MAXV}; i++) {
+        if (i >= uCount) break;
+        float v = density(i, mp);
+        float thr = max(uThrA[i], 1e-4);   // a zero contour has no crossing at all: see isoOccupied
+        if (prev[i] < thr && v >= thr) {
+          // One step spans several voxels at the default step count, and shading its far
+          // end would terrace the surface into visible shells — bisect the bracket first.
+          float a = tp, b = tc;
+          for (int k = 0; k < 5; k++) {
+            float m = 0.5 * (a + b);
+            if (density(i, ro + rd * m) < thr) a = m; else b = m;
+          }
+          if (b < best) { best = b; bi = i; }   // two maps can cross in one step: nearest wins
+        }
+        prev[i] = v;
+      }
+      if (bi >= 0) { hitSlot = bi; tHit = best; break; }
+      tp = tc;
+    }
+    if (hitSlot < 0) { outColor = vec4(uBg, 1.0); return; }
+    vec3 hp = ro + rd * tHit;
+    vec3 n = isoNormal(hitSlot, hp);
+    // A cut face across a locally flat region has no gradient worth normalising; face the
+    // viewer instead of shading from noise.
+    if (dot(n, n) < 0.5) n = -rd;
+    if (dot(n, rd) > 0.0) n = -n;              // two-sided, as gl.js is via gl_FrontFacing
+    outColor = vec4(isoShade(hitSlot, hp, n, rd, dt), 1.0);
   } else {                                   // front-to-back emission/absorption
     vec3 acc = vec3(0.0); float alpha = 0.0;
     for (int s = 0; s < 512; s++) {
@@ -207,7 +372,8 @@ export function createVolume(canvas) {
     uGamma = u("uGamma"), uBright = u("uBright"), uMode = u("uMode"), uSteps = u("uSteps"),
     uVolN = [u("uVol0"), u("uVol1"), u("uVol2"), u("uVol3")],
     uVolB = u("uVolB"), uMix = u("uMix"), uCount = u("uCount"),
-    uClipOn = u("uClipOn"), uClipN = u("uClipN"), uClipRange = u("uClipRange"), uDiverging = u("uDiverging");
+    uClipOn = u("uClipOn"), uClipN = u("uClipN"), uClipRange = u("uClipRange"), uDiverging = u("uDiverging"),
+    uVoxA = u("uVoxA"), uLightMode = u("uLightMode"), uKeyDirL = u("uKeyDir"), uFillDirL = u("uFillDir");
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -244,6 +410,10 @@ export function createVolume(canvas) {
   const slotBoxHi = Array.from({ length: MAXV }, () => [1, 1, 1]);
   const slotThr = new Float32Array(MAXV).fill(0.45);
   const slotCol = Array.from({ length: MAXV }, () => [0.784, 0.784, 0.784]);
+  // Grid dimensions per slot, kept only so iso mode can take its gradient over one texel
+  // of the grid it is actually shading. The placeholder texture is 1³ until a real upload.
+  const slotDim = Array.from({ length: MAXV }, () => [64, 64, 64]);
+  let lightMode = 0;             // iso lighting preset; the other modes ignore it
   // Model-space clip slab, shared with the surface renderer: keep clipRange[0] <=
   // dot(p, clipN) <= clipRange[1]. A null normal is no clipping at all.
   let clipN = null, clipRange = [0, 0];
@@ -312,10 +482,22 @@ export function createVolume(canvas) {
     const eye = orbit.eye, M = orbit.model;
     // march in MODEL space: transform = proj·view·M, so invert(mvp) maps clip→model
     // and the eye in model space is M⁻¹·eye_world (M = translate(pan)·R; camera is fixed on +Z).
-    const mvp = multiply(multiply(projection(aspect, 0.01, 100), lookAt(eye, [0, 0, 0], [0, 1, 0])), M);
+    const view = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+    const mvp = multiply(multiply(projection(aspect, 0.01, 100), view), M);
     const ivp = invert(mvp); if (!ivp) return;
     const Minv = invert(M); if (!Minv) return;
     const em = mulVec4(Minv, [eye[0], eye[1], eye[2], 1]);
+    // The lights are fixed to the camera (gl.js does the same, following ChimeraX's
+    // move_lights_with_camera), but the march runs in model space, so each camera-space
+    // direction is carried back through the rotation of view·M — rigid, so the inverse
+    // rotation is the transpose, i.e. multiply by the 3x3 from the left. This is what keeps
+    // the lit side facing the viewer's upper left however far the model is orbited.
+    const mv = multiply(view, M);
+    const toModelDir = (d) => [
+      mv[0] * d[0] + mv[1] * d[1] + mv[2] * d[2],
+      mv[4] * d[0] + mv[5] * d[1] + mv[6] * d[2],
+      mv[8] * d[0] + mv[9] * d[1] + mv[10] * d[2],
+    ];
     const ub = unionBox();
     gl.useProgram(prog);
     gl.uniformMatrix4fv(uInvVP, false, ivp);
@@ -326,6 +508,9 @@ export function createVolume(canvas) {
     gl.uniform1fv(uThrA, slotThr); gl.uniform3fv(uColA, flat3(slotCol));
     gl.uniform1f(uGamma, gamma); gl.uniform1f(uBright, bright);
     gl.uniform1i(uMode, mode); gl.uniform1i(uSteps, steps);
+    gl.uniform3fv(uVoxA, flat3(slotDim.map((d) => [1 / Math.max(1, d[0]), 1 / Math.max(1, d[1]), 1 / Math.max(1, d[2])])));
+    gl.uniform1i(uLightMode, lightMode);
+    gl.uniform3fv(uKeyDirL, toModelDir(KEY_DIR)); gl.uniform3fv(uFillDirL, toModelDir(FILL_DIR));
     gl.uniform1i(uCount, count);
     gl.uniform1i(uDiverging, diverging ? 1 : 0);
     gl.uniform1f(uMix, gridB ? mix : 0);
@@ -349,6 +534,7 @@ export function createVolume(canvas) {
   function setVolume(nx, ny, nz, u8, lo, hi) {
     upload(slotTex[0], nx, ny, nz, u8);
     grid = { nx, ny, nz };
+    slotDim[0] = [nx, ny, nz];
     count = 1;
     if (lo && hi) { slotBoxLo[0] = lo.slice(); slotBoxHi[0] = hi.slice(); }   // the cube the surface mesh uses, so the two modes coincide
     hasTex = true; orbit.invalidatePivot(); render();           // a new map is a new box to pivot on
@@ -361,6 +547,7 @@ export function createVolume(canvas) {
     for (let i = 0; i < n; i++) {
       const s = slots[i];
       upload(slotTex[i], s.nx, s.ny, s.nz, s.data);
+      slotDim[i] = [s.nx, s.ny, s.nz];
       if (s.lo && s.hi) { slotBoxLo[i] = s.lo.slice(); slotBoxHi[i] = s.hi.slice(); }
       if (s.color) slotCol[i] = s.color.slice();
       if (Number.isFinite(s.threshold)) slotThr[i] = Math.max(0, Math.min(1, s.threshold));
@@ -388,7 +575,10 @@ export function createVolume(canvas) {
     // Blend weight, 0 = the near map, 1 = the far one. Called every animation frame, so
     // it must stay cheap — which it is, being a few uniform writes and a draw.
     setMix(t) { mix = Math.max(0, Math.min(1, t)); render(); },
-    setMode(m) { mode = m === "emission" ? 1 : 0; render(); },
+    setMode(m) { mode = m === "emission" ? 1 : m === "iso" ? 2 : 0; render(); },
+    // Iso lighting preset, the same three names gl.js takes, so one control can drive
+    // both renderers and the two views stay lit alike. Ignored by MIP and glow.
+    setLighting(name) { lightMode = LIGHT_MODES[name] !== undefined ? LIGHT_MODES[name] : 0; render(); },
     // Signed-difference rendering of slot 0 (red = lost, blue = gained). The caller
     // is responsible for having uploaded a symmetric-range grid (see /api/paint/grid).
     setDiverging(on) { diverging = !!on; render(); },

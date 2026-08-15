@@ -175,7 +175,7 @@ async function setActive(i) {
   if (models.length > 1) markActiveRow();
   schedSaveScene();
   await loadHistogram();
-  if (state.render === "mip" || state.render === "emission") loadVolume();
+  if (inVolumeMode()) loadVolume();
   else if (state.render === "slices") loadSlices();
 }
 
@@ -187,7 +187,20 @@ async function loadHistogram() {
 
 async function fetchGrid(m, size) {
   const buf = await (await fetch(`./api/grid?m=${m}&size=${size}`)).arrayBuffer();
-  return parseGrid(buf);
+  const g = parseGrid(buf);
+  g.size = size;   // the cached grid has to remember what it was cut at (see volGridSize)
+  return g;
+}
+
+// Volume-mode grid resolution, per style. MIP and glow integrate along the ray, so 96³ is
+// already smooth; an isosurface shows every voxel of the grid it was cut from and at 96³
+// comes out visibly blobby, so it pays for the bigger download (the backend caps at 256).
+const volGridSize = () => (state.render === "iso" ? 224 : 96);
+// The cached grid is only reusable at the size the current style wants.
+async function volGrid(m) {
+  const want = volGridSize();
+  if (!m.gridVol || m.gridVol.size !== want) m.gridVol = await fetchGrid(m.index, want);
+  return m.gridVol;
 }
 
 // One contour costs a full marching-cubes pass over the whole volume plus a multi-MB mesh
@@ -312,7 +325,7 @@ async function loadVolume() {
   const tok = volGuard.take();   // changing the shown set mid-download: newest wins
   try {
     for (const m of show) {
-      if (!m.gridVol) m.gridVol = await fetchGrid(m.index, 96);
+      await volGrid(m);
       if (volGuard.stale(tok)) return;
     }
     volSlots = show.map((m) => models.indexOf(m));
@@ -402,7 +415,7 @@ function onLevel(level, dragging) {
       }
       loadSurfaces();                        // full pass over the rest on release
     }
-  } else if (state.render === "mip" || state.render === "emission") {
+  } else if (inVolumeMode()) {
     const slot = volSlots.indexOf(state.active);
     if (slot >= 0) volRenderer.setSlotThreshold(slot, normThreshold());
     else volRenderer.setThreshold(normThreshold());   // morph / fallback: slot 0
@@ -561,7 +574,9 @@ function toggleSolo(i) {
   schedSaveScene();
 }
 
-const inVolumeMode = () => state.render === "mip" || state.render === "emission";
+// The three volume styles, all drawn by the ray-marcher on the same canvas.
+const isVolumeStyle = (mode) => mode === "mip" || mode === "emission" || mode === "iso";
+const inVolumeMode = () => isVolumeStyle(state.render);
 
 // Show exactly this set of maps (list indices) — what compute and paint do with
 // their result: a derived map is what you asked to see, and leaving the inputs
@@ -729,7 +744,7 @@ async function prepareMorph() {
       for (let i = 0; i < morph.seq.length; i++) {
         const m = models[morph.seq[i]];
         status(`Loading ${m.name} (${i + 1}/${morph.seq.length})…`, "busy");
-        if (!m.gridVol) m.gridVol = await fetchGrid(m.index, 96);
+        await volGrid(m);
       }
       beginMorph();
       // The morph runs single-slot; give slot 0 the sequence's colour and contour.
@@ -856,7 +871,7 @@ function show(el, on) { el.style.display = on ? "" : "none"; }
 // mode switch would otherwise drop you at that renderer's default view. Carry the camera
 // across instead. `camera` outlives the cameraless slice view; "Reset view" drops it so a
 // reset is not undone by the next switch.
-const camera3d = (mode) => (mode === "surface" ? renderer : mode === "mip" || mode === "emission" ? volRenderer : null);
+const camera3d = (mode) => (mode === "surface" ? renderer : isVolumeStyle(mode) ? volRenderer : null);
 let camera = null;
 
 function setMode(mode) {
@@ -868,7 +883,7 @@ function setMode(mode) {
   if (from) camera = from.getCamera();
   state.render = mode;
   const isSurface = mode === "surface";
-  const isVolume = mode === "mip" || mode === "emission";
+  const isVolume = isVolumeStyle(mode);
   const isSlices = mode === "slices";
 
   show($("gl"), isSurface);
@@ -886,6 +901,9 @@ function setMode(mode) {
   if (isVolume) $("volStyle").value = mode;
   // Contextual controls: only the current mode's rows exist on screen.
   show($("dispSurface"), isSurface);
+  // Lighting drives the surface renderer and the shaded-iso volume style alike, so its row
+  // belongs to both modes and to neither of the other two volume styles.
+  show($("lightRow"), isSurface || mode === "iso");
   show($("dispVolume"), isVolume);
   show($("dispSlices"), isSlices);
   show($("colorlbl"), !isSlices);
@@ -893,7 +911,13 @@ function setMode(mode) {
   $("secClip").hidden = isSlices;      // the slab cuts the 3D views only
 
   if (isSurface) { renderer.render(); loadSurfaces(); }
-  else if (isVolume) { volRenderer.setMode(mode === "emission" ? "emission" : "mip"); loadVolume(); }
+  else if (isVolume) {
+    volRenderer.setMode(mode);
+    // Iso is shaded, so it needs the lighting preset the select is sitting on — it may have
+    // been changed while a surface was on screen, or restored from a previous session.
+    if (mode === "iso") volRenderer.setLighting($("light").value);
+    loadVolume();
+  }
   else { loadSlices(); }
   // Morphing is a 3D notion; orthogonal slices have nothing to animate.
   $("morph").hidden = !(models.length > 1 && info && info.morph_shape) || isSlices;
@@ -912,8 +936,8 @@ $("modeSeg").addEventListener("click", (e) => {
   setMode(seg === "volume" ? volStyle : seg);
 });
 $("volStyle").addEventListener("change", (e) => {
-  volStyle = e.target.value === "emission" ? "emission" : "mip";
-  if (state.render === "mip" || state.render === "emission") setMode(volStyle);
+  volStyle = isVolumeStyle(e.target.value) ? e.target.value : "mip";
+  if (inVolumeMode()) setMode(volStyle);
 });
 
 // Export menu: the four ways out of the viewer, one dropdown.
@@ -962,7 +986,8 @@ const SEC_KEY = "hax_mrc_sections";
   }
 })();
 
-$("light").addEventListener("change", (e) => renderer.setLighting(e.target.value));
+// One lighting choice for both shaded views: the mesh surface and the ray-cast iso.
+$("light").addEventListener("change", (e) => { renderer.setLighting(e.target.value); volRenderer.setLighting(e.target.value); });
 $("smooth").addEventListener("input", (e) => {
   active().smooth = +e.target.value;
   active().surface = null;                     // the cached mesh was cut at the old smoothing
@@ -1454,7 +1479,7 @@ async function togglePdb() {
         await setActive(saved.active);
       }
     }
-    const mode = saved && ["surface", "mip", "emission", "slices"].includes(saved.mode)
+    const mode = saved && ["surface", "mip", "emission", "iso", "slices"].includes(saved.mode)
       ? saved.mode : "surface";
     setMode(mode);
     if (saved && saved.camera && Array.isArray(saved.camera.R)) {

@@ -1772,7 +1772,9 @@ function setRenderMode(mode) {
   if (mode !== state.render) clearFrameCache();   // surface<->volume payloads differ
   const surf = mode === "surface";
   const isSlices = mode === "slices";
-  const isVol = mode === "mip" || mode === "emission";
+  // Three volume styles now share the ray-marcher canvas: MIP, glow and the shaded
+  // isosurface. Only the style passed to volRenderer.setMode tells them apart.
+  const isVol = mode === "mip" || mode === "emission" || mode === "iso";
   // Surface and the ray-marcher live on different canvases, each with its own camera;
   // the slice view has none. Hand the outgoing 3D camera over so the map does not jump
   // back to a default view when returning from slices to a 3D mode.
@@ -1799,7 +1801,7 @@ function setRenderMode(mode) {
       slices.setContrast(+$("slicelo").value, +$("slicehi").value); slices.setCrosshair($("slicecross").checked);
     } catch (err) { status("Slices unavailable: " + err.message, "err"); setRenderMode("surface"); return; }
   }
-  if (isVol) volRenderer.setMode(mode === "emission" ? "emission" : "mip");
+  if (isVol) volRenderer.setMode(mode);   // iso keeps volume.js's default "standard" lighting: this viewer has no lighting control for it
   const to = surf ? renderer : isVol ? volRenderer : null;
   if (to && to !== from && camera) to.setCamera(camera);
   if (isSlices) { refreshSlices(); return; }
@@ -1873,6 +1875,11 @@ function loadLandSlices() {
   status(`Landscape density slices ${g.nx}×${g.ny}×${g.nz} · ${axisLabel(state.x)} · ${axisLabel(state.y)} · ${axisLabel(state.z)}`);
 }
 
+// Grid resolution for the ray-marcher, per style: an isosurface shows every voxel of the
+// grid it was cut from, and 96³ — smooth enough for MIP and glow, which integrate along the
+// ray — comes out blobby. Volume payloads are cached by URL, so the size is part of the key.
+const volGridSize = () => (state.render === "iso" ? 224 : 96);
+
 function normThreshold() {
   if (!curVolMeta) return 0.45;
   const span = curVolMeta.vmax - curVolMeta.vmin || 1;
@@ -1884,7 +1891,7 @@ async function loadVolume(index) {
   const token = ++decodeToken;
   status("Loading volume…", "busy");
   try {
-    const res = await fetch(`./api/grid?index=${index}&size=96`);
+    const res = await fetch(`./api/grid?index=${index}&size=${volGridSize()}`);
     if (!res.ok) throw new Error(await res.text());
     const g = parseGrid(await res.arrayBuffer());
     if (token !== decodeToken) return;
@@ -1892,7 +1899,7 @@ async function loadVolume(index) {
     volRenderer.setVolume(g.nx, g.ny, g.nz, g.data, g.boxLo, g.boxHi);
     volRenderer.setThreshold(normThreshold());
     volRenderer.setColor(colorForIndex(index));
-    status(`Volume ${g.nx}×${g.ny}×${g.nz} · ${state.render === "emission" ? "glow" : "MIP"}`);
+    status(`Volume ${g.nx}×${g.ny}×${g.nz} · ${state.render === "emission" ? "glow" : state.render === "iso" ? "shaded iso" : "MIP"}`);
   } catch (err) { if (token === decodeToken) status("Volume load failed: " + err.message, "err"); }
 }
 
@@ -2167,7 +2174,7 @@ function frameRequest(i, draft) {
     const q = at + (draft ? `&smooth=${draftSmooth()}&size=${PLAY_GRID}` : `&smooth=${state.smooth}`) + level;
     return { surface: true, url: `./api/decode?${q}`, key: `s|${q}` };
   }
-  const q = `${at}&size=96`;
+  const q = `${at}&size=${volGridSize()}`;
   return { surface: false, url: `./api/grid?${q}`, key: `v|${q}` };
 }
 
