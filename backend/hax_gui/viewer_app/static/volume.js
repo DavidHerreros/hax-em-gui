@@ -79,6 +79,12 @@ uniform sampler3D uVol1;
 uniform sampler3D uVol2;
 uniform sampler3D uVol3;
 uniform sampler3D uVolB;    // morph partner of slot 0; only sampled while mixing
+// Every grid arrives normalized to its OWN [vmin, vmax], so mixing two of them raw is not a
+// density blend at all unless the two maps happen to share a range. These carry the partner's
+// samples into slot 0's normalized space before the mix. Identity (1, 0) whenever the two
+// ranges match, which is every case except a morph across maps with different extrema.
+uniform float uBScale;
+uniform float uBOff;
 // The opacity pyramid: one mipmapped R8 volume per slot holding the OPACITY the cone tracer
 // composites, baked from the density grid and the contour (see bakeOpacity in the JS).
 uniform sampler3D uOpac0;
@@ -145,7 +151,7 @@ vec3 toWorld(vec3 ndc) { vec4 p = uInvVP * vec4(ndc, 1.0); return p.xyz / p.w; }
 // walks is the separate opacity volume — but textureLod(…, 0.0) is what a non-mipmapped
 // LINEAR texture wants anyway, so this stays exactly as it was.
 float sampleVol(int i, vec3 p) {
-  if (i == 0) { float a = textureLod(uVol0, p, 0.0).r; return uMix > 0.0 ? mix(a, textureLod(uVolB, p, 0.0).r, uMix) : a; }
+  if (i == 0) { float a = textureLod(uVol0, p, 0.0).r; return uMix > 0.0 ? mix(a, textureLod(uVolB, p, 0.0).r * uBScale + uBOff, uMix) : a; }
   if (i == 1) return textureLod(uVol1, p, 0.0).r;
   if (i == 2) return textureLod(uVol2, p, 0.0).r;
   return textureLod(uVol3, p, 0.0).r;
@@ -167,6 +173,11 @@ float density(int i, vec3 mp) {
 // Opacity of slot i at an explicit mip level. Slot 0 blends with the morph partner's
 // pyramid: a blend of opacities is exact at either end of a morph and a good approximation
 // between, and it is the only way the ambient term can follow a GPU-side morph at all.
+//
+// Deliberately NOT rescaled by uBScale/uBOff, unlike the density mix above. Those carry one
+// map's density into the other's normalized range; an opacity has already been thresholded in
+// its own map's range and is a pure 0..1 coverage, the same physical quantity for both maps,
+// so blending them raw is what is correct here.
 float sampleOpac(int i, vec3 p, float lod) {
   if (i == 0) { float a = textureLod(uOpac0, p, lod).r; return uMix > 0.0 ? mix(a, textureLod(uOpacB, p, lod).r, uMix) : a; }
   if (i == 1) return textureLod(uOpac1, p, lod).r;
@@ -695,6 +706,7 @@ export function createVolume(canvas) {
     uGamma = u("uGamma"), uBright = u("uBright"), uMode = u("uMode"), uSteps = u("uSteps"),
     uVolN = [u("uVol0"), u("uVol1"), u("uVol2"), u("uVol3")],
     uVolB = u("uVolB"), uMix = u("uMix"), uCount = u("uCount"), uActA = u("uActA"),
+    uBScale = u("uBScale"), uBOff = u("uBOff"),
     uClipOn = u("uClipOn"), uClipN = u("uClipN"), uClipRange = u("uClipRange"), uDiverging = u("uDiverging"),
     uVoxA = u("uVoxA"), uLightMode = u("uLightMode"), uKeyDirL = u("uKeyDir"), uFillDirL = u("uFillDir"),
     uDepthRow = u("uDepthRow"), uDepthRange = u("uDepthRange"), uMaxLodA = u("uMaxLodA"),
@@ -775,6 +787,13 @@ export function createVolume(canvas) {
   let grid = null;   // { nx, ny, nz } of slot 0; null until one is, which is what the camera tests
   let gridB = null;  // the morph's far end, same shape; null when not morphing
   let dimB = null;   // its dims, so its opacity pyramid can be baked at the same size
+  // The resident morph pool: every map of a prepared morph, uploaded and baked once, so a leg
+  // change is a texture BIND rather than two uploads, two blurs and two pyramid bakes. That
+  // work took long enough to swallow frames at every leg boundary, which is exactly where a
+  // morph's motion is least forgiving.
+  let pool = null;          // { tex[], opac[], dim[], lo[], hi[] } or null
+  let poolA = -1, poolB = -1;
+  let bScale = 1, bOff = 0; // partner -> near map's normalized range; identity off a pool leg
   let mix = 0;       // blend weight in [0,1]; 0 = slot 0 alone
   let diverging = false;   // slot 0 holds a signed difference grid (zero at u8 midpoint)
 
@@ -916,6 +935,11 @@ export function createVolume(canvas) {
     ];
     const ub = unionBox();
     gl.useProgram(prog);
+    // Is a morph-pool leg on screen? Slot 0 and its partner then ARE two pool maps: same
+    // uniforms, same boxes, same blend — only the bound textures and the cross-map rescale
+    // differ. Decided up here because uMix depends on it: without a pool the partner is
+    // texB and `gridB` says whether one exists, but a pool leg always has one.
+    const legOn = !!(pool && poolA >= 0 && poolB >= 0);
     gl.uniformMatrix4fv(uInvVP, false, ivp);
     gl.uniform3fv(uEye, [em[0], em[1], em[2]]);
     gl.uniform3fv(uBg, bg);
@@ -935,22 +959,27 @@ export function createVolume(canvas) {
     gl.uniform1i(uCount, count);
     gl.uniform1iv(uActA, new Int32Array(slotOn.map((on) => (on ? 1 : 0))));
     gl.uniform1i(uDiverging, diverging ? 1 : 0);
-    gl.uniform1f(uMix, gridB ? mix : 0);
+    gl.uniform1f(uMix, (legOn || gridB) ? mix : 0);
     gl.uniform1i(uClipOn, clipN ? 1 : 0);
     if (clipN) { gl.uniform3fv(uClipN, clipN); gl.uniform2fv(uClipRange, clipRange); }
+    const tex0 = legOn ? pool.tex[poolA] : slotTex[0];
+    const texPartner = legOn ? pool.tex[poolB] : (gridB ? texB : slotTex[0]);
+    const opac0 = legOn ? pool.opac[poolA] : opacTex[0];
+    const opacPartner = legOn ? pool.opac[poolB] : (gridB ? opacTexB : opacTex[0]);
+    gl.uniform1f(uBScale, legOn ? bScale : 1); gl.uniform1f(uBOff, legOn ? bOff : 0);
     // Every sampler stays bound (placeholder textures make the unused ones complete).
     for (let i = 0; i < MAXV; i++) {
-      gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_3D, slotTex[i]); gl.uniform1i(uVolN[i], i);
+      gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_3D, i === 0 ? tex0 : slotTex[i]); gl.uniform1i(uVolN[i], i);
     }
-    gl.activeTexture(gl.TEXTURE0 + MAXV); gl.bindTexture(gl.TEXTURE_3D, gridB ? texB : slotTex[0]); gl.uniform1i(uVolB, MAXV);
+    gl.activeTexture(gl.TEXTURE0 + MAXV); gl.bindTexture(gl.TEXTURE_3D, texPartner); gl.uniform1i(uVolB, MAXV);
     // The opacity pyramid rides on the units above the density grids; iso is the only mode
     // that reads it, but every unit stays bound and complete for the others' sake.
     for (let i = 0; i < MAXV; i++) {
       const un = MAXV + 1 + i;
-      gl.activeTexture(gl.TEXTURE0 + un); gl.bindTexture(gl.TEXTURE_3D, opacTex[i]); gl.uniform1i(uOpacN[i], un);
+      gl.activeTexture(gl.TEXTURE0 + un); gl.bindTexture(gl.TEXTURE_3D, i === 0 ? opac0 : opacTex[i]); gl.uniform1i(uOpacN[i], un);
     }
     gl.activeTexture(gl.TEXTURE0 + 2 * MAXV + 1);
-    gl.bindTexture(gl.TEXTURE_3D, gridB ? opacTexB : opacTex[0]); gl.uniform1i(uOpacB, 2 * MAXV + 1);
+    gl.bindTexture(gl.TEXTURE_3D, opacPartner); gl.uniform1i(uOpacB, 2 * MAXV + 1);
     gl.bindVertexArray(vao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null);
   }
   function render() { resize(); drawScene(1); }
@@ -1132,7 +1161,11 @@ export function createVolume(canvas) {
       render();
     }, 150);
   }
-  function ensureOpacity() { if (mode === 2 && hasTex && anyDirty()) bakeAll(); }
+  // Never while a morph pool is playing: its pyramids are per map and were baked when the
+  // pool was built, and the slot pyramids it is standing in for are not on screen. Together
+  // with setMorphThreshold's deliberate lack of invalidation, this is what guarantees no bake
+  // can be scheduled by anything playback does.
+  function ensureOpacity() { if (mode === 2 && hasTex && !pool && anyDirty()) bakeAll(); }
 
   function setVolume(nx, ny, nz, u8, lo, hi) {
     // Same array, same dims, same blur? Then the texture already holds it — re-uploading a
@@ -1201,6 +1234,67 @@ export function createVolume(canvas) {
     hasSmoothing,
     // How many maps a composited scene can hold; the controller reports truncation.
     maxSlots: MAXV,
+    // ---- resident morph pool ----------------------------------------------------------
+    //
+    // Build every map of a morph at once: a density texture (blurred at the current sigma)
+    // and its own opacity pyramid, baked at that map's OWN normalized contour so the ambient
+    // shading is mass-consistent per map rather than per frame. After this, a leg change binds
+    // two textures and writes a few uniforms — no uploads, no blurs, no bakes, nothing that
+    // can drop a frame at a leg boundary, which is where a morph's motion is least forgiving.
+    //
+    // Returns false if the GPU could not hold it (a long sequence at a large box is real
+    // VRAM), having freed whatever it managed to build, so the caller can fall back to the
+    // old per-leg streaming rather than losing the morph.
+    setMorphPool(entries) {
+      // Teardown, either as an explicit stop or before building a new one.
+      if (pool) {
+        for (const t of pool.tex) gl.deleteTexture(t);
+        for (const t of pool.opac) gl.deleteTexture(t);
+        pool = null; poolA = -1; poolB = -1; bScale = 1; bOff = 0;
+      }
+      if (!entries || !entries.length) { render(); return true; }
+      const built = { tex: [], opac: [], dim: [], lo: [], hi: [] };
+      while (gl.getError() !== gl.NO_ERROR) { /* start from a clean error state */ }
+      for (const e of entries) {
+        const dt = makeVolTex(false), ot = makeVolTex(true);
+        built.tex.push(dt); built.opac.push(ot);
+        built.dim.push([e.nx, e.ny, e.nz]);
+        built.lo.push(e.lo ? e.lo.slice() : slotBoxLo[0].slice());
+        built.hi.push(e.hi ? e.hi.slice() : slotBoxHi[0].slice());
+        upload(dt, e.nx, e.ny, e.nz, e.data);
+        blurIfNeeded(dt, e.nx, e.ny, e.nz, e.data);
+        bakeOpacity(dt, ot, [e.nx, e.ny, e.nz], Math.max(0, Math.min(1, e.thr)));
+        if (gl.getError() !== gl.NO_ERROR) {            // out of memory, most likely
+          for (const t of built.tex) gl.deleteTexture(t);
+          for (const t of built.opac) gl.deleteTexture(t);
+          return false;
+        }
+      }
+      pool = built;
+      return true;
+    },
+    // Which two pool maps this leg runs between, and the two corrections that make the blend
+    // honest: bScale/bOff carry the far map's samples into the near map's normalized range,
+    // and thrFrame is the contour for this frame (see setMorphThreshold). Binding only — the
+    // redraw comes from setMix, which every caller issues straight after.
+    setMorphLeg(ia, ib, scale, off, thrFrame) {
+      if (!pool || ia < 0 || ib < 0 || ia >= pool.tex.length || ib >= pool.tex.length) return;
+      poolA = ia; poolB = ib;
+      bScale = Number.isFinite(scale) ? scale : 1;
+      bOff = Number.isFinite(off) ? off : 0;
+      if (Number.isFinite(thrFrame)) slotThr[0] = Math.max(0, Math.min(1, thrFrame));
+      // Slot 0 IS the near pool map for the duration: its box, its dims, its voxel size.
+      slotBoxLo[0] = pool.lo[ia].slice(); slotBoxHi[0] = pool.hi[ia].slice();
+      slotDim[0] = pool.dim[ia].slice();
+      grid = { nx: slotDim[0][0], ny: slotDim[0][1], nz: slotDim[0][2] };
+      count = 1; slotOn.fill(false); slotOn[0] = true;
+      hasTex = true;
+    },
+    // The contour for one frame. Deliberately does NOT invalidate any pyramid: the pool's
+    // pyramids are per map and fixed, and this moves every frame — invalidating would rearm
+    // the 150 ms debounce on every frame (so it would never fire) and, if it ever did, would
+    // bake a slot pyramid nothing is looking at. Being explicit rather than lucky.
+    setMorphThreshold(v) { slotThr[0] = Math.max(0, Math.min(1, v)); },
     // The far end of a morph. Pass null to stop morphing and go back to one volume. The
     // camera is untouched either way: the two ends share a grid, so they share the box the
     // pivot is derived from.

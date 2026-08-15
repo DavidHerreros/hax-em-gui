@@ -206,16 +206,21 @@ async function fetchGrid(m, size, bits = 8) {
 // the quantisation, so 16-bit grids must NOT go through it).
 const ISO_GRID_U8 = 256;      // fallback: as fine as the uint8 payload is worth taking
 const ISO_MAX = 384;          // backend cap for 16-bit requests
-function volWant(m) {
+// A morph keeps EVERY map of the sequence resident on the GPU at once, so its grids are
+// capped harder than a single map's: ten maps at a native 384 box would be ~1 GB of VRAM,
+// where 256 puts each map (density + pyramid) at ~55 MB. The grid cache is keyed by size, so
+// leaving the morph and going back to one map simply refetches at native.
+const ISO_MORPH_MAX = 256;
+function volWant(m, cap) {
   if (state.render !== "iso") return { size: 96, bits: 8 };
   if (!volRenderer.hasF16) return { size: ISO_GRID_U8, bits: 8 };
-  return { size: Math.min(ISO_MAX, Math.max(...m.shape)), bits: 16 };
+  return { size: Math.min(cap || ISO_MAX, Math.max(...m.shape)), bits: 16 };
 }
 // The cached grid is reusable only if it is the payload the current style wants — same size
 // AND same sample type. The smoothing tag stops a uint8 grid from being blurred twice, which
 // would soften it for good.
-async function volGrid(m) {
-  const want = volWant(m);
+async function volGrid(m, cap) {
+  const want = volWant(m, cap);
   const cached = m.gridVol;
   if (!cached || cached.size !== want.size || !!cached.f16 !== (want.bits === 16)) {
     m.gridVol = await fetchGrid(m.index, want.size, want.bits);
@@ -444,6 +449,78 @@ async function loadSlices() {
       ? `Difference slices · ${models[painted.m].name} − ${models[painted.other].name} · red = lost · blue = gained`
       : `Slices ${g.nx}×${g.ny}×${g.nz} · ${m.name}` + (models.length > 1 ? " · active map only" : ""));
   } catch (err) { status("Slice load failed: " + err.message, "err"); }
+}
+
+// ---- constant-mass contours for a morph, computed client-side --------------------------
+//
+// The surface morph contours every frame with meshing.level_for_mass, so the enclosed mass is
+// held constant and the shape comparison is fair; the volume morph never did, which is why
+// its surface visibly breathed as the blend crossed a map whose variance differed. These are
+// the same arithmetic, on the grid the GPU is actually showing.
+//
+// "Mass" is the server's enclosed_mass: the SUM OF RAW VOXEL VALUES at or above the level —
+// not a voxel count, not sum(v - level). Mirrored deliberately, so the volume morph and the
+// surface morph of the same maps are cut at the same contours.
+let halfLUT = null;
+function halfToFloatTable() {
+  if (halfLUT) return halfLUT;
+  const t = new Float32Array(65536);
+  const b = new ArrayBuffer(4), u32 = new Uint32Array(b), f32 = new Float32Array(b);
+  for (let h = 0; h < 65536; h++) {
+    const sign = (h & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+    if (exp === 0) {
+      if (man === 0) { t[h] = sign ? -0 : 0; continue; }
+      exp = 1;                                   // subnormal: renormalise into float32
+      while (!(man & 0x400)) { man <<= 1; exp--; }
+      man &= 0x3ff;
+      u32[0] = sign | ((exp + 127 - 15) << 23) | (man << 13);
+    } else if (exp === 31) {
+      u32[0] = sign | 0x7f800000 | (man << 13);  // inf / nan
+    } else {
+      u32[0] = sign | ((exp + 127 - 15) << 23) | (man << 13);
+    }
+    t[h] = f32[0];
+  }
+  halfLUT = t;
+  return t;
+}
+
+const MASS_BINS = 1024;
+// One pass over the grid: how much raw mass sits in each normalized-value bin, and the
+// reverse cumulative sum of it, which is mass-above-a-level and is monotone in the level.
+function massCurve(g) {
+  const n = g.nx * g.ny * g.nz, per = new Float64Array(MASS_BINS);
+  const span = (g.vmax - g.vmin) || 1;
+  const T = g.f16 ? halfToFloatTable() : null;
+  for (let i = 0; i < n; i++) {
+    const v = T ? T[g.data[i]] : g.data[i] / 255;
+    let b = (v * MASS_BINS) | 0;
+    if (b < 0) b = 0; else if (b >= MASS_BINS) b = MASS_BINS - 1;
+    per[b] += g.vmin + ((b + 0.5) / MASS_BINS) * span;   // raw value, bin-centred
+  }
+  const above = new Float64Array(MASS_BINS + 1);
+  for (let b = MASS_BINS - 1; b >= 0; b--) above[b] = above[b + 1] + per[b];
+  return above;
+}
+// Mass above a normalized level, interpolated inside the bin so it is the exact inverse of
+// levelForMass below (round-tripping a level through the two must not move it).
+function massAbove(above, level) {
+  const x = Math.max(0, Math.min(1, level)) * MASS_BINS;
+  const b = Math.min(MASS_BINS - 1, Math.floor(x)), f = x - b;
+  return above[b] + (above[b + 1] - above[b]) * f;
+}
+// The normalized level whose mass-above matches `target` — the client-side twin of
+// meshing.level_for_mass. Mass falls as the level rises, so the search walks DOWN from the
+// top for the first bin edge that still meets the target and interpolates inside that bin.
+function levelForMass(above, target) {
+  if (!(target > 0)) return 1;
+  if (above[0] <= target) return 0;              // the whole grid holds no more than this
+  let b = MASS_BINS - 1;
+  while (b >= 0 && above[b] < target) b--;
+  const hi = above[b], lo = above[b + 1];
+  const f = hi > lo ? (hi - target) / (hi - lo) : 0;   // 0 = the bin's low edge
+  return Math.max(0, Math.min(1, (b + f) / MASS_BINS));
 }
 
 // contour level (absolute) -> ray-marcher threshold in [0,1] over the grid range
@@ -695,6 +772,7 @@ const morph = {
   cache: null,       // surface mode: parsed mesh per frame
   cacheKey: "",      // what `cache` was built for; a mismatch means Prepare again
   loadedPair: "",    // which (a,b) textures are on the GPU; uploads happen per leg, not per frame
+  pool: null,        // iso: per-map contours for the resident GPU pool, or null if streaming
   refMass: -1,       // enclosed mass of frame 0, held constant across the morph
   showing: false,    // is the morph on screen (as opposed to the maps)?
 };
@@ -709,7 +787,9 @@ const morphKey = () => [morph.seq.join(","), morph.perLeg, morph.mass, morph.qua
 function frameSpec(k) {
   const legs = morphLegs();
   const leg = Math.min(Math.floor(k / morph.perLeg), legs - 1);
-  return { a: morph.seq[leg], b: morph.seq[leg + 1], t: (k - leg * morph.perLeg) / morph.perLeg };
+  // `leg` is also the pool index of the near map (the pool is built in morph.seq order), which
+  // a repeated map in the sequence makes ambiguous if you go looking for it by model index.
+  return { a: morph.seq[leg], b: morph.seq[leg + 1], t: (k - leg * morph.perLeg) / morph.perLeg, leg };
 }
 
 function toggleMorphMember(i) {
@@ -746,12 +826,26 @@ async function showMorphFrame(k) {
   if (!morphLegs()) return;
   morph.frame = Math.max(0, Math.min(morphFrames() - 1, k));
   $("morphScrub").value = String(morph.frame);
-  const { a, b, t } = frameSpec(morph.frame);
+  const { a, b, t, leg } = frameSpec(morph.frame);
   if (state.render === "surface") {
     const mesh = morph.cache && morph.cache[morph.frame];
     if (!mesh) return;
     renderer.setModelMesh(MORPH_ID, mesh.positions, mesh.normals, mesh.indices);
     renderer.setModelColor(MORPH_ID, hexToRgb(models[morph.seq[0]].color));
+  } else if (morph.pool) {
+    // The whole sequence is already on the GPU: a frame is two binds and three uniforms.
+    // bScale/bOff carry the far map's samples into the near map's normalized range (each grid
+    // is normalized to its own vmin/vmax, so a raw blend of two maps with different ranges is
+    // not a density blend at all), and the contour is interpolated between the two maps' own
+    // mass-matched levels — exact at both ends, so a leg boundary cannot pop.
+    const P = morph.pool, ia = leg, ib = leg + 1;
+    const span = Math.max(P.vmax[ia] - P.vmin[ia], 1e-9);
+    const scale = (P.vmax[ib] - P.vmin[ib]) / span;
+    const off = (P.vmin[ib] - P.vmin[ia]) / span;
+    const thrFrame = P.thr[ia] * (1 - t) + (P.thr[ib] * scale + off) * t;
+    volRenderer.setMorphLeg(ia, ib, scale, off, thrFrame);
+    volRenderer.setMorphThreshold(thrFrame);
+    volRenderer.setMix(t);                 // the one call that redraws
   } else {
     const ga = models[a].gridVol, gb = models[b].gridVol;
     if (!ga || !gb) return;
@@ -777,12 +871,56 @@ function beginMorph() {
 function stopMorph() {
   pauseMorph();
   morph.loadedPair = "";   // whatever happens next re-uploads its own textures
+  // Before the showing check, deliberately: a pool built by a Prepare that never reached the
+  // screen would otherwise hold its textures for the life of the page. The pool owns its own
+  // textures, so tearing it down leaves the slot textures exactly as the maps left them.
+  if (morph.pool) { volRenderer.setMorphPool(null); morph.pool = null; }
   if (!morph.showing) return;
   morph.showing = false;
   renderer.dropModel(MORPH_ID);
   volRenderer.setVolumeB(0, 0, 0, null);
   for (const m of models) renderer.setModelVisible(m.index, m.visible);
   if (state.render !== "surface") loadVolume();
+}
+
+// Put the whole sequence on the GPU and work out what contour each map should be cut at.
+//
+// Two problems solved in one pass. The contour: a morph held at one sigma breathes, because
+// blending two maps lowers the variance and sigma tracks it — so each map gets the level that
+// encloses the same MASS as the first map does at its chosen contour (the same rule the
+// surface morph uses, via meshing.level_for_mass). The illumination: each map's opacity
+// pyramid is baked at that map's own contour, so the ambient shading is consistent from map to
+// map instead of popping when the leg changes.
+//
+// Returns null if the GPU could not hold the pool, and the caller keeps the streaming path.
+async function buildMorphPool() {
+  const grids = morph.seq.map((i) => models[i].gridVol);
+  if (grids.some((g) => !g)) return null;
+  const first = grids[0];
+  status("Matching contours across the sequence…", "busy");
+  const curves = [];
+  for (let i = 0; i < grids.length; i++) {
+    // Yield between maps: this is ~100 ms of arithmetic each, and the status line is the
+    // only sign the viewer has not hung.
+    status(`Matching contours (${i + 1}/${grids.length})…`, "busy");
+    await new Promise((r) => setTimeout(r, 0));
+    curves.push(massCurve(grids[i]));
+  }
+  const thr0 = thrFor(models[morph.seq[0]]);
+  const refMass = massAbove(curves[0], thr0);
+  const thr = grids.map((g, i) => (i === 0 ? thr0
+    : morph.mass ? levelForMass(curves[i], refMass)   // same enclosed mass as map 0
+                 : thrFor(models[morph.seq[i]])));    // constant sigma: each map's own level
+  const entries = grids.map((g, i) => ({
+    nx: g.nx, ny: g.ny, nz: g.nz, data: g.data, lo: g.boxLo, hi: g.boxHi,
+    vmin: g.vmin, vmax: g.vmax, thr: thr[i],
+  }));
+  status("Uploading the sequence…", "busy");
+  if (!volRenderer.setMorphPool(entries)) { volRenderer.setMorphPool(null); return null; }
+  // density bytes + the R8 opacity volume and its mip chain (1 + 1/8 + 1/64 + ... ≈ 1.15)
+  const bytes = grids.reduce((acc, g) => acc + g.nx * g.ny * g.nz * ((g.f16 ? 2 : 1) + 1.15), 0);
+  return { thr, vmin: grids.map((g) => g.vmin), vmax: grids.map((g) => g.vmax),
+           mb: Math.round(bytes / (1024 * 1024)) };
 }
 
 const MORPH_BUDGET_MB = 512;
@@ -794,20 +932,26 @@ async function prepareMorph() {
   btn.disabled = true;
   try {
     if (state.render !== "surface") {
-      // Volume mode: just make sure every map in the sequence is on hand as a grid.
+      // Volume mode: just make sure every map in the sequence is on hand as a grid. In iso the
+      // whole sequence then goes onto the GPU at once (see setMorphPool), so the grids are
+      // fetched at the morph cap rather than at the native box.
+      const isoMorph = state.render === "iso";
+      const cap = isoMorph ? ISO_MORPH_MAX : undefined;
       for (let i = 0; i < morph.seq.length; i++) {
         const m = models[morph.seq[i]];
         status(`Loading ${m.name} (${i + 1}/${morph.seq.length})…`, "busy");
-        await volGrid(m);
+        await volGrid(m, cap);
       }
+      morph.pool = isoMorph ? await buildMorphPool() : null;
       beginMorph();
       // The morph runs single-slot; give slot 0 the sequence's colour and contour.
       // A leftover diverging flag from a painted diff would mis-read the maps.
       volRenderer.setDiverging(false);
       volRenderer.setColor(hexToRgb(models[morph.seq[0]].color));
-      volRenderer.setThreshold(thrFor(models[morph.seq[0]]));
+      if (!morph.pool) volRenderer.setThreshold(thrFor(models[morph.seq[0]]));
       await showMorphFrame(morph.frame);
-      status(`Morph ready · ${morph.seq.length} maps · blended on the GPU`);
+      status(`Morph ready · ${morph.seq.length} maps · blended on the GPU`
+             + (morph.pool ? ` · ${morph.pool.mb} MB resident · ${morph.mass ? "constant mass" : "constant σ"}` : ""));
       updateMorphUI();
       return;
     }
