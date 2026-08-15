@@ -96,6 +96,7 @@ uniform int uSteps;
 // happens in model space, and the lights are fixed to the camera as in gl.js, so the
 // rotation has to be undone once per frame rather than per fragment.
 uniform vec3 uVoxA[${MAXV}];
+uniform float uMaxLodA[${MAXV}];   // last mip level of each slot's grid: floor(log2(max dim))
 uniform int uLightMode;     // 0 = standard, 1 = smooth, 2 = ray traced
 uniform vec3 uKeyDir;       // model space, direction the key light shines
 uniform vec3 uFillDir;
@@ -120,11 +121,25 @@ uniform vec2 uClipRange;
 
 vec3 toWorld(vec3 ndc) { vec4 p = uInvVP * vec4(ndc, 1.0); return p.xyz / p.w; }
 
+// The volumes carry a mipmap chain now (iso's cone tracing walks it), which means the
+// MIN filter is LINEAR_MIPMAP_LINEAR and a bare texture() would pick a level from screen-space
+// derivatives — a ray march has no meaningful ones, and at silhouettes they explode, so every
+// ordinary sample is pinned to level 0 with textureLod. Only the cone tracer chooses a level,
+// and it computes it from the cone's radius rather than from derivatives.
 float sampleVol(int i, vec3 p) {
-  if (i == 0) { float a = texture(uVol0, p).r; return uMix > 0.0 ? mix(a, texture(uVolB, p).r, uMix) : a; }
-  if (i == 1) return texture(uVol1, p).r;
-  if (i == 2) return texture(uVol2, p).r;
-  return texture(uVol3, p).r;
+  if (i == 0) { float a = textureLod(uVol0, p, 0.0).r; return uMix > 0.0 ? mix(a, textureLod(uVolB, p, 0.0).r, uMix) : a; }
+  if (i == 1) return textureLod(uVol1, p, 0.0).r;
+  if (i == 2) return textureLod(uVol2, p, 0.0).r;
+  return textureLod(uVol3, p, 0.0).r;
+}
+
+// Same slot chain at an explicit mip level. Slot 0 keeps blending with the morph partner:
+// a morphing map has to occlude and shadow as the blend it is showing, not as its near end.
+float sampleVolLod(int i, vec3 p, float lod) {
+  if (i == 0) { float a = textureLod(uVol0, p, lod).r; return uMix > 0.0 ? mix(a, textureLod(uVolB, p, lod).r, uMix) : a; }
+  if (i == 1) return textureLod(uVol1, p, lod).r;
+  if (i == 2) return textureLod(uVol2, p, lod).r;
+  return textureLod(uVol3, p, lod).r;
 }
 
 // Density of slot i at a model-space point: zero outside its own box (the sampler's
@@ -138,6 +153,19 @@ float density(int i, vec3 mp) {
     if (d < uClipRange.x || d > uClipRange.y) return 0.0;
   }
   return sampleVol(i, p);
+}
+
+// density() at an explicit mip level — the box test and the clip slab are unchanged, so a
+// cone sample outside the map or inside the cut contributes nothing, exactly as a primary
+// sample would.
+float densityLod(int i, vec3 mp, float lod) {
+  vec3 p = (mp - uBoxLoA[i]) / (uBoxHiA[i] - uBoxLoA[i]);
+  if (any(lessThan(p, vec3(0.0))) || any(greaterThan(p, vec3(1.0)))) return 0.0;
+  if (uClipOn == 1) {
+    float d = dot(mp, uClipN);
+    if (d < uClipRange.x || d > uClipRange.y) return 0.0;
+  }
+  return sampleVolLod(i, p, lod);
 }
 
 // Diverging (signed) grids put ZERO at 0.5 — outside the box or the clip slab the
@@ -179,18 +207,6 @@ vec3 isoNormal(int i, vec3 mp) {
   return len < 1e-8 ? vec3(0.0) : -g / len;    // zero-length: the caller falls back
 }
 
-// Is any slot's interior here? Shadow and occlusion rays only need "something opaque is
-// in the way", not which map it belongs to.
-bool isoOccupied(vec3 mp) {
-  for (int i = 0; i < ${MAXV}; i++) {
-    if (i >= uCount) break;
-    // The floor keeps a contour dragged to zero from declaring empty space solid — outside
-    // the box and outside the clip slab density() returns exactly 0.
-    if (density(i, mp) >= max(uThrA[i], 1e-4)) return true;
-  }
-  return false;
-}
-
 // Where a ray leaves the union box — the length a secondary ray can usefully march.
 float boxFar(vec3 o, vec3 d) {
   vec3 inv = 1.0 / d;
@@ -199,26 +215,64 @@ float boxFar(vec3 o, vec3 d) {
   return min(min(tmax.x, tmax.y), tmax.z);
 }
 
-// Key-light shadow for the ray-traced preset, standing in for gl.js's 2048² shadow map:
-// march towards the light and kill the key term on the first occupied sample. Twice the
-// primary step, because a shadow's edge tolerates an error the silhouette does not, and
-// the ray is started off the surface or step one would shadow the point against itself.
-// Every length here is in VOXELS of the map, never in units of the primary step dt: dt is
-// (tf - tn) / steps and so changes with the view direction, and a binary visibility test
-// scaled by it flips answers from frame to frame as you orbit — which is exactly what made
-// the surface flash while rotating. The primary march stays on dt (it has to span whatever
-// segment this pixel's ray covers); everything downstream of the hit is view-independent.
-float isoShadow(vec3 p, vec3 n, float vox) {
-  vec3 L = -uKeyDir;                    // uKeyDir is where the light shines, not where it is
-  vec3 o = p + n * vox;
+// How opaque density has to be counted as: a voxel a little over the contour is solid, and a
+// mip level that averaged it with its empty neighbours must still read as solid or a thin
+// wall stops casting shadow. THE calibration knob for the whole shaded look — higher makes
+// occlusion crisper and darker, lower makes it softer and brighter.
+const float OCC_GAIN = 8.0;
+
+// Visibility along a CONE, the estimator that replaced binary occlusion rays.
+//
+// Binary rays were the wrong tool and it showed: a ray steps over thin features, a grazing
+// ray skims above a rough surface without ever registering, and each one answers only 0 or 1,
+// so the ambient term came back at ~1 almost everywhere and the smooth preset rendered as
+// blown-out white. gl.js's ambient is 64 PCF-filtered shadow maps, i.e. PARTIAL visibility
+// including grazing self-occlusion, and that partiality is the entire look. A cone widens
+// with distance and reads the map at the mip level matching its radius, so one sample covers
+// everything inside it: an occluder that a ray would thread past still dims it.
+//
+// Samples march geometrically (each covers the gap the last one left), and the accumulated
+// visibility multiplies, so the far end of the cone matters less than the near end — as it
+// should, being both further away and coarser.
+float coneVis(vec3 o, vec3 L, float vox, float tanHalf, float growth, int nsamp) {
+  float voxEdge = max(vox / 1.7320508, 1e-6);   // voxel diagonal -> voxel edge
   float tf = boxFar(o, L);
-  float st = vox * 1.5;
-  for (int s = 1; s < 256; s++) {
-    float t = st * float(s);
+  float vis = 1.0;
+  float t = vox * 1.5;
+  for (int k = 0; k < 12; k++) {
+    if (k >= nsamp) break;
     if (t > tf) break;
-    if (isoOccupied(o + L * t)) return 0.0;
+    vec3 sp = o + L * t;
+    float lod = log2(max(tanHalf * t / voxEdge, 1.0));
+    float occ = 0.0;
+    // Every active map occludes: in a composited scene one map casts ambient shadow on
+    // another exactly as two halves of one map do.
+    for (int j = 0; j < ${MAXV}; j++) {
+      if (j >= uCount) break;
+      float thrJ = max(uThrA[j], 1e-4);
+      float v = densityLod(j, sp, clamp(lod, 0.0, uMaxLodA[j]));
+      occ += clamp((v - thrJ) * OCC_GAIN / max(1.0 - thrJ, 1e-3), 0.0, 1.0);
+    }
+    vis *= 1.0 - clamp(occ, 0.0, 1.0);
+    if (vis < 0.03) break;
+    t *= growth;
   }
-  return 1.0;
+  return vis;
+}
+
+// Key-light shadow for the ray-traced preset: one narrow cone towards the light, standing in
+// for gl.js's 2048² PCF shadow map. Narrow because a key shadow has a defined edge — but a
+// cone, not a ray, so that edge is soft the way the filtered map's is, and the term is
+// continuous in [0,1] rather than a hard 0/1 that would crawl as the camera moves.
+//
+// Every length here is in VOXELS of the map, never in units of the primary step dt: dt is
+// (tf - tn) / steps and so changes with the view direction, and a visibility test scaled by
+// it flips answers from frame to frame as you orbit — which is exactly what made the surface
+// flash while rotating. The primary march stays on dt (it has to span whatever segment this
+// pixel's ray covers); everything downstream of the hit is view-independent.
+float isoShadow(vec3 p, vec3 n, float vox) {
+  vec3 o = p + n * vox;                 // off the surface, or the cone shadows it on itself
+  return coneVis(o, -uKeyDir, vox, 0.07, 1.45, 12);
 }
 
 // The ambient term, as gl.js computes it: NOT local ambient occlusion, but the
@@ -226,32 +280,30 @@ float isoShadow(vec3 p, vec3 n, float vox) {
 //
 //     mshadow = sum_i max(-dot(N, dir_i), 0) * vis_i / (0.25 * N)
 //
-// with dir_i the direction light i shines and vis_i its unobstructed visibility. The 0.25 is
-// the mean of max(cos, 0) over a uniformly sampled sphere, so a point that can see the whole
-// sky comes out at exactly 1 and leaves the ambient intensity untouched. This is what draws
-// the broad dark-in-the-pockets gradient the mesh view has: an occluder a whole domain away
-// still blocks a direction, which no small-radius sampling can notice.
+// with dir_i the direction light i shines and vis_i its visibility. The 0.25 is the mean of
+// max(cos, 0) over a uniformly sampled sphere, so a point that can see the whole sky comes
+// out at exactly 1 and leaves the ambient intensity untouched. This is what draws the broad
+// dark-in-the-pockets gradient the mesh view has: an occluder a whole domain away still
+// blocks a direction, which no small-radius sampling could notice.
 //
-// Half the directions face away from the surface and are skipped before their ray is cast,
-// so the real cost is ~8 coarse rays at hit pixels only.
+// Wide cones, because 16 of them have to cover the sphere: tan(half-angle) 0.577 is 30°,
+// and seven geometric samples reach ~36 voxels, far enough for one domain to shade another.
+// Half the directions face away from the surface and are skipped before their cone is
+// traced, so the real cost is ~8 cones of <=7 samples at hit pixels only.
 float isoMultishadow(vec3 p, vec3 n, float vox) {
-  vec3 o = p + n * vox;           // off the surface, or every ray shadows the point on itself
-  float st = vox * 1.5;           // coarse: an ambient term tolerates a missed thin wall
-  float sh = 0.0;
+  vec3 o = p + n * vox;
+  float sh = 0.0, wsum = 0.0;
   for (int i = 0; i < ${MS_COUNT}; i++) {
     float w = max(-dot(n, MSDIR[i]), 0.0);
     if (w <= 0.0) continue;
-    vec3 L = -MSDIR[i];           // towards the light
-    float tf = boxFar(o, L);
-    float vis = 1.0;
-    for (int t = 1; t < 128; t++) {      // 128 * 1.5 voxels clears the diagonal of a 256^3 box
-      float tt = st * float(t);
-      if (tt > tf) break;
-      if (isoOccupied(o + L * tt)) { vis = 0.0; break; }
-    }
-    sh += w * vis;
+    sh += w * coneVis(o, -MSDIR[i], vox, 0.577, 1.7, 7);
+    wsum += w;
   }
-  return sh / (0.25 * float(${MS_COUNT}));
+  // gl.js divides by the constant 0.25*N — the expectation of wsum — which its 64 directions
+  // approach closely enough. At 16 directions that constant leaves a ±7% ripple in the
+  // unoccluded ambient that reads as faint mottling on smooth faces, so normalise by the
+  // actual weight sum instead: the same quantity both estimate, without the sample noise.
+  return sh / max(wsum, 1e-4);
 }
 
 // ChimeraX's lighting equation (gl.js's fragment shader), with the preset intensities and
@@ -391,7 +443,7 @@ void main() {
       for (int i = 0; i < ${MAXV}; i++) {
         if (i >= uCount) break;
         float v = density(i, mp);
-        float thr = max(uThrA[i], 1e-4);   // a zero contour has no crossing at all: see isoOccupied
+        float thr = max(uThrA[i], 1e-4);   // a contour dragged to zero has no crossing at all
         if (prev[i] < thr && v >= thr) {
           // One step spans several voxels at the default step count, and shading its far
           // end would terrace the surface into visible shells — bisect the bracket first.
@@ -536,7 +588,7 @@ export function createVolume(canvas) {
     uVolB = u("uVolB"), uMix = u("uMix"), uCount = u("uCount"),
     uClipOn = u("uClipOn"), uClipN = u("uClipN"), uClipRange = u("uClipRange"), uDiverging = u("uDiverging"),
     uVoxA = u("uVoxA"), uLightMode = u("uLightMode"), uKeyDirL = u("uKeyDir"), uFillDirL = u("uFillDir"),
-    uDepthRow = u("uDepthRow"), uDepthRange = u("uDepthRange");
+    uDepthRow = u("uDepthRow"), uDepthRange = u("uDepthRange"), uMaxLodA = u("uMaxLodA");
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -550,7 +602,9 @@ export function createVolume(canvas) {
   function makeVolTex() {
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_3D, t);
-    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    // Mipmapped minification: iso's cone tracing reads the map at the level matching each
+    // cone's radius. Every other sample path pins level 0 with textureLod (see sampleVol).
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -558,6 +612,7 @@ export function createVolume(canvas) {
     // A 1-voxel placeholder makes the texture complete from birth: unused slots are
     // still bound (sampling an incomplete unit is undefined behaviour on some drivers).
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, 1, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
+    gl.generateMipmap(gl.TEXTURE_3D);   // ...and mipmap-complete, now that the MIN filter wants levels
     return t;
   }
   const slotTex = Array.from({ length: MAXV }, makeVolTex);
@@ -691,6 +746,7 @@ export function createVolume(canvas) {
     gl.uniform1f(uGamma, gamma); gl.uniform1f(uBright, bright);
     gl.uniform1i(uMode, mode); gl.uniform1i(uSteps, steps);
     gl.uniform3fv(uVoxA, flat3(slotDim.map((d) => [1 / Math.max(1, d[0]), 1 / Math.max(1, d[1]), 1 / Math.max(1, d[2])])));
+    gl.uniform1fv(uMaxLodA, new Float32Array(slotDim.map((d) => Math.floor(Math.log2(Math.max(2, d[0], d[1], d[2]))))));
     gl.uniform1i(uLightMode, lightMode);
     gl.uniform3fv(uKeyDirL, toModelDir(KEY_DIR)); gl.uniform3fv(uFillDirL, toModelDir(FILL_DIR));
     // Third row of view·M (column-major: elements 2, 6, 10, 14) — the shader dots it with a
@@ -711,10 +767,14 @@ export function createVolume(canvas) {
   }
   function render() { resize(); drawScene(1); }
 
+  // Every upload path — setVolume, setSlots and the morph's setVolumeB — goes through here,
+  // so every texture on screen carries a full chain. Building it costs one pass over a third
+  // more texels than the upload itself, once per map.
   function upload(target, nx, ny, nz, u8) {
     gl.bindTexture(gl.TEXTURE_3D, target);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, nx, ny, nz, 0, gl.RED, gl.UNSIGNED_BYTE, u8);
+    gl.generateMipmap(gl.TEXTURE_3D);
   }
 
   function setVolume(nx, ny, nz, u8, lo, hi) {
