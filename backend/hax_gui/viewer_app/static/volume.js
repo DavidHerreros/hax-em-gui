@@ -27,6 +27,34 @@ const KEY_DIR = normalize([0.577, -0.577, -0.577]);
 const FILL_DIR = normalize([-0.2, -0.2, -0.959]);
 const LIGHT_MODES = { standard: 0, smooth: 1, raytraced: 2 };
 
+// gl.js's "multishadow" ambient light, cut down to a size a per-fragment ray march can
+// afford: gl.js renders 64 depth maps from uniformly distributed directions and sums their
+// visibility with a cosine weight; here the same sum is evaluated with occlusion rays from
+// 16 directions. Sixteen is enough because the weight is cosine and the term is ambient —
+// what matters is the *broad* gradient (deep in a pocket sees little of the sphere, an
+// exposed face sees half of it), which is exactly what a local AO cone could not produce.
+// The directions are a Fibonacci spiral over the whole sphere, generated once and baked
+// into the shader source, and they live in MODEL space like gl.js's atlas, so the shading
+// stays welded to the map while you orbit instead of swimming with the camera.
+const MS_DIRS = (() => {
+  const n = 16, ga = Math.PI * (3 - Math.sqrt(5)), out = [];
+  for (let i = 0; i < n; i++) {
+    const z = 1 - (2 * i + 1) / n, r = Math.sqrt(Math.max(0, 1 - z * z)), a = ga * i;
+    out.push([r * Math.cos(a), r * Math.sin(a), z]);
+  }
+  return out;
+})();
+const MS_COUNT = MS_DIRS.length;
+const msGLSL = `const vec3 MSDIR[${MS_COUNT}] = vec3[${MS_COUNT}](`
+  + MS_DIRS.map((d) => `vec3(${d.map((v) => v.toFixed(6)).join(", ")})`).join(", ") + ");";
+
+// Depth cue, mirroring gl.js (which mirrors ChimeraX): fractions of the near-to-far range
+// derived from the scene's bounding sphere, and the padding/clamping that range is built
+// with. Values copied from gl.js — the two views fade at the same distances or the same map
+// looks nearer in one of them.
+const DEPTH_CUE_START = 0.5, DEPTH_CUE_END = 1.0;
+const NEAR_FAR_PAD = 0.01, MIN_NEAR_FRACTION = 0.001;
+
 const VERT = `#version 300 es
 precision highp float;
 layout(location=0) in vec2 aPos;
@@ -71,6 +99,13 @@ uniform vec3 uVoxA[${MAXV}];
 uniform int uLightMode;     // 0 = standard, 1 = smooth, 2 = ray traced
 uniform vec3 uKeyDir;       // model space, direction the key light shines
 uniform vec3 uFillDir;
+// Depth cue. uDepthRow is the third row of view*M, which is all the march needs to turn a
+// model-space hit into the camera-space axial distance the fade is a function of; the range
+// is the pair of distances the fade runs between (see depthCueRange in the JS below).
+uniform vec4 uDepthRow;
+uniform vec2 uDepthRange;
+
+${msGLSL}
 
 // Clip slab, the same model-space plane pair the surface renderer cuts with: keep the
 // samples whose signed distance along the unit normal uClipN lands inside uClipRange,
@@ -128,8 +163,14 @@ float densityN(vec3 mp) {
 // boxes and non-cubic grids therefore come out right, which a gradient taken in normalized
 // texture space and used as-is would not. Sampling goes through density(), so slot 0's
 // normals follow the morph blend and the clip slab cuts normals as well as geometry.
+//
+// The stencil is TWO texels wide, not one. The grid is uint8, so a one-texel difference is
+// dominated by quantisation noise — it renders as a crumpled foil, where the mesh view gets
+// smooth normals for free (averaged over the triangles at each vertex, then Taubin-smoothed).
+// Two texels let the linear sampler low-pass the noise at a cost in fine detail that is far
+// smaller than the noise it removes.
 vec3 isoNormal(int i, vec3 mp) {
-  vec3 h = max(uVoxA[i] * (uBoxHiA[i] - uBoxLoA[i]), vec3(1e-6));
+  vec3 h = max(2.0 * uVoxA[i] * (uBoxHiA[i] - uBoxLoA[i]), vec3(1e-6));
   float dx = density(i, mp + vec3(h.x, 0.0, 0.0)) - density(i, mp - vec3(h.x, 0.0, 0.0));
   float dy = density(i, mp + vec3(0.0, h.y, 0.0)) - density(i, mp - vec3(0.0, h.y, 0.0));
   float dz = density(i, mp + vec3(0.0, 0.0, h.z)) - density(i, mp - vec3(0.0, 0.0, h.z));
@@ -175,22 +216,37 @@ float isoShadow(vec3 p, vec3 n, float dt) {
   return 1.0;
 }
 
-// Cheap local ambient occlusion for the two presets whose look depends on it: gl.js gets
-// this from 64 real shadow maps, which is out of reach inside a per-fragment ray march, so
-// sample a narrow cone around the normal at two radii and darken the ambient term by the
-// fraction that lands inside matter. It reproduces creases and pockets, not a whole domain
-// shadowing its neighbour — deliberately subtle rather than wrong at a large scale.
-float isoAO(vec3 p, vec3 n, float dt) {
-  vec3 up = abs(n.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
-  vec3 tx = normalize(cross(up, n)), ty = cross(n, tx);
-  float occ = 0.0;
-  for (int k = 0; k < 6; k++) {
-    float a = 6.2831853 * float(k) / 6.0;
-    vec3 d = normalize(n + 0.9 * (cos(a) * tx + sin(a) * ty));
-    if (isoOccupied(p + d * (3.0 * dt))) occ += 1.0;
-    if (isoOccupied(p + d * (7.0 * dt))) occ += 1.0;
+// The ambient term, as gl.js computes it: NOT local ambient occlusion, but the
+// cosine-weighted fraction of the whole sphere of directions this point can see out of —
+//
+//     mshadow = sum_i max(-dot(N, dir_i), 0) * vis_i / (0.25 * N)
+//
+// with dir_i the direction light i shines and vis_i its unobstructed visibility. The 0.25 is
+// the mean of max(cos, 0) over a uniformly sampled sphere, so a point that can see the whole
+// sky comes out at exactly 1 and leaves the ambient intensity untouched. This is what draws
+// the broad dark-in-the-pockets gradient the mesh view has: an occluder a whole domain away
+// still blocks a direction, which no small-radius sampling can notice.
+//
+// Half the directions face away from the surface and are skipped before their ray is cast,
+// so the real cost is ~8 coarse rays at hit pixels only.
+float isoMultishadow(vec3 p, vec3 n, float dt) {
+  vec3 o = p + n * dt * 1.5;      // off the surface, or every ray shadows the point on itself
+  float st = dt * 3.0;            // coarse: an ambient term tolerates a missed thin wall
+  float sh = 0.0;
+  for (int i = 0; i < ${MS_COUNT}; i++) {
+    float w = max(-dot(n, MSDIR[i]), 0.0);
+    if (w <= 0.0) continue;
+    vec3 L = -MSDIR[i];           // towards the light
+    float tf = boxFar(o, L);
+    float vis = 1.0;
+    for (int t = 1; t < 48; t++) {
+      float tt = st * float(t);
+      if (tt > tf) break;
+      if (isoOccupied(o + L * tt)) { vis = 0.0; break; }
+    }
+    sh += w * vis;
   }
-  return occ / 12.0;
+  return sh / (0.25 * float(${MS_COUNT}));
 }
 
 // ChimeraX's lighting equation (gl.js's fragment shader), with the preset intensities and
@@ -207,11 +263,14 @@ vec3 isoShade(int i, vec3 p, vec3 n, vec3 rd, float dt) {
   vec3 R = normalize(reflect(uKeyDir, n));
   float sf = pow(max(-dot(R, rd), 0.0), 30.0);      // MATERIAL.exponent
   float shadow = uLightMode == 2 ? isoShadow(p, n, dt) : 1.0;
-  float amb = uLightMode == 0 ? 1.0 : 1.0 - 0.75 * isoAO(p, n, dt);
+  float amb = uLightMode == 0 ? 1.0 : isoMultishadow(p, n, dt);
   vec3 base = uColA[i];
   vec3 Iamb = base * (0.8 * lamb) * amb;                                  // MATERIAL.ambient
   vec3 Idiff = base * (0.8 * lkey * kf * shadow + 0.8 * lfill * ff);      // MATERIAL.diffuse
   vec3 Ispec = vec3(0.3 * lkey * sf * shadow);                            // MATERIAL.specular
+  // Not tone-mapped and not clamped, exactly as in gl.js: the soft preset's ambient is 1.5,
+  // so an unoccluded face lands above 1 and clips against the framebuffer. That clipping is
+  // what the preset looks like in ChimeraX.
   return Iamb + Idiff + Ispec;
 }
 
@@ -341,7 +400,14 @@ void main() {
     // viewer instead of shading from noise.
     if (dot(n, n) < 0.5) n = -rd;
     if (dot(n, rd) > 0.0) n = -n;              // two-sided, as gl.js is via gl_FrontFacing
-    outColor = vec4(isoShade(hitSlot, hp, n, rd, dt), 1.0);
+    vec3 Ifrag = isoShade(hitSlot, hp, n, rd, dt);
+    // Depth cue, applied for every preset because gl.js applies it for every preset: the
+    // far side of the map fades into the background, and without it the surface reads flat.
+    // -(row2 . hp + row2.w) is the camera-space axial distance of the hit (the camera looks
+    // down -z), which is the quantity gl.js fades on.
+    float dcue = -(dot(uDepthRow.xyz, hp) + uDepthRow.w);
+    float dim = (uDepthRange.y - dcue) / max(uDepthRange.y - uDepthRange.x, 1e-6);
+    outColor = vec4(mix(uBg, Ifrag, clamp(dim, 0.0, 1.0)), 1.0);
   } else {                                   // front-to-back emission/absorption
     vec3 acc = vec3(0.0); float alpha = 0.0;
     for (int s = 0; s < 512; s++) {
@@ -373,7 +439,8 @@ export function createVolume(canvas) {
     uVolN = [u("uVol0"), u("uVol1"), u("uVol2"), u("uVol3")],
     uVolB = u("uVolB"), uMix = u("uMix"), uCount = u("uCount"),
     uClipOn = u("uClipOn"), uClipN = u("uClipN"), uClipRange = u("uClipRange"), uDiverging = u("uDiverging"),
-    uVoxA = u("uVoxA"), uLightMode = u("uLightMode"), uKeyDirL = u("uKeyDir"), uFillDirL = u("uFillDir");
+    uVoxA = u("uVoxA"), uLightMode = u("uLightMode"), uKeyDirL = u("uKeyDir"), uFillDirL = u("uFillDir"),
+    uDepthRow = u("uDepthRow"), uDepthRange = u("uDepthRange");
 
   // full-screen quad
   const vao = gl.createVertexArray();
@@ -473,6 +540,25 @@ export function createVolume(canvas) {
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   }
   const flat3 = (arr) => new Float32Array(arr.flat());
+
+  // ChimeraX View.near_far_distances, transcribed from gl.js's depthCueRange: the scene's
+  // bounding sphere projected onto the view axis, padded, then clamped so the near plane
+  // stays in front of the eye — and the cue fades between fixed fractions of that. Deriving
+  // it from the model rather than from the GL frustum (fixed here at 0.01..100) is what
+  // makes the fade track the map as you zoom, and is what keeps this view's fade identical
+  // to the mesh view's. The bounding sphere of a box is the sphere through its corners.
+  function depthCueRange(mv, ub) {
+    const c = [0, 0, 0], sz = [0, 0, 0];
+    for (let a = 0; a < 3; a++) { c[a] = (ub.lo[a] + ub.hi[a]) / 2; sz[a] = ub.hi[a] - ub.lo[a]; }
+    const radius = 0.5 * Math.hypot(sz[0], sz[1], sz[2]);
+    const d = -(mv[2] * c[0] + mv[6] * c[1] + mv[10] * c[2] + mv[14]);   // camera looks down -z
+    const r = (1 + NEAR_FAR_PAD) * radius;
+    let near = d - r, far = d + r;
+    const nearMin = far > near ? MIN_NEAR_FRACTION * (far - near) : 1;
+    near = Math.max(near, nearMin);
+    if (far <= near) far = 2 * near;
+    return [near + (far - near) * DEPTH_CUE_START, near + (far - near) * DEPTH_CUE_END];
+  }
   function drawScene(alpha = 1) {
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.clearColor(bg[0], bg[1], bg[2], alpha);
@@ -511,6 +597,10 @@ export function createVolume(canvas) {
     gl.uniform3fv(uVoxA, flat3(slotDim.map((d) => [1 / Math.max(1, d[0]), 1 / Math.max(1, d[1]), 1 / Math.max(1, d[2])])));
     gl.uniform1i(uLightMode, lightMode);
     gl.uniform3fv(uKeyDirL, toModelDir(KEY_DIR)); gl.uniform3fv(uFillDirL, toModelDir(FILL_DIR));
+    // Third row of view·M (column-major: elements 2, 6, 10, 14) — the shader dots it with a
+    // model-space hit to get the camera-space depth the cue fades on.
+    gl.uniform4fv(uDepthRow, [mv[2], mv[6], mv[10], mv[14]]);
+    gl.uniform2fv(uDepthRange, depthCueRange(mv, ub));
     gl.uniform1i(uCount, count);
     gl.uniform1i(uDiverging, diverging ? 1 : 0);
     gl.uniform1f(uMix, gridB ? mix : 0);
