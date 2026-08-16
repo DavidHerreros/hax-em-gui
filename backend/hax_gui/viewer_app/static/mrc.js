@@ -816,7 +816,19 @@ function onLevel(level, dragging) {
   const m = active();
   m.sigma = (level - m.mean) / (m.std || 1);
   $("sigVal").textContent = m.sigma.toFixed(2) + " σ";
-  if (state.render === "surface") {
+  // A morph owns the scene while it is showing, and the slider retargets IT rather than the
+  // map underneath — the maps are hidden, so driving them would be a gesture with no picture.
+  // The gesture's sigma is what carries over; which map the histogram is drawn from does not
+  // matter, because a morph is cut relative to its own first map (see applyMorphSigma).
+  if (morph.showing) {
+    if (!retargetMorph(m.sigma, !!dragging) && inVolumeMode()) {
+      // A STREAMING volume morph has no pool — it draws the pair through slot 0 — so its
+      // contour is still just that threshold, exactly as it was. A server-cached SURFACE morph
+      // has finished meshes and no field to re-cut them from, so its contour stays frozen at
+      // Prepare, also exactly as it was; there is nothing here to do about it.
+      volRenderer.setThreshold(normThreshold());
+    }
+  } else if (state.render === "surface") {
     loadSurface(state.active, !!dragging);   // the active map tracks the drag live
     if (linkContour && !dragging) {
       for (const other of visibleModels()) {
@@ -1059,8 +1071,15 @@ const morph = {
 const morphLegs = () => Math.max(0, morph.seq.length - 1);
 const morphFrames = () => (morphLegs() ? morphLegs() * morph.perLeg + 1 : 0);
 // Everything a prepared cache depends on. Changing any of it invalidates the cache.
+//
+// Every sequence map's sigma is in here, not just map 0's. In constant-mass mode map 0's is the
+// only one that moves the series, but constant-sigma mode cuts each map at its own level, so a
+// contour change anywhere in the sequence makes the cached meshes wrong — and the contour is
+// something the slider can now move DURING a morph, which is what turned that from a case that
+// could not arise into one that does.
 const morphKey = () => [morph.seq.join(","), morph.perLeg, morph.mass, morph.quality,
-                        active().smooth, models[morph.seq[0]] ? models[morph.seq[0]].sigma : 0].join("|");
+                        active().smooth,
+                        morph.seq.map((i) => (models[i] ? models[i].sigma : 0)).join(",")].join("|");
 
 // Frame k -> which pair, and how far between them.
 function frameSpec(k) {
@@ -1172,7 +1191,11 @@ async function showMorphFrame(k) {
 // `channel` decides what supersedes what. The scrubber leaves it at the default, so a tick
 // issued while an older one is still marching wins; a Prepare pass contouring several legs at
 // once gives each leg its own, so concurrent legs do not cancel each other.
-async function localMorphMesh(leg, t, stride, smooth, channel) {
+// `pair` overrides which field keys this leg blends, and exists for the parallel Prepare: a leg
+// in run r > 0 reads its first map through an ALIASED key so its run's fields can sit in a
+// worker of their own (see planLegRuns). Everything else — the scrubber, a single-run Prepare —
+// leaves it undefined and gets the sequence's own keys.
+async function localMorphMesh(leg, t, stride, smooth, channel, pair) {
   const L = morph.local;
   if (!L) return null;
   {
@@ -1183,7 +1206,8 @@ async function localMorphMesh(leg, t, stride, smooth, channel) {
     const span = Math.max(L.vmax[ia] - L.vmin[ia], 1e-9);
     const scale = (L.vmax[ib] - L.vmin[ib]) / span;
     const off = (L.vmin[ib] - L.vmin[ia]) / span;
-    const req = { keyA: L.keys[ia], keyB: L.keys[ib], t, scale, off, smooth, stride };
+    const req = { keyA: pair ? pair.a : L.keys[ia], keyB: pair ? pair.b : L.keys[ib],
+                  t, scale, off, smooth, stride };
     if (channel) req.channel = channel;
     // Constant mass is solved on the blended field itself, per frame — what the server path
     // does with level_for_mass, and what the GPU morph can only approximate.
@@ -1191,15 +1215,17 @@ async function localMorphMesh(leg, t, stride, smooth, channel) {
     else req.level = L.thr[ia] * (1 - t) + (L.thr[ib] * scale + off) * t;
     let res = await mc.morphFrame(req);
     // A miss means the field is not in the worker the engine sent this to — either the budget
-    // evicted it, or the leg's two maps were placed in different workers and a blend cannot
-    // cross that line. Re-storing it `near` its partner is what fixes both: it puts the pair
-    // back together, so this leg's remaining frames go straight through. The pull is always
-    // toward the earlier map of the pair, so a long sequence settles instead of ping-ponging.
+    // evicted it, or this leg's two fields ended up apart and a blend cannot cross that line.
+    // Re-storing the absent one `near` its partner fixes both: it puts the pair back together
+    // and this leg's remaining frames go straight through.
+    //
+    // The key that missed may be an alias, so the grid to re-store it from is found by which
+    // SIDE of the request it was rather than by looking the key up in the sequence — an alias
+    // appears nowhere in L.keys, and the map it stands for is the one this leg blends from.
     if (res && res.miss) {
       const near = res.miss === req.keyA ? req.keyB : req.keyA;
-      for (let i = 0; i < L.keys.length; i++) {
-        if (L.keys[i] === res.miss) mc.store(L.keys[i], models[morph.seq[i]].gridVol, { near });
-      }
+      const src = models[morph.seq[res.miss === req.keyA ? ia : ib]].gridVol;
+      if (src) mc.store(res.miss, src, { near });
       res = await mc.morphFrame(req);
     }
     // A null reply means a newer request on the morph channel superseded this one — during a
@@ -1217,7 +1243,9 @@ async function localMorphMesh(leg, t, stride, smooth, channel) {
 let morphPrepGen = 0;
 let morphPreparing = false;      // a Prepare loop owns the worker's morph channel
 let localFrameBusy = false;
-async function localMorphFrame(leg, t) {
+// `draft` forces the cheap cut regardless of the Quality setting: it is what a contour drag
+// previews with, where a frame has to land inside a pointermove rather than look final.
+async function localMorphFrame(leg, t, draft) {
   // While Prepare is contouring the series, the scrubber does not also contour. It no longer
   // has to be for channel reasons — Prepare gives each leg its own — but a scrub frame would
   // still take a worker away from the pass building the cache, and the cache is what the
@@ -1225,8 +1253,9 @@ async function localMorphFrame(leg, t) {
   if (!morph.local || localFrameBusy || morphPreparing) return;
   localFrameBusy = true;
   try {
-    const res = await localMorphMesh(leg, t, morph.quality === "draft" ? 2 : 1,
-                                     models[morph.seq[0]].smooth);
+    const full = models[morph.seq[0]].smooth;
+    const res = await localMorphMesh(leg, t, (draft || morph.quality === "draft") ? 2 : 1,
+                                     draft ? Math.min(full, DRAFT_SMOOTH) : full);
     if (!res) return;
     if (state.render !== "surface" || !morph.showing) return;
     renderer.setModelMesh(MORPH_ID, res.positions, res.normals, res.indices);
@@ -1298,18 +1327,35 @@ async function buildMorphPool() {
   // same level to within a histogram bin). The endpoints are NOT recomputed from the
   // subsample — they are the exact per-map levels above — because a leg boundary is where the
   // two legs must agree exactly or the surface steps.
+  // The CURVES themselves are kept, not just the levels read off them. A mass curve is a
+  // property of a FIELD, not of the target mass you invert it at — so keeping them turns a
+  // later contour change from "recompute the whole thing" (seconds, and the reason the contour
+  // was frozen at Prepare) into a handful of levelForMass lookups. See retargetMorphLevels.
+  //
+  // The bill is small enough not to think about: a curve is MASS_BINS+1 float64s, 8.2 KB, and a
+  // ten-map sequence keeps ten map curves plus nine legs of seven interior curves — about
+  // 0.5 MB against the hundreds of megabytes the pool's textures already hold.
   const CURVE_N = 8;
   let curveLevels = null;
+  const legCurves = [], legScale = [], legOff = [];
+  for (let leg = 0; leg + 1 < grids.length; leg++) {
+    const span = Math.max(grids[leg].vmax - grids[leg].vmin, 1e-9);
+    legScale.push((grids[leg + 1].vmax - grids[leg + 1].vmin) / span);
+    legOff.push((grids[leg + 1].vmin - grids[leg].vmin) / span);
+  }
   if (morph.mass && grids.length > 1) {
     curveLevels = [];
     for (let leg = 0; leg + 1 < grids.length; leg++) {
       const gA = grids[leg], gB = grids[leg + 1];
       const sameGrid = gA.nx === gB.nx && gA.ny === gB.ny && gA.nz === gB.nz;
-      const span = Math.max(gA.vmax - gA.vmin, 1e-9);
-      const scale = (gB.vmax - gB.vmin) / span, off = (gB.vmin - gA.vmin) / span;
+      const scale = legScale[leg], off = legOff[leg];
       const ends = [thr[leg], thr[leg + 1] * scale + off];      // A-space, exact
       const row = new Array(CURVE_N + 1);
       row[0] = ends[0]; row[CURVE_N] = ends[1];
+      // Null for a leg with nothing to invert — a mismatched-grid pair — which is exactly
+      // where the loop below falls back to the straight line, and exactly where a retarget
+      // has to fall back to it too.
+      const rowCurves = sameGrid ? [] : null;
       for (let k = 1; k < CURVE_N; k++) {
         // Two maps on different grids cannot be blended voxel-wise at all (the server refuses
         // to morph them); the straight line is all there is to say for such a pair.
@@ -1317,13 +1363,16 @@ async function buildMorphPool() {
         status(`Matching contours… leg ${leg + 1}/${grids.length - 1} (${k}/${CURVE_N - 1})`, "busy");
         await new Promise((r) => setTimeout(r, 0));
         const t = k / CURVE_N;
-        const lvl = levelForMass(blendedMassCurve(gA, gB, t, scale, off, 4), refMass);
+        const curve = blendedMassCurve(gA, gB, t, scale, off, 4);
+        rowCurves.push(curve);
+        const lvl = levelForMass(curve, refMass);
         // A saturated solve means the subsample lost the mass entirely (a narrow feature
         // missed by the stride). Fall back to the straight line for that sample rather than
         // collapsing the contour to zero.
         row[k] = (lvl <= 0 || lvl >= 1) ? ends[0] * (1 - t) + ends[1] * t : lvl;
       }
       curveLevels.push(row);
+      legCurves.push(rowCurves);
     }
   }
   const entries = grids.map((g, i) => ({
@@ -1336,10 +1385,183 @@ async function buildMorphPool() {
   const bytes = grids.reduce((acc, g) => acc + g.nx * g.ny * g.nz * ((g.f16 ? 2 : 1) + 1.15), 0);
   return { thr, curves: curveLevels, box: Math.max(first.nx, first.ny, first.nz),
            vmin: grids.map((g) => g.vmin), vmax: grids.map((g) => g.vmax),
+           // Everything a retarget needs, so it never has to touch a grid again.
+           mapCurves: curves, legCurves, legScale, legOff, curveN: CURVE_N,
            mb: Math.round(bytes / (1024 * 1024)) };
 }
 
 
+
+// How many legs of a Prepare may contour at once, and which legs each of those runs owns.
+//
+// Legs only run in parallel if their fields are in DIFFERENT workers, and adjacent legs share a
+// map — which is why round 1's `near` retries pulled a whole sequence onto one worker and got
+// no parallelism out of it. Contiguous runs of legs fix that for the price of one duplicated
+// field per extra run: run r's first map is also run r−1's last, so only that one map needs a
+// second copy (under an aliased key), and every other field stays where it is.
+//
+// R is bounded by three things and takes the smallest. The threads there are to run on. The
+// legs there are to split. And memory, twice over: `2 x fieldBytes` is the floor for a run to
+// hold a pair at all, and the second term is the one that matters for a long sequence — the
+// budget has to hold every map PLUS one extra per additional run, so a sequence that already
+// fills the budget gets R = 1 rather than a Prepare that spends itself evicting and re-decoding.
+//
+// Pure arithmetic, no globals: the harness lifts it verbatim.
+function planLegRuns(legs, nmaps, fieldBytes, workers, budgetBytes) {
+  const bytes = Math.max(1, fieldBytes | 0);
+  const pairFits = Math.floor(budgetBytes / (2 * bytes));
+  const spare = Math.floor(budgetBytes / bytes) - nmaps;   // fields we can afford to duplicate
+  const R = Math.max(1, Math.min(workers, legs, pairFits, 1 + Math.max(0, spare)));
+  const runs = [];
+  let first = 0;
+  for (let r = 0; r < R; r++) {
+    const len = Math.ceil((legs - first) / (R - r));       // near-equal, longest first
+    runs.push({ first, last: first + len - 1 });
+    first += len;
+  }
+  return { R, runs };
+}
+
+// The field key each leg blends from, per leg, given a run plan. Run 0 uses the sequence's own
+// keys throughout. Run r > 0 reads its FIRST map through an alias and everything after it
+// plainly — which is what makes the runs' key sets disjoint: run r owns maps
+// (first .. last+1], plus an aliased copy of `first`, and its neighbour owns `first` plainly.
+function legKeyPlan(runs, keys) {
+  const alias = [];      // the duplicate fields this plan needs, and which map each stands for
+  const perLeg = [], runKeys = [];
+  runs.forEach((run, r) => {
+    const keyAt = (i) => {
+      if (r === 0 || i !== run.first) return keys[i];
+      const a = `${keys[i]}#run${r}`;
+      if (!alias.some((x) => x.key === a)) alias.push({ key: a, seq: i });
+      return a;
+    };
+    // Maps first..last+1 are what this run reads; the first of them is its anchor.
+    const mine = [];
+    for (let i = run.first; i <= run.last + 1; i++) mine.push({ seq: i, key: keyAt(i) });
+    runKeys.push(mine);
+    for (let leg = run.first; leg <= run.last; leg++) {
+      perLeg[leg] = { a: keyAt(leg), b: keyAt(leg + 1), run: r };
+    }
+  });
+  return { perLeg, alias, runKeys };
+}
+
+// ---- live contour during a morph -----------------------------------------
+//
+// Both morph paths used to freeze the contour at Prepare, because moving it meant redoing the
+// work Prepare had just done: inverting a mass curve per map and per interior sample of every
+// leg. What makes it live instead is that a mass curve belongs to the FIELD, not to the target
+// mass you invert it at — so Prepare keeps the curves (buildMorphPool above, and the local
+// prep below) and a contour gesture is only the inversions, which are a binary search over
+// 1024 bins each.
+//
+// The normalized range a retarget must speak in is the one the morph was BUILT against, not
+// whatever the map's grid says today: the pool's textures and the workers' fields hold that
+// normalization, and a grid refetched at another size since Prepare would otherwise shift
+// every level. thrFor reads nothing but vmin/vmax, so handing it the stored pair is enough.
+const morphRange = (S, i) => ({ vmin: S.vmin[i], vmax: S.vmax[i] });
+
+// The sigma of a morph gesture applies to the SEQUENCE, not to whichever map the histogram
+// happens to be showing. In constant-mass mode only map 0 has a sigma that means anything —
+// every other map is cut at whatever level encloses map 0's mass. In constant-sigma mode the
+// mode's whole claim is "each map at its own level", so one gesture moves them all together,
+// which is what linkContour does for still maps.
+function applyMorphSigma(sigma) {
+  models[morph.seq[0]].sigma = sigma;
+  if (!morph.mass) for (const i of morph.seq) models[i].sigma = sigma;
+}
+
+// Iso morph: retarget the resident pool in place, this frame.
+//
+// The cost is the reason this can run on every pointermove rather than on release. A ten-map
+// sequence — the longest anyone builds — is 10 inversions over the map curves plus 9 legs x 7
+// interior points: 73 walks down a 1024-bin curve, measured at 2.7 us for the lot, or about
+// 370 complete retargets per millisecond. Nothing here touches a grid, uploads a texture or
+// allocates; that is what keeping the curves bought.
+function retargetMorphLevels(sigma) {
+  const P = morph.pool;
+  if (!P || !P.mapCurves) return;
+  applyMorphSigma(sigma);
+  const thr0 = thrFor(models[morph.seq[0]], morphRange(P, 0));
+  const refMass = massAbove(P.mapCurves[0], thr0);
+  for (let i = 0; i < P.thr.length; i++) {
+    P.thr[i] = i === 0 ? thr0
+      : morph.mass ? levelForMass(P.mapCurves[i], refMass)      // same enclosed mass as map 0
+                   : thrFor(models[morph.seq[i]], morphRange(P, i));
+  }
+  // The per-leg rows, rebuilt exactly as buildMorphPool builds them: exact endpoints from the
+  // new per-map levels, interior points re-inverted on the curves it kept, and the same
+  // saturated-solve fallback to the straight line.
+  if (P.curves) {
+    for (let leg = 0; leg < P.curves.length; leg++) {
+      const row = P.curves[leg], N = row.length - 1;
+      const e0 = P.thr[leg], e1 = P.thr[leg + 1] * P.legScale[leg] + P.legOff[leg];
+      row[0] = e0; row[N] = e1;
+      const cs = P.legCurves[leg];
+      for (let k = 1; k < N; k++) {
+        const t = k / N, lerp = e0 * (1 - t) + e1 * t;
+        if (!cs) { row[k] = lerp; continue; }        // mismatched grids: nothing to invert
+        const lvl = levelForMass(cs[k - 1], refMass);
+        row[k] = (lvl <= 0 || lvl >= 1) ? lerp : lvl;
+      }
+    }
+  }
+  // The silhouette, now: showMorphFrame reads P.thr/P.curves and issues the leg binding and
+  // the threshold, so the new contour is on screen this frame whether the morph is playing or
+  // parked. The pool's opacity pyramids follow on their own debounce (see volume.js).
+  showMorphFrame(morph.frame);
+  volRenderer.setMorphPoolThresholds(P.thr);
+}
+
+// Surface morph: preview at draft quality while the pointer is down, rebuild the cache on
+// release. There is no equivalent of the pool's "two uniforms" here — every frame is a march —
+// so the honest thing is to show one frame cheaply during the gesture and pay for the series
+// once the level has settled.
+//
+// Only the LOCAL path can do this at all. A server-cached morph (hide-dust on, or a map whose
+// grid never became resident) has its frames as finished meshes from the server and no field
+// to re-cut them from, so its contour stays frozen at Prepare exactly as it always was.
+function retargetLocalMorph(sigma, dragging) {
+  const L = morph.local;
+  if (!L) return;
+  applyMorphSigma(sigma);
+  if (morph.mass && L.mapCurves) {
+    // The worker solves each frame's level from massTarget on the blended field itself, so the
+    // reference mass is the only thing a retarget has to move.
+    L.refMass = massAbove(L.mapCurves[0], thrFor(models[morph.seq[0]], morphRange(L, 0)));
+  } else {
+    for (let i = 0; i < L.thr.length; i++) L.thr[i] = thrFor(models[morph.seq[i]], morphRange(L, i));
+  }
+  // The prepared meshes were cut at the old level: they are wrong now, and showMorphFrame
+  // prefers them over anything live. Dropping the cache puts the morph back into the state it
+  // is in during a first Prepare — the scrubber contours on the fly, playback waits — which is
+  // exactly what this is.
+  if (morph.cache || morphPreparing) {
+    morph.cache = null;
+    morph.cacheKey = "";
+    if (morphPreparing) morphPrepGen++;    // a Prepare still filling the old level: abandon it
+    updateMorphUI();
+  }
+  if (dragging) {
+    const { t, leg } = frameSpec(morph.frame);
+    localMorphFrame(leg, t, true);         // draft: stride 2 and the draft smoothing clamp
+    return;
+  }
+  prepareMorph();                          // release: rebuild the series in the background
+}
+
+// A contour gesture while a morph is on screen. Returns false when the morph on screen is one
+// whose contour cannot move, so the caller knows nothing happened.
+function retargetMorph(sigma, dragging) {
+  if (morph.pool) retargetMorphLevels(sigma);
+  else if (morph.local && state.render === "surface") retargetLocalMorph(sigma, dragging);
+  else return false;
+  // The gesture moved the sequence's sigmas, so the sequence's preferences are what to save —
+  // the still-map path saves the one map it moved, and this is the same rule.
+  if (!dragging) for (const i of morph.seq) saveMapPref(models[i]);
+  return true;
+}
 
 async function prepareMorph() {
   if (!morphLegs()) return;
@@ -1416,11 +1638,24 @@ async function prepareMorph() {
         keys.push(key); vmin.push(g.vmin); vmax.push(g.vmax); thr.push(thrFor(m, g));
       }
       if (keys.length === morph.seq.length) {
+        // Every map's mass curve, not only map 0's. Map 0's alone would answer "what mass are
+        // we holding constant"; keeping them all is what lets a contour drag during the morph
+        // re-solve the whole sequence without touching a grid again (see retargetLocalMorph).
+        // ~100 ms per map, once, against a Prepare that is already seconds of marching — and
+        // only in constant-mass mode, because constant sigma inverts nothing.
+        let mapCurves = null;
+        if (morph.mass) {
+          mapCurves = [];
+          for (let i = 0; i < morph.seq.length; i++) {
+            status(`Matching contours (${i + 1}/${morph.seq.length})…`, "busy");
+            await new Promise((r) => setTimeout(r, 0));
+            mapCurves.push(massCurve(models[morph.seq[i]].gridVol));
+          }
+        }
         // The mass every frame is cut to: map 0's, at its own contour, in raw units — the
         // same reference meshing.level_for_mass is given server-side.
-        const refMass = morph.mass
-          ? massAbove(massCurve(models[morph.seq[0]].gridVol), thr[0]) : 0;
-        morph.local = { keys, vmin, vmax, thr, refMass };
+        const refMass = morph.mass ? massAbove(mapCurves[0], thr[0]) : 0;
+        morph.local = { keys, vmin, vmax, thr, refMass, mapCurves };
         morph.cache = null;
         // The morph goes on screen before the cache exists, so the scrubber has something to
         // move through while it builds — on-the-fly frames, at whatever rate the worker
@@ -1441,13 +1676,32 @@ async function prepareMorph() {
         // frames all blend the same two fields, so they belong to whichever worker holds that
         // pair and have to stay in order (they also share a channel, and sequential awaits are
         // what keeps newest-wins from cancelling a frame that is already marching). Different
-        // legs have no such tie, so they go at once and the pool spreads them.
+        // legs have no such tie, so they can go at once.
         //
-        // How much that actually wins depends on where the fields ended up: adjacent legs share
-        // a map, and the miss-and-restore in localMorphMesh pulls each pair together, so a long
-        // sequence tends to gather onto one worker after the first frame of each leg. The gain
-        // is real for the early frames and for sequences whose maps were already spread; it is
-        // never a loss, because a converged sequence is exactly what the single worker did.
+        // Whether they actually do is a placement question, and it used to answer itself badly:
+        // adjacent legs share a map, so the miss-and-restore in localMorphMesh pulled every pair
+        // together and a long sequence gathered onto ONE worker, leaving the concurrency with
+        // nothing to spread. Contiguous RUNS of legs fix it — each run gets its own worker and
+        // its own copy of the single map it shares with its neighbour (planLegRuns prices that
+        // against the engine's budget), and the fields are placed deliberately below instead of
+        // being discovered by a miss.
+        const g0 = models[morph.seq[0]].gridVol;
+        const { R, runs } = planLegRuns(morphLegs(), morph.seq.length,
+                                        g0.nx * g0.ny * g0.nz * 4,
+                                        mc.workers, mc.budgetBytes);
+        const { perLeg: legKeys, alias, runKeys } = legKeyPlan(runs, keys);
+        // Place each run's fields together, run by run: the anchor goes wherever there is most
+        // room — which is a different worker for each run, because the runs placed before it
+        // have already filled the others — and the rest of the run follows it. Doing this up
+        // front rather than letting the first frame of each leg discover it with a miss saves a
+        // round trip per leg and, more to the point, is what decides that two runs land in two
+        // different workers instead of converging on one.
+        for (const mine of runKeys) {
+          const anchor = mine[0].key;
+          for (const { seq, key } of mine) {
+            mc.store(key, models[morph.seq[seq]].gridVol, key === anchor ? undefined : { near: anchor });
+          }
+        }
         const byLeg = new Map();
         for (let k = 0; k < n; k++) {
           const { t, leg } = frameSpec(k);
@@ -1462,7 +1716,7 @@ async function prepareMorph() {
               for (const { k, t } of frames) {
                 // Abandoned: the mode changed, the morph was stopped, or another Prepare started.
                 if (gen !== morphPrepGen || state.render !== "surface" || !morph.showing) { abandoned = true; return; }
-                const res = await localMorphMesh(leg, t, stride, smooth, `morph:${leg}`);
+                const res = await localMorphMesh(leg, t, stride, smooth, `morph:${leg}`, legKeys[leg]);
                 if (!res) throw new Error("contouring was interrupted");
                 cache[k] = { positions: res.positions, normals: res.normals, indices: res.indices,
                              bytes: res.positions.byteLength + res.normals.byteLength + res.indices.byteLength };
@@ -1486,13 +1740,22 @@ async function prepareMorph() {
               throw err;
             }
           }));
-        } finally { morphPreparing = false; }
+        } finally {
+          morphPreparing = false;
+          // The duplicates were scaffolding for this pass — they exist only so two runs could
+          // contour at once — and each is a whole field. Drop them however the pass ended, or a
+          // Prepare that failed halfway would leave a map's worth of memory resident under a
+          // key nothing will ever ask for again. The scrubber uses the sequence's own keys, so
+          // nothing after this needs them.
+          for (const a of alias) mc.drop(a.key);
+        }
         if (abandoned) return;
         morph.cache = cache;
         morph.cacheKey = morphKey();
         await showMorphFrame(morph.frame);
         status(`Morph ready · ${n} frames · ${(cachedBytes / (1024 * 1024)).toFixed(0)} MB cached`
-               + " · contoured in the browser" + (morph.mass ? " · constant mass" : " · constant σ"));
+               + " · contoured in the browser" + (R > 1 ? ` · ${R} threads` : "")
+               + (morph.mass ? " · constant mass" : " · constant σ"));
         updateMorphUI();
         return;
       }

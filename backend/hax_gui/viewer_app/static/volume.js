@@ -1127,6 +1127,12 @@ export function createVolume(canvas) {
   // own dirty bit.
   const opacDirtyA = Array.from({ length: MAXV }, () => true);
   let opacDirtyB = true, opacTimer = null, smoothTimer = null, pendingDirty = null;
+  // The morph pool's pyramids have their own debounce, deliberately separate from opacTimer.
+  // The two stand for different textures — opacTimer for the slot pyramids a still scene draws,
+  // this one for the per-map pool pyramids a morph draws — and a contour drag on either must
+  // not keep rearming the other's timer, which is how a debounce turns into a bake that never
+  // happens. See setMorphPoolThresholds.
+  let poolOpacTimer = null;
   function markDirty(which) {
     if (which === "all") { opacDirtyA.fill(true); opacDirtyB = true; }
     else if (which === "B") opacDirtyB = true;
@@ -1246,14 +1252,16 @@ export function createVolume(canvas) {
     // VRAM), having freed whatever it managed to build, so the caller can fall back to the
     // old per-leg streaming rather than losing the morph.
     setMorphPool(entries) {
-      // Teardown, either as an explicit stop or before building a new one.
+      // Teardown, either as an explicit stop or before building a new one. A rebake still
+      // pending from a contour drag has to go with it, or it wakes up holding deleted textures.
+      if (poolOpacTimer) { clearTimeout(poolOpacTimer); poolOpacTimer = null; }
       if (pool) {
         for (const t of pool.tex) gl.deleteTexture(t);
         for (const t of pool.opac) gl.deleteTexture(t);
         pool = null; poolA = -1; poolB = -1; bScale = 1; bOff = 0;
       }
       if (!entries || !entries.length) { render(); return true; }
-      const built = { tex: [], opac: [], dim: [], lo: [], hi: [] };
+      const built = { tex: [], opac: [], dim: [], lo: [], hi: [], thr: [] };
       while (gl.getError() !== gl.NO_ERROR) { /* start from a clean error state */ }
       for (const e of entries) {
         const dt = makeVolTex(false), ot = makeVolTex(true);
@@ -1261,9 +1269,11 @@ export function createVolume(canvas) {
         built.dim.push([e.nx, e.ny, e.nz]);
         built.lo.push(e.lo ? e.lo.slice() : slotBoxLo[0].slice());
         built.hi.push(e.hi ? e.hi.slice() : slotBoxHi[0].slice());
+        const thr = Math.max(0, Math.min(1, e.thr));
+        built.thr.push(thr);
         upload(dt, e.nx, e.ny, e.nz, e.data);
         blurIfNeeded(dt, e.nx, e.ny, e.nz, e.data);
-        bakeOpacity(dt, ot, [e.nx, e.ny, e.nz], Math.max(0, Math.min(1, e.thr)));
+        bakeOpacity(dt, ot, [e.nx, e.ny, e.nz], thr);
         if (gl.getError() !== gl.NO_ERROR) {            // out of memory, most likely
           for (const t of built.tex) gl.deleteTexture(t);
           for (const t of built.opac) gl.deleteTexture(t);
@@ -1291,10 +1301,34 @@ export function createVolume(canvas) {
       hasTex = true;
     },
     // The contour for one frame. Deliberately does NOT invalidate any pyramid: the pool's
-    // pyramids are per map and fixed, and this moves every frame — invalidating would rearm
-    // the 150 ms debounce on every frame (so it would never fire) and, if it ever did, would
-    // bake a slot pyramid nothing is looking at. Being explicit rather than lucky.
+    // pyramids are per map and this moves every frame — invalidating would rearm the 150 ms
+    // debounce on every frame (so it would never fire) and, if it ever did, would bake a slot
+    // pyramid nothing is looking at. Being explicit rather than lucky. Retargeting the pool's
+    // CONTOUR, which is a different thing and happens per gesture rather than per frame, goes
+    // through setMorphPoolThresholds below.
     setMorphThreshold(v) { slotThr[0] = Math.max(0, Math.min(1, v)); },
+    // New per-map contours for a pool that is already uploaded — a contour drag during a morph.
+    //
+    // The silhouette does not wait for any of this: the primary march reads density and
+    // slotThr[0], so setMorphLeg/setMorphThreshold put the new isosurface on screen the same
+    // frame. What is baked into the pool's pyramids is the OCCLUSION, and rebaking ten of them
+    // per pointermove is exactly the work that would drop the drag to a slideshow. So the
+    // pyramids follow on a 150 ms debounce: ambient shading can trail the gesture by that much
+    // (it is a soft, low-frequency term — you cannot see it settle), and the shape it is
+    // shading never trails at all.
+    setMorphPoolThresholds(thrs) {
+      if (!pool || !thrs || !thrs.length) return;
+      pool.thr = Array.from(thrs, (v) => Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0)));
+      if (poolOpacTimer) clearTimeout(poolOpacTimer);
+      poolOpacTimer = setTimeout(() => {
+        poolOpacTimer = null;
+        if (!pool || !pool.thr) return;      // the morph was torn down while this waited
+        for (let i = 0; i < pool.tex.length; i++) {
+          bakeOpacity(pool.tex[i], pool.opac[i], pool.dim[i], pool.thr[i] || 0);
+        }
+        render();
+      }, 150);
+    },
     // The far end of a morph. Pass null to stop morphing and go back to one volume. The
     // camera is untouched either way: the two ends share a grid, so they share the box the
     // pivot is derived from.

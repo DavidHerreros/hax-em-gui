@@ -122,6 +122,14 @@ export function createMcEngine() {
 
   return {
     get available() { return alive(); },
+    // How many threads are actually available, and how many decoded bytes the pool may hold.
+    // The morph Prepare needs both to decide how many legs it can contour at once: legs run in
+    // parallel only if their fields are in different workers, and giving a run its own copy of
+    // the map it shares with its neighbour costs one more field — 125 MiB at a 320³ box, out of
+    // this budget. Read rather than assumed, because the worker count depends on the machine
+    // and a dead worker takes its share of the parallelism with it.
+    get workers() { return pool.filter((w) => !w.dead).length; },
+    get budgetBytes() { return BUDGET_BYTES; },
     // Is this exact grid already decoded in the pool? Keys carry the grid's identity
     // (model, size, sample type), so a refetch at a different resolution is a different key
     // and cannot be confused with the old one.
