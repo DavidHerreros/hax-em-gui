@@ -152,6 +152,8 @@ export function WorkflowsView() {
   let drag = null;          // active node drag / wiring / pan gesture
   let nodeSeq = 1, edgeSeq = 1;
   let focusMode = rememberedFocus();   // dim everything not wired to the selection?
+  let stepSearch = "";      // lowercased step-search query; dims non-matches + drives the dropdown
+  let searchState = { matches: [], hi: -1 };   // current dropdown matches + keyboard highlight
   let minimapOn = true;     // overview window visible?
   let mmCollapsed = false;  // overview shrunk to its title pill?
   let mmXform = null;       // last minimap transform (for click-to-navigate)
@@ -171,10 +173,32 @@ export function WorkflowsView() {
   // start as soon as their device has a free slot, so several can be running at once.
   const nameInput = h("input", { class: "wf-name", placeholder: "Workflow name", value: "" });
   nameInput.addEventListener("input", () => { dirty = true, touchHistory(); });
-  const wfSelect = h("select", { class: "wf-select", title: "Open a saved workflow" });
+  const wfSelect = h("select", { class: "wf-select", title: "Open a project or draft workflow" });
   wfSelect.addEventListener("change", async () => {
-    if (!(await confirmDiscard())) { wfSelect.value = wf.id; return; }
-    openWorkflow(wfSelect.value || null);
+    const v = wfSelect.value;
+    if (v === "new-project") {
+      const name = await promptModal({ title: "New project", label: "Project name", placeholder: "my-project", okText: "Create" });
+      if (!name) { syncPickerValue(); return; }
+      if (!(await confirmDiscard())) { syncPickerValue(); return; }
+      try {
+        const created = await api.createProject(name);
+        store.openProject(created);
+        await openProjectById(created.id);
+      } catch (err) { flash("Couldn't create project: " + (err.detail || err.message), "err"); syncPickerValue(); }
+      return;
+    }
+    if (!(await confirmDiscard())) { syncPickerValue(); return; }
+    if (v.startsWith("p:")) {
+      const pid = v.slice(2);
+      const project = projList.find((p) => p.id === pid);
+      if (project) store.openProject(project);
+      try { await openProjectById(pid); }
+      catch (err) { flash("Open failed: " + (err.detail || err.message), "err"); syncPickerValue(); }
+    } else if (v.startsWith("w:")) {
+      openWorkflow(v.slice(2));
+    } else {
+      syncPickerValue();   // the disabled "— open —" placeholder — nothing to do
+    }
   });
   const statusEl = h("span", { class: "wf-status muted" }, "");
   const zoomLabel = h("button", { class: "btn small wf-zoom", title: "Reset zoom to 100%", onclick: resetZoom }, "100%");
@@ -184,6 +208,12 @@ export function WorkflowsView() {
     onclick: (e) => openContextMenu(e.currentTarget, wfMenuItems()) }, icon("more", 15));
   const viewMenuBtn = h("button", { class: "btn small", title: "View & layout",
     onclick: (e) => openContextMenu(e.currentTarget, viewMenuItems()) }, icon("sliders", 14), "View");
+
+  // Step search: the canvas dims to non-matches (same as focus mode's dim/near/focused
+  // classes below) while a dropdown lists the same matches for jumping straight to one.
+  const searchInput = h("input", { class: "wf-search", type: "search", placeholder: "Search steps…" });
+  const searchDd = h("div", { class: "wf-search-dd", hidden: true });
+  const searchWrap = h("div", { class: "wf-search-wrap" }, searchInput, searchDd);
 
   // Steps run concurrently, capped per device: a step's GPU (or the CPU) is the resource
   // it contends for, so branches on different GPUs already run side by side at 1. Raising
@@ -196,15 +226,14 @@ export function WorkflowsView() {
 
   const topbar = h("div", { class: "wf-topbar" },
     h("div", { class: "wf-zone" }, h("strong", null, "Workflow"), wfSelect, nameInput, parSel, wfMenuBtn),
-    h("div", { class: "wf-zone" }, viewMenuBtn, zoomLabel),
+    h("div", { class: "wf-zone" }, searchWrap, viewMenuBtn, zoomLabel),
     h("span", { class: "wf-spacer" }),
     statusEl, actionsEl);
 
   // Menus are built on open, so they always read the current workflow / layout state.
   function wfMenuItems() {
     const items = [
-      { label: "New workflow", icon: icon("plus", 15), onClick: async () => { if (await confirmDiscard()) openWorkflow(null); } },
-      { label: "Open project as workflow", icon: icon("box", 15), onClick: openProject },
+      { label: "New draft workflow", icon: icon("plus", 15), onClick: async () => { if (await confirmDiscard()) openWorkflow(null); } },
     ];
     if (!(wf && wf.project_id)) items.push({ label: "Save as project", icon: icon("save", 15), onClick: saveAsProject });
     if (wf && wf.project_id) items.push({ label: "Reconnect step inputs", icon: icon("link", 15), onClick: relinkInputs });
@@ -538,21 +567,54 @@ export function WorkflowsView() {
     loadLabels().catch(() => {});
     loadProgramGroups().catch(() => {});
     await refreshList();
-    // Reopen the workflow left open last time (if it still exists), so entering the
-    // page resumes where you were instead of a blank canvas. Falls back to empty.
+    // Project-first: entering the builder shows whatever project is already active,
+    // full stop — that beats reopening some other draft/project left open last time.
+    // Only when there's no active project do we fall back to the old "resume where
+    // you were" behavior, and then to a blank canvas.
+    const activePid = getState().activeProjectId;
+    if (activePid) {
+      try { await openProjectById(activePid); return; }
+      catch { /* stale/removed project — fall through to the paths below */ }
+    }
     const last = localStorage.getItem(LAST_WF_KEY);
     if (last && wfList.some((w) => w.id === last)) openWorkflow(last);
     else openWorkflow(null);
   }
 
-  let wfList = [];   // last-fetched saved-workflow list (drives the reopen check)
+  let wfList = [];    // last-fetched workflow list, ALL projects (drives the reopen check + picker groups)
+  let projList = [];  // last-fetched project list (drives the picker's "Projects" group)
   async function refreshList() {
-    const pid = getState().activeProjectId;
-    try { wfList = await api.workflows(pid); } catch { wfList = []; }
+    const [projects, workflows] = await Promise.all([api.projects().catch(() => []), api.workflows().catch(() => [])]);
+    projList = projects; wfList = workflows;
     clear(wfSelect);
-    wfSelect.appendChild(h("option", { value: "" }, "— saved workflows —"));
-    for (const w of wfList) wfSelect.appendChild(h("option", { value: w.id }, w.name || "Untitled"));
-    if (wf) wfSelect.value = wf.id;
+    wfSelect.appendChild(h("option", { value: "", disabled: true }, "— open —"));
+    wfSelect.appendChild(h("option", { value: "new-project" }, "＋ New project…"));
+    const projGroup = h("optgroup", { label: "Projects" });
+    for (const p of projList) projGroup.appendChild(h("option", { value: "p:" + p.id }, p.name));
+    wfSelect.appendChild(projGroup);
+    // Standalone workflows saved while this project was active — shown only once its
+    // live canvas is actually open, so switching projects doesn't leak the last one's drafts.
+    if (wf && wf.kind === "project") {
+      const inProject = wfList.filter((w) => w.project_id === wf.project_id && w.kind !== "project");
+      if (inProject.length) {
+        const grp = h("optgroup", { label: "In this project" });
+        for (const w of inProject) grp.appendChild(h("option", { value: "w:" + w.id }, w.name || "Untitled"));
+        wfSelect.appendChild(grp);
+      }
+    }
+    const drafts = wfList.filter((w) => !w.project_id);
+    if (drafts.length) {
+      const grp = h("optgroup", { label: "Drafts" });
+      for (const w of drafts) grp.appendChild(h("option", { value: "w:" + w.id }, w.name || "Untitled"));
+      wfSelect.appendChild(grp);
+    }
+    syncPickerValue();
+  }
+
+  // What the picker should show for the currently open workflow: the project it lives
+  // in (if it IS that project's live canvas), the draft itself, or nothing.
+  function syncPickerValue() {
+    wfSelect.value = wf ? (wf.kind === "project" ? "p:" + wf.project_id : "w:" + wf.id) : "";
   }
 
   function renderPalette() {
@@ -777,6 +839,10 @@ export function WorkflowsView() {
   }
 
   const nodeById = (id) => graph.nodes.find((n) => n.id === id);
+  // A step "matches" the search box on its custom name or its program, same rule the
+  // jobs-list name filter uses. False whenever the box is empty, so callers can gate
+  // dim/dropdown logic on stepSearch alone without a separate truthiness check.
+  const searchMatch = (n) => !!stepSearch && ((n.name || "").toLowerCase().includes(stepSearch) || n.program.toLowerCase().includes(stepSearch));
   const inputsOf = (program) => Object.entries((byName[program] || {}).bindable || {});
   const LABEL_ROW_H = 22;   // height of one wrapped row of label chips
   const nodeLabels = (n) => labelsByIds(n.labels);
@@ -847,6 +913,10 @@ export function WorkflowsView() {
       // three tiers: the selection (already ringed by .sel/.primary), the steps it is
       // wired to, and everything else.
       if (focus) el.classList.add(!focus.nodes.has(n.id) ? "dim" : (selectedSet.has(n.id) ? "focused" : "near"));
+      // renderNodes() rebuilds every node from scratch, so the search dim/ring has to be
+      // reapplied here too — otherwise a selection change or a poll refresh would silently
+      // drop it until the next keystroke.
+      if (stepSearch) el.classList.add(searchMatch(n) ? "search-match" : "search-dim");
       nodesLayer.appendChild(el);
     }
     redrawWires(null, focus);
@@ -956,11 +1026,85 @@ export function WorkflowsView() {
       if (!s || !d) continue;
       const ins = inputsOf(d.program);
       const idx = Math.max(0, ins.findIndex(([f]) => f === e.field));
-      svg.appendChild(wirePath(outPort(s), inPort(d, idx, ins.length), e, false,
-        focus ? (focus.edges.has(e.id) ? "hot" : "dim") : null));
+      // Focus mode (if on) owns the dim/hot call; otherwise a live search dims any wire
+      // whose endpoints are both non-matches.
+      const fs = focus
+        ? (focus.edges.has(e.id) ? "hot" : "dim")
+        : (stepSearch && !(searchMatch(s) || searchMatch(d)) ? "dim" : null);
+      svg.appendChild(wirePath(outPort(s), inPort(d, idx, ins.length), e, false, fs));
     }
     if (drag && drag.kind === "wire" && tempTo) svg.appendChild(wirePath(outPort(nodeById(drag.from)), tempTo, null, true));
   }
+
+  // ── step search: canvas dim + jump-list dropdown driven by the same query ──
+  function closeSearchDd() { searchDd.hidden = true; }
+
+  // Cheap live pass over the already-rendered nodes (same trick the marquee uses):
+  // toggling classes beats a full renderNodes() on every keystroke.
+  function applySearch() {
+    const active = !!stepSearch;
+    for (const el of nodesLayer.querySelectorAll(".wf-node")) {
+      const n = nodeById(el.dataset.node);
+      const m = n && searchMatch(n);
+      el.classList.toggle("search-dim", active && !m);
+      el.classList.toggle("search-match", active && !!m);
+    }
+    redrawWires();
+    renderSearchDropdown();
+  }
+
+  function renderSearchDropdown() {
+    clear(searchDd);
+    if (!stepSearch) { searchDd.hidden = true; searchState = { matches: [], hi: -1 }; return; }
+    const matches = graph.nodes.filter(searchMatch);
+    if (searchState.hi < 0 || searchState.hi >= matches.length) searchState.hi = matches.length ? 0 : -1;
+    searchState.matches = matches;
+    matches.forEach((n, i) => {
+      const st = runState && runState[n.id] ? runState[n.id].status : null;
+      const row = h("div", {
+        class: "wf-search-row" + (i === searchState.hi ? " hi" : ""),
+        onmousedown: (e) => { e.preventDefault(); jumpTo(n.id); },   // preventDefault: don't blur the input before the click lands
+      },
+        h("span", { class: "wf-search-name" }, n.name || n.program),
+        n.name ? h("span", { class: "wf-search-prog mono" }, n.program) : null,
+        st ? h("span", { class: "wf-search-st", style: { color: statusColor(st) } }, st) : null);
+      searchDd.appendChild(row);
+    });
+    searchDd.appendChild(h("div", { class: "wf-search-count" }, `${matches.length} of ${graph.nodes.length} steps match`));
+    searchDd.hidden = false;
+  }
+
+  // Navigate to a step from the dropdown (click or Enter). No hover preview — this is
+  // the only thing that moves the selection/viewport; the query and the canvas dim
+  // both stay exactly as they were.
+  function jumpTo(id) {
+    selectOnly(id);
+    renderNodes(); renderInspector();
+    const n = nodeById(id);
+    if (n) scrollToContent(n.x + NODE_W / 2, n.y + nodeHeight(n) / 2);
+    closeSearchDd();
+  }
+
+  searchInput.addEventListener("input", (e) => {
+    stepSearch = e.target.value.trim().toLowerCase();
+    applySearch();
+  });
+  searchInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      stepSearch = ""; searchInput.value = "";
+      applySearch();
+      return;
+    }
+    if (!searchState.matches.length) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); searchState.hi = (searchState.hi + 1) % searchState.matches.length; renderSearchDropdown(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); searchState.hi = (searchState.hi - 1 + searchState.matches.length) % searchState.matches.length; renderSearchDropdown(); }
+    else if (e.key === "Enter") { e.preventDefault(); jumpTo(searchState.matches[searchState.hi].id); }
+  });
+  searchInput.addEventListener("blur", () => {
+    // Let a row's mousedown-select land before the dropdown disappears under it.
+    setTimeout(closeSearchDd, 120);
+  });
 
   // ── gestures (node drag + wiring) ──
   function canvasPoint(e) {
@@ -1458,16 +1602,20 @@ export function WorkflowsView() {
   }
 
   // ── open a project as a live workflow ──
-  async function openProject() {
-    const pid = getState().activeProjectId;
-    if (!pid) { flash("Open a project first (Projects) to open it as a workflow.", "err"); return; }
+  // Get-or-create + reconcile `pid`'s per-project workflow and switch the canvas to it.
+  // Shared by the picker (picking a project, or "New project…") and boot()'s auto-open
+  // of whatever project is already active — each of those decides for itself what a
+  // failure means (flash an error vs. quietly fall back to something else), so this
+  // throws rather than swallowing.
+  async function openProjectById(pid) {
     flash("Opening project…", "busy");
-    try {
-      const opened = await api.workflowFromProject(pid);
-      await refreshList();
-      await openWorkflow(opened.id);
-      flash(`Opened "${wf ? wf.name : "project"}" as a live workflow — edits & runs change the project.`, "muted");
-    } catch (err) { flash("Open failed: " + (err.detail || err.message), "err"); }
+    const opened = await api.workflowFromProject(pid);
+    await refreshList();
+    await openWorkflow(opened.id);
+    // refreshList()'s "In this project" group reads the CURRENT wf, which was still the
+    // outgoing one on the call above — rebuild the picker now that wf is the opened project.
+    await refreshList();
+    flash(`Opened "${wf ? wf.name : "project"}" as a live workflow — edits & runs change the project.`, "muted");
   }
 
   // Create a new project backed by this workflow (so edits/runs populate it).
@@ -1527,14 +1675,14 @@ export function WorkflowsView() {
     try {
       if (wf) wf = await api.updateWorkflow(wf.id, { name, graph: graphSnapshot() });
       else wf = await api.createWorkflow({ project_id: pid, name, graph: graphSnapshot() });
-      dirty = false; rememberWorkflow(wf.id); flash("Saved.", "muted"); await refreshList(); wfSelect.value = wf.id; syncActions();
+      dirty = false; rememberWorkflow(wf.id); flash("Saved.", "muted"); await refreshList(); syncPickerValue(); syncActions();
     } catch (err) { flash("Save failed: " + (err.detail || err.message), "err"); }
     return wf;
   }
 
   // ids === null -> run the whole workflow; an array -> run that subset only.
   async function runNodes(ids) {
-    if (!(wf && wf.project_id) && !getState().activeProjectId) { flash("Open a project first (Projects), or use “Save as project” — steps run into a project.", "err"); return; }
+    if (!(wf && wf.project_id) && !getState().activeProjectId) { flash("Open a project from the picker above, or use “Save as project” — steps run into a project.", "err"); return; }
     if (!graph.nodes.length) { flash("Add at least one step.", "warn"); return; }
     if (ids && !ids.length) { flash("Select one or more steps first.", "warn"); return; }
     // Running a subset re-makes those steps under everything they feed, so ask what
@@ -1643,17 +1791,21 @@ export function WorkflowsView() {
     // canvas, so the first open of a freshly built view doesn't record its 0,0 start.
     if (graph.nodes.length) rememberViewport();
     selectedSet.clear();
+    // A query from the outgoing workflow must not dim/ring steps in the one being opened —
+    // and its match list holds that workflow's node ids, which Enter would otherwise
+    // still "select" here.
+    stepSearch = ""; searchInput.value = ""; searchState = { matches: [], hi: -1 }; closeSearchDd();
     if (!id) {
       wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; nameInput.value = ""; seedHistory();
       dirty = false;          // a fresh canvas has nothing to lose yet
-      wfSelect.value = ""; rememberWorkflow(null);
+      syncPickerValue(); rememberWorkflow(null);
       renderNodes(); restoreViewport("");
       renderInspector(); syncActions(); flash("New workflow.", "muted"); return;
     }
     try {
       wf = await api.workflow(id);
       adoptGraph(wf.graph || {});
-      runState = wf.run_state || null; selected = null; nameInput.value = wf.name || ""; wfSelect.value = wf.id;
+      runState = wf.run_state || null; selected = null; nameInput.value = wf.name || ""; syncPickerValue();
       // What was just loaded IS the saved state — without this reset, a dirty flag
       // from the previous canvas followed you into a workflow you never touched.
       dirty = false;

@@ -132,17 +132,21 @@ export function JobsView() {
   root.appendChild(body);
   mount(body, skeleton("260px"));
 
-  const filters = { project: "", program: "", status: "", label: "" };
+  const filters = { name: "", project: "", program: "", status: "", label: "" };
+  const nameInput = h("input", { class: "input filter-search", type: "search", placeholder: "Filter by name…",
+    oninput: (e) => { filters.name = e.target.value.trim().toLowerCase(); renderBody(); } });
   const projectSel = filterSelect("All projects", (v) => { filters.project = v; renderBody(); });
   const programSel = filterSelect("All programs", (v) => { filters.program = v; renderBody(); });
   const statusSel = filterSelect("All statuses", (v) => { filters.status = v; renderBody(); });
   const labelSel = filterSelect("All labels", (v) => { filters.label = v; renderBody(); });
   const clearBtn = h("button", { class: "btn ghost filter-clear", title: "Clear filters", onclick: () => {
-    filters.project = filters.program = filters.status = filters.label = "";
+    filters.name = filters.project = filters.program = filters.status = filters.label = "";
+    nameInput.value = "";
     projectSel.value = programSel.value = statusSel.value = labelSel.value = "";
     renderBody();
   } }, icon("x", 14), "Clear");
   filterBar.append(
+    h("div", { class: "filter-group" }, icon("search", 14), nameInput),
     h("div", { class: "filter-group" }, icon("box", 14), projectSel),
     h("div", { class: "filter-group" }, icon("sliders", 14), programSel),
     h("div", { class: "filter-group" }, icon("list", 14), statusSel),
@@ -164,6 +168,7 @@ export function JobsView() {
     if (!allJobs.length) content = h("p", { class: "muted" }, "No jobs yet. Pick a program from the right menu.");
     else {
       const jobs = allJobs.filter((j) =>
+        (!filters.name || (j.name || "").toLowerCase().includes(filters.name) || j.program.toLowerCase().includes(filters.name)) &&
         (!filters.project || projectKey(j) === filters.project) &&
         (!filters.program || j.program === filters.program) &&
         (!filters.status || j.status === filters.status) &&
