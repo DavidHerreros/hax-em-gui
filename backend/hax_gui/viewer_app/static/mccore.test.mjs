@@ -9,7 +9,7 @@
 // so getting it wrong turns a map inside out. Two topologies, because a sphere alone would
 // not exercise the cases with more than one crossing per tetrahedron.
 import { marchingCubes, taubin, vertexNormals, massCurveField, massAbove, levelForMass, blendFields,
-  blendedMassCurve, massCurve } from "./mccore.js";
+  blendedMassCurve, massCurve, blockMinMax, decodeField, BLOCK } from "./mccore.js";
 
 let failures = 0;
 function check(name, ok, detail = "") {
@@ -35,6 +35,15 @@ function buildField(fn) {
 // Positive inside, as a density map is: high in the middle of the object.
 const sphere = buildField((x, y, z) => 0.6 - Math.hypot(x, y, z));
 const torus = buildField((x, y, z) => 0.22 - Math.hypot(Math.hypot(x, y) - 0.55, z));
+// Five small, well-separated blobs — a real map's shape of problem rather than a test one:
+// almost all of the volume is vacuum, which is what the block skip table is for, and the
+// separation is what a per-block interval must handle and a coarser summary would not.
+const BLOBS = [[-0.6, -0.6, -0.6], [0.55, -0.4, 0.2], [-0.2, 0.6, -0.5], [0.3, 0.35, 0.65], [0, 0, 0.05]];
+const blobs = buildField((x, y, z) => {
+  let s = 0;
+  for (const c of BLOBS) s += Math.exp(-(((x - c[0]) ** 2) + ((y - c[1]) ** 2) + ((z - c[2]) ** 2)) / 0.006);
+  return s;
+});
 
 // Trilinear sample of the field at a model-space point, for checking that vertices really
 // are on the isosurface (the inverse of the mapping above).
@@ -193,6 +202,125 @@ check("mesh is closed (every edge in exactly 2 triangles)", openEdges(tor.mesh.i
   check("a strided draft sits on the same sphere (within a strided cell)", worst < 2 * (2 / N),
     `${worst.toFixed(4)} < ${(4 / N).toFixed(4)}`);
   check("draft is closed", openEdges(draft.indices) === 0);
+}
+
+// ---- block min/max, and the promise that skipping cannot change a mesh ----
+//
+// The skip table is an optimisation, so the only thing worth testing about it is that it is
+// invisible: a march with the table must produce the SAME BYTES as a march without it, or the
+// viewer's surfaces silently depend on which code path ran. Bit-identity, not "close".
+{
+  console.log("\n--- block min/max ---");
+  // Brute force, on a random field with dimensions that are not multiples of the block size —
+  // partial blocks at the far edge of every axis are exactly where an off-by-one lives.
+  const bx = 21, by = 13, bz = 17;
+  let seed = 12345;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const rf = new Float32Array(bx * by * bz);
+  for (let i = 0; i < rf.length; i++) rf[i] = rnd() * 4 - 2;
+  const tbl = blockMinMax(rf, bx, by, bz);
+  let worst = 0, covered = 0;
+  for (let k = 0; k < tbl.bz; k++) {
+    for (let j = 0; j < tbl.by; j++) {
+      for (let i = 0; i < tbl.bx; i++) {
+        let lo = Infinity, hi = -Infinity;
+        for (let z = k * BLOCK; z < Math.min(bz, (k + 1) * BLOCK); z++) {
+          for (let y = j * BLOCK; y < Math.min(by, (j + 1) * BLOCK); y++) {
+            for (let x = i * BLOCK; x < Math.min(bx, (i + 1) * BLOCK); x++) {
+              const v = rf[(z * by + y) * bx + x];
+              if (v < lo) lo = v;
+              if (v > hi) hi = v;
+              covered++;
+            }
+          }
+        }
+        const b = (k * tbl.by + j) * tbl.bx + i;
+        worst = Math.max(worst, Math.abs(tbl.min[b] - lo), Math.abs(tbl.max[b] - hi));
+      }
+    }
+  }
+  check("block dims are ceil(n / 8) on every axis",
+    tbl.bx === Math.ceil(bx / BLOCK) && tbl.by === Math.ceil(by / BLOCK) && tbl.bz === Math.ceil(bz / BLOCK),
+    `${tbl.bx}x${tbl.by}x${tbl.bz} for ${bx}x${by}x${bz}`);
+  check("blocks partition the samples (every sample in exactly one)", covered === rf.length,
+    `${covered} of ${rf.length}`);
+  check("every block's min/max matches brute force exactly", worst === 0, `worst difference ${worst}`);
+
+  // decodeField hands back the table for the field it just decoded; the two must agree, since
+  // the worker marches with one against the other.
+  const g = { nx: 12, ny: 9, nz: 11, f16: false, vmin: 0, vmax: 1, data: new Uint8Array(12 * 9 * 11) };
+  for (let i = 0; i < g.data.length; i++) g.data[i] = (i * 37) & 255;
+  const dec = decodeField(g);
+  const ref = blockMinMax(dec.field, g.nx, g.ny, g.nz);
+  let same = dec.blocks.bx === ref.bx && dec.blocks.by === ref.by && dec.blocks.bz === ref.bz;
+  for (let b = 0; same && b < ref.min.length; b++) same = dec.blocks.min[b] === ref.min[b] && dec.blocks.max[b] === ref.max[b];
+  check("decodeField's table is blockMinMax of the field it returned", same);
+}
+
+// ---- block-skip parity ----
+{
+  console.log("\n--- block-skip parity (with blocks vs without) ---");
+  const same = (a, b) => {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  };
+  const cases = [
+    ["sphere", sphere, [0, 0.25]],
+    ["torus", torus, [0, 0.08]],
+    ["blobs", blobs, [0.25, 0.8]],
+  ];
+  for (const [name, field, levels] of cases) {
+    const blocks = blockMinMax(field, N, N, N);
+    for (const level of levels) {
+      for (const stride of [1, 2]) {
+        const opts = { boxLo: BOX_LO, boxHi: BOX_HI, stride };
+        const plain = marchingCubes(field, N, N, N, level, opts);
+        const fast = marchingCubes(field, N, N, N, level, { ...opts, blocks });
+        const ok = same(plain.positions, fast.positions) && same(plain.normals, fast.normals)
+          && same(plain.indices, fast.indices);
+        check(`${name} level ${level} stride ${stride}: identical with and without blocks`, ok,
+          `${plain.indices.length / 3} triangles`);
+      }
+    }
+  }
+  // Dimensions that are not multiples of the block size, and not equal to each other: the
+  // partial blocks at the far edge have to be tested by a march, not only by the table.
+  {
+    const nx = 37, ny = 29, nz = 23;
+    const f = new Float32Array(nx * ny * nz);
+    for (let z = 0; z < nz; z++) {
+      for (let y = 0; y < ny; y++) {
+        for (let x = 0; x < nx; x++) {
+          const dx = x / nx - 0.5, dy = y / ny - 0.5, dz = z / nz - 0.5;
+          f[(z * ny + y) * nx + x] = Math.sin(9 * dx) * Math.cos(11 * dy) + 0.7 * Math.sin(13 * dz);
+        }
+      }
+    }
+    const blocks = blockMinMax(f, nx, ny, nz);
+    let ok = true, tris = 0;
+    for (const level of [-0.4, 0.3]) {
+      for (const stride of [1, 2, 3]) {
+        const a = marchingCubes(f, nx, ny, nz, level, { stride });
+        const b = marchingCubes(f, nx, ny, nz, level, { stride, blocks });
+        tris += a.indices.length / 3;
+        ok = ok && same(a.positions, b.positions) && same(a.normals, b.normals) && same(a.indices, b.indices);
+      }
+    }
+    check("a 37x29x23 field is identical with and without blocks (levels x strides 1,2,3)", ok, `${tris} triangles`);
+  }
+  // The point of all this: how much of a sparse field the table gets to skip.
+  {
+    const blocks = blockMinMax(blobs, N, N, N);
+    const t0 = process.hrtime.bigint();
+    marchingCubes(blobs, N, N, N, 0.5, { boxLo: BOX_LO, boxHi: BOX_HI });
+    const plain = Number(process.hrtime.bigint() - t0) / 1e6;
+    const t1 = process.hrtime.bigint();
+    marchingCubes(blobs, N, N, N, 0.5, { boxLo: BOX_LO, boxHi: BOX_HI, blocks });
+    const fast = Number(process.hrtime.bigint() - t1) / 1e6;
+    console.log(`      ${N}^3 blobs at level 0.5: ${plain.toFixed(1)} ms without blocks, `
+      + `${fast.toFixed(1)} ms with (${(plain / fast).toFixed(2)}x)`);
+  }
 }
 
 // ---- mass arithmetic ----

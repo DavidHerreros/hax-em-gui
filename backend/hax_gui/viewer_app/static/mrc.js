@@ -326,7 +326,8 @@ const dustParam = () => (dust.on && dust.size > 1 ? `&dust=${Math.round(dust.siz
 // Contour in the browser, off the grid this map already has resident. This is the whole
 // point of the local path: no request, no marching-cubes queue behind other maps, no
 // multi-megabyte mesh over the network — a drag becomes a sequence of local marches that the
-// worker can actually keep up with.
+// worker pool can actually keep up with, and several maps march at once because the pool is
+// several threads.
 async function contourLocal(m, g, draft) {
   status(models.length > 1 ? `Contouring ${m.name}…` : "Contouring…", "busy");
   const key = mcKey(m, g);
@@ -335,8 +336,9 @@ async function contourLocal(m, g, draft) {
                  smooth: draft ? Math.min(m.smooth, DRAFT_SMOOTH) : m.smooth,
                  stride: draft ? 2 : 1 };
   let res = await mc.contour(key, opts);
-  // The worker's LRU can drop a field between requests; the payload is still here, so put it
-  // back and ask once more rather than falling back to the server for a grid we already hold.
+  // The engine's memory budget can evict a field between requests, and a worker that died
+  // takes its fields with it; the payload is still here either way, so put it back and ask
+  // once more rather than falling back to the server for a grid we already hold.
   if (res && res.miss) { mc.store(key, g); res = await mc.contour(key, opts); }
   if (!res || res.miss) return;                             // superseded by a newer contour
   if (res.error) { status("Contour failed: " + res.error, "err"); return; }
@@ -379,7 +381,13 @@ async function runPrefetch() {
       // Skip anything that stopped being worth fetching while it waited.
       if (!m || !m.visible || dust.on || volGridReady(m) || m.gridFetching) continue;
       m.gridFetching = true;
-      try { await volGrid(m); } catch { /* the server path keeps working */ }
+      try {
+        const g = await volGrid(m);
+        // Hand it to the worker pool while nothing is waiting on it. The first local contour
+        // would otherwise open with a 65 MB structured clone and a ~100 ms decode on the
+        // worker's thread — paid here, in the idle stretch this queue exists for, it is free.
+        if (g && mc.available && !dust.on) { const key = mcKey(m, g); if (!mc.has(key)) mc.store(key, g); }
+      } catch { /* the server path keeps working */ }
       finally { m.gridFetching = false; }
     }
   } finally { prefetchRunning = false; }
@@ -433,15 +441,23 @@ function reportSurface() {
 const surfGuard = latestWins();
 
 // Contour every visible map that has not been contoured yet (on open, and whenever a map is
-// switched back on) — DRAFT FIRST, then refine.
+// switched back on). Two quite different jobs, split by whether the map's grid is already in
+// the browser.
 //
-// Both passes are sequential, because each request is a marching-cubes pass server-side and
-// firing twenty at once just queues them behind each other with less feedback. The split is
-// what fixes the wait: a full pass is ~750 ms and ~21 MB per map at a 320³ box, so ten maps
+// Maps that still have to go through the server are contoured DRAFT FIRST, then refined, and
+// both passes are sequential: each request is a marching-cubes pass server-side and firing
+// twenty at once just queues them behind each other with less feedback. The split is what
+// fixes the wait there: a full pass is ~750 ms and ~21 MB per map at a 320³ box, so ten maps
 // meant many seconds of "Contouring…" with an unchanged canvas, while a draft is ~80 ms and
-// ~4 MB. After the first pass every map is on screen; the second replaces each draft in place
-// (the server scales drafts into the same cube, which is what makes them refine without
-// jumping — the contour drag has relied on that since it was written).
+// ~4 MB. The second pass replaces each draft in place (the server scales drafts into the same
+// cube, which is what makes them refine without jumping — the contour drag has relied on that
+// since it was written).
+//
+// Maps whose grid is resident take neither. They contour in the worker pool, which is several
+// threads and no network at all, so there is nothing to serialise them for and nothing a draft
+// would buy: they all go at once, at full resolution, and land as they finish. The two groups
+// also run alongside each other, because they contend for nothing — one is cores, the other is
+// the connection.
 //
 // Only the full mesh stamps m.surface, so an interrupted refine simply retries next time.
 async function loadSurfaces() {
@@ -452,15 +468,30 @@ async function loadSurfaces() {
   const live = () => state.render === "surface" && !surfGuard.stale(tok);
   surfaceRuns++;                                // pauses the background grid prefetch
   try {
-    for (const m of todo) {                     // pass 1: something on screen, fast
-      await surfaceOnce(models.indexOf(m), true);
+    const resident = [], viaServer = [];
+    for (const m of todo) (localContourGrid(m) ? resident : viaServer).push(m);
+    let done = 0;
+    const localPass = Promise.all(resident.map(async (m) => {
       if (!live()) return;
-    }
-    for (const m of todo) {                     // pass 2: the real thing, in place
-      if (m.surface === m.sigma) continue;      // a live single-map load got there first
       await surfaceOnce(models.indexOf(m), false);
-      if (!live()) return;
-    }
+      done++;
+      // contourLocal writes its own "Contouring <name>…" as each starts, so this only has to
+      // keep a count of the ones that have landed.
+      if (live() && resident.length > 1) status(`Contouring… (${done}/${resident.length})`, "busy");
+    }));
+    const serverPass = (async () => {
+      for (const m of viaServer) {                // pass 1: something on screen, fast
+        await surfaceOnce(models.indexOf(m), true);
+        if (!live()) return;
+      }
+      for (const m of viaServer) {                // pass 2: the real thing, in place
+        if (m.surface === m.sigma) continue;      // a live single-map load got there first
+        await surfaceOnce(models.indexOf(m), false);
+        if (!live()) return;
+      }
+    })();
+    await Promise.all([localPass, serverPass]);
+    if (!live()) return;
     reportSurface();
   } finally {
     // Whatever happened, the screen is as settled as this run will make it: let the queued
@@ -523,9 +554,10 @@ function assignSlots(want) {
   return next;
 }
 
-// Local contouring. The engine owns the worker; `mcKey` is the identity of a decoded field
-// inside it — model, resolution and sample type — so a grid refetched at another size is a
-// different field and can never be mistaken for the old one.
+// Local contouring. The engine owns the worker pool and decides which worker holds what;
+// `mcKey` is the identity of a decoded field inside it — model, resolution and sample type —
+// so a grid refetched at another size is a different field and can never be mistaken for the
+// old one.
 const mc = createMcEngine();
 const mcKey = (m, g) => `m${m.index}:${g.nx}x${g.ny}x${g.nz}:${g.f16 ? 16 : 8}`;
 // Can this map be contoured in the browser? It needs the worker, a resident grid at the
@@ -1029,9 +1061,13 @@ async function showMorphFrame(k) {
 }
 
 // The mesh for one frame of a locally contoured morph: the blend of the leg's two resident
-// fields, contoured in the worker. Used twice — to build the playback cache in Prepare, and
-// to answer the scrubber while that cache is still being built.
-async function localMorphMesh(leg, t, stride, smooth) {
+// fields, contoured in the worker holding them. Used twice — to build the playback cache in
+// Prepare, and to answer the scrubber while that cache is still being built.
+//
+// `channel` decides what supersedes what. The scrubber leaves it at the default, so a tick
+// issued while an older one is still marching wins; a Prepare pass contouring several legs at
+// once gives each leg its own, so concurrent legs do not cancel each other.
+async function localMorphMesh(leg, t, stride, smooth, channel) {
   const L = morph.local;
   if (!L) return null;
   {
@@ -1043,14 +1079,21 @@ async function localMorphMesh(leg, t, stride, smooth) {
     const scale = (L.vmax[ib] - L.vmin[ib]) / span;
     const off = (L.vmin[ib] - L.vmin[ia]) / span;
     const req = { keyA: L.keys[ia], keyB: L.keys[ib], t, scale, off, smooth, stride };
+    if (channel) req.channel = channel;
     // Constant mass is solved on the blended field itself, per frame — what the server path
     // does with level_for_mass, and what the GPU morph can only approximate.
     if (morph.mass && L.refMass > 0) req.massTarget = L.refMass;
     else req.level = L.thr[ia] * (1 - t) + (L.thr[ib] * scale + off) * t;
     let res = await mc.morphFrame(req);
-    if (res && res.miss) {                       // the LRU dropped a field: put it back
+    // A miss means the field is not in the worker the engine sent this to — either the budget
+    // evicted it, or the leg's two maps were placed in different workers and a blend cannot
+    // cross that line. Re-storing it `near` its partner is what fixes both: it puts the pair
+    // back together, so this leg's remaining frames go straight through. The pull is always
+    // toward the earlier map of the pair, so a long sequence settles instead of ping-ponging.
+    if (res && res.miss) {
+      const near = res.miss === req.keyA ? req.keyB : req.keyA;
       for (let i = 0; i < L.keys.length; i++) {
-        if (L.keys[i] === res.miss) mc.store(L.keys[i], models[morph.seq[i]].gridVol);
+        if (L.keys[i] === res.miss) mc.store(L.keys[i], models[morph.seq[i]].gridVol, { near });
       }
       res = await mc.morphFrame(req);
     }
@@ -1070,9 +1113,10 @@ let morphPrepGen = 0;
 let morphPreparing = false;      // a Prepare loop owns the worker's morph channel
 let localFrameBusy = false;
 async function localMorphFrame(leg, t) {
-  // While Prepare is contouring the series, the scrubber does not also contour: the two would
-  // supersede each other on the worker's single morph channel and the Prepare would keep
-  // losing frames it had already started. The slider still moves; the cache is moments away.
+  // While Prepare is contouring the series, the scrubber does not also contour. It no longer
+  // has to be for channel reasons — Prepare gives each leg its own — but a scrub frame would
+  // still take a worker away from the pass building the cache, and the cache is what the
+  // slider is waiting for. The slider still moves; it is moments away.
   if (!morph.local || localFrameBusy || morphPreparing) return;
   localFrameBusy = true;
   try {
@@ -1247,7 +1291,7 @@ async function prepareMorph() {
       updateMorphUI();
       return;
     }
-    // Surface mode, local path: every map's grid goes into the worker and every frame is
+    // Surface mode, local path: every map's grid goes into the worker pool and every frame is
     // contoured there, with no server involvement at all. The frames are still CACHED — the
     // cache is what lets playback run at the timer's rate, and contouring per tick instead
     // (the first version of this) generated a few frames a second and looked exactly like
@@ -1287,31 +1331,58 @@ async function prepareMorph() {
         const smooth = models[morph.seq[0]].smooth;
         const gen = ++morphPrepGen;
         const cache = new Array(n);
-        let cachedBytes = 0;
+        let cachedBytes = 0, landed = 0, abandoned = false;
+        // The frames of one leg, in order, per leg. Legs are what parallelises here: a leg's
+        // frames all blend the same two fields, so they belong to whichever worker holds that
+        // pair and have to stay in order (they also share a channel, and sequential awaits are
+        // what keeps newest-wins from cancelling a frame that is already marching). Different
+        // legs have no such tie, so they go at once and the pool spreads them.
+        //
+        // How much that actually wins depends on where the fields ended up: adjacent legs share
+        // a map, and the miss-and-restore in localMorphMesh pulls each pair together, so a long
+        // sequence tends to gather onto one worker after the first frame of each leg. The gain
+        // is real for the early frames and for sequences whose maps were already spread; it is
+        // never a loss, because a converged sequence is exactly what the single worker did.
+        const byLeg = new Map();
+        for (let k = 0; k < n; k++) {
+          const { t, leg } = frameSpec(k);
+          if (!byLeg.has(leg)) byLeg.set(leg, []);
+          byLeg.get(leg).push({ k, t });
+        }
         morphPreparing = true;
+        status(`Preparing morph… 0/${n}`, "busy");
         try {
-          for (let k = 0; k < n; k++) {
-            // Abandoned: the mode changed, the morph was stopped, or another Prepare started.
-            if (gen !== morphPrepGen || state.render !== "surface" || !morph.showing) return;
-            status(`Preparing morph… ${k + 1}/${n}`, "busy");
-            const { t, leg } = frameSpec(k);
-            const res = await localMorphMesh(leg, t, stride, smooth);
-            if (!res) throw new Error("contouring was interrupted");
-            cache[k] = { positions: res.positions, normals: res.normals, indices: res.indices,
-                         bytes: res.positions.byteLength + res.normals.byteLength + res.indices.byteLength };
-            cachedBytes += cache[k].bytes;
-            // The same byte budget the server path enforces, and for the same reason: n frames
-            // of multi-MB meshes will OOM the tab. Frame 0 prices the series before the grind.
-            if (k === 0 && cache[0].bytes * n > morphBudgetBytes()) {
-              throw new Error(`~${Math.round(cache[0].bytes * n / (1024 * 1024))} MB of meshes for ${n} frames — `
-                              + `switch Quality to draft or shorten the sequence (budget ${morphBudgetMB()} MB)`);
+          await Promise.all([...byLeg].map(async ([leg, frames]) => {
+            try {
+              for (const { k, t } of frames) {
+                // Abandoned: the mode changed, the morph was stopped, or another Prepare started.
+                if (gen !== morphPrepGen || state.render !== "surface" || !morph.showing) { abandoned = true; return; }
+                const res = await localMorphMesh(leg, t, stride, smooth, `morph:${leg}`);
+                if (!res) throw new Error("contouring was interrupted");
+                cache[k] = { positions: res.positions, normals: res.normals, indices: res.indices,
+                             bytes: res.positions.byteLength + res.normals.byteLength + res.indices.byteLength };
+                cachedBytes += cache[k].bytes;
+                status(`Preparing morph… ${++landed}/${n}`, "busy");
+                // The same byte budget the server path enforces, and for the same reason: n frames
+                // of multi-MB meshes will OOM the tab. Frame 0 prices the series before the grind.
+                if (k === 0 && cache[0].bytes * n > morphBudgetBytes()) {
+                  throw new Error(`~${Math.round(cache[0].bytes * n / (1024 * 1024))} MB of meshes for ${n} frames — `
+                                  + `switch Quality to draft or shorten the sequence (budget ${morphBudgetMB()} MB)`);
+                }
+                if (cachedBytes > morphBudgetBytes()) {
+                  throw new Error(`morph cache passed ${morphBudgetMB()} MB at frame ${k + 1}/${n} — `
+                                  + "switch Quality to draft or shorten the sequence");
+                }
+              }
+            } catch (err) {
+              // One leg giving up ends the pass, so tell the others: bumping the generation is
+              // the same signal a stopped morph sends, and they check it between frames.
+              morphPrepGen++;
+              throw err;
             }
-            if (cachedBytes > morphBudgetBytes()) {
-              throw new Error(`morph cache passed ${morphBudgetMB()} MB at frame ${k + 1}/${n} — `
-                              + "switch Quality to draft or shorten the sequence");
-            }
-          }
+          }));
         } finally { morphPreparing = false; }
+        if (abandoned) return;
         morph.cache = cache;
         morph.cacheKey = morphKey();
         await showMorphFrame(morph.frame);

@@ -57,8 +57,68 @@ export function halfToFloatTable() {
   return t;
 }
 
-// A grid payload (wire.js parseGrid) -> the normalized 0..1 field, as float32. The payload's
-// vmin/vmax say what those numbers mean in the map's own units; nothing here needs them.
+// ---------------------------------------------------------------------------
+// block min/max (the empty-space skip table)
+// ---------------------------------------------------------------------------
+
+// A cryoEM map is mostly vacuum, and marching it spends most of its time proving that: at a
+// 320³ box the eight-corner occupancy test alone is ~312 ms of the ~673 ms a full contour
+// costs, nearly all of it on cubes that were never going to produce a triangle. The table
+// below is how that time is bought back — one min and one max per 8³ block of samples, so a
+// whole 8×8×8 neighbourhood can be dismissed with two comparisons instead of 512.
+//
+// Eight is not arbitrary: the table is 1/512th of the field (256 KB for a 320³ map, small
+// enough to stay in cache while the march sweeps it) and a block is still coarse enough that
+// a real surface only lights up a shell of them.
+export const BLOCK = 8;
+
+// Per-block min and max over `field`, with block b covering samples [8b, 8(b+1)) clamped to
+// the axis — blocks partition the samples, so every sample is in exactly one.
+//
+// Traversal is z, y, x rather than block-by-block deliberately: reading the field in memory
+// order lets the prefetcher work, and the scatter is into bx accumulators (40 of them for a
+// 320³ map) that never leave L1.
+//
+// NaN is contagious here, by design. A block holding one poisons its interval to
+// (-inf, +inf), which makes every tile that touches it unconditionally active — so a field
+// with NaNs simply gets no skipping rather than silently losing geometry, and the promise
+// that the table can never change the output survives inputs nobody sane would feed it.
+export function blockMinMax(field, nx, ny, nz) {
+  const bx = Math.ceil(nx / BLOCK), by = Math.ceil(ny / BLOCK), bz = Math.ceil(nz / BLOCK);
+  const nb = bx * by * bz;
+  const min = new Float32Array(nb).fill(Infinity);
+  const max = new Float32Array(nb).fill(-Infinity);
+  for (let z = 0; z < nz; z++) {
+    const planeB = ((z / BLOCK) | 0) * by * bx;
+    for (let y = 0; y < ny; y++) {
+      const rowB = planeB + ((y / BLOCK) | 0) * bx;
+      const row = (z * ny + y) * nx;
+      for (let bi = 0, x = 0; bi < bx; bi++) {
+        const b = rowB + bi, xe = Math.min(nx, x + BLOCK);
+        let lo = min[b], hi = max[b];
+        for (; x < xe; x++) {
+          const v = field[row + x];
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+          else if (v !== v) { lo = -Infinity; hi = Infinity; }
+        }
+        min[b] = lo; max[b] = hi;
+      }
+    }
+  }
+  return { min, max, bx, by, bz };
+}
+
+// A grid payload (wire.js parseGrid) -> the normalized 0..1 field as float32, together with
+// its block min/max table. The payload's vmin/vmax say what those numbers mean in the map's
+// own units; nothing here needs them.
+//
+// Returned as a pair rather than as a bare field because every caller that decodes a grid
+// also wants to march it, and the table is the cheaper half of the job (~25 ms against ~100 ms
+// for the decode of a 320³ map). It is a second pass rather than one fused loop on purpose:
+// fusing would mean a second copy of the blocking arithmetic living inside the decoder, where
+// the tests cannot reach it, to save a pass that runs once per grid and is paid back by the
+// first contour.
 export function decodeField(g) {
   const n = g.nx * g.ny * g.nz, out = new Float32Array(n);
   if (g.f16) {
@@ -67,7 +127,7 @@ export function decodeField(g) {
   } else {
     for (let i = 0; i < n; i++) out[i] = g.data[i] / 255;
   }
-  return out;
+  return { field: out, blocks: blockMinMax(out, g.nx, g.ny, g.nz) };
 }
 
 // The density blend a morph frame shows, in the NEAR map's normalized space: the same
@@ -261,6 +321,13 @@ const PAIR_OF = [[-1, 0, 1, 2], [0, -1, 3, 4], [1, 3, -1, 5], [2, 4, 5, -1]];
  * Positions land in the model-space box [boxLo, boxHi], with sample j of the FULL grid at
  * lo + (j + 0.5) * (hi - lo) / n. Returns an indexed mesh with shared vertices and outward
  * (down-gradient) normals.
+ *
+ * `opts.blocks` is a blockMinMax table over the SAME field, and is purely an accelerator: with
+ * it the scan dismisses whole 8³ neighbourhoods of vacuum at once, without it the function
+ * behaves exactly as it did before the table existed. The output is bit-identical either way,
+ * and mccore.test.mjs pins that down — a skipped cube has all eight corners inside blocks
+ * whose combined interval excludes `level`, so every corner is on the same side of it and the
+ * occupancy test would have rejected the cube anyway.
  */
 export function marchingCubes(field, nx, ny, nz, level, opts = {}) {
   const stride = Math.max(1, opts.stride | 0 || 1);
@@ -303,6 +370,29 @@ export function marchingCubes(field, nx, ny, nz, level, opts = {}) {
   const pairA = new Int32Array(4), pairB = new Int32Array(4);
   const px = new Float64Array(4), py = new Float64Array(4), pz = new Float64Array(4);
 
+  // Empty-space skipping, as a 2D mask over the (blockJ, blockI) tiles of the current K row.
+  //
+  // The mask has to be rebuilt as K advances, but only when the K row moves into a different
+  // pair of block layers — for stride 1 that is twice every eight slices, so the whole
+  // apparatus costs about a million comparisons for a 320³ march that it saves hundreds of
+  // millions of field reads on.
+  //
+  // A cube at strided index I spans raw samples [I·s, I·s + s], so it can reach past its own
+  // block by `bex` blocks; every tile is therefore tested against the union of its own block
+  // and the bex blocks after it on each axis. For a stride of 8 or less that is one extra
+  // block per axis, which is where the 2×2×2 union in the loop below comes from.
+  const blocks = opts.blocks || null;
+  const bmin = blocks ? blocks.min : null, bmax = blocks ? blocks.max : null;
+  const bxb = blocks ? blocks.bx : 0, byb = blocks ? blocks.by : 0;
+  const bex = ((stride + BLOCK - 1) / BLOCK) | 0;
+  const tile = blocks ? new Uint8Array(bxb * byb) : null;
+  // Where the I loop resumes after skipping tile bi: the first strided index whose raw sample
+  // lands in the next block along. Always strictly greater than any I inside tile bi, so the
+  // jump can never stall.
+  const tileEnd = blocks ? new Int32Array(bxb) : null;
+  if (blocks) for (let b = 0; b < bxb; b++) tileEnd[b] = Math.ceil((b + 1) * BLOCK / stride);
+  let haveK0 = -1, haveK1 = -1;
+
   // Create (or reuse) the vertex on the edge between cube corners p and q of the tet.
   function edgeVertex(I, J, K, t, e) {
     const spec = TET_EDGES[t][e];
@@ -318,8 +408,42 @@ export function marchingCubes(field, nx, ny, nz, level, opts = {}) {
     const clearBase = ((K + 1) & 1) * planeSlots;
     edgeId.fill(-1, clearBase, clearBase + planeSlots);
     if (K === 0) edgeId.fill(-1, 0, planeSlots);
+    if (blocks) {
+      const z0 = K * stride, k0 = (z0 / BLOCK) | 0;
+      const k1 = Math.min(blocks.bz - 1, ((z0 + stride) / BLOCK) | 0);
+      if (k0 !== haveK0 || k1 !== haveK1) {
+        haveK0 = k0; haveK1 = k1;
+        for (let bj = 0; bj < byb; bj++) {
+          const bj1 = Math.min(byb - 1, bj + bex);
+          for (let bi = 0; bi < bxb; bi++) {
+            const bi1 = Math.min(bxb - 1, bi + bex);
+            let lo = Infinity, hi = -Infinity;
+            for (let k = k0; k <= k1; k++) {
+              for (let j = bj; j <= bj1; j++) {
+                let b = (k * byb + j) * bxb + bi;
+                for (let i = bi; i <= bi1; i++, b++) {
+                  if (bmin[b] < lo) lo = bmin[b];
+                  if (bmax[b] > hi) hi = bmax[b];
+                }
+              }
+            }
+            // Active only if the level actually falls inside the union: `lo < level` means some
+            // corner can be below it and `hi >= level` that some corner can be at or above it,
+            // which is precisely the condition the per-cube occupancy test checks.
+            tile[bj * bxb + bi] = (lo < level && hi >= level) ? 1 : 0;
+          }
+        }
+      }
+    }
     for (let J = 0; J < my - 1; J++) {
+      const tileRow = blocks ? (((J * stride) / BLOCK) | 0) * bxb : 0;
       for (let I = 0; I < mx - 1; I++) {
+        if (blocks) {
+          const bi = (I * stride / BLOCK) | 0;
+          // Nothing in this tile can cross the level: jump straight to the next one. The for
+          // loop's own increment carries I onto the boundary, hence the -1.
+          if (!tile[tileRow + bi]) { I = tileEnd[bi] - 1; continue; }
+        }
         const base = K * sz + J * sy + I * sx;
         const v0 = field[base], v1 = field[base + sx], v2 = field[base + sy], v3 = field[base + sx + sy];
         const v4 = field[base + sz], v5 = field[base + sx + sz], v6 = field[base + sy + sz], v7 = field[base + sx + sy + sz];
@@ -451,11 +575,26 @@ export function vertexNormals(positions, indices) {
 // Taubin λ|μ smoothing, in place, mirroring meshing._taubin_smooth including its constants
 // and its duplicate-edge weighting (an edge shared by two triangles is counted twice, both
 // in the neighbour sum and in the degree, which is what the server's sparse matrix does).
+//
+// The 2·iterations passes ping-pong between two preallocated float32 buffers. The obvious
+// implementation snapshots the positions per pass with `Float64Array.from(positions)`, which
+// at a 320³ map's 1.17M vertices is a 28 MB allocation twelve times over for six iterations —
+// enough garbage to make the collector a visible share of the cost. Halving the buffer to
+// float32 also halves what the gather reads, and the gather is nearly the whole loop: measured
+// apart, one pass over this mesh is ~30 ms of neighbour gathering against ~4 ms of everything
+// else, which is the floor the shape of the adjacency sets and the reason this is a ~1.15x win
+// rather than the several-fold one the allocation figure suggests.
+//
+// Nothing about the numbers changes: the old code stored each pass back into `positions`,
+// which is float32, so it rounded to single precision every pass exactly as this does, and
+// the neighbour sums are accumulated in plain JS numbers (f64) in both.
 export function taubin(positions, indices, iterations, lam = 0.5, mu = -0.53) {
   const it = iterations | 0;
   if (it <= 0 || !positions.length || !indices.length) return positions;
   const nv = positions.length / 3;
-  // CSR-ish adjacency with multiplicity: count, then fill.
+  // CSR-ish adjacency with multiplicity: count, then fill. Neighbours are stored as their
+  // offset INTO the position buffer (v * 3) rather than as vertex ids, which takes the
+  // multiply out of the one loop that runs fourteen million times per pass.
   const deg = new Int32Array(nv);
   const bump = (a, b) => { deg[a]++; deg[b]++; };
   for (let f = 0; f < indices.length; f += 3) {
@@ -465,22 +604,27 @@ export function taubin(positions, indices, iterations, lam = 0.5, mu = -0.53) {
   for (let v = 0; v < nv; v++) start[v + 1] = start[v] + deg[v];
   const nbr = new Int32Array(start[nv]);
   const fill = start.slice(0, nv);
-  const put = (a, b) => { nbr[fill[a]++] = b; nbr[fill[b]++] = a; };
+  const put = (a, b) => { nbr[fill[a]++] = b * 3; nbr[fill[b]++] = a * 3; };
   for (let f = 0; f < indices.length; f += 3) {
     put(indices[f], indices[f + 1]); put(indices[f + 1], indices[f + 2]); put(indices[f + 2], indices[f]);
   }
+  let src = new Float32Array(positions.length);
+  let dst = new Float32Array(positions.length);
+  src.set(positions);
   const step = (w) => {
-    const src = Float64Array.from(positions);
     for (let v = 0; v < nv; v++) {
-      const s = start[v], e = start[v + 1], d = e - s;
-      if (!d) continue;
+      const p = v * 3, s = start[v], e = start[v + 1], d = e - s;
+      const x = src[p], y = src[p + 1], z = src[p + 2];
+      if (!d) { dst[p] = x; dst[p + 1] = y; dst[p + 2] = z; continue; }
       let sx = 0, sy = 0, sz = 0;
-      for (let k = s; k < e; k++) { const q = nbr[k] * 3; sx += src[q]; sy += src[q + 1]; sz += src[q + 2]; }
-      positions[v * 3] = src[v * 3] + w * (sx / d - src[v * 3]);
-      positions[v * 3 + 1] = src[v * 3 + 1] + w * (sy / d - src[v * 3 + 1]);
-      positions[v * 3 + 2] = src[v * 3 + 2] + w * (sz / d - src[v * 3 + 2]);
+      for (let k = s; k < e; k++) { const q = nbr[k]; sx += src[q]; sy += src[q + 1]; sz += src[q + 2]; }
+      dst[p] = x + w * (sx / d - x);
+      dst[p + 1] = y + w * (sy / d - y);
+      dst[p + 2] = z + w * (sz / d - z);
     }
+    const t = src; src = dst; dst = t;
   };
   for (let i = 0; i < it; i++) { step(lam); step(mu); }
+  positions.set(src);
   return positions;
 }
