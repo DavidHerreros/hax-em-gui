@@ -25,6 +25,8 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +79,23 @@ def _read_scale(path: str) -> tuple[float, list[float]]:
 # handles are kept alive for the process lifetime; the viewer is per-session.
 _MMAP_BYTES = int(os.environ.get("HAX_VIEWER_MMAP_MB", "512")) * 1024 * 1024
 _OPEN_MMAPS: list[Any] = []
+
+# How much encoded /api/grid payload the process may keep. Packing one is a strided copy plus
+# a normalize, a clip and a float16 conversion over the whole volume — measured at about a
+# second for a native 320³ f16 payload, against ~50 ms to hand the cached bytes back — and the
+# answer never changes, because a model's volume never changes. What made that worth caching is
+# the viewer's grid prefetch: it now asks for every map on the scene, and a mode flip or a
+# re-open asks for all of them again.
+#
+# The cap is global rather than per model because it is the process's memory that is at
+# stake, not any one map's: ten native f16 payloads are ~650 MB sitting on top of the
+# volumes they were cut from. Set HAX_VIEWER_GRID_CACHE_MB=0 to switch the cache off.
+#
+# Read as a float and then floored, unlike _MMAP_BYTES above, for two reasons: a fractional
+# megabyte is the only way to exercise eviction in a test without allocating a real gigabyte,
+# and `int("512.0")` raises — an env var with a decimal point in it should not take the
+# server down before it has served a request.
+_GRID_CACHE_BYTES = int(float(os.environ.get("HAX_VIEWER_GRID_CACHE_MB", "512")) * 1024 * 1024)
 
 
 def _load_mrc(path: str) -> np.ndarray:
@@ -201,6 +220,45 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
         resp = await call_next(request)
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
+
+    # Encoded /api/grid payloads, newest last, under a lock because the sync endpoints run in
+    # starlette's threadpool and several tabs (or the viewer's own prefetch queue) can be in
+    # `grid` at once. Only /api/grid is cached: /api/paint/grid depends on the pair AND on the
+    # ± range the caller picked, /api/morph/grid on the blend fraction, and neither is issued
+    # in the volume the prefetch is. Nothing here has to think about dust or paint either —
+    # those are surface endpoints and never produce a grid payload.
+    grid_cache: OrderedDict[tuple[int, int, int], bytes] = OrderedDict()
+    grid_lock = threading.Lock()
+    # Exposed on the app so a test can tell a hit from a miss without timing it.
+    app.state.grid_cache_stats = {"hits": 0, "misses": 0, "bytes": 0, "entries": 0}
+
+    def _grid_cache_get(key: tuple[int, int, int]) -> bytes | None:
+        stats = app.state.grid_cache_stats
+        with grid_lock:
+            payload = grid_cache.get(key)
+            if payload is None:
+                stats["misses"] += 1
+                return None
+            grid_cache.move_to_end(key)      # least recently used first, for the eviction below
+            stats["hits"] += 1
+            return payload
+
+    def _grid_cache_put(key: tuple[int, int, int], payload: bytes) -> None:
+        # A payload too big for the whole budget is simply not cached: evicting everything
+        # else to hold one map would be worse than re-encoding it.
+        if _GRID_CACHE_BYTES <= 0 or len(payload) > _GRID_CACHE_BYTES:
+            return
+        stats = app.state.grid_cache_stats
+        with grid_lock:
+            old = grid_cache.pop(key, None)
+            if old is not None:
+                stats["bytes"] -= len(old)
+            grid_cache[key] = payload
+            stats["bytes"] += len(payload)
+            while stats["bytes"] > _GRID_CACHE_BYTES and len(grid_cache) > 1:
+                _, dead = grid_cache.popitem(last=False)
+                stats["bytes"] -= len(dead)
+            stats["entries"] = len(grid_cache)
 
     @app.get("/api/health")
     def health() -> dict:
@@ -331,14 +389,29 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
         `bits=16` returns the same thing with float16 samples under the GRID16 tag, and
         raises the size cap to 384 so the shaded-isosurface mode can ask for the map at its
         native resolution (a `size` at or above the box strides by 1, i.e. no downsampling
-        at all). Everything else keeps the uint8 payload and the 256 cap."""
+        at all). Everything else keeps the uint8 payload and the 256 cap.
+
+        The bytes are cached per (model, requested size, sample width) — see the LRU above
+        the endpoints — because packing them is the expensive half of this and the volume
+        they are packed from never changes."""
         model = scene.get(m)
         cap = 384 if int(bits) == 16 else 256
-        ds, step = _downsample(model.vol, int(max(16, min(cap, size))))
-        full, off = scene.norm(model)
-        lo, hi = grid_box(model.vol.shape, ds.shape, step, full_size=full, offset=off)
-        return Response(content=_grid_payload(ds, model.stats, lo, hi, bits=bits),
-                        media_type="application/octet-stream")
+        want = int(max(16, min(cap, size)))
+        # Any size at or above the box strides by 1 and hands back the map itself, so a
+        # 384 request and a 200 request against a 200³ map are the same bytes. Folding them
+        # onto one key keeps the cache from holding the native payload twice — which is
+        # exactly what the viewer would cause, asking 256 in one mode and 384 in another.
+        want = min(want, int(max(model.vol.shape)))
+        wide = 16 if int(bits) == 16 else 8
+        key = (model.index, want, wide)
+        payload = _grid_cache_get(key)
+        if payload is None:
+            ds, step = _downsample(model.vol, want)
+            full, off = scene.norm(model)
+            lo, hi = grid_box(model.vol.shape, ds.shape, step, full_size=full, offset=off)
+            payload = _grid_payload(ds, model.stats, lo, hi, bits=bits)
+            _grid_cache_put(key, payload)
+        return Response(content=payload, media_type="application/octet-stream")
 
     @app.get("/api/morph/grid")
     def morph_grid(a: int = Query(...), b: int = Query(...), t: float = Query(0.5),

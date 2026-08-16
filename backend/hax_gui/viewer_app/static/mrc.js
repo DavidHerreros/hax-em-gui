@@ -191,12 +191,19 @@ async function loadHistogram() {
   hist.setData(h, h.mean + m.sigma * h.std);
 }
 
-async function fetchGrid(m, size, bits = 8) {
+// `signal` lets a superseded run stop its download. A grid is 65 MB at a native box and the
+// browser only opens six connections to a host, so a run that has already been overtaken goes
+// on occupying one of them for seconds — the newest-wins guards drop its payload, but only
+// after it has finished arriving, which is exactly the wrong order.
+async function fetchGrid(m, size, bits = 8, signal) {
   const url = `./api/grid?m=${m}&size=${size}` + (bits === 16 ? "&bits=16" : "");
-  const g = parseGrid(await (await fetch(url)).arrayBuffer());
+  const g = parseGrid(await (await fetch(url, { signal })).arrayBuffer());
   g.size = size;   // the cached grid has to remember what it was cut at (see volWant)
   return g;
 }
+// Did this reject because someone cancelled it? Then the run that cancelled it has already
+// decided what happens next, and there is nothing to report.
+const aborted = (err) => !!err && err.name === "AbortError";
 
 // What the current render style wants out of /api/grid.
 //
@@ -263,10 +270,10 @@ function volWant(m, cap) {
 // the cache-by-size logic above, the identity skip in the renderer and the morph pool are all
 // completely unaware of it; it is dropped the moment the real grid lands.
 const ISO_DRAFT = 128;
-async function volDraft(m) {
+async function volDraft(m, signal) {
   if (m.gridVolDraft) return m.gridVolDraft;
-  m.gridVolDraft = volRenderer.hasF16 ? await fetchGrid(m.index, ISO_DRAFT, 16)
-                                      : await fetchGrid(m.index, 96, 8);
+  m.gridVolDraft = volRenderer.hasF16 ? await fetchGrid(m.index, ISO_DRAFT, 16, signal)
+                                      : await fetchGrid(m.index, 96, 8, signal);
   return m.gridVolDraft;
 }
 // Is the cached grid the payload the current style wants — same size AND same sample type?
@@ -275,14 +282,54 @@ function volGridReady(m) {
   return !!m.gridVol && m.gridVol.size === w.size && !!m.gridVol.f16 === (w.bits === 16);
 }
 
+// One download per (map, payload), however many callers ask for it.
+//
+// Two callers wanting the same grid at the same moment is now the normal case rather than a
+// corner: the volume loader fetches what it needs to draw while the prefetch queue
+// independently decides the same map is worth having resident. Both used to find the cache
+// stale and both used to download 65 MB, and last writer won — wasteful, but harmless,
+// because the two payloads were identical.
+//
+// Cancellation is what makes that no longer harmless: one caller giving up must not take the
+// other caller's download with it. So the fetch is shared and it is abandoned only when every
+// caller that asked for it has walked away. The prefetch queue asks WITHOUT a signal, which is
+// the whole statement "this download is never wasted" — it counts as a consumer that never
+// leaves, so a grid the queue wants finishes arriving no matter who else loses interest.
+function sharedGridFetch(m, want, signal) {
+  const key = `${want.size}:${want.bits}`;
+  let live = m.gridPending;
+  // A record whose controller has already fired is doomed — its rejection has simply not been
+  // delivered yet — so a caller arriving in that window starts a fresh fetch rather than
+  // joining one that is on its way to throwing at it.
+  if (!live || live.key !== key || live.ctrl.signal.aborted) {
+    const ctrl = new AbortController();
+    live = m.gridPending = { key, ctrl, wanted: 0, promise: null };
+    // Clear the slot on settle, but only if it is still this fetch: a later caller wanting a
+    // different payload has already replaced it, and must not be un-registered by an older one.
+    const done = () => { if (m.gridPending === live) m.gridPending = null; };
+    live.promise = fetchGrid(m.index, want.size, want.bits, ctrl.signal)
+      .then((g) => { done(); return g; }, (err) => { done(); throw err; });
+  }
+  live.wanted++;
+  if (signal) {
+    const leave = () => { if (--live.wanted <= 0) live.ctrl.abort(); };
+    if (signal.aborted) leave();                                  // superseded before it even asked
+    else signal.addEventListener("abort", leave, { once: true });
+  }
+  return live.promise;
+}
+
 // The cached grid is reusable only if it is the payload the current style wants — same size
 // AND same sample type. The smoothing tag stops a uint8 grid from being blurred twice, which
 // would soften it for good.
-async function volGrid(m, cap) {
+//
+// An aborted fetch rejects out of here without touching m.gridVol, so a cancelled run leaves
+// the map exactly as it found it — with its previous grid, or with none.
+async function volGrid(m, cap, signal) {
   const want = volWant(m, cap);
   const cached = m.gridVol;
   if (!cached || cached.size !== want.size || !!cached.f16 !== (want.bits === 16)) {
-    m.gridVol = await fetchGrid(m.index, want.size, want.bits);
+    m.gridVol = await sharedGridFetch(m, want, signal);
   }
   const g = m.gridVol;
   if (state.render === "iso" && !g.f16 && !g.smoothed) {
@@ -365,21 +412,43 @@ async function contourLocal(m, g, draft) {
 const prefetchQ = [];
 let prefetchRunning = false;
 let surfaceRuns = 0;            // how many loadSurfaces passes are currently live
+let volumeRuns = 0;             // ...and loadVolume passes, which own the connection just as much
+// Is a resident grid worth having at all right now? volWant only asks for the payload the
+// local contourer and the shaded-iso mode use while one of those is on screen; in MIP or glow
+// it asks for a 96³ stand-in, and draining the queue there would REPLACE a map's native grid
+// with a coarse one. So the queue holds its contents and waits for a mode that wants them.
+const prefetchWorth = () => state.render === "surface" || state.render === "iso";
+// Nothing on screen is loading: the queue may have the connection.
+const prefetchIdle = () => !surfaceRuns && !volumeRuns;
 function queuePrefetch(m) {
   if (!mc.available || dust.on || m.gridFetching || volGridReady(m)) return;
   if (!prefetchQ.includes(m)) prefetchQ.push(m);
-  if (!surfaceRuns) runPrefetch();
+  if (prefetchIdle()) runPrefetch();
+}
+// Every map at once, visible ones first. The first contour of a map used to be what queued it,
+// so a map you had not touched yet always went through the server once before it could ever be
+// local, and a map you had merely switched off never became local at all — even though
+// switching it back on is exactly the interaction this is meant to make instant. Queuing costs
+// nothing: the gates below decide when any of it actually runs.
+function queueAllPrefetch() {
+  if (!prefetchWorth()) return;
+  for (const m of visibleModels()) queuePrefetch(m);
+  for (const m of models) if (!m.visible) queuePrefetch(m);
 }
 async function runPrefetch() {
   if (prefetchRunning) return;
   prefetchRunning = true;
   try {
     while (prefetchQ.length) {
-      // A new contouring pass has the connection; leave the rest queued for its end.
-      if (surfaceRuns) return;
+      // A contouring pass or a volume load has the connection; leave the rest queued for its
+      // end. Same for a mode that does not want these payloads — the queue keeps its contents
+      // and queueAllPrefetch restarts it when the user comes back to a mode that does.
+      if (!prefetchIdle() || !prefetchWorth()) return;
       const m = prefetchQ.shift();
-      // Skip anything that stopped being worth fetching while it waited.
-      if (!m || !m.visible || dust.on || volGridReady(m) || m.gridFetching) continue;
+      // Skip anything that stopped being worth fetching while it waited. Being HIDDEN is not
+      // one of those things: the grid a map needs is the same whether it is on screen or not,
+      // and having it ready is what makes switching the map on instant rather than a download.
+      if (!m || dust.on || volGridReady(m) || m.gridFetching) continue;
       m.gridFetching = true;
       try {
         const g = await volGrid(m);
@@ -393,7 +462,10 @@ async function runPrefetch() {
   } finally { prefetchRunning = false; }
 }
 
-async function surfaceOnce(idx, draft) {
+// `signal` belongs to the loadSurfaces pass this call is part of, and is undefined for the
+// single-map paths (the contour drag, and the one-map repaint after map arithmetic): those
+// coalesce through makeLive instead, and a mesh they asked for is a mesh they still want.
+async function surfaceOnce(idx, draft, signal) {
   const m = models[idx];
   if (!m) return;
   const local = localContourGrid(m);
@@ -405,12 +477,12 @@ async function surfaceOnce(idx, draft) {
     let mesh;
     if (painted && painted.m === idx && models[painted.other]) {
       const res = await fetch(`./api/paint?m=${m.index}&other=${models[painted.other].index}`
-                              + `&sigma=${m.sigma.toFixed(3)}${detail}`);
+                              + `&sigma=${m.sigma.toFixed(3)}${detail}`, { signal });
       if (!res.ok) throw new Error(((await res.json()).detail) || res.statusText);
       mesh = parseColorMesh(await res.arrayBuffer());
     } else {
       const buf = await (await fetch(`./api/decode?m=${m.index}&sigma=${m.sigma.toFixed(3)}`
-                                     + `${dustParam()}${detail}`)).arrayBuffer();
+                                     + `${dustParam()}${detail}`, { signal })).arrayBuffer();
       mesh = parseMesh(buf);
     }
     if (state.render !== "surface") return;   // mode switched while we were waiting
@@ -424,7 +496,10 @@ async function surfaceOnce(idx, draft) {
     // not run while a contouring pass is live, so this cannot compete with the maps still
     // waiting to appear.
     if (!draft) queuePrefetch(m);
-  } catch (err) { status("Contour failed: " + err.message, "err"); }
+  } catch (err) {
+    if (aborted(err)) return;      // a newer pass took over and cancelled this download
+    status("Contour failed: " + err.message, "err");
+  }
 }
 const loadSurface = makeLive(surfaceOnce);
 
@@ -438,7 +513,13 @@ function reportSurface() {
 // Newest-run-wins for the two-pass contouring below: the refine pass is long enough that a
 // visibility change can easily land in the middle of it, and a stale run must not go on
 // pushing meshes for a set of maps that is no longer on screen.
+//
+// The guard alone only stops a stale run from PAINTING. Its downloads carried on to the end —
+// a full mesh is ~21 MB — holding one of the six connections the browser will open to this
+// host and delaying the pass the user is actually waiting for. The controller cancels them
+// outright: one per run, aborted by whichever run takes the token next.
 const surfGuard = latestWins();
+let surfAbort = null;
 
 // Contour every visible map that has not been contoured yet (on open, and whenever a map is
 // switched back on). Two quite different jobs, split by whether the map's grid is already in
@@ -465,6 +546,9 @@ async function loadSurfaces() {
   const todo = visibleModels().filter((m) => m.surface !== m.sigma);
   if (!todo.length) { reportSurface(); return; }
   const tok = surfGuard.take();
+  if (surfAbort) surfAbort.abort();             // the pass we just superseded stops downloading
+  surfAbort = new AbortController();
+  const signal = surfAbort.signal;
   const live = () => state.render === "surface" && !surfGuard.stale(tok);
   surfaceRuns++;                                // pauses the background grid prefetch
   try {
@@ -481,12 +565,12 @@ async function loadSurfaces() {
     }));
     const serverPass = (async () => {
       for (const m of viaServer) {                // pass 1: something on screen, fast
-        await surfaceOnce(models.indexOf(m), true);
+        await surfaceOnce(models.indexOf(m), true, signal);
         if (!live()) return;
       }
       for (const m of viaServer) {                // pass 2: the real thing, in place
         if (m.surface === m.sigma) continue;      // a live single-map load got there first
-        await surfaceOnce(models.indexOf(m), false);
+        await surfaceOnce(models.indexOf(m), false, signal);
         if (!live()) return;
       }
     })();
@@ -497,7 +581,7 @@ async function loadSurfaces() {
     // Whatever happened, the screen is as settled as this run will make it: let the queued
     // grids have the connection now.
     surfaceRuns--;
-    if (!surfaceRuns) runPrefetch();
+    if (prefetchIdle()) runPrefetch();
   }
 }
 
@@ -571,6 +655,18 @@ function localContourGrid(m) {
 }
 
 const volGuard = latestWins();
+// The downloads the newest volume run owns, so a superseded one can be told to stop. Volume
+// grids are the biggest thing this viewer pulls — 65 MB each, several per run — and until now
+// a run that had already been overtaken went on pulling all of them and only had its payloads
+// discarded at the guard, which is to say after they had cost everything they were going to.
+let volAbort = null;
+// Take the newest-wins token and the run's cancellation together, so the two can never drift
+// apart: whoever takes the token is by definition the run whose downloads should survive.
+function volRun() {
+  if (volAbort) volAbort.abort();
+  volAbort = new AbortController();
+  return { tok: volGuard.take(), signal: volAbort.signal };
+}
 async function loadVolume() {
   if (morph.showing) return;     // the morph owns the volume canvas
   if (paintedAlone()) return loadDiffVolume();
@@ -583,7 +679,7 @@ async function loadVolume() {
   const dropped = Math.max(0, show.length - volRenderer.maxSlots);
   if (dropped) show = show.slice(0, volRenderer.maxSlots);
   status("Loading volume…", "busy");
-  const tok = volGuard.take();   // changing the shown set mid-download: newest wins
+  const { tok, signal } = volRun();   // changing the shown set mid-download: newest wins
   // Push whatever each map currently has — its real grid if it has arrived, otherwise its
   // draft. Sticky slots plus the renderer's identity check mean a map whose grid did not
   // change costs nothing here, so this is cheap to call repeatedly as the fetches land.
@@ -599,6 +695,7 @@ async function loadVolume() {
                color: hexToRgb(m.color), threshold: thrFor(m, g) };
     }));
   };
+  volumeRuns++;                  // pauses the background grid prefetch, as a contour pass does
   try {
     const need = show.filter((m) => !volGridReady(m));
     // Draft pass, iso only: a map with nothing to show at all gets a 128³ stand-in first, so
@@ -608,7 +705,7 @@ async function loadVolume() {
       const blank = need.filter((m) => !m.gridVol);
       for (let i = 0; i < blank.length; i++) {
         status(`Loading volume… draft ${i + 1}/${blank.length}`, "busy");
-        await volDraft(blank[i]);
+        await volDraft(blank[i], signal);
         if (volGuard.stale(tok)) return;
       }
       if (blank.length) pushSlots();
@@ -618,7 +715,7 @@ async function loadVolume() {
     for (let i = 0; i < need.length; i++) {
       const m = need[i];
       status(need.length > 1 ? `Loading volume… ${i + 1}/${need.length}` : "Loading volume…", "busy");
-      await volGrid(m);
+      await volGrid(m, undefined, signal);
       if (volGuard.stale(tok)) return;
       delete m.gridVolDraft;      // the real thing is resident; ~4 MB of stand-in is dead weight
       pushSlots();
@@ -630,7 +727,12 @@ async function loadVolume() {
       ? `Volume · ${show.length} maps composited`
         + (dropped ? ` · ${dropped} hidden (max ${volRenderer.maxSlots})` : "")
       : `Volume ${g0.nx}×${g0.ny}×${g0.nz} · ${show[0].name}`);
-  } catch (err) { status("Volume load failed: " + err.message, "err"); }
+  } catch (err) {
+    if (!aborted(err)) status("Volume load failed: " + err.message, "err");
+  } finally {
+    volumeRuns--;
+    if (prefetchIdle()) runPrefetch();
+  }
 }
 
 // Volume rendering of the painted difference: the signed A − B grid ray-marched
@@ -638,7 +740,10 @@ async function loadVolume() {
 // reading as the painted surface. The contour threshold does not apply here.
 async function loadDiffVolume() {
   status("Loading difference volume…", "busy");
-  const tok = volGuard.take();
+  // Through volRun even though the difference grid is a small one and is not itself
+  // cancellable: taking the token is what supersedes an ordinary volume load, and that load's
+  // native grids are exactly the downloads worth stopping.
+  const { tok } = volRun();
   try {
     if (!painted.gridVol) painted.gridVol = await fetchPaintGrid(96);
     if (volGuard.stale(tok) || !painted) return;
@@ -1567,6 +1672,12 @@ function setMode(mode) {
     loadVolume();
   }
   else { loadSlices(); }
+  // Entering a mode that wants resident grids: queue every map's. This is also how they get
+  // queued at page OPEN — boot's whole job ends in a setMode, so by the time this line runs the
+  // model list is loaded and the first render pass has been kicked off one line above. The
+  // gates in runPrefetch are what keep the queue behind that paint rather than in front of it.
+  // A no-op in the modes that do not want these payloads.
+  queueAllPrefetch();
   // Morphing is a 3D notion; orthogonal slices have nothing to animate.
   $("morph").hidden = !(models.length > 1 && info && info.morph_shape) || isSlices;
   if (!$("morph").hidden) updateMorphUI();
