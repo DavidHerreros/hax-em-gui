@@ -17,6 +17,8 @@ import { createHistogram } from "./histogram.js";
 import { createSlices } from "./slices.js";
 import { parseColorMesh, parseGrid, parseMesh } from "./wire.js";
 import { latestWins, makeLive } from "./viewerbase.js";
+import { createMcEngine } from "./mcengine.js";
+import { massCurve, massAbove, levelForMass } from "./mccore.js";
 
 const $ = (id) => document.getElementById(id);
 const THEME_BG = { dark: "#040610", light: "#e7ecf3" };
@@ -212,7 +214,10 @@ const ISO_MAX = 384;          // backend cap for 16-bit requests
 // leaving the morph and going back to one map simply refetches at native.
 const ISO_MORPH_MAX = 256;
 function volWant(m, cap) {
-  if (state.render !== "iso") return { size: 96, bits: 8 };
+  // Surface mode wants the same payload iso does: it is the grid the browser contours from
+  // (see localContourGrid), and sharing it means switching between the two modes costs no
+  // download at all.
+  if (state.render !== "iso" && state.render !== "surface") return { size: 96, bits: 8 };
   if (!volRenderer.hasF16) return { size: ISO_GRID_U8, bits: 8 };
   return { size: Math.min(cap || ISO_MAX, Math.max(...m.shape)), bits: 16 };
 }
@@ -281,9 +286,47 @@ const dustParam = () => (dust.on && dust.size > 1 ? `&dust=${Math.round(dust.siz
 // so contour and smoothing changes keep it (the paint endpoint contours + samples in
 // one pass, so this costs the same as a plain decode). Hide-dust is the one option a
 // painted surface ignores — the paint endpoint has no dust pass.
+// Contour in the browser, off the grid this map already has resident. This is the whole
+// point of the local path: no request, no marching-cubes queue behind other maps, no
+// multi-megabyte mesh over the network — a drag becomes a sequence of local marches that the
+// worker can actually keep up with.
+async function contourLocal(m, g, draft) {
+  status(models.length > 1 ? `Contouring ${m.name}…` : "Contouring…", "busy");
+  const key = mcKey(m, g);
+  if (!mc.has(key)) mc.store(key, g);
+  const opts = { level: thrFor(m, g),                       // the same normalized contour iso uses
+                 smooth: draft ? Math.min(m.smooth, DRAFT_SMOOTH) : m.smooth,
+                 stride: draft ? 2 : 1 };
+  let res = await mc.contour(key, opts);
+  // The worker's LRU can drop a field between requests; the payload is still here, so put it
+  // back and ask once more rather than falling back to the server for a grid we already hold.
+  if (res && res.miss) { mc.store(key, g); res = await mc.contour(key, opts); }
+  if (!res || res.miss) return;                             // superseded by a newer contour
+  if (res.error) { status("Contour failed: " + res.error, "err"); return; }
+  if (state.render !== "surface") return;                   // mode switched while we marched
+  renderer.setModelMesh(m.index, res.positions, res.normals, res.indices);
+  renderer.setModelColor(m.index, hexToRgb(m.color));
+  renderer.setModelVisible(m.index, m.visible);
+  if (!draft) m.surface = m.sigma;                          // only a full mesh settles the map
+  if (!res.indices.length) { status(`Empty surface at this contour (${m.name})`, "warn"); return; }
+  reportSurface();
+}
+
+// Fetch the grid this map would be contoured from, in the background: the first show still
+// goes through the server (nothing is resident yet), but every contour after the grid lands
+// is local — which is the moment the contour slider stops being a request-per-drag and
+// becomes live.
+function prefetchGrid(m) {
+  if (!mc.available || dust.on || m.gridFetching || volGridReady(m)) return;
+  m.gridFetching = true;
+  volGrid(m).catch(() => { /* the server path keeps working */ }).finally(() => { m.gridFetching = false; });
+}
+
 async function surfaceOnce(idx, draft) {
   const m = models[idx];
   if (!m) return;
+  const local = localContourGrid(m);
+  if (local) return contourLocal(m, local, draft);
   status(models.length > 1 ? `Contouring ${m.name}…` : "Contouring…", "busy");
   try {
     const detail = draft ? `&smooth=${Math.min(m.smooth, DRAFT_SMOOTH)}&size=${draftSize()}`
@@ -306,6 +349,8 @@ async function surfaceOnce(idx, draft) {
     if (!draft) m.surface = m.sigma;
     if (!mesh.indices.length) { status(`Empty surface at this contour (${m.name})`, "warn"); return; }
     reportSurface();
+    // The map is on screen; now go and get the grid, so the next contour of it is local.
+    if (!draft) prefetchGrid(m);
   } catch (err) { status("Contour failed: " + err.message, "err"); }
 }
 const loadSurface = makeLive(surfaceOnce);
@@ -403,6 +448,21 @@ function assignSlots(want) {
     next[free] = mi;
   }
   return next;
+}
+
+// Local contouring. The engine owns the worker; `mcKey` is the identity of a decoded field
+// inside it — model, resolution and sample type — so a grid refetched at another size is a
+// different field and can never be mistaken for the old one.
+const mc = createMcEngine();
+const mcKey = (m, g) => `m${m.index}:${g.nx}x${g.ny}x${g.nz}:${g.f16 ? 16 : 8}`;
+// Can this map be contoured in the browser? It needs the worker, a resident grid at the
+// resolution the volume modes use, and none of the two features only the server has: dust
+// removal (a connected-component pass over the whole volume) and painting (sampling a second
+// map onto the surface).
+function localContourGrid(m) {
+  if (!mc.available || dust.on) return null;
+  if (painted && models[painted.m] === m) return null;
+  return volGridReady(m) ? m.gridVol : null;
 }
 
 const volGuard = latestWins();
@@ -528,67 +588,8 @@ async function loadSlices() {
 // "Mass" is the server's enclosed_mass: the SUM OF RAW VOXEL VALUES at or above the level —
 // not a voxel count, not sum(v - level). Mirrored deliberately, so the volume morph and the
 // surface morph of the same maps are cut at the same contours.
-let halfLUT = null;
-function halfToFloatTable() {
-  if (halfLUT) return halfLUT;
-  const t = new Float32Array(65536);
-  const b = new ArrayBuffer(4), u32 = new Uint32Array(b), f32 = new Float32Array(b);
-  for (let h = 0; h < 65536; h++) {
-    const sign = (h & 0x8000) << 16;
-    let exp = (h >> 10) & 0x1f, man = h & 0x3ff;
-    if (exp === 0) {
-      if (man === 0) { t[h] = sign ? -0 : 0; continue; }
-      exp = 1;                                   // subnormal: renormalise into float32
-      while (!(man & 0x400)) { man <<= 1; exp--; }
-      man &= 0x3ff;
-      u32[0] = sign | ((exp + 127 - 15) << 23) | (man << 13);
-    } else if (exp === 31) {
-      u32[0] = sign | 0x7f800000 | (man << 13);  // inf / nan
-    } else {
-      u32[0] = sign | ((exp + 127 - 15) << 23) | (man << 13);
-    }
-    t[h] = f32[0];
-  }
-  halfLUT = t;
-  return t;
-}
-
-const MASS_BINS = 1024;
-// One pass over the grid: how much raw mass sits in each normalized-value bin, and the
-// reverse cumulative sum of it, which is mass-above-a-level and is monotone in the level.
-function massCurve(g) {
-  const n = g.nx * g.ny * g.nz, per = new Float64Array(MASS_BINS);
-  const span = (g.vmax - g.vmin) || 1;
-  const T = g.f16 ? halfToFloatTable() : null;
-  for (let i = 0; i < n; i++) {
-    const v = T ? T[g.data[i]] : g.data[i] / 255;
-    let b = (v * MASS_BINS) | 0;
-    if (b < 0) b = 0; else if (b >= MASS_BINS) b = MASS_BINS - 1;
-    per[b] += g.vmin + ((b + 0.5) / MASS_BINS) * span;   // raw value, bin-centred
-  }
-  const above = new Float64Array(MASS_BINS + 1);
-  for (let b = MASS_BINS - 1; b >= 0; b--) above[b] = above[b + 1] + per[b];
-  return above;
-}
-// Mass above a normalized level, interpolated inside the bin so it is the exact inverse of
-// levelForMass below (round-tripping a level through the two must not move it).
-function massAbove(above, level) {
-  const x = Math.max(0, Math.min(1, level)) * MASS_BINS;
-  const b = Math.min(MASS_BINS - 1, Math.floor(x)), f = x - b;
-  return above[b] + (above[b + 1] - above[b]) * f;
-}
-// The normalized level whose mass-above matches `target` — the client-side twin of
-// meshing.level_for_mass. Mass falls as the level rises, so the search walks DOWN from the
-// top for the first bin edge that still meets the target and interpolates inside that bin.
-function levelForMass(above, target) {
-  if (!(target > 0)) return 1;
-  if (above[0] <= target) return 0;              // the whole grid holds no more than this
-  let b = MASS_BINS - 1;
-  while (b >= 0 && above[b] < target) b--;
-  const hi = above[b], lo = above[b + 1];
-  const f = hi > lo ? (hi - target) / (hi - lo) : 0;   // 0 = the bin's low edge
-  return Math.max(0, Math.min(1, (b + f) / MASS_BINS));
-}
+// The mass arithmetic itself lives in mccore.js, because the contouring worker needs the very
+// same functions and two copies of a numerical routine is one copy too many.
 
 // contour level (absolute) -> ray-marcher threshold in [0,1] over the grid range
 function normThreshold() {
@@ -840,6 +841,7 @@ const morph = {
   cacheKey: "",      // what `cache` was built for; a mismatch means Prepare again
   loadedPair: "",    // which (a,b) textures are on the GPU; uploads happen per leg, not per frame
   pool: null,        // iso: per-map contours for the resident GPU pool, or null if streaming
+  local: null,       // surface: contour every frame in the worker, instead of caching meshes
   refMass: -1,       // enclosed mass of frame 0, held constant across the morph
   showing: false,    // is the morph on screen (as opposed to the maps)?
 };
@@ -874,7 +876,8 @@ function updateMorphUI() {
     ? morph.seq.map((i) => models[i].name.replace(/\.[^.]+$/, "")).join(" → ")
     : "pick maps in Models above";
   $("morphSeq").classList.toggle("muted", !ok);
-  const ready = ok && (state.render !== "surface" || (morph.cache && morph.cacheKey === morphKey()));
+  const ready = ok && (state.render !== "surface" || !!morph.local
+                       || (morph.cache && morph.cacheKey === morphKey()));
   $("morphPrepare").disabled = !ok;
   // Volume mode has nothing to prepare, so say so rather than leaving a live-looking
   // button that does almost nothing.
@@ -894,6 +897,7 @@ async function showMorphFrame(k) {
   morph.frame = Math.max(0, Math.min(morphFrames() - 1, k));
   $("morphScrub").value = String(morph.frame);
   const { a, b, t, leg } = frameSpec(morph.frame);
+  if (state.render === "surface" && morph.local) { await localMorphFrame(leg, t); return; }
   if (state.render === "surface") {
     const mesh = morph.cache && morph.cache[morph.frame];
     if (!mesh) return;
@@ -929,6 +933,46 @@ async function showMorphFrame(k) {
   }
 }
 
+// One frame of a locally contoured morph.
+//
+// Frame-skipping, deliberately: if the worker is still marching when the next tick arrives,
+// that tick is dropped rather than queued. The morph then advances at whatever rate the
+// machine can contour — which is how ChimeraX plays a morph too — instead of falling further
+// and further behind the timer and finishing minutes after the animation appeared to.
+let localFrameBusy = false;
+async function localMorphFrame(leg, t) {
+  const L = morph.local;
+  if (!L || localFrameBusy) return;
+  localFrameBusy = true;
+  try {
+    const ia = leg, ib = leg + 1;
+    // The far map's samples carried into the near map's normalized range — the same
+    // correction the ray-marcher applies with uBScale/uBOff, so the surface morph and the iso
+    // morph of one pair show the same density.
+    const span = Math.max(L.vmax[ia] - L.vmin[ia], 1e-9);
+    const scale = (L.vmax[ib] - L.vmin[ib]) / span;
+    const off = (L.vmin[ib] - L.vmin[ia]) / span;
+    const req = { keyA: L.keys[ia], keyB: L.keys[ib], t, scale, off,
+                  smooth: models[morph.seq[0]].smooth,
+                  stride: morph.quality === "draft" ? 2 : 1 };
+    // Constant mass is solved on the blended field itself, per frame, which is the thing the
+    // cached-mesh path used to do server-side and the GPU morph can only approximate.
+    if (morph.mass && L.refMass > 0) req.massTarget = L.refMass;
+    else req.level = L.thr[ia] * (1 - t) + (L.thr[ib] * scale + off) * t;
+    let res = await mc.morphFrame(req);
+    if (res && res.miss) {                       // the LRU dropped a field: put it back
+      for (let i = 0; i < L.keys.length; i++) {
+        if (L.keys[i] === res.miss) mc.store(L.keys[i], models[morph.seq[i]].gridVol);
+      }
+      res = await mc.morphFrame(req);
+    }
+    if (!res || res.miss || res.error) return;
+    if (state.render !== "surface" || !morph.showing) return;
+    renderer.setModelMesh(MORPH_ID, res.positions, res.normals, res.indices);
+    renderer.setModelColor(MORPH_ID, hexToRgb(models[morph.seq[0]].color));
+  } finally { localFrameBusy = false; }
+}
+
 // Hide the maps and show the morph instead — they occupy the same space, and drawing
 // both would just be the endpoints ghosting through every frame.
 function beginMorph() {
@@ -942,6 +986,7 @@ function stopMorph() {
   // screen would otherwise hold its textures for the life of the page. The pool owns its own
   // textures, so tearing it down leaves the slot textures exactly as the maps left them.
   if (morph.pool) { volRenderer.setMorphPool(null); morph.pool = null; }
+  morph.local = null;              // the worker keeps its fields; only this binding goes
   if (!morph.showing) return;
   morph.showing = false;
   renderer.dropModel(MORPH_ID);
@@ -1021,6 +1066,38 @@ async function prepareMorph() {
              + (morph.pool ? ` · ${morph.pool.mb} MB resident · ${morph.mass ? "constant mass" : "constant σ"}` : ""));
       updateMorphUI();
       return;
+    }
+    // Surface mode, local path: every map's grid in the worker, and every frame contoured on
+    // the fly. No mesh cache at all — which is the point, because the cache is what forced the
+    // 512 MB budget check below and what made "Prepare" a minutes-long grind on a long
+    // sequence. Preparing here is just making sure the grids are resident.
+    if (mc.available && !dust.on && !painted) {
+      const keys = [], vmin = [], vmax = [], thr = [];
+      for (let i = 0; i < morph.seq.length; i++) {
+        const m = models[morph.seq[i]];
+        status(`Loading ${m.name} (${i + 1}/${morph.seq.length})…`, "busy");
+        await volGrid(m);
+        const g = m.gridVol;
+        if (!g) { keys.length = 0; break; }
+        const key = mcKey(m, g);
+        if (!mc.has(key)) mc.store(key, g);
+        keys.push(key); vmin.push(g.vmin); vmax.push(g.vmax); thr.push(thrFor(m, g));
+      }
+      if (keys.length === morph.seq.length) {
+        // The mass every frame is cut to: map 0's, at its own contour, in raw units — the
+        // same reference meshing.level_for_mass is given server-side.
+        const refMass = morph.mass
+          ? massAbove(massCurve(models[morph.seq[0]].gridVol), thr[0]) : 0;
+        morph.local = { keys, vmin, vmax, thr, refMass };
+        morph.cache = null;
+        beginMorph();
+        await showMorphFrame(morph.frame);
+        status(`Morph ready · ${morph.seq.length} maps · contoured in the browser`
+               + (morph.mass ? " · constant mass" : " · constant σ"));
+        updateMorphUI();
+        return;
+      }
+      morph.local = null;   // a grid did not arrive: fall through to the server-cached path
     }
     // Surface mode: contour every frame up front. Frame 0 also fixes the reference
     // mass, so the whole series is cut at one enclosed mass rather than one sigma.
@@ -1313,8 +1390,10 @@ $("morphFrames").addEventListener("change", (e) => {
   e.target.value = String(morph.perLeg);
   morph.cache = null; stopMorph(); updateMorphUI();
 });
-$("morphMass").addEventListener("change", (e) => { morph.mass = e.target.checked; morph.cache = null; updateMorphUI(); });
-$("morphQuality").addEventListener("change", (e) => { morph.quality = e.target.value; morph.cache = null; updateMorphUI(); });
+// Both change what a frame IS, so both drop whatever was prepared — the cached meshes on the
+// server path, and the local path's reference mass with them.
+$("morphMass").addEventListener("change", (e) => { morph.mass = e.target.checked; morph.cache = null; morph.local = null; updateMorphUI(); });
+$("morphQuality").addEventListener("change", (e) => { morph.quality = e.target.value; morph.cache = null; morph.local = null; updateMorphUI(); });
 $("morphPrepare").addEventListener("click", prepareMorph);
 $("morphPlay").addEventListener("click", () => (morph.playing ? pauseMorph() : playMorph()));
 $("morphScrub").addEventListener("input", (e) => { pauseMorph(); showMorphFrame(+e.target.value); });
