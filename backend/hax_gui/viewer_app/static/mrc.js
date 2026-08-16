@@ -18,7 +18,7 @@ import { createSlices } from "./slices.js";
 import { parseColorMesh, parseGrid, parseMesh } from "./wire.js";
 import { latestWins, makeLive } from "./viewerbase.js";
 import { createMcEngine } from "./mcengine.js";
-import { massCurve, massAbove, levelForMass } from "./mccore.js";
+import { massCurve, massAbove, levelForMass, blendedMassCurve } from "./mccore.js";
 
 const $ = (id) => document.getElementById(id);
 const THEME_BG = { dark: "#040610", light: "#e7ecf3" };
@@ -208,11 +208,23 @@ async function fetchGrid(m, size, bits = 8) {
 // the quantisation, so 16-bit grids must NOT go through it).
 const ISO_GRID_U8 = 256;      // fallback: as fine as the uint8 payload is worth taking
 const ISO_MAX = 384;          // backend cap for 16-bit requests
-// A morph keeps EVERY map of the sequence resident on the GPU at once, so its grids are
-// capped harder than a single map's: ten maps at a native 384 box would be ~1 GB of VRAM,
-// where 256 puts each map (density + pyramid) at ~55 MB. The grid cache is keyed by size, so
-// leaving the morph and going back to one map simply refetches at native.
-const ISO_MORPH_MAX = 256;
+// A morph keeps EVERY map of the sequence resident on the GPU at once, so unlike a single map
+// it has to be priced before it is fetched. Short sequences fit at native resolution and
+// should have it — capping them at 256 was why an iso morph looked coarse next to a surface
+// one, and it also threw away the native grids single-map viewing had already downloaded.
+// Long sequences do not fit and are capped, which is a real loss of detail but the honest
+// alternative to a driver refusing the allocation halfway through.
+const ISO_MORPH_MAX = 256;                 // the capped size, when the budget says so
+const ISO_POOL_BUDGET_MB = 768;            // how much VRAM one morph may hold
+// Bytes a map costs in the pool: the f16 density grid plus its R8 opacity volume and mips
+// (1 + 1/8 + 1/64 + ... = 1.15). Mirrors the estimate buildMorphPool reports.
+const poolBytesFor = (box) => box ** 3 * (2 + 1.15);
+// Does the whole sequence fit at native resolution?
+function poolFitsNative() {
+  let bytes = 0;
+  for (const i of morph.seq) bytes += poolBytesFor(Math.min(ISO_MAX, Math.max(...models[i].shape)));
+  return { fits: bytes <= ISO_POOL_BUDGET_MB * 1024 * 1024, mb: Math.round(bytes / (1024 * 1024)) };
+}
 function volWant(m, cap) {
   // Surface mode wants the same payload iso does: it is the grid the browser contours from
   // (see localContourGrid), and sharing it means switching between the two modes costs no
@@ -960,7 +972,18 @@ async function showMorphFrame(k) {
     const span = Math.max(P.vmax[ia] - P.vmin[ia], 1e-9);
     const scale = (P.vmax[ib] - P.vmin[ib]) / span;
     const off = (P.vmin[ib] - P.vmin[ia]) / span;
-    const thrFrame = P.thr[ia] * (1 - t) + (P.thr[ib] * scale + off) * t;
+    // The contour for this frame: read off the leg's solved constant-mass curve where there
+    // is one (piecewise-linear between the nine solved points), and only fall back to the
+    // straight line between the endpoint levels for constant-sigma morphs, where there is
+    // nothing to solve.
+    let thrFrame;
+    const row = P.curves && P.curves[ia];
+    if (row) {
+      const x = t * (row.length - 1), i0 = Math.min(row.length - 2, Math.floor(x)), f = x - i0;
+      thrFrame = row[i0] * (1 - f) + row[i0 + 1] * f;
+    } else {
+      thrFrame = P.thr[ia] * (1 - t) + (P.thr[ib] * scale + off) * t;
+    }
     volRenderer.setMorphLeg(ia, ib, scale, off, thrFrame);
     volRenderer.setMorphThreshold(thrFrame);
     volRenderer.setMix(t);                 // the one call that redraws
@@ -1088,6 +1111,47 @@ async function buildMorphPool() {
   const thr = grids.map((g, i) => (i === 0 ? thr0
     : morph.mass ? levelForMass(curves[i], refMass)   // same enclosed mass as map 0
                  : thrFor(models[morph.seq[i]])));    // constant sigma: each map's own level
+  // The contour ACROSS each leg, at constant enclosed mass.
+  //
+  // Interpolating between the two endpoint levels — what this used to do — is only right at
+  // the endpoints: a blend of two maps has lower variance than either, so the level that
+  // encloses the reference mass dips mid-leg, and holding the straight line instead made the
+  // surface visibly gain and lose density halfway through every leg. So solve it properly at
+  // eight interior points and interpolate the solution rather than the endpoints.
+  //
+  // Subsampled at stride 4: a mass curve is a statistic over tens of millions of voxels and
+  // every 64th of them settles it (measured in mccore.test.mjs: a stride-4 curve picks the
+  // same level to within a histogram bin). The endpoints are NOT recomputed from the
+  // subsample — they are the exact per-map levels above — because a leg boundary is where the
+  // two legs must agree exactly or the surface steps.
+  const CURVE_N = 8;
+  let curveLevels = null;
+  if (morph.mass && grids.length > 1) {
+    curveLevels = [];
+    for (let leg = 0; leg + 1 < grids.length; leg++) {
+      const gA = grids[leg], gB = grids[leg + 1];
+      const sameGrid = gA.nx === gB.nx && gA.ny === gB.ny && gA.nz === gB.nz;
+      const span = Math.max(gA.vmax - gA.vmin, 1e-9);
+      const scale = (gB.vmax - gB.vmin) / span, off = (gB.vmin - gA.vmin) / span;
+      const ends = [thr[leg], thr[leg + 1] * scale + off];      // A-space, exact
+      const row = new Array(CURVE_N + 1);
+      row[0] = ends[0]; row[CURVE_N] = ends[1];
+      for (let k = 1; k < CURVE_N; k++) {
+        // Two maps on different grids cannot be blended voxel-wise at all (the server refuses
+        // to morph them); the straight line is all there is to say for such a pair.
+        if (!sameGrid) { row[k] = ends[0] * (1 - k / CURVE_N) + ends[1] * (k / CURVE_N); continue; }
+        status(`Matching contours… leg ${leg + 1}/${grids.length - 1} (${k}/${CURVE_N - 1})`, "busy");
+        await new Promise((r) => setTimeout(r, 0));
+        const t = k / CURVE_N;
+        const lvl = levelForMass(blendedMassCurve(gA, gB, t, scale, off, 4), refMass);
+        // A saturated solve means the subsample lost the mass entirely (a narrow feature
+        // missed by the stride). Fall back to the straight line for that sample rather than
+        // collapsing the contour to zero.
+        row[k] = (lvl <= 0 || lvl >= 1) ? ends[0] * (1 - t) + ends[1] * t : lvl;
+      }
+      curveLevels.push(row);
+    }
+  }
   const entries = grids.map((g, i) => ({
     nx: g.nx, ny: g.ny, nz: g.nz, data: g.data, lo: g.boxLo, hi: g.boxHi,
     vmin: g.vmin, vmax: g.vmax, thr: thr[i],
@@ -1096,7 +1160,8 @@ async function buildMorphPool() {
   if (!volRenderer.setMorphPool(entries)) { volRenderer.setMorphPool(null); return null; }
   // density bytes + the R8 opacity volume and its mip chain (1 + 1/8 + 1/64 + ... ≈ 1.15)
   const bytes = grids.reduce((acc, g) => acc + g.nx * g.ny * g.nz * ((g.f16 ? 2 : 1) + 1.15), 0);
-  return { thr, vmin: grids.map((g) => g.vmin), vmax: grids.map((g) => g.vmax),
+  return { thr, curves: curveLevels, box: Math.max(first.nx, first.ny, first.nz),
+           vmin: grids.map((g) => g.vmin), vmax: grids.map((g) => g.vmax),
            mb: Math.round(bytes / (1024 * 1024)) };
 }
 
@@ -1110,16 +1175,41 @@ async function prepareMorph() {
   try {
     if (state.render !== "surface") {
       // Volume mode: just make sure every map in the sequence is on hand as a grid. In iso the
-      // whole sequence then goes onto the GPU at once (see setMorphPool), so the grids are
-      // fetched at the morph cap rather than at the native box.
+      // whole sequence then goes onto the GPU at once (see setMorphPool), so what it costs
+      // decides what resolution it gets: a sequence that fits keeps the native grids (which
+      // single-map iso viewing has usually already downloaded, so Prepare fetches nothing at
+      // all), and only one that does not gets capped.
       const isoMorph = state.render === "iso";
-      const cap = isoMorph ? ISO_MORPH_MAX : undefined;
-      for (let i = 0; i < morph.seq.length; i++) {
-        const m = models[morph.seq[i]];
-        status(`Loading ${m.name} (${i + 1}/${morph.seq.length})…`, "busy");
-        await volGrid(m, cap);
+      const fetchSeq = async (cap) => {
+        for (let i = 0; i < morph.seq.length; i++) {
+          const m = models[morph.seq[i]];
+          status(`Loading ${m.name} (${i + 1}/${morph.seq.length})…`, "busy");
+          await volGrid(m, cap);
+        }
+      };
+      if (isoMorph) {
+        const fit = poolFitsNative();
+        if (!fit.fits) {
+          status(`Sequence needs ~${fit.mb} MB at full resolution — loading at ${ISO_MORPH_MAX}³ `
+                 + `to fit GPU memory (budget ${ISO_POOL_BUDGET_MB} MB)…`, "busy");
+        }
+        await fetchSeq(fit.fits ? undefined : ISO_MORPH_MAX);
+        morph.pool = await buildMorphPool();
+        // The estimate said it would fit and the driver disagreed: take the capped grids and
+        // try once more before giving up on the pool entirely. The native grids stay in the
+        // per-map cache only until the smaller fetch replaces them (cache-by-size keeps one
+        // payload per map), so a later single-map view re-fetches at native — a download, not
+        // a correctness problem.
+        if (!morph.pool && fit.fits) {
+          status("The GPU would not hold the sequence at full resolution — retrying at "
+                 + `${ISO_MORPH_MAX}³…`, "busy");
+          await fetchSeq(ISO_MORPH_MAX);
+          morph.pool = await buildMorphPool();
+        }
+      } else {
+        await fetchSeq(undefined);
+        morph.pool = null;
       }
-      morph.pool = isoMorph ? await buildMorphPool() : null;
       beginMorph();
       // The morph runs single-slot; give slot 0 the sequence's colour and contour.
       // A leftover diverging flag from a painted diff would mis-read the maps.
@@ -1128,7 +1218,8 @@ async function prepareMorph() {
       if (!morph.pool) volRenderer.setThreshold(thrFor(models[morph.seq[0]]));
       await showMorphFrame(morph.frame);
       status(`Morph ready · ${morph.seq.length} maps · blended on the GPU`
-             + (morph.pool ? ` · ${morph.pool.mb} MB resident · ${morph.mass ? "constant mass" : "constant σ"}` : ""));
+             + (morph.pool ? ` · ${morph.pool.box}³ · ${morph.pool.mb} MB resident`
+                             + ` · ${morph.mass ? "constant mass" : "constant σ"}` : ""));
       updateMorphUI();
       return;
     }

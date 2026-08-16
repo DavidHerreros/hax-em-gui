@@ -118,6 +118,50 @@ export function massCurve(g) {
   return above;
 }
 
+// The mass curve of a MORPH FRAME, straight off the two wire grids, optionally subsampled.
+//
+// A morph frame's density is a blend, so its enclosed mass is not any single map's — holding
+// the mass constant across a leg means solving the level on the blended field itself, and the
+// blend only exists for the instant that frame is on screen. Building the curve from the two
+// payloads avoids materialising the blend at all.
+//
+// `stride` subsamples every axis: a mass curve is a statistic over tens of millions of
+// voxels, and every 64th of them is plenty for one. The result is scaled back up by the
+// sampling factor so it stays in the same absolute units as massCurve() over the full grid —
+// which is what makes it comparable to a reference mass taken there.
+//
+// The blend, and therefore the curve, is in the NEAR map's normalized space (scale/off carry
+// the far map into it, exactly as blendFields and the ray-marcher's uBScale/uBOff do), so the
+// near map's vmin/vmax are what convert it back to raw mass units.
+export function blendedMassCurve(gA, gB, t, scale = 1, off = 0, stride = 1) {
+  const nx = gA.nx, ny = gA.ny, nz = gA.nz;
+  const per = new Float64Array(MASS_BINS);
+  const span = (gA.vmax - gA.vmin) || 1;
+  const TA = gA.f16 ? halfToFloatTable() : null;
+  const TB = gB.f16 ? halfToFloatTable() : null;
+  const u = 1 - t;
+  let count = 0;
+  for (let k = 0; k < nz; k += stride) {
+    for (let j = 0; j < ny; j += stride) {
+      const row = (k * ny + j) * nx;
+      for (let i = 0; i < nx; i += stride) {
+        const p = row + i;
+        const a = TA ? TA[gA.data[p]] : gA.data[p] / 255;
+        const b = TB ? TB[gB.data[p]] : gB.data[p] / 255;
+        const v = a * u + (b * scale + off) * t;
+        let bin = (v * MASS_BINS) | 0;
+        if (bin < 0) bin = 0; else if (bin >= MASS_BINS) bin = MASS_BINS - 1;
+        per[bin] += gA.vmin + ((bin + 0.5) / MASS_BINS) * span;
+        count++;
+      }
+    }
+  }
+  const w = count ? (nx * ny * nz) / count : 1;      // scale the subsample back to full size
+  const above = new Float64Array(MASS_BINS + 1);
+  for (let b = MASS_BINS - 1; b >= 0; b--) above[b] = above[b + 1] + per[b] * w;
+  return above;
+}
+
 // Mass above a normalized level, interpolated inside the bin so it is the exact inverse of
 // levelForMass (round-tripping a level through the two must not move it).
 export function massAbove(above, level) {

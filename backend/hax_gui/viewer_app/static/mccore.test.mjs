@@ -8,7 +8,8 @@
 // normals must point out of the high-density region — the surface is lit by that convention,
 // so getting it wrong turns a map inside out. Two topologies, because a sphere alone would
 // not exercise the cases with more than one crossing per tetrahedron.
-import { marchingCubes, taubin, vertexNormals, massCurveField, massAbove, levelForMass, blendFields } from "./mccore.js";
+import { marchingCubes, taubin, vertexNormals, massCurveField, massAbove, levelForMass, blendFields,
+  blendedMassCurve, massCurve } from "./mccore.js";
 
 let failures = 0;
 function check(name, ok, detail = "") {
@@ -205,6 +206,56 @@ check("mesh is closed (every edge in exactly 2 triangles)", openEdges(tor.mesh.i
   check("levelForMass inverts massAbove (<2e-3)", Math.abs(back - lvl) < 2e-3, `${lvl} -> ${back.toFixed(5)}`);
   const b = blendFields(new Float32Array([0, 0.5, 1]), new Float32Array([1, 1, 1]), 0.25, 2, -0.5);
   check("blendFields applies the A-space rescale", Math.abs(b[0] - 0.375) < 1e-6, `${b[0]}`);
+}
+
+// ---- the blended mass curve, and what subsampling costs it ----
+//
+// The constant-mass morph solves its level on this curve, so the question that matters is
+// whether a SUBSAMPLED curve gives the same LEVEL as the full one, not whether the two curves
+// match. Two synthetic uint8 grids with different ranges, so the A-space rescale is exercised
+// too, and one narrow feature in A so subsampling has something to miss.
+//
+// The error is set by the number of samples, not by the stride: at 128^3 a stride of 4 leaves
+// 32768 of them, where a real 320^3 map leaves 512000 — sixteen times as many — so the figure
+// printed here is a pessimistic stand-in for what the viewer actually does.
+{
+  console.log("\n--- blended mass curve (128^3 pair, subsampled) ---");
+  const M = 128, np = M * M * M;
+  const mk = (f, vmin, vmax) => {
+    const data = new Uint8Array(np);
+    for (let k = 0; k < M; k++) {
+      for (let j = 0; j < M; j++) {
+        for (let i = 0; i < M; i++) {
+          const x = (i / M) * 2 - 1, y = (j / M) * 2 - 1, z = (k / M) * 2 - 1;
+          data[(k * M + j) * M + i] = Math.max(0, Math.min(255, Math.round(255 * f(x, y, z))));
+        }
+      }
+    }
+    return { nx: M, ny: M, nz: M, data, f16: false, vmin, vmax };
+  };
+  const gA = mk((x, y, z) => Math.exp(-4 * (x * x + y * y + z * z))
+                             + 0.3 * Math.exp(-30 * ((x - 0.4) ** 2 + y * y + z * z)), -0.2, 1.8);
+  const gB = mk((x, y, z) => Math.exp(-4 * ((x - 0.3) ** 2 + y * y + z * z)), 0.1, 2.4);
+  const spanA = gA.vmax - gA.vmin;
+  const scale = (gB.vmax - gB.vmin) / spanA, off = (gB.vmin - gA.vmin) / spanA;
+  const refMass = massAbove(massCurve(gA), 0.5);
+  const ts = [0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875];
+  for (const stride of [4, 2]) {
+    let worst = 0;
+    for (const t of ts) {
+      const full = levelForMass(blendedMassCurve(gA, gB, t, scale, off, 1), refMass);
+      const sub = levelForMass(blendedMassCurve(gA, gB, t, scale, off, stride), refMass);
+      worst = Math.max(worst, Math.abs(full - sub));
+    }
+    console.log(`      stride ${stride} (${Math.round(np / stride ** 3)} samples): worst level error ${worst.toExponential(2)}`);
+    check(`stride ${stride} solves the same level as the full curve (<5e-3 of the range)`,
+      worst < 5e-3, `${worst.toExponential(2)}`);
+  }
+  // The endpoints must be the maps' own curves, or a leg boundary would step.
+  const at0 = blendedMassCurve(gA, gB, 0, scale, off, 1), plain = massCurve(gA);
+  let d = 0;
+  for (let b = 0; b < plain.length; b += 64) d = Math.max(d, Math.abs(at0[b] - plain[b]) / (plain[0] || 1));
+  check("at t = 0 the blended curve is map A's own curve", d < 1e-9, `max relative difference ${d.toExponential(2)}`);
 }
 
 // ---- timing, split into the two things that actually scale differently ----
