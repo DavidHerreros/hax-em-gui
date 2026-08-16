@@ -312,14 +312,40 @@ async function contourLocal(m, g, draft) {
   reportSurface();
 }
 
-// Fetch the grid this map would be contoured from, in the background: the first show still
-// goes through the server (nothing is resident yet), but every contour after the grid lands
-// is local — which is the moment the contour slider stops being a request-per-drag and
-// becomes live.
-function prefetchGrid(m) {
+// Fetch the grid a map would be contoured from, in the background: the first show still goes
+// through the server (nothing is resident yet), but every contour after the grid lands is
+// local — which is the moment the contour slider stops being a request-per-drag and becomes
+// live.
+//
+// Queued, one at a time, and never while a contouring pass is running. Firing these off as
+// each map finished contouring — the obvious way, and what round 11 did — put ten 65 MB grid
+// downloads onto the same connection pool and the same server as the contour requests that
+// had not happened yet, so showing ten maps got SLOWER than before there was any prefetch at
+// all. The maps on screen come first; the grids are what makes the *next* interaction fast,
+// and they can wait for the screen to settle.
+const prefetchQ = [];
+let prefetchRunning = false;
+let surfaceRuns = 0;            // how many loadSurfaces passes are currently live
+function queuePrefetch(m) {
   if (!mc.available || dust.on || m.gridFetching || volGridReady(m)) return;
-  m.gridFetching = true;
-  volGrid(m).catch(() => { /* the server path keeps working */ }).finally(() => { m.gridFetching = false; });
+  if (!prefetchQ.includes(m)) prefetchQ.push(m);
+  if (!surfaceRuns) runPrefetch();
+}
+async function runPrefetch() {
+  if (prefetchRunning) return;
+  prefetchRunning = true;
+  try {
+    while (prefetchQ.length) {
+      // A new contouring pass has the connection; leave the rest queued for its end.
+      if (surfaceRuns) return;
+      const m = prefetchQ.shift();
+      // Skip anything that stopped being worth fetching while it waited.
+      if (!m || !m.visible || dust.on || volGridReady(m) || m.gridFetching) continue;
+      m.gridFetching = true;
+      try { await volGrid(m); } catch { /* the server path keeps working */ }
+      finally { m.gridFetching = false; }
+    }
+  } finally { prefetchRunning = false; }
 }
 
 async function surfaceOnce(idx, draft) {
@@ -349,8 +375,10 @@ async function surfaceOnce(idx, draft) {
     if (!draft) m.surface = m.sigma;
     if (!mesh.indices.length) { status(`Empty surface at this contour (${m.name})`, "warn"); return; }
     reportSurface();
-    // The map is on screen; now go and get the grid, so the next contour of it is local.
-    if (!draft) prefetchGrid(m);
+    // The map is on screen; queue its grid so the next contour of it is local. The queue does
+    // not run while a contouring pass is live, so this cannot compete with the maps still
+    // waiting to appear.
+    if (!draft) queuePrefetch(m);
   } catch (err) { status("Contour failed: " + err.message, "err"); }
 }
 const loadSurface = makeLive(surfaceOnce);
@@ -385,16 +413,24 @@ async function loadSurfaces() {
   if (!todo.length) { reportSurface(); return; }
   const tok = surfGuard.take();
   const live = () => state.render === "surface" && !surfGuard.stale(tok);
-  for (const m of todo) {                       // pass 1: something on screen, fast
-    await surfaceOnce(models.indexOf(m), true);
-    if (!live()) return;
+  surfaceRuns++;                                // pauses the background grid prefetch
+  try {
+    for (const m of todo) {                     // pass 1: something on screen, fast
+      await surfaceOnce(models.indexOf(m), true);
+      if (!live()) return;
+    }
+    for (const m of todo) {                     // pass 2: the real thing, in place
+      if (m.surface === m.sigma) continue;      // a live single-map load got there first
+      await surfaceOnce(models.indexOf(m), false);
+      if (!live()) return;
+    }
+    reportSurface();
+  } finally {
+    // Whatever happened, the screen is as settled as this run will make it: let the queued
+    // grids have the connection now.
+    surfaceRuns--;
+    if (!surfaceRuns) runPrefetch();
   }
-  for (const m of todo) {                       // pass 2: the real thing, in place
-    if (m.surface === m.sigma) continue;        // a live single-map load got there first
-    await surfaceOnce(models.indexOf(m), false);
-    if (!live()) return;
-  }
-  reportSurface();
 }
 
 // Which model (by list index) each renderer slot holds, INDEXED BY SLOT: volSlots[s] is the
@@ -876,8 +912,11 @@ function updateMorphUI() {
     ? morph.seq.map((i) => models[i].name.replace(/\.[^.]+$/, "")).join(" → ")
     : "pick maps in Models above";
   $("morphSeq").classList.toggle("muted", !ok);
-  const ready = ok && (state.render !== "surface" || !!morph.local
-                       || (morph.cache && morph.cacheKey === morphKey()));
+  // Playback needs prepared frames in surface mode, as it always did — morph.local alone
+  // only means "grids are resident, so the scrubber can contour on the fly while the cache
+  // builds", which is not something to play at.
+  const ready = ok && (state.render !== "surface" || (morph.cache && morph.cacheKey === morphKey()));
+  const scrubbable = ready || (state.render === "surface" && !!morph.local && morph.showing);
   $("morphPrepare").disabled = !ok;
   // Volume mode has nothing to prepare, so say so rather than leaving a live-looking
   // button that does almost nothing.
@@ -886,7 +925,7 @@ function updateMorphUI() {
   $("morphRecord").disabled = !ready;
   // The .mrc export computes its frames server-side, so it only needs a sequence.
   $("morphExport").disabled = !ok;
-  $("morphScrub").disabled = !ready;
+  $("morphScrub").disabled = !scrubbable;
   $("morphScrub").max = String(Math.max(0, morphFrames() - 1));
 }
 
@@ -897,13 +936,21 @@ async function showMorphFrame(k) {
   morph.frame = Math.max(0, Math.min(morphFrames() - 1, k));
   $("morphScrub").value = String(morph.frame);
   const { a, b, t, leg } = frameSpec(morph.frame);
-  if (state.render === "surface" && morph.local) { await localMorphFrame(leg, t); return; }
   if (state.render === "surface") {
+    // The cache is what makes playback smooth: prepared frames go up at the timer's rate,
+    // where contouring on the fly runs at whatever rate the machine manages (a few frames a
+    // second) and visibly stutters. On-the-fly is only the stand-in for a scrub before the
+    // cache exists.
     const mesh = morph.cache && morph.cache[morph.frame];
-    if (!mesh) return;
-    renderer.setModelMesh(MORPH_ID, mesh.positions, mesh.normals, mesh.indices);
-    renderer.setModelColor(MORPH_ID, hexToRgb(models[morph.seq[0]].color));
-  } else if (morph.pool) {
+    if (mesh) {
+      renderer.setModelMesh(MORPH_ID, mesh.positions, mesh.normals, mesh.indices);
+      renderer.setModelColor(MORPH_ID, hexToRgb(models[morph.seq[0]].color));
+      return;
+    }
+    if (morph.local) await localMorphFrame(leg, t);
+    return;
+  }
+  if (morph.pool) {
     // The whole sequence is already on the GPU: a frame is two binds and three uniforms.
     // bScale/bOff carry the far map's samples into the near map's normalized range (each grid
     // is normalized to its own vmin/vmax, so a raw blend of two maps with different ranges is
@@ -933,18 +980,13 @@ async function showMorphFrame(k) {
   }
 }
 
-// One frame of a locally contoured morph.
-//
-// Frame-skipping, deliberately: if the worker is still marching when the next tick arrives,
-// that tick is dropped rather than queued. The morph then advances at whatever rate the
-// machine can contour — which is how ChimeraX plays a morph too — instead of falling further
-// and further behind the timer and finishing minutes after the animation appeared to.
-let localFrameBusy = false;
-async function localMorphFrame(leg, t) {
+// The mesh for one frame of a locally contoured morph: the blend of the leg's two resident
+// fields, contoured in the worker. Used twice — to build the playback cache in Prepare, and
+// to answer the scrubber while that cache is still being built.
+async function localMorphMesh(leg, t, stride, smooth) {
   const L = morph.local;
-  if (!L || localFrameBusy) return;
-  localFrameBusy = true;
-  try {
+  if (!L) return null;
+  {
     const ia = leg, ib = leg + 1;
     // The far map's samples carried into the near map's normalized range — the same
     // correction the ray-marcher applies with uBScale/uBOff, so the surface morph and the iso
@@ -952,11 +994,9 @@ async function localMorphFrame(leg, t) {
     const span = Math.max(L.vmax[ia] - L.vmin[ia], 1e-9);
     const scale = (L.vmax[ib] - L.vmin[ib]) / span;
     const off = (L.vmin[ib] - L.vmin[ia]) / span;
-    const req = { keyA: L.keys[ia], keyB: L.keys[ib], t, scale, off,
-                  smooth: models[morph.seq[0]].smooth,
-                  stride: morph.quality === "draft" ? 2 : 1 };
-    // Constant mass is solved on the blended field itself, per frame, which is the thing the
-    // cached-mesh path used to do server-side and the GPU morph can only approximate.
+    const req = { keyA: L.keys[ia], keyB: L.keys[ib], t, scale, off, smooth, stride };
+    // Constant mass is solved on the blended field itself, per frame — what the server path
+    // does with level_for_mass, and what the GPU morph can only approximate.
     if (morph.mass && L.refMass > 0) req.massTarget = L.refMass;
     else req.level = L.thr[ia] * (1 - t) + (L.thr[ib] * scale + off) * t;
     let res = await mc.morphFrame(req);
@@ -966,7 +1006,31 @@ async function localMorphFrame(leg, t) {
       }
       res = await mc.morphFrame(req);
     }
-    if (!res || res.miss || res.error) return;
+    // A null reply means a newer request on the morph channel superseded this one — during a
+    // Prepare that can only be the scrubber, so ask once more rather than losing the frame.
+    if (res === null) res = await mc.morphFrame(req);
+    if (!res || res.miss || res.error) return null;
+    return res;
+  }
+}
+
+// The scrubber's path while no cache exists yet: contour on the fly, and drop ticks that
+// arrive while the worker is still marching rather than queueing them.
+// Bumped by anything that abandons a Prepare, so the frame loop can stop between frames
+// instead of marching to the end of a sequence nobody is waiting for.
+let morphPrepGen = 0;
+let morphPreparing = false;      // a Prepare loop owns the worker's morph channel
+let localFrameBusy = false;
+async function localMorphFrame(leg, t) {
+  // While Prepare is contouring the series, the scrubber does not also contour: the two would
+  // supersede each other on the worker's single morph channel and the Prepare would keep
+  // losing frames it had already started. The slider still moves; the cache is moments away.
+  if (!morph.local || localFrameBusy || morphPreparing) return;
+  localFrameBusy = true;
+  try {
+    const res = await localMorphMesh(leg, t, morph.quality === "draft" ? 2 : 1,
+                                     models[morph.seq[0]].smooth);
+    if (!res) return;
     if (state.render !== "surface" || !morph.showing) return;
     renderer.setModelMesh(MORPH_ID, res.positions, res.normals, res.indices);
     renderer.setModelColor(MORPH_ID, hexToRgb(models[morph.seq[0]].color));
@@ -987,6 +1051,7 @@ function stopMorph() {
   // textures, so tearing it down leaves the slot textures exactly as the maps left them.
   if (morph.pool) { volRenderer.setMorphPool(null); morph.pool = null; }
   morph.local = null;              // the worker keeps its fields; only this binding goes
+  morphPrepGen++;                  // stop any Prepare still contouring frames
   if (!morph.showing) return;
   morph.showing = false;
   renderer.dropModel(MORPH_ID);
@@ -1067,10 +1132,13 @@ async function prepareMorph() {
       updateMorphUI();
       return;
     }
-    // Surface mode, local path: every map's grid in the worker, and every frame contoured on
-    // the fly. No mesh cache at all — which is the point, because the cache is what forced the
-    // 512 MB budget check below and what made "Prepare" a minutes-long grind on a long
-    // sequence. Preparing here is just making sure the grids are resident.
+    // Surface mode, local path: every map's grid goes into the worker and every frame is
+    // contoured there, with no server involvement at all. The frames are still CACHED — the
+    // cache is what lets playback run at the timer's rate, and contouring per tick instead
+    // (the first version of this) generated a few frames a second and looked exactly like
+    // that. What the local path removes is the network: a 24-frame morph of three maps was
+    // two dozen multi-megabyte mesh downloads and as many marching-cubes jobs queued on one
+    // server, and is now a few grid fetches and some arithmetic in a background thread.
     if (mc.available && !dust.on && !painted) {
       const keys = [], vmin = [], vmax = [], thr = [];
       for (let i = 0; i < morph.seq.length; i++) {
@@ -1090,10 +1158,50 @@ async function prepareMorph() {
           ? massAbove(massCurve(models[morph.seq[0]].gridVol), thr[0]) : 0;
         morph.local = { keys, vmin, vmax, thr, refMass };
         morph.cache = null;
+        // The morph goes on screen before the cache exists, so the scrubber has something to
+        // move through while it builds — on-the-fly frames, at whatever rate the worker
+        // manages. Playback waits for the cache (see updateMorphUI).
         beginMorph();
         await showMorphFrame(morph.frame);
-        status(`Morph ready · ${morph.seq.length} maps · contoured in the browser`
-               + (morph.mass ? " · constant mass" : " · constant σ"));
+
+        // Then contour every frame up front, exactly as the server path does, for the same
+        // reason: prepared meshes play back at the timer's rate. Contouring per tick instead
+        // (what round 11 shipped) generated 4-8 frames a second and looked it.
+        const n = morphFrames();
+        const stride = morph.quality === "draft" ? 2 : 1;
+        const smooth = models[morph.seq[0]].smooth;
+        const gen = ++morphPrepGen;
+        const cache = new Array(n);
+        let cachedBytes = 0;
+        morphPreparing = true;
+        try {
+          for (let k = 0; k < n; k++) {
+            // Abandoned: the mode changed, the morph was stopped, or another Prepare started.
+            if (gen !== morphPrepGen || state.render !== "surface" || !morph.showing) return;
+            status(`Preparing morph… ${k + 1}/${n}`, "busy");
+            const { t, leg } = frameSpec(k);
+            const res = await localMorphMesh(leg, t, stride, smooth);
+            if (!res) throw new Error("contouring was interrupted");
+            cache[k] = { positions: res.positions, normals: res.normals, indices: res.indices,
+                         bytes: res.positions.byteLength + res.normals.byteLength + res.indices.byteLength };
+            cachedBytes += cache[k].bytes;
+            // The same byte budget the server path enforces, and for the same reason: n frames
+            // of multi-MB meshes will OOM the tab. Frame 0 prices the series before the grind.
+            if (k === 0 && cache[0].bytes * n > MORPH_BUDGET_BYTES) {
+              throw new Error(`~${Math.round(cache[0].bytes * n / (1024 * 1024))} MB of meshes for ${n} frames — `
+                              + `switch Quality to draft or shorten the sequence (budget ${MORPH_BUDGET_MB} MB)`);
+            }
+            if (cachedBytes > MORPH_BUDGET_BYTES) {
+              throw new Error(`morph cache passed ${MORPH_BUDGET_MB} MB at frame ${k + 1}/${n} — `
+                              + "switch Quality to draft or shorten the sequence");
+            }
+          }
+        } finally { morphPreparing = false; }
+        morph.cache = cache;
+        morph.cacheKey = morphKey();
+        await showMorphFrame(morph.frame);
+        status(`Morph ready · ${n} frames · ${(cachedBytes / (1024 * 1024)).toFixed(0)} MB cached`
+               + " · contoured in the browser" + (morph.mass ? " · constant mass" : " · constant σ"));
         updateMorphUI();
         return;
       }
