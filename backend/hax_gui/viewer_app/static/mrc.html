@@ -196,6 +196,15 @@
               </select>
               <label class="hist-opt">fps <input id="morphFps" type="number" min="1" max="60" value="30" /></label>
             </div>
+            <!-- What a morph is allowed to occupy. Neither number is knowable from inside the
+                 page, so these are defaults you can overrule; both take effect at the next
+                 Prepare. Empty restores the default. -->
+            <div class="rrow"><span>mem</span>
+              <label class="hist-opt" title="RAM the surface morph's cached meshes may use. Prepare refuses the sequence rather than exceeding it — lower Quality to draft or shorten the sequence. Blank = default (512 MB). Takes effect at the next Prepare.">cache
+                <input id="memCache" type="number" min="128" max="8192" step="128" placeholder="512" /> MB</label>
+              <label class="hist-opt" title="GPU memory the iso morph's resident maps may use. A sequence that would exceed it is loaded at 256³ instead of at full resolution. The default is half the server GPU's free memory, which is only the right card when the browser runs on the same machine. Takes effect at the next Prepare.">pool
+                <input id="memPool" type="number" min="256" max="8192" step="128" placeholder="768" /> MB</label>
+            </div>
             <div class="rrow morph-ctl">
               <button id="morphPrepare" class="btn" title="Compute the frames">Prepare</button>
               <button id="morphPlay" class="btn" disabled>▶</button>

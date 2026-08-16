@@ -123,6 +123,7 @@ document.addEventListener("visibilitychange", () => { if (document.hidden) saveS
 // ---- data loaders --------------------------------------------------------
 async function loadInfo() {
   info = await (await fetch("./api/info")).json();
+  syncBudgetInputs();   // the GPU-derived default is only knowable once info is in
   const prefs = readJSON(MAP_PREFS_KEY) || {};
   // Reloading the scene (map arithmetic grows it) must not undo the visibility
   // you set up — carry it over by file; only genuinely new models default to on.
@@ -215,7 +216,30 @@ const ISO_MAX = 384;          // backend cap for 16-bit requests
 // Long sequences do not fit and are capped, which is a real loss of detail but the honest
 // alternative to a driver refusing the allocation halfway through.
 const ISO_MORPH_MAX = 256;                 // the capped size, when the budget says so
-const ISO_POOL_BUDGET_MB = 768;            // how much VRAM one morph may hold
+// How much VRAM one morph may hold, and how much RAM the surface morph's mesh cache may.
+//
+// Neither is knowable from inside the page: WebGL will not say how much video memory is free,
+// and the browser will not say how much RAM it can spare (navigator.deviceMemory is capped at
+// 8 and rounded to powers of two, which is worse than a stated guess). So: the server's card,
+// if it reported one, else a fixed number — and in both cases the user can overrule it, which
+// is the only thing that is correct when the browser and the server are different machines.
+const ISO_POOL_FALLBACK_MB = 768, MORPH_CACHE_FALLBACK_MB = 512;
+const BUDGET_KEY = "hax_mrc_budgets";      // global preference, not per scene
+const budgetPrefs = () => readJSON(BUDGET_KEY) || {};
+function isoPoolBudgetMB() {
+  const override = budgetPrefs().pool;
+  if (Number.isFinite(override) && override > 0) return override;
+  // Half of what the card has free: a morph is not the only thing on the GPU (the maps
+  // themselves, the browser's own compositor, whatever else the machine is running).
+  const g = info && info.gpu_mem;
+  if (g && Number.isFinite(g.free_mb)) return Math.max(512, Math.min(4096, Math.round(0.5 * g.free_mb)));
+  return ISO_POOL_FALLBACK_MB;
+}
+function morphBudgetMB() {
+  const override = budgetPrefs().cache;
+  return (Number.isFinite(override) && override > 0) ? override : MORPH_CACHE_FALLBACK_MB;
+}
+const morphBudgetBytes = () => morphBudgetMB() * 1024 * 1024;
 // Bytes a map costs in the pool: the f16 density grid plus its R8 opacity volume and mips
 // (1 + 1/8 + 1/64 + ... = 1.15). Mirrors the estimate buildMorphPool reports.
 const poolBytesFor = (box) => box ** 3 * (2 + 1.15);
@@ -223,7 +247,8 @@ const poolBytesFor = (box) => box ** 3 * (2 + 1.15);
 function poolFitsNative() {
   let bytes = 0;
   for (const i of morph.seq) bytes += poolBytesFor(Math.min(ISO_MAX, Math.max(...models[i].shape)));
-  return { fits: bytes <= ISO_POOL_BUDGET_MB * 1024 * 1024, mb: Math.round(bytes / (1024 * 1024)) };
+  const budget = isoPoolBudgetMB();
+  return { fits: bytes <= budget * 1024 * 1024, mb: Math.round(bytes / (1024 * 1024)), budget };
 }
 function volWant(m, cap) {
   // Surface mode wants the same payload iso does: it is the grid the browser contours from
@@ -1165,8 +1190,7 @@ async function buildMorphPool() {
            mb: Math.round(bytes / (1024 * 1024)) };
 }
 
-const MORPH_BUDGET_MB = 512;
-const MORPH_BUDGET_BYTES = MORPH_BUDGET_MB * 1024 * 1024;
+
 
 async function prepareMorph() {
   if (!morphLegs()) return;
@@ -1191,7 +1215,7 @@ async function prepareMorph() {
         const fit = poolFitsNative();
         if (!fit.fits) {
           status(`Sequence needs ~${fit.mb} MB at full resolution — loading at ${ISO_MORPH_MAX}³ `
-                 + `to fit GPU memory (budget ${ISO_POOL_BUDGET_MB} MB)…`, "busy");
+                 + `to fit GPU memory (budget ${fit.budget} MB, adjustable under Morph)…`, "busy");
         }
         await fetchSeq(fit.fits ? undefined : ISO_MORPH_MAX);
         morph.pool = await buildMorphPool();
@@ -1278,12 +1302,12 @@ async function prepareMorph() {
             cachedBytes += cache[k].bytes;
             // The same byte budget the server path enforces, and for the same reason: n frames
             // of multi-MB meshes will OOM the tab. Frame 0 prices the series before the grind.
-            if (k === 0 && cache[0].bytes * n > MORPH_BUDGET_BYTES) {
+            if (k === 0 && cache[0].bytes * n > morphBudgetBytes()) {
               throw new Error(`~${Math.round(cache[0].bytes * n / (1024 * 1024))} MB of meshes for ${n} frames — `
-                              + `switch Quality to draft or shorten the sequence (budget ${MORPH_BUDGET_MB} MB)`);
+                              + `switch Quality to draft or shorten the sequence (budget ${morphBudgetMB()} MB)`);
             }
-            if (cachedBytes > MORPH_BUDGET_BYTES) {
-              throw new Error(`morph cache passed ${MORPH_BUDGET_MB} MB at frame ${k + 1}/${n} — `
+            if (cachedBytes > morphBudgetBytes()) {
+              throw new Error(`morph cache passed ${morphBudgetMB()} MB at frame ${k + 1}/${n} — `
                               + "switch Quality to draft or shorten the sequence");
             }
           }
@@ -1312,9 +1336,9 @@ async function prepareMorph() {
     // unbounded it OOMs the tab (n frames x multi-MB full-quality meshes). Frame 0
     // prices the series before the long grind; the running total catches variation.
     let cachedBytes = first.bytes;
-    if (first.bytes * n > MORPH_BUDGET_BYTES) {
+    if (first.bytes * n > morphBudgetBytes()) {
       throw new Error(`~${Math.round(first.bytes * n / (1024 * 1024))} MB of meshes for ${n} frames — ` +
-                      `switch Quality to draft or shorten the sequence (budget ${MORPH_BUDGET_MB} MB)`);
+                      `switch Quality to draft or shorten the sequence (budget ${morphBudgetMB()} MB)`);
     }
     const level = morph.mass ? `mass=${morph.refMass}` : `sigma=${sigma.toFixed(3)}`;
     for (let k = 1; k < n; k++) {
@@ -1322,8 +1346,8 @@ async function prepareMorph() {
       status(`Preparing morph… ${k + 1}/${n}`, "busy");
       cache[k] = await fetchMorphMesh(a, b, t, level, smooth, size);
       cachedBytes += cache[k].bytes;
-      if (cachedBytes > MORPH_BUDGET_BYTES) {
-        throw new Error(`morph cache passed ${MORPH_BUDGET_MB} MB at frame ${k + 1}/${n} — ` +
+      if (cachedBytes > morphBudgetBytes()) {
+        throw new Error(`morph cache passed ${morphBudgetMB()} MB at frame ${k + 1}/${n} — ` +
                         "switch Quality to draft or shorten the sequence");
       }
     }
@@ -1584,6 +1608,26 @@ $("bg").addEventListener("input", (e) => { const rgb = hexToRgb(e.target.value);
 $("reset").addEventListener("click", () => { camera = null; renderer.resetView(); volRenderer.resetView(); slices.resetZoom(); });
 $("mrc").addEventListener("click", () => { window.location.href = `./api/mrc?m=${active().index}`; });
 $("saveMap").addEventListener("click", saveMap);
+// The two memory budgets. The inputs always SHOW the number in force — the stored override if
+// there is one, otherwise whatever the default resolved to — so the nvidia-smi-derived figure
+// is visible rather than implicit. Clearing an input drops the override and the default comes
+// back. Neither is applied retroactively: a prepared morph keeps whatever it was built with.
+function syncBudgetInputs() {
+  const p = budgetPrefs();
+  $("memCache").value = Number.isFinite(p.cache) && p.cache > 0 ? String(p.cache) : String(morphBudgetMB());
+  $("memPool").value = Number.isFinite(p.pool) && p.pool > 0 ? String(p.pool) : String(isoPoolBudgetMB());
+}
+function onBudgetInput(which, el, lo, hi) {
+  const raw = el.value.trim();
+  const next = budgetPrefs();
+  if (!raw) delete next[which];                      // cleared: back to the default
+  else next[which] = Math.max(lo, Math.min(hi, Math.round(+raw) || lo));
+  writeJSON(BUDGET_KEY, next);
+  syncBudgetInputs();
+}
+$("memCache").addEventListener("change", (e) => onBudgetInput("cache", e.target, 128, 8192));
+$("memPool").addEventListener("change", (e) => onBudgetInput("pool", e.target, 256, 8192));
+
 $("morphFrames").addEventListener("change", (e) => {
   morph.perLeg = Math.max(2, Math.min(120, +e.target.value || 24));
   e.target.value = String(morph.perLeg);

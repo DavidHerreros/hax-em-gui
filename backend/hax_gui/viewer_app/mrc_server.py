@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +211,10 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
         return {
             "title": title,
             "full_size": scene.full,
+            # What the viewer's morph pool is allowed to hold, in the only terms anything here
+            # can measure. Queried per request rather than at import because free memory is
+            # what the number is for and it moves.
+            "gpu_mem": _gpu_mem(),
             # Same grid everywhere => the frontend may offer to morph. None => it must not.
             "morph_shape": list(scene.morph_shape()) if scene.morph_shape() else None,
             "models": [
@@ -565,6 +570,26 @@ def _morph_pair(scene: _Scene, a: int, b: int) -> tuple[np.ndarray, np.ndarray]:
             status_code=400,
             detail=f"cannot morph maps on different grids: {va.shape} vs {vb.shape}")
     return va, vb
+
+
+def _gpu_mem() -> dict[str, int] | None:
+    """Total and free memory of the first GPU, or None if that cannot be established.
+
+    Advisory, and the frontend treats it that way: this is the SERVER's card. It is the right
+    number when the browser is on the same machine (the usual case — the viewer is normally
+    opened next to the job that produced the maps) or when both render against the same GPU,
+    and it is merely a plausible one otherwise. Which is why the viewer exposes a manual
+    override next to the value it derives from this: a remote user with a laptop GPU and a
+    compute node's A100 in this field would otherwise be handed a budget it cannot honour.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2.0, check=True).stdout
+        total, free = (int(v.strip()) for v in out.splitlines()[0].split(","))
+        return {"total_mb": total, "free_mb": free}
+    except Exception:      # noqa: BLE001 - no nvidia-smi, no GPU, a timeout, odd output: all "unknown"
+        return None
 
 
 def _grid_payload(ds: np.ndarray, stats: dict[str, Any], lo, hi, vrange=None,
