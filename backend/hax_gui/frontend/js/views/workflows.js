@@ -131,6 +131,26 @@ export function WorkflowsView() {
       histIdx = history.length - 1;
     }, 400);
   }
+  // Moving a box, Tidy, restoring a pinned layout — cosmetic, not a decision the user
+  // needs to be asked about on their way out. These stay undoable (touchHistory still
+  // runs) but auto-save on their own debounce instead of setting `dirty`, so they never
+  // trip the unsaved-changes guard the way an actual graph edit does.
+  function touchLayout() {
+    layoutDirty = true;
+    touchHistory();
+    clearTimeout(layoutTimer);
+    layoutTimer = setTimeout(flushLayoutSave, 1000);
+  }
+  function flushLayoutSave() {
+    clearTimeout(layoutTimer);
+    // Checked here, not at schedule time: a semantic edit landing inside the debounce
+    // window must NOT get silently persisted — it rides along with the next explicit Save.
+    if (!(wf && layoutDirty && !dirty)) return;
+    const id = wf.id;   // captured now: `wf` may point at a different workflow by the time this resolves
+    api.updateWorkflow(id, { graph: graphSnapshot() })
+      .then((u) => { if (wf && wf.id === id) { wf = u; layoutDirty = false; } })
+      .catch(() => {});
+  }
   function timeTravel(dir) {
     clearTimeout(histTimer);                    // a pending push would clobber the jump
     const to = histIdx + dir;
@@ -147,6 +167,7 @@ export function WorkflowsView() {
   const selectedSet = new Set();   // multi-selection (run / move together)
   let runState = null;      // {nodeId: {job_id, status, error}}
   let dirty = false;
+  let layoutDirty = false, layoutTimer = null;   // layout-only changes: auto-saved, never trip the unsaved-changes guard
   let poll = null;
   const schemaCache = {};
   let drag = null;          // active node drag / wiring / pan gesture
@@ -276,7 +297,7 @@ export function WorkflowsView() {
   }
   function viewMenuItems() {
     const items = [
-      { label: "Tidy — arrange by dependency", icon: icon("sliders", 15), onClick: () => { autoLayout(); dirty = true, touchHistory(); } },
+      { label: "Tidy — arrange by dependency", icon: icon("sliders", 15), onClick: () => { autoLayout(); touchLayout(); } },
       { label: horiz() ? "Switch to vertical" : "Switch to horizontal", icon: icon(horiz() ? "chevronRight" : "arrowRight", 15), onClick: toggleOrientation },
       { label: "Center in view", icon: icon("orbit", 15), onClick: centerView },
       { label: minimapOn ? "Hide overview map" : "Show overview map", icon: icon("grid", 15), onClick: toggleMinimap },
@@ -1243,7 +1264,7 @@ export function WorkflowsView() {
       }
       redrawWires();
     } else if (drag && drag.kind === "node" && drag.moved) {
-      dirty = true, touchHistory();
+      touchLayout();
     }
     drag = null;
   }
@@ -1661,7 +1682,7 @@ export function WorkflowsView() {
       let y = refs.length ? Math.min(...refs.map((n) => n.y)) : 40;
       for (const n of unknown) { n.x = x1 + 80; n.y = y; y += nodeHeight(n) + 26; }
     }
-    dirty = true, touchHistory(); renderNodes(); centerView();
+    touchLayout(); renderNodes(); centerView();
     flash(unknown.length ? `Restored the pinned layout; placed ${unknown.length} new node(s) alongside it.` : "Restored the pinned layout.", "muted");
   }
 
@@ -1675,7 +1696,7 @@ export function WorkflowsView() {
     try {
       if (wf) wf = await api.updateWorkflow(wf.id, { name, graph: graphSnapshot() });
       else wf = await api.createWorkflow({ project_id: pid, name, graph: graphSnapshot() });
-      dirty = false; rememberWorkflow(wf.id); flash("Saved.", "muted"); await refreshList(); syncPickerValue(); syncActions();
+      dirty = false; layoutDirty = false; rememberWorkflow(wf.id); flash("Saved.", "muted"); await refreshList(); syncPickerValue(); syncActions();
     } catch (err) { flash("Save failed: " + (err.detail || err.message), "err"); }
     return wf;
   }
@@ -1787,6 +1808,9 @@ export function WorkflowsView() {
 
   async function openWorkflow(id) {
     stopPolling();
+    // Flush any pending layout autosave for the OUTGOING workflow before anything below
+    // reassigns `wf`/`graph` — this is what makes a just-moved box survive a switch.
+    flushLayoutSave();
     // Park the outgoing workflow's view before `wf` changes. Skipped for an empty
     // canvas, so the first open of a freshly built view doesn't record its 0,0 start.
     if (graph.nodes.length) rememberViewport();
@@ -1798,6 +1822,7 @@ export function WorkflowsView() {
     if (!id) {
       wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; nameInput.value = ""; seedHistory();
       dirty = false;          // a fresh canvas has nothing to lose yet
+      layoutDirty = false;    // ...and nothing pending to autosave either
       syncPickerValue(); rememberWorkflow(null);
       renderNodes(); restoreViewport("");
       renderInspector(); syncActions(); flash("New workflow.", "muted"); return;
@@ -1809,6 +1834,7 @@ export function WorkflowsView() {
       // What was just loaded IS the saved state — without this reset, a dirty flag
       // from the previous canvas followed you into a workflow you never touched.
       dirty = false;
+      layoutDirty = false;
       rememberWorkflow(wf.id);
       // freshly imported / never-laid-out graphs have all-zero coords — tidy once
       if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
@@ -1873,5 +1899,5 @@ export function WorkflowsView() {
   }
   const onBeforeUnload = (e) => { if (unsavedMsg()) { e.preventDefault(); e.returnValue = ""; } };
   window.addEventListener("beforeunload", onBeforeUnload);
-  return { el: root, cleanup: () => { rememberViewport(); stopPolling(); document.removeEventListener("keydown", onKey); window.removeEventListener("beforeunload", onBeforeUnload); } };
+  return { el: root, cleanup: () => { flushLayoutSave(); rememberViewport(); stopPolling(); document.removeEventListener("keydown", onKey); window.removeEventListener("beforeunload", onBeforeUnload); } };
 }
