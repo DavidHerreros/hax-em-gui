@@ -590,7 +590,11 @@ class WorkflowManager:
             # instead; the next launch that does produce a job replaces it.
             prior = (prior_state or {}).get(n["id"]) or {}
             if prior.get("status") == "failed" and not prior.get("job_id"):
-                state[n["id"]] = {"job_id": None, "status": "failed", "error": prior.get("error")}
+                # error_fields rides along: a canvas poll runs seconds after the failure,
+                # and dropping it here would wipe the per-field detail just as the client
+                # renders it. Absent on entries written before it existed — that is fine.
+                state[n["id"]] = {"job_id": None, "status": "failed", "error": prior.get("error"),
+                                  "error_fields": prior.get("error_fields")}
             elif jid and jid in by_job:
                 state[n["id"]] = {"job_id": jid, "status": by_job[jid]["status"],
                                   "stale": bool(by_job[jid].get("stale")), "error": None}
@@ -1150,7 +1154,12 @@ class WorkflowManager:
                                     dropped_args=dropped)
         except Exception as exc:  # noqa: BLE001 - surface build/validation failures per node
             state = self._fresh_state(wid)
-            state[nid] = {"job_id": None, "status": "failed", "error": str(exc)}
+            # A ValidationError knows *which* parameters it objected to, and flattening it
+            # to one sentence threw that away: the canvas could only say the step failed.
+            # Keeping the per-field dict is what lets it highlight the offending inputs in
+            # the step's own form. Anything else reaching here has no `.errors`.
+            state[nid] = {"job_id": None, "status": "failed", "error": str(exc),
+                          "error_fields": getattr(exc, "errors", None) or None}
             self._set_run(wid, "running", state)
             return
 

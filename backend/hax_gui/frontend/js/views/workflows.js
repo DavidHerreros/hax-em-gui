@@ -20,6 +20,7 @@ import { paramForm } from "./paramForm.js";
 import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
+import { fixParamsModal } from "./fixParams.js";
 import { confirmCascade, downstreamNodes, nodeAsDependent } from "./cascadeModal.js";
 import { pickProject } from "./pickProject.js";
 import { loadProgramGroups, isModed } from "../programGroups.js";
@@ -166,6 +167,7 @@ export function WorkflowsView() {
   let selected = null;      // primary selected node id (drives the inspector)
   const selectedSet = new Set();   // multi-selection (run / move together)
   let runState = null;      // {nodeId: {job_id, status, error}}
+  let flaggedFor = null;    // node whose parameter errors the inspector has already scrolled to
   let dirty = false;
   let layoutDirty = false, layoutTimer = null;   // layout-only changes: auto-saved, never trip the unsaved-changes guard
   let poll = null;
@@ -336,6 +338,9 @@ export function WorkflowsView() {
   }
 
   function syncActions() {
+    // Rebuilding this cluster mid-node-drag can wrap `.wf-topbar` onto a second row and
+    // shift the canvas out from under the pointer — deferred to onUp instead.
+    if (drag && drag.kind === "node") return;
     parSel.value = String((wf && wf.max_per_device) || 1);
     parSel.disabled = !wf;
     clear(actionsEl);
@@ -348,6 +353,16 @@ export function WorkflowsView() {
         h("button", { class: "btn secondary small", title: "Remove the selected step(s) (Delete / Backspace). Save to persist.", onclick: () => removeNodes([...selectedSet]) }, icon("x", 14)));
     }
     actionsEl.appendChild(saveBtn);
+    // Every parameter that would sink a run, repairable in one pass. Only offered when
+    // there is something to repair — otherwise it is a button that always says "no".
+    const bad = issueCount();
+    if (bad) {
+      actionsEl.appendChild(h("button", {
+        class: "btn secondary", style: { color: "var(--warn)", borderColor: "var(--warn)" },
+        title: `${bad} parameter${bad === 1 ? "" : "s"} would stop a run before any job is created. Fix them here.`,
+        onclick: () => openFixParams(null),
+      }, icon("sliders", 15), `Fix parameters (${bad})`));
+    }
     if (running) {
       if (n) actionsEl.appendChild(h("button", { class: "btn secondary", title: "Queue the selected step(s) onto the running workflow — each starts as soon as its dependencies are met and its device is free",
         onclick: () => runNodes([...selectedSet]) }, icon("plus", 15), "Queue selected"));
@@ -670,6 +685,7 @@ export function WorkflowsView() {
     graph.nodes.push(node);
     selectOnly(id); dirty = true, touchHistory();
     renderNodes(); renderInspector();
+    prefetchSchemas();   // a program new to this graph: its chip appears when the schema lands
     return node;
   }
   // The job backing a node, if any: project-canvas nodes carry `job_id`; a
@@ -925,6 +941,111 @@ export function WorkflowsView() {
       : "Focus mode off.", "muted");
   }
 
+  // ── parameter issues ──
+  // What build_command (backend/hax_gui/command.py) would reject, worked out here so a
+  // step can say so *before* it is run: a launch that fails validation produces no job,
+  // so there is no log to read the reason from and the step just turns red. The checks
+  // below mirror that function; whatever it rejected for reasons the client cannot see
+  // (a binding whose source job is gone) comes back as `error_fields` on the run state
+  // and is merged in.
+  const emptyArg = (v) => v === undefined || v === null || (typeof v === "string" && v.trim() === "");
+  // Python's int()/float(), not JS's: int("3.5") and float("x") both raise, so a plain
+  // Number() cast would pass values the backend is about to refuse.
+  const intLike = (v) => (typeof v === "number" ? Number.isFinite(v) : /^[+-]?\d+$/.test(String(v).trim()));
+  const numLike = (v) => {
+    if (typeof v === "number") return Number.isFinite(v);
+    const s = String(v).trim();
+    return s !== "" && (!Number.isNaN(Number(s)) || /^[+-]?(inf(inity)?|nan)$/i.test(s));   // float() takes inf/nan
+  };
+  const wiredInto = (n, field) => graph.edges.some((e) => e.to === n.id && e.field === field);
+
+  // [{ field, message, source }] — "params" for what the schema check found, "launch"
+  // for what the last failed launch reported.
+  function stepIssues(n) {
+    const schema = schemaCache[n.program];
+    if (!schema) return [];        // not fetched yet — prefetchSchemas() re-renders when it lands
+    const args = n.args || {};
+    const out = [];
+    for (const f of visibleFields(schema)) {
+      // A wired input is filled from the graph at launch, and a boolean is always
+      // sendable. Neither can be "missing". visibleFields() also keeps the auto-managed
+      // output/scratch args out of this — _run_node strips them before building.
+      if (f.type === "boolean" || wiredInto(n, f.name)) continue;
+      const v = args[f.name];
+      if (emptyArg(v)) {
+        if (f.required) out.push({ field: f.name, message: "required", source: "params" });
+        continue;
+      }
+      if (f.type === "enum" && f.choices && !f.choices.includes(v)) out.push({ field: f.name, message: `must be one of ${JSON.stringify(f.choices)}`, source: "params" });
+      else if (f.type === "integer" && !intLike(v)) out.push({ field: f.name, message: "must be an integer", source: "params" });
+      else if (f.type === "number" && !numLike(v)) out.push({ field: f.name, message: "must be a number", source: "params" });
+    }
+    const failed = runState && runState[n.id] && runState[n.id].error_fields;
+    if (failed && typeof failed === "object" && !Array.isArray(failed)) {
+      const seen = new Set(out.map((i) => i.field));
+      for (const [field, message] of Object.entries(failed)) {
+        if (!seen.has(field)) out.push({ field, message: String(message), source: "launch" });
+      }
+    }
+    return out;
+  }
+
+  // Recomputed on demand rather than cached: a graph is a few dozen nodes, and nothing
+  // then has to remember to invalidate it when an argument or a wire changes.
+  function issueCount() {
+    let n = 0;
+    for (const node of graph.nodes) n += stepIssues(node).length;
+    return n;
+  }
+
+  // The catalog is deliberately fieldless (registry.py), so every chip depends on a
+  // schema that only arrives per program. Pull the ones this graph needs in one go
+  // instead of waiting for the user to click each step.
+  function prefetchSchemas() {
+    const missing = [...new Set(graph.nodes.map((n) => n.program))].filter((p) => p && !schemaCache[p]);
+    if (!missing.length) return;
+    // renderNodes() + syncActions(), but never renderInspector(): the inspector would
+    // rebuild the form under a user already typing in it, and it reloads its own schema
+    // anyway. syncActions() has to be spelled out — renderNodes() calls it, but only
+    // when a node drag isn't in flight, and the toolbar's count is as new as the chips.
+    Promise.all(missing.map(loadSchema)).then(() => { if (root.isConnected) { renderNodes(); syncActions(); } });
+  }
+
+  // One pass over every broken parameter in the graph (or just `ids`) — the alternative
+  // is selecting each step in turn, and the inspector only shows one at a time.
+  async function openFixParams(ids) {
+    const scope = ids ? graph.nodes.filter((n) => ids.includes(n.id)) : graph.nodes;
+    const steps = [];
+    for (const n of scope) {
+      const schema = schemaCache[n.program];
+      if (!schema) continue;
+      const issues = stepIssues(n);
+      if (!issues.length) continue;
+      // Fixable = a field this form can render that isn't fed by a wire. The rest (a
+      // wired input, an argument the program no longer has) is listed but not editable.
+      const known = new Set(visibleFields(schema).map((f) => f.name));
+      const fixable = (node, list) => list.filter((i) => known.has(i.field) && !wiredInto(node, i.field));
+      steps.push({
+        node: n, schema,
+        issues: fixable(n, issues),
+        wiredIssues: issues.filter((i) => !known.has(i.field) || wiredInto(n, i.field)),
+        recheck: (node) => fixable(node, stepIssues(node)),
+      });
+    }
+    if (!steps.length) { flash("Nothing to fix — every step's parameters are complete.", "muted"); return; }
+    // The forms write into the live node objects, and a poll that adopts the server
+    // graph would swap those objects out from under them — the same reason the inspector
+    // is protected (see startPolling). So the first keystroke marks the canvas dirty,
+    // and a dismissed window puts the flag back where it found it.
+    const wasDirty = dirty;
+    const res = await fixParamsModal({ steps, onGoToStep: (id) => jumpTo(id), onEdit: () => { dirty = true; } });
+    if (!res) { dirty = wasDirty; renderNodes(); renderInspector(); return; }   // edits rolled back — redraw the chips
+    dirty = true, touchHistory();
+    await save();
+    renderNodes(); renderInspector();
+    if (res.action === "save-run" && res.nodes.length) runNodes(res.nodes);
+  }
+
   // ── rendering ──
   function renderNodes() {
     clear(nodesLayer);
@@ -956,6 +1077,7 @@ export function WorkflowsView() {
     const st = runState && runState[n.id] ? runState[n.id].status : null;
     // Its inputs were re-made after it ran, so what it holds no longer matches them.
     const stale = !!(runState && runState[n.id] && runState[n.id].stale);
+    const issues = stepIssues(n);   // parameters a run would reject (empty until the schema is in)
     const running = wf && wf.status === "running";
     const el = h("div", {
       class: "wf-node" + (selectedSet.has(n.id) ? " sel" : "") + (selected === n.id ? " primary" : "") + (stale ? " stale" : ""),
@@ -969,6 +1091,12 @@ export function WorkflowsView() {
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
       stale ? h("span", { class: "wf-node-stale", title: "A step this one depends on has been re-run since — these outputs are out of date. Run it again to refresh them." }, icon("refresh", 11)) : null,
+      issues.length ? h("button", {
+        class: "wf-node-issues",
+        title: `${issues.length} parameter${issues.length === 1 ? "" : "s"} would stop this step from running:\n`
+          + issues.map((i) => `  ${i.field} — ${i.message}`).join("\n") + "\nClick to fix.",
+        onclick: (e) => { e.stopPropagation(); openFixParams([n.id]); },
+      }, "!" + issues.length) : null,
       st ? h("span", { class: "wf-node-st", style: { color: statusColor(st) } }, st) : null,
       h("button", { class: "wf-node-run", title: running ? "Queue this step onto the running workflow — it starts when its device is free" : "Run this step", onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon(running ? "plus" : "play", 12)),
       h("button", { class: "wf-node-run", title: "Duplicate this step (un-run copy)", onclick: (e) => { e.stopPropagation(); duplicateNodes([n.id]); } }, icon("copy", 12)),
@@ -1143,11 +1271,15 @@ export function WorkflowsView() {
     if (e.shiftKey || e.ctrlKey || e.metaKey) toggleSel(n.id);
     else if (!selectedSet.has(n.id)) selectOnly(n.id);
     else selected = n.id;
-    renderNodes(); renderInspector();
+    // canvasPoint() reads the canvas's live bounding rect, so it has to run — and `drag`
+    // has to be set — before renderNodes() below gets any chance to reflow the topbar
+    // (see syncActions()'s node-drag guard): once that shifts the canvas under the
+    // pointer, every subsequent onMove delta is offset by however far it moved.
     const p = canvasPoint(e);
     // move every selected node together
     const group = (selectedSet.has(n.id) ? [...selectedSet] : [n.id]).map((id) => nodeById(id)).filter(Boolean);
     drag = { kind: "node", id: n.id, ox: p.x, oy: p.y, start: group.map((g) => ({ id: g.id, x: g.x, y: g.y })) };
+    renderNodes(); renderInspector();
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -1267,6 +1399,7 @@ export function WorkflowsView() {
       touchLayout();
     }
     drag = null;
+    syncActions();   // deferred by the node-drag guard above — show the cluster now that it's safe to reflow
   }
 
   // Persist a step rename: save the graph, and let the server carry the new name onto
@@ -1289,6 +1422,7 @@ export function WorkflowsView() {
     if (!n) {
       inspBody.appendChild(h("div", { class: "wf-insp-empty muted" },
         "Select a step to edit its parameters. Wire a step's output port into another step's input port to pass data. Shift-click to multi-select. Double-click a step that has run to open its job log."));
+      flaggedFor = null;   // nothing shown: the next step selected gets its scroll
       return;
     }
     inspBody.appendChild(h("div", { class: "wf-insp-head" }, h("strong", null, n.program)));
@@ -1318,7 +1452,7 @@ export function WorkflowsView() {
     // stores only the arguments that differ from the program's defaults, so a
     // default changed in hax-em is picked up on the next run — hence the sparse
     // `set` that deletes rather than storing an empty value.
-    inspBody.appendChild(paramForm(schema, visibleFields(schema), {
+    const form = paramForm(schema, visibleFields(schema), {
       density: "compact",
       get: (name) => n.args[name],
       set: (name, v, f) => {
@@ -1345,7 +1479,19 @@ export function WorkflowsView() {
         if (!(f.name in bindable)) return null;
         return isMultiField(n.program, f.name) ? "wirable, multi" : "wirable";
       },
-    }).el);
+    });
+    inspBody.appendChild(form.el);
+    // Say which parameters are wrong on the parameters themselves. A failed launch only
+    // ever produced one flattened sentence, and it had nowhere to appear: the step has no
+    // job, so there is no log page to send the user to.
+    const errs = {};
+    for (const i of stepIssues(n)) errs[i.field] = i.message;
+    // Marked on every render (a mark that came and went with a re-wire or a drag would be
+    // no mark at all), but *scrolled to* only when this step has just become the selected
+    // one: renderInspector() also runs on every drag start and every edge change, and a
+    // panel that jumps each time you pick a step up is unusable.
+    if (Object.keys(errs).length) form.setErrors(errs, { scroll: flaggedFor !== n.id });
+    flaggedFor = n.id;
   }
 
   function loadSchema(program) {
@@ -1771,6 +1917,7 @@ export function WorkflowsView() {
     seedHistory();
     nodeSeq = Math.max(1, ...graph.nodes.map((n) => +(n.id.replace(/\D/g, "")) || 0)) + 1;
     edgeSeq = Math.max(1, ...graph.edges.map((e) => +((e.id || "").replace(/\D/g, "")) || 0)) + 1;
+    prefetchSchemas();   // the issue chips need every program's fields, not just the selected step's
   }
 
   function startPolling() {
@@ -1820,7 +1967,7 @@ export function WorkflowsView() {
     // still "select" here.
     stepSearch = ""; searchInput.value = ""; searchState = { matches: [], hi: -1 }; closeSearchDd();
     if (!id) {
-      wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; nameInput.value = ""; seedHistory();
+      wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; flaggedFor = null; nameInput.value = ""; seedHistory();
       dirty = false;          // a fresh canvas has nothing to lose yet
       layoutDirty = false;    // ...and nothing pending to autosave either
       syncPickerValue(); rememberWorkflow(null);
@@ -1830,7 +1977,7 @@ export function WorkflowsView() {
     try {
       wf = await api.workflow(id);
       adoptGraph(wf.graph || {});
-      runState = wf.run_state || null; selected = null; nameInput.value = wf.name || ""; syncPickerValue();
+      runState = wf.run_state || null; selected = null; flaggedFor = null; nameInput.value = wf.name || ""; syncPickerValue();
       // What was just loaded IS the saved state — without this reset, a dirty flag
       // from the previous canvas followed you into a workflow you never touched.
       dirty = false;
