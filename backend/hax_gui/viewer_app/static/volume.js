@@ -878,10 +878,13 @@ export function createVolume(canvas) {
   // snapshot() sizes the canvas itself and calls drawScene directly, so exports are never
   // reduced. A morph recording drives setMix, not the orbit, so lastInteract stays old and
   // captureStream records at full resolution too.
+  // A recording pins the backing store to a fixed multiple of the CSS box (see
+  // startCanvasRecording): motion downscaling is off for its duration.
+  let renderScale = null;
   function resize() {
     const full = Math.min(window.devicePixelRatio || 1, 2);
-    const moving = mode === 2 && (performance.now() - lastInteract) < MOTION_WINDOW_MS;
-    const dpr = moving ? full * MOTION_SCALE : full;
+    const moving = renderScale == null && mode === 2 && (performance.now() - lastInteract) < MOTION_WINDOW_MS;
+    const dpr = renderScale != null ? renderScale : moving ? full * MOTION_SCALE : full;
     const w = Math.max(1, Math.floor(canvas.clientWidth * dpr)), h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   }
@@ -1398,6 +1401,8 @@ export function createVolume(canvas) {
     getCamera() { return orbit.getState(); },   // handed to the other renderer on a render-mode switch
     setCamera(cam) { orbit.setState(cam); },
     captureStream(fps) { return canvas.captureStream(fps); },
+    canvas,
+    setRenderScale(s) { renderScale = s; render(); },
     async snapshot({ scale = 2, transparent = false } = {}) {
       const ow = canvas.width, oh = canvas.height;
       canvas.width = Math.floor(canvas.clientWidth * scale); canvas.height = Math.floor(canvas.clientHeight * scale);

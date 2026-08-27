@@ -31,3 +31,39 @@ export function latestWins() {
     stale: (tok) => tok !== current,
   };
 }
+
+// Canvas video export. MediaRecorder's default bitrate (~2.5 Mbps) is fixed regardless of
+// frame size, so a full-resolution canvas gets crushed into a blurry stream that looks far
+// worse than the live view. Two fixes: a bitrate that grows with the pixel count (a
+// generous 0.25 bit per pixel per frame — 1080p at 30 fps ≈ 15 Mbps), and, when the
+// renderer supports it, drawing into a larger backing store for the duration so the movie
+// carries the same detail a 2× snapshot does. Returns { stop() → Promise<Blob> }.
+export const RECORD_SCALE = 2;
+export function startCanvasRecording(target, fps, { scale = RECORD_SCALE } = {}) {
+  if (target.setRenderScale) target.setRenderScale(scale);
+  const canvas = target.canvas;
+  const px = canvas ? canvas.width * canvas.height : 1920 * 1080;
+  const videoBitsPerSecond = Math.min(80e6, Math.max(8e6, Math.round(0.25 * px * fps)));
+  const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm";
+  let rec;
+  try {
+    rec = new MediaRecorder(target.captureStream(fps), { mimeType: mime, videoBitsPerSecond });
+  } catch (err) {
+    if (target.setRenderScale) target.setRenderScale(null);
+    throw err;
+  }
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  rec.start();
+  return {
+    stop() {
+      return new Promise((res) => {
+        rec.onstop = () => {
+          if (target.setRenderScale) target.setRenderScale(null);
+          res(new Blob(chunks, { type: "video/webm" }));
+        };
+        rec.stop();
+      });
+    },
+  };
+}

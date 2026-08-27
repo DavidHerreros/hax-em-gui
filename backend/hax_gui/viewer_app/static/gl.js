@@ -672,8 +672,9 @@ export function createRenderer(canvas) {
   const orbit = createOrbit(canvas, () => render(), null,
     { fitRadius: 1.33, probeDepth: centreDepth, modelBounds: sceneBounds });
 
+  let renderScale = null;   // pinned backing-store scale while a video is being recorded
   function resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = renderScale != null ? renderScale : Math.min(window.devicePixelRatio || 1, 2);
     const w = Math.max(1, Math.floor(canvas.clientWidth * dpr)), h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   }
@@ -912,6 +913,8 @@ export function createRenderer(canvas) {
     getCamera() { return orbit.getState(); },   // handed to the other renderer on a render-mode switch
     setCamera(cam) { orbit.setState(cam); },
     captureStream(fps) { return canvas.captureStream(fps); },
+    canvas,
+    setRenderScale(s) { renderScale = s; render(); },
     async snapshot({ scale = 2, transparent = false } = {}) {
       const ow = canvas.width, oh = canvas.height;
       canvas.width = Math.floor(canvas.clientWidth * scale);

@@ -16,7 +16,7 @@ import { createVolume, smoothGrid } from "./volume.js";
 import { createHistogram } from "./histogram.js";
 import { createSlices } from "./slices.js";
 import { parseColorMesh, parseGrid, parseMesh } from "./wire.js";
-import { latestWins, makeLive } from "./viewerbase.js";
+import { latestWins, makeLive, startCanvasRecording } from "./viewerbase.js";
 import { createMcEngine } from "./mcengine.js";
 import { massCurve, massAbove, levelForMass, blendedMassCurve } from "./mccore.js";
 
@@ -1838,13 +1838,8 @@ async function recordMorph() {
   if (!target.captureStream) { status("Recording is not available for this view.", "err"); return; }
   const fps = Math.max(1, +$("morphFps").value || 30);
   let rec;
-  const chunks = [];
-  try {
-    const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm";
-    rec = new MediaRecorder(target.captureStream(fps), { mimeType: mime });
-    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-    rec.start();
-  } catch (err) { status("Recording unavailable: " + err.message, "err"); return; }
+  try { rec = startCanvasRecording(target, fps); }
+  catch (err) { status("Recording unavailable: " + err.message, "err"); return; }
 
   pauseMorph();
   const btn = $("morphRecord");
@@ -1856,15 +1851,13 @@ async function recordMorph() {
     status(`Recording… ${k + 1}/${n}`, "busy");
     await new Promise((r) => setTimeout(r, 1000 / fps));
   }
-  rec.onstop = () => {
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob(chunks, { type: "video/webm" }));
-    a.download = "morph.webm";
-    a.click();
-    URL.revokeObjectURL(a.href);
-    status(`Recording saved · ${n} frames at ${fps} fps`);
-  };
-  rec.stop();
+  const blob = await rec.stop();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "morph.webm";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  status(`Recording saved · ${n} frames at ${fps} fps`);
   btn.disabled = false;
 }
 

@@ -7,7 +7,7 @@ import { createCloud } from "./cloud.js";
 import { createHistogram } from "./histogram.js";
 import { createSlices } from "./slices.js";
 import { FMT, parseGrid, parseMesh, unwrap } from "./wire.js";
-import { makeLive } from "./viewerbase.js";
+import { makeLive, startCanvasRecording } from "./viewerbase.js";
 
 // Density colormaps (RGB 0–255 control stops, low→high). Default inferno, to
 // match the desktop annotate_space landscape (napari "inferno" over a dark
@@ -2430,13 +2430,9 @@ async function recordSeries() {
   if (!state.timeline.length && !(await buildTimeline())) { status("Build a path first (shift-click states).", "warn"); return; }
   const active = state.render === "surface" ? renderer : volRenderer;
   if (!active || !active.captureStream) { status("Recording unavailable for this view.", "err"); return; }
-  let rec = null; const chunks = [];
-  try {
-    const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm";
-    rec = new MediaRecorder(active.captureStream(30), { mimeType: mime });
-    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-    rec.start();
-  } catch (err) { status("Recording unavailable: " + err.message, "err"); return; }
+  let rec = null;
+  try { rec = startCanvasRecording(active, 30); }
+  catch (err) { status("Recording unavailable: " + err.message, "err"); return; }
   recording = true; setPlaying(true);
   // Recording stays on full-resolution frames — an exported movie is the one place the
   // draft would be a real loss — but it now prefetches ahead of itself instead of decoding
@@ -2447,7 +2443,7 @@ async function recordSeries() {
   for (let i = recStep; i < state.timeline.length && playing; i += recStep) { await renderFrame(i, false); status(`Recording… ${i + 1}/${state.timeline.length}`, "busy"); await sleep(recDelay); }
   fillToken++;
   setPlaying(false); recording = false;
-  rec.stop(); rec.onstop = () => downloadBlob(new Blob(chunks, { type: "video/webm" }), "morph.webm");
+  downloadBlob(await rec.stop(), "morph.webm");
   status("Recording saved (morph.webm).");
 }
 
