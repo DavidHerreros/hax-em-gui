@@ -30,6 +30,8 @@ function build(job) {
   if (job.return_code != null && !job.active) rows.push(["Exit code", String(job.return_code)]);
   if (job.stale) rows.push(["Stale", "an input was re-run after this finished"]);
   if (job.project_name) rows.push(["Project", job.project_name]);
+  const folder = (job.workdir || "").replace(/\/+$/, "").split("/").pop();
+  if (folder) rows.push(["Folder", h("span", { class: "mono", style: { wordBreak: "break-all" } }, folder)]);
   return h("div", { class: "job-tip" },
     h("div", { class: "job-tip-title" }, job.name || job.program),
     h("dl", null, ...rows.map(([k, v]) => [h("dt", null, k), h("dd", null, v)])));

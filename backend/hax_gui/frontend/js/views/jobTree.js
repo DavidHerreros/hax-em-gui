@@ -86,7 +86,7 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
   const projWrap = h("div", { class: "jt-pop-anchor jt-projrow" }, projBtn, switchBtn);
   switchBtn.onclick = (e) => { e.stopPropagation(); togglePop(projWrap, buildProjectMenu); };
 
-  const search = h("input", { class: "jt-search-in", type: "search", placeholder: "Filter runs", value: memo.q,
+  const search = h("input", { class: "jt-search-in", type: "search", placeholder: "Filter by name, program or run id", value: memo.q,
     oninput: (e) => { memo.q = e.target.value.trim().toLowerCase(); renderList(); } });
   const filterBtn = h("button", { class: "jt-ibtn", title: "Filter by status, program or label" }, icon("sliders", 14));
   const filterBadge = h("span", { class: "jt-badge", hidden: true });
@@ -162,8 +162,11 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
   }
 
   function filterCount() { return memo.status.size + memo.program.size + memo.label.size + (memo.stale ? 1 : 0); }
+  // The run folder is `<program>_<job id>` (jobs.py), so a search matches the id at its
+  // end and anything printed in a log or a path — the shortest way to find "that run".
+  const folderOf = (j) => (j.workdir || "").replace(/\/+$/, "").split("/").pop() || "";
   function matches(j) {
-    if (memo.q && !`${j.name || ""} ${j.program}`.toLowerCase().includes(memo.q)) return false;
+    if (memo.q && !`${j.name || ""} ${j.program} ${j.id} ${folderOf(j)}`.toLowerCase().includes(memo.q)) return false;
     if (memo.status.size && !memo.status.has(j.status)) return false;
     if (memo.program.size && !memo.program.has(j.program)) return false;
     if (memo.label.size && !(j.labels || []).some((l) => memo.label.has(l.id))) return false;
