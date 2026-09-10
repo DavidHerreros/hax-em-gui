@@ -21,7 +21,7 @@ import { jobMenuButton, jobDisplayName, jobsSignature } from "./jobs.js";
 import { makeJobDraggable } from "./inputBinding.js";
 import { attachJobTip, hideJobTip } from "./jobTip.js";
 import { loadLabels } from "./labels.js";
-import { navigate } from "../router.js";
+import { navigate, currentPath } from "../router.js";
 import { openContextMenu } from "./contextMenu.js";
 import { createProjectPrompt, projectMenuItems } from "./projectOverview.js";
 
@@ -116,6 +116,15 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
     document.addEventListener("mousedown", onDocDown, true);
   }
 
+  // Switching projects keeps the user on the view they are in (Metrics, Viewer,
+  // Workflows…): the tree re-reads the new project's runs on the store change. The
+  // one page that cannot survive the switch is a run detail, since that run belongs
+  // to the old project — fall back to the project overview from there.
+  function switchProject(p) {
+    store.openProject(p);
+    if (currentPath().startsWith("/jobs/")) navigate("/project");
+  }
+
   function buildProjectMenu(el) {
     const ps = memo.projects || [];
     const active = getState().activeProjectId;
@@ -127,7 +136,7 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
       const shown = ps.filter((p) => !needle || p.name.toLowerCase().includes(needle));
       for (const p of shown) {
         rows.appendChild(h("div", { class: "jt-pop-row" + (p.id === active ? " on" : ""),
-          onclick: () => { closePop(); store.openProject(p); navigate("/project"); } },
+          onclick: () => { closePop(); switchProject(p); } },
           h("span", { class: "jt-pop-row-name" }, p.name),
           p.runs != null ? h("span", { class: "jt-count" }, `${p.runs}`) : null,
           h("button", { class: "row-menu", title: "Project options",
