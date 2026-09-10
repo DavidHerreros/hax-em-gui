@@ -230,6 +230,10 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
     // Straight into the run folder, without going through the detail view first.
     // A saved-but-never-run job has no folder yet.
     if (job.workdir) items.push({ label: "Output folder…", icon: icon("folderOpen", 15), onClick: () => openFileBrowser(job.workdir) });
+    // Active runs can be stopped from here without opening them; a queued job is
+    // simply dropped from the queue. Delete is only offered once the run is over.
+    if (job.status === "queued") items.push({ label: "Unqueue", icon: icon("ban", 15), danger: true, onClick: cancel });
+    else if (job.status === "running" || job.status === "pending") items.push({ label: "Cancel", icon: icon("ban", 15), danger: true, onClick: cancel });
     if (!job.active) items.push({ label: "Delete", icon: icon("trash", 15), danger: true, onClick: del });
     openContextMenu(anchor, items);
   }
@@ -242,6 +246,14 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
     const name = await promptModal({ title: "Rename run", label: "Run name", value: job.name || "", placeholder: job.program, okText: "Rename" });
     if (name === null) return;
     try { const u = await api.renameJob(job.id, name); job.name = u.name; store.renameViewerForJob(job.id, u.name); if (onRenamed) onRenamed(u); } catch { /* ignore */ }
+  }
+  async function cancel() {
+    const queued = job.status === "queued";
+    if (!(await confirmModal({ title: queued ? "Remove from queue?" : "Cancel run?", danger: true,
+        okText: queued ? "Unqueue" : "Cancel run",
+        message: queued ? "This job will be taken out of the queue. You can re-run it later."
+                        : "The run and its workers will be stopped. Intermediate checkpoints are kept." }))) return;
+    try { await api.cancelJob(job.id); } catch (err) { toastError(err, queued ? "Could not unqueue this job." : "Could not cancel this run."); }
   }
   async function del() {
     if (!(await confirmModal({ title: "Delete run?", danger: true, okText: "Delete run",

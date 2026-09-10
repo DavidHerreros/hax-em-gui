@@ -228,7 +228,8 @@ export function jobDetailPanel(id) {
   function renderHead() {
     clear(head);
     if (!job) { head.appendChild(h("h1", { class: "jd-title" }, "…")); return; }
-    const running = status === "running" || status === "pending";
+    const queued = status === "queued";
+    const running = status === "running" || status === "pending" || queued;
     // Being torn down: no longer cancellable, not finished either — the final
     // status arrives over the WS once the process group has been reaped.
     const cancelling = status === "cancelling";
@@ -254,14 +255,18 @@ export function jobDetailPanel(id) {
     if (status === "saved") {
       actions.append(h("button", { class: "btn", onclick: startSaved, title: "Launch this saved job now" }, icon("play", 15), "Run"));
     } else if (running) {
-      actions.append(
-        job.has_metrics ? watchBtn() : null,
-        h("button", { class: "btn secondary", style: { color: "var(--warn)" }, onclick: (e) => {
+      // A queued job was never launched: cancelling it just drops it from the queue.
+      const stopLabel = queued ? "Unqueue" : "Cancel";
+      append(actions, [
+        job.has_metrics && !queued ? watchBtn() : null,
+        h("button", { class: "btn secondary", style: { color: "var(--warn)" },
+          title: queued ? "Remove this job from the queue (it can be re-run later)" : "Stop this run and its workers",
+          onclick: (e) => {
           // immediate feedback; the terminal status still arrives over the WS once
           // the process group has been torn down
-          const b = e.currentTarget; b.disabled = true; b.lastChild.textContent = "Cancelling…";
-          api.cancelJob(id).catch(() => { b.disabled = false; b.lastChild.textContent = "Cancel"; });
-        } }, icon("ban", 15), "Cancel"));
+          const b = e.currentTarget; b.disabled = true; b.lastChild.textContent = queued ? "Unqueuing…" : "Cancelling…";
+          api.cancelJob(id).catch(() => { b.disabled = false; b.lastChild.textContent = stopLabel; });
+        } }, icon("ban", 15), stopLabel)]);
     } else if (cancelling) {
       actions.append(h("button", { class: "btn secondary", style: { color: "var(--warn)" }, disabled: true,
         title: "Stopping this run and its workers…" }, icon("ban", 15), "Cancelling…"));
@@ -269,14 +274,14 @@ export function jobDetailPanel(id) {
       // A cancelled/failed/interrupted run that already committed an intermediate
       // checkpoint can be resumed in place (backend sets job.resumable). Paired
       // actions (Continue/Rerun + their "Edit &" variant) collapse into split buttons.
-      actions.append(
+      append(actions, [
         canResume ? splitButton(
           { icon: "restore", label: "Continue", title: "Resume from the last saved checkpoint with the same inputs", onClick: continueRun },
           [{ icon: icon("sliders", 15), label: "Edit & continue", onClick: editContinue }]) : null,
         splitButton(
           { icon: "play", label: "Rerun", title: "Re-launch immediately with the same inputs (a fresh run)", onClick: rerun },
           [{ icon: icon("copy", 15), label: "Edit & rerun", onClick: editRerun },
-           { icon: icon("plus", 15), label: "Reproduce as new run", onClick: reproduce }]));
+           { icon: icon("plus", 15), label: "Reproduce as new run", onClick: reproduce }])]);
     }
     if (job.has_metrics && status !== "saved") actions.append(metricsBtn());
     if (viewable(job)) actions.append(viewerBtn());
@@ -716,7 +721,7 @@ export function jobDetailPanel(id) {
   let poll = null;
   // 'cancelling' counts as active: the run is still being torn down and its final
   // status is still to come, so keep polling/streaming until it lands.
-  const isActive = () => status === "running" || status === "pending" || status === "cancelling";
+  const isActive = () => status === "running" || status === "pending" || status === "queued" || status === "cancelling";
   function updatePolling() {
     const active = isActive();
     if (active && !poll) poll = poller(() => { loadOutputs(); refreshProgress(); }, 4000, { immediate: false });
@@ -765,7 +770,7 @@ export function jobDetailPanel(id) {
   // run back up: fresh metadata, empty terminals, a new log stream.
   const offEvents = onJobEvent((m) => {
     if (m.kind !== "job" || m.job_id !== id) return;
-    const nowActive = m.status === "pending" || m.status === "running";
+    const nowActive = m.status === "pending" || m.status === "queued" || m.status === "running";
     if (!nowActive || isActive()) return;
     api.job(id).then((j) => {
       job = j; status = j.status;
