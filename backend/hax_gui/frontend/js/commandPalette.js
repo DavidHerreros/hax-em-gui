@@ -6,11 +6,11 @@ import { h, clear } from "./h.js";
 import { icon } from "./icons.js";
 import { api } from "./api.js";
 import { navigate } from "./router.js";
-import { store } from "./store.js";
+import { store, getState } from "./store.js";
 
 const VIEWS = [
   { label: "Home", hint: "view", icon: "home", go: () => navigate("/") },
-  { label: "Project", hint: "view", icon: "box", go: () => navigate("/project") },
+  { label: "Project", hint: "view", icon: "box", go: () => navigate(getState().projectRoute) },
   { label: "Metrics", hint: "view", icon: "chart", go: () => navigate("/metrics") },
   { label: "3D viewer", hint: "view", icon: "orbit", go: () => navigate("/viewer") },
   { label: "Workflows", hint: "view", icon: "workflow", go: () => navigate("/workflows") },

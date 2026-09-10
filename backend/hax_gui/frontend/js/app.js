@@ -27,6 +27,7 @@ const THEME_KEY = "hax_gui_theme";
 
 const NAV = [
   { path: "/", label: "Home", icon: "home", match: (p) => p === "/" },
+  // href is rewritten on every route change to wherever the Project tab was left (see onRoute below).
   { path: "/project", label: "Project", icon: "box", match: (p) => p.startsWith("/project") || p.startsWith("/jobs") },
   { path: "/metrics", label: "Metrics", icon: "chart", match: (p) => p.startsWith("/metrics") },
   { path: "/viewer", label: "3D viewer", icon: "orbit", match: (p) => p.startsWith("/viewer") },
@@ -129,6 +130,9 @@ function buildSidebar() {
     for (const a of allLinks) {
       const item = [...NAV, { path: "/settings", match: (p) => p.startsWith("/settings") }].find((x) => x.path === a.getAttribute("data-path"));
       a.classList.toggle("active", item.match(path));
+      // Coming back to the Project tab lands on the run (or overview) it was left on,
+      // the way Metrics keeps its open runs and the viewer its window.
+      if (item.path === "/project") a.href = "#" + getState().projectRoute;
     }
   });
   return sidebar;

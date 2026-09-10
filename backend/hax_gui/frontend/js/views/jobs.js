@@ -130,6 +130,7 @@ export function jobTimeEl(job, cls = "time") {
 export function JobsView(params = {}) {
   const id = params.id || null;
   if (id) store.setLastJob(id);
+  store.setProjectRoute(id ? `/jobs/${id}` : "/project");   // the nav's "Project" link returns here
   const tree = jobTree({
     isSelected: (j) => j.id === id,
     onSelect: (j) => { if (j.id !== id) navigate(`/jobs/${j.id}`); },

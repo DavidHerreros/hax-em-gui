@@ -18,6 +18,7 @@ const state = {
   prefill: null,        // { program, values, gpu } to preload a form from a past job
   formNonce: 0,         // bumped whenever the launcher form should rebuild
   lastJobId: null,      // run last selected in the job tree; Metrics / Viewer preselect it
+  projectRoute: "/project",   // where the Project tab was left (a run, or the overview), so the nav goes back there
 };
 
 (function restore() {
@@ -115,6 +116,7 @@ export const store = {
   },
 
   setLastJob(id) { state.lastJobId = id || null; },   // no emit: nothing re-renders on it
+  setProjectRoute(path) { state.projectRoute = path || "/project"; },   // no emit: read on the next route change
 
   selectProgram(name) { state.selectedProgram = name; state.rightOpen = true; state.formNonce++; persist(); emit(); },
   clearProgram() { state.selectedProgram = null; state.formNonce++; emit(); },
