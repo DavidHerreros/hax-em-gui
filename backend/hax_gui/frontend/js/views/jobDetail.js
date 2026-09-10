@@ -20,6 +20,7 @@ import { createTerminal } from "./terminal.js";
 import { openFileBrowser } from "./filePicker.js";
 import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
 import { metricsTabInfo } from "./runBrowser.js";
+import { onJobEvent } from "../events.js";
 
 // Route wrapper kept for callers that still mount the detail on its own.
 export function JobDetailView(params) { return jobDetailPanel(params.id); }
@@ -757,5 +758,25 @@ export function jobDetailPanel(id) {
   }
   connectLog();
 
-  return { el: root, cleanup: () => { if (closeLog) closeLog(); if (poll) poll.stop(); } };
+  // A finished run's log socket is closed by the server after the replay, and the
+  // page stops polling — so when the same job is launched again in place (edit &
+  // rerun from the launcher, Run from the tree's row menu, a queued cascade) nothing
+  // here would notice. The global event channel announces the relaunch; pick the
+  // run back up: fresh metadata, empty terminals, a new log stream.
+  const offEvents = onJobEvent((m) => {
+    if (m.kind !== "job" || m.job_id !== id) return;
+    const nowActive = m.status === "pending" || m.status === "running";
+    if (!nowActive || isActive()) return;
+    api.job(id).then((j) => {
+      job = j; status = j.status;
+      termOut.reset(); termErr.reset();
+      clear(actionErr); diagPanel.hidden = true;
+      renderHead(); renderOverview(); renderParams(); renderLineage();
+      outputsSig = null; loadOutputs(); updatePolling();
+      selectPane("log");
+      connectLog();
+    }).catch(() => {});
+  });
+
+  return { el: root, cleanup: () => { offEvents(); if (closeLog) closeLog(); if (poll) poll.stop(); } };
 }

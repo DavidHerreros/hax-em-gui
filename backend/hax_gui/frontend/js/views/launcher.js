@@ -3,7 +3,12 @@
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api, ApiError } from "../api.js";
-import { navigate } from "../router.js";
+import { navigate, currentPath, reload } from "../router.js";
+
+// Go to `path`, or rebuild the page when it is already the one on screen: setting an
+// unchanged hash fires no hashchange, so "open the run you just relaunched" used to
+// leave the old, finished view in place.
+function goTo(path) { if (currentPath() === path) reload(); else navigate(path); }
 import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
 import { initialValues, visibleFields } from "./formFields.js";
@@ -281,7 +286,7 @@ export function buildLauncher() {
         if (created && created.id) targetJobId = created.id;
         store.setActiveProject(proj.id);
         // Land on the run just created (or saved) rather than on a list.
-        navigate(created && created.id ? `/jobs/${created.id}` : "/project");
+        goTo(created && created.id ? `/jobs/${created.id}` : "/project");
       } catch (err) {
         if (err instanceof ApiError && err.status === 422 && err.detail && err.detail.errors) {
           // Opens the groups holding the offending fields and scrolls to the first.
@@ -329,7 +334,7 @@ export function buildLauncher() {
           launched += 1;
         }
         store.setActiveProject(proj.id);
-        navigate("/project");     // a sweep: several runs, so the project's tree is the place
+        goTo("/project");     // a sweep: several runs, so the project's tree is the place
       } catch (err) {
         const done = launched ? ` (${launched} of ${vals.length} runs were already launched)` : "";
         if (err instanceof ApiError && err.status === 422 && err.detail && err.detail.errors) {
