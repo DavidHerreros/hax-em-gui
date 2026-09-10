@@ -1,18 +1,21 @@
-// Jobs list with light polling. The detail view streams live instead.
-import { h, mount, clear } from "../h.js";
+// Project page: the shared job tree on the left; on the right the selected run
+// (/jobs/:id) or, with none selected, the project itself (/project). Row helpers
+// used by every run list live here too.
+import { h, mount } from "../h.js";
 import { icon } from "../icons.js";
 import { toastError } from "../toast.js";
 import { confirmModal } from "./confirmModal.js";
 import { api } from "../api.js";
-import { errorBox, skeleton } from "./ui.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
 import { pickProject } from "./pickProject.js";
 import { openFileBrowser } from "./filePicker.js";
-import { jobLabelChips, loadLabels } from "./labels.js";
-import { store } from "../store.js";
-import { poller } from "../poller.js";
-import { onJobEvent } from "../events.js";
+import { store, getState, subscribe } from "../store.js";
+import { navigate } from "../router.js";
+import { jobTree } from "./jobTree.js";
+import { jobWorkspace, stageEmpty } from "./jobWorkspace.js";
+import { jobDetailPanel } from "./jobDetail.js";
+import { projectOverview, createProjectPrompt } from "./projectOverview.js";
 
 export function badge(status) {
   const animated = status === "running" || status === "pending";
@@ -124,151 +127,54 @@ export function jobTimeEl(job, cls = "time") {
     dur ? h("span", { class: "time-dur" }, " · " + dur) : null);
 }
 
-export function JobsView() {
-  const root = h("div", { class: "view" }, h("h1", { style: { marginBottom: "16px" } }, "Jobs"));
-  const filterBar = h("div", { class: "jobs-filters" });
-  const body = h("div");
-  root.appendChild(filterBar);
-  root.appendChild(body);
-  mount(body, skeleton("260px"));
-
-  const filters = { name: "", project: "", program: "", status: "", label: "" };
-  const nameInput = h("input", { class: "input filter-search", type: "search", placeholder: "Filter by name…",
-    oninput: (e) => { filters.name = e.target.value.trim().toLowerCase(); renderBody(); } });
-  const projectSel = filterSelect("All projects", (v) => { filters.project = v; renderBody(); });
-  const programSel = filterSelect("All programs", (v) => { filters.program = v; renderBody(); });
-  const statusSel = filterSelect("All statuses", (v) => { filters.status = v; renderBody(); });
-  const labelSel = filterSelect("All labels", (v) => { filters.label = v; renderBody(); });
-  const clearBtn = h("button", { class: "btn ghost filter-clear", title: "Clear filters", onclick: () => {
-    filters.name = filters.project = filters.program = filters.status = filters.label = "";
-    nameInput.value = "";
-    projectSel.value = programSel.value = statusSel.value = labelSel.value = "";
-    renderBody();
-  } }, icon("x", 14), "Clear");
-  filterBar.append(
-    h("div", { class: "filter-group" }, icon("search", 14), nameInput),
-    h("div", { class: "filter-group" }, icon("box", 14), projectSel),
-    h("div", { class: "filter-group" }, icon("sliders", 14), programSel),
-    h("div", { class: "filter-group" }, icon("list", 14), statusSel),
-    h("div", { class: "filter-group" }, icon("more", 14), labelSel),
-    clearBtn);
-
-  let allJobs = [];
-  let stop = false;
-  let lastSig = null;
-  let animatedOnce = false;
-
-  // A rename mutates the job object in place (which lives in `allJobs`), so realign
-  // the signature to what we already show — otherwise the next 3s poll sees the name
-  // change, rebuilds the whole list, and the scroll jumps back to the top.
-  const hooks = { afterLocalRename() { lastSig = jobsSignature(allJobs); } };
-
-  function renderBody() {
-    let content;
-    if (!allJobs.length) content = h("p", { class: "muted" }, "No jobs yet. Pick a program from the right menu.");
-    else {
-      const jobs = allJobs.filter((j) =>
-        (!filters.name || (j.name || "").toLowerCase().includes(filters.name) || j.program.toLowerCase().includes(filters.name)) &&
-        (!filters.project || projectKey(j) === filters.project) &&
-        (!filters.program || j.program === filters.program) &&
-        (!filters.status || j.status === filters.status) &&
-        (!filters.label || (j.labels || []).some((l) => l.id === filters.label)));
-      content = jobs.length ? groupedList(jobs, hooks) : h("p", { class: "muted" }, "No jobs match the current filters.");
-    }
-    mount(body, content);
-    // Animate the row entrance only on the first paint; later refreshes (every 3s)
-    // rebuild the list, and re-animating them makes the list visibly "jump".
-    body.classList.toggle("no-anim", animatedOnce);
-    animatedOnce = true;
+export function JobsView(params = {}) {
+  const id = params.id || null;
+  if (id) store.setLastJob(id);
+  const tree = jobTree({
+    isSelected: (j) => j.id === id,
+    onSelect: (j) => { if (j.id !== id) navigate(`/jobs/${j.id}`); },
+  });
+  const stage = h("div", { class: "jw-stage" });
+  let detail = null;
+  function showProject() {
+    detail?.cleanup?.();
+    const proj = store.activeProject();
+    detail = proj ? projectOverview(proj) : null;
+    mount(stage, detail ? detail.el : stageEmpty("No project open",
+      h("span", null, "Choose one from the switcher on the left, or ",
+        h("button", { class: "jt-link", onclick: () => createProjectPrompt() }, "create a project"), ".")));
   }
-
-  function syncFilters() {
-    syncOptions(projectSel, distinct(allJobs.map(projectKey)), filters, "project");
-    syncOptions(programSel, distinct(allJobs.map((j) => j.program)), filters, "program");
-    syncOptions(statusSel, distinct(allJobs.map((j) => j.status)), filters, "status");
-    syncLabelOptions();
-  }
-
-  // The label filter maps id -> name (a job carries label objects, not strings).
-  function syncLabelOptions() {
-    const seen = new Map();
-    for (const j of allJobs) for (const l of j.labels || []) seen.set(l.id, l.name);
-    const sig = JSON.stringify([...seen]);
-    if (labelSel._sig === sig) return;
-    labelSel._sig = sig;
-    if (filters.label && !seen.has(filters.label)) filters.label = "";
-    clear(labelSel);
-    labelSel.appendChild(h("option", { value: "" }, "All labels"));
-    for (const [id, name] of [...seen].sort((a, b) => a[1].localeCompare(b[1])))
-      labelSel.appendChild(h("option", { value: id, selected: id === filters.label }, name));
-    labelSel.value = filters.label;
-  }
-
-  async function refresh() {
-    try {
-      const jobs = await api.jobs();
-      if (stop) return;
-      const sig = jobsSignature(jobs);
-      if (sig === lastSig) return; // nothing changed -> don't rebuild (avoids flicker)
-      lastSig = sig;
-      allJobs = jobs;
-      syncFilters();
-      renderBody();
-    } catch (err) {
-      lastSig = null; // next successful poll must repaint over the error box
-      if (!stop) mount(body, errorBox(err));
-    }
-  }
-  loadLabels().catch(() => {});
-  const p = poller(refresh, 3000);
-  const offEvents = onJobEvent(() => p.kick());   // push beats the 3 s tick
-
-  return { el: root, cleanup: () => { stop = true; p.stop(); offEvents(); } };
+  if (id) { detail = jobDetailPanel(id); stage.appendChild(detail.el); }
+  else showProject();
+  // With no run selected the page is the project: a project switch repaints the stage
+  // in place (the tree follows the store on its own).
+  let lastPid = getState().activeProjectId;
+  const unsub = subscribe(() => { const pid = getState().activeProjectId; if (!id && pid !== lastPid) { lastPid = pid; showProject(); } });
+  const el = h("div", { class: "view" }, jobWorkspace(tree.el, stage));
+  return { el, cleanup: () => { unsub(); tree.cleanup(); detail?.cleanup?.(); } };
 }
 
-function projectKey(job) { return job.project_name || "(no project)"; }
-function distinct(arr) { return [...new Set(arr)].sort((a, b) => String(a).localeCompare(String(b))); }
-
-function filterSelect(allLabel, onChange) {
-  const sel = h("select", { class: "input filter-select", onchange: (e) => onChange(e.target.value) },
-    h("option", { value: "" }, allLabel));
-  sel._allLabel = allLabel;
-  return sel;
-}
-
-// Rebuild a select's options only when the value set changes, preserving (or
-// clearing) the current selection.
-function syncOptions(sel, values, filters, key) {
-  const want = JSON.stringify(values);
-  if (sel._sig === want) return;
-  sel._sig = want;
-  if (filters[key] && !values.includes(filters[key])) filters[key] = "";
-  clear(sel);
-  sel.appendChild(h("option", { value: "" }, sel._allLabel));
-  for (const v of values) sel.appendChild(h("option", { value: v, selected: v === filters[key] }, v));
-  sel.value = filters[key];
-}
-
-// Group jobs under their project (alphabetical; "(no project)" last).
-function groupedList(jobs, hooks) {
-  const groups = new Map();
-  for (const j of jobs) {
-    const k = projectKey(j);
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(j);
+// Copy this run's recipe into another project: pick a destination, then open the New
+// Run form there preloaded with the program + parameters (data inputs cleared, to be
+// set in the target project). Nothing runs until the user saves/launches it there.
+export async function copyJobToProject(job) {
+  const target = await pickProject({
+    title: "Copy run to project", okText: "copy here", excludeId: job.project_id,
+    hint: "Opens the New Run form in the chosen project, preloaded with this run's program and settings. Data inputs are cleared for you to set there.",
+  });
+  if (!target) return;
+  try {
+    const pf = await api.jobCopyPrefill(job.id);
+    store.prefillProgram({ program: pf.program, values: pf.values, gpu: pf.gpu, name: pf.name,
+                           projectId: target.id, projectName: target.name });
+  } catch (err) {
+    toastError(err, "Could not copy this run.");
   }
-  const keys = [...groups.keys()].sort((a, b) =>
-    a === "(no project)" ? 1 : b === "(no project)" ? -1 : a.localeCompare(b));
-  return h("div", null, ...keys.map((k) => {
-    const items = groups.get(k);
-    return h("div", { class: "jobs-group" },
-      h("div", { class: "jobs-group-head" },
-        icon("box", 14),
-        h("span", { class: "jobs-group-name" }, k),
-        h("span", { class: "jobs-group-count" }, String(items.length))),
-      h("div", null, ...items.map((j, i) => row(j, i, hooks))));
-  }));
 }
+
+
+
+
 
 // A change signature for a job list: re-render only when ids/statuses/names change.
 // Signature to decide whether a background refresh needs to rebuild the list.
@@ -326,23 +232,7 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
     if (!job.active) items.push({ label: "Delete", icon: icon("trash", 15), danger: true, onClick: del });
     openContextMenu(anchor, items);
   }
-  // Copy this run's recipe into another project: pick a destination, then open the New
-  // Run form there preloaded with the program + parameters (data inputs cleared, to be
-  // set in the target project). Nothing runs until the user saves/launches it there.
-  async function copyToProject() {
-    const target = await pickProject({
-      title: "Copy run to project", okText: "copy here", excludeId: job.project_id,
-      hint: "Opens the New Run form in the chosen project, preloaded with this run's program and settings. Data inputs are cleared for you to set there.",
-    });
-    if (!target) return;
-    try {
-      const pf = await api.jobCopyPrefill(job.id);
-      store.prefillProgram({ program: pf.program, values: pf.values, gpu: pf.gpu, name: pf.name,
-                             projectId: target.id, projectName: target.name });
-    } catch (err) {
-      toastError(err, "Could not copy this run.");
-    }
-  }
+  const copyToProject = () => copyJobToProject(job);
   async function run() {
     try { await api.startJob(job.id); location.hash = "#/jobs/" + job.id; }
     catch (err) { toastError(err, "Failed to start job."); }
@@ -366,34 +256,3 @@ export function gpuLabel(gpu) {
   return gpu === "cpu" ? "CPU" : "GPU " + gpu;
 }
 
-function row(job, i, hooks) {
-  const title = h("span", { class: "prog" }, jobDisplayName(job));
-  const line1 = h("div", { class: "jr-line1" },
-    badge(job.status),
-    staleBadge(job),
-    title,
-    jobRelTimeEl(job),
-    jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); hooks?.afterLocalRename?.(); }, onDeleted: () => a.remove() }));
-
-  const dur = jobDuration(job);
-  const p = job.progress;
-  const progressText = p ? [p.epochs ? `Epoch ${p.epoch}/${p.epochs}` : null, `${Math.round(p.pct)}%`, fmtEta(p.eta_s)]
-    .filter(Boolean).join(" · ") : null;
-  const segs = [
-    job.name ? h("span", { class: "jr-seg prog-sub mono" }, job.program) : null,
-    gpuLabel(job.gpu) ? h("span", { class: "jr-seg" }, gpuLabel(job.gpu)) : null,
-    dur ? h("span", { class: "jr-seg" }, dur) : null,
-    progressText ? h("span", { class: "jr-seg" }, progressText) : null,
-  ].filter(Boolean);
-  if ((job.labels || []).length) segs.push(jobLabelChips(job, { max: 3 }));
-  const line2 = segs.length ? h("div", { class: "jr-line2" }, ...segs) : null;
-
-  const a = h(
-    "a",
-    { class: "job-row", href: "#/jobs/" + job.id, style: { animationDelay: `${Math.min(i, 30) * 0.02}s` } },
-    line1,
-    line2,
-    p ? h("div", { class: "jr-bar" }, h("div", { class: "jr-fill", style: { width: Math.max(2, p.pct) + "%" } })) : null
-  );
-  return a;
-}

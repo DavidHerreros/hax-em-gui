@@ -230,7 +230,7 @@ export function buildLauncher() {
       if (!proj) {
         runBar.appendChild(h("div", { class: "run-hint" },
           h("span", { class: "muted" }, "Open a project to run programs."),
-          h("button", { class: "btn secondary", onclick: () => navigate("/projects") }, "Go to Projects")));
+          h("button", { class: "btn secondary", onclick: () => navigate("/project") }, "Open a project")));
         return;
       }
       runBtn.disabled = false;
@@ -280,7 +280,8 @@ export function buildLauncher() {
         // it (e.g. Save job → Run launches that saved job rather than a new one).
         if (created && created.id) targetJobId = created.id;
         store.setActiveProject(proj.id);
-        navigate("/projects");
+        // Land on the run just created (or saved) rather than on a list.
+        navigate(created && created.id ? `/jobs/${created.id}` : "/project");
       } catch (err) {
         if (err instanceof ApiError && err.status === 422 && err.detail && err.detail.errors) {
           // Opens the groups holding the offending fields and scrolls to the first.
@@ -328,7 +329,7 @@ export function buildLauncher() {
           launched += 1;
         }
         store.setActiveProject(proj.id);
-        navigate("/projects");
+        navigate("/project");     // a sweep: several runs, so the project's tree is the place
       } catch (err) {
         const done = launched ? ` (${launched} of ${vals.length} runs were already launched)` : "";
         if (err instanceof ApiError && err.status === 422 && err.detail && err.detail.errors) {

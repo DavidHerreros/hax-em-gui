@@ -8,7 +8,7 @@ const state = {
   leftCollapsed: false,
   pmCollapsed: false,   // project-manager (flash-card) rail collapsed?
   rightOpen: true,
-  openProjects: [],     // [{id, name}]
+  openProjects: [],     // [{id, name, path}] projects seen so far; only activeProjectId has a UI now
   activeProjectId: null,
   openMetrics: [],      // [{id, logdir, title, jobId}] — native metrics tabs, not persisted
   activeMetricsId: null,
@@ -17,6 +17,7 @@ const state = {
   selectedProgram: null, // program name shown in the right menu (null = catalog list)
   prefill: null,        // { program, values, gpu } to preload a form from a past job
   formNonce: 0,         // bumped whenever the launcher form should rebuild
+  lastJobId: null,      // run last selected in the job tree; Metrics / Viewer preselect it
 };
 
 (function restore() {
@@ -112,6 +113,8 @@ export const store = {
     }
     if (changed) emit();
   },
+
+  setLastJob(id) { state.lastJobId = id || null; },   // no emit: nothing re-renders on it
 
   selectProgram(name) { state.selectedProgram = name; state.rightOpen = true; state.formNonce++; persist(); emit(); },
   clearProgram() { state.selectedProgram = null; state.formNonce++; emit(); },

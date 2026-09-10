@@ -10,8 +10,7 @@ import { store } from "./store.js";
 
 const VIEWS = [
   { label: "Home", hint: "view", icon: "home", go: () => navigate("/") },
-  { label: "Projects", hint: "view", icon: "box", go: () => navigate("/projects") },
-  { label: "Jobs", hint: "view", icon: "list", go: () => navigate("/jobs") },
+  { label: "Project", hint: "view", icon: "box", go: () => navigate("/project") },
   { label: "Metrics", hint: "view", icon: "chart", go: () => navigate("/metrics") },
   { label: "3D viewer", hint: "view", icon: "orbit", go: () => navigate("/viewer") },
   { label: "Workflows", hint: "view", icon: "workflow", go: () => navigate("/workflows") },
@@ -106,7 +105,7 @@ export function openPalette() {
   api.projects().then((ps) => {
     items.push(...ps.map((p) => ({
       label: p.name, hint: "project", icon: "box",
-      go: () => { store.openProject(p); navigate("/projects"); },
+      go: () => { store.openProject(p); navigate("/project"); },
     })));
     refilter();
   }).catch(() => {});

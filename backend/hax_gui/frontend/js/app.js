@@ -2,7 +2,7 @@
 // program launcher. Routing for the top-level sections; tabs live in the views.
 import { h, mount } from "./h.js";
 import { icon } from "./icons.js";
-import { defineRoutes, setOutlet, onRoute, startRouter, currentPath, reload } from "./router.js";
+import { defineRoutes, setOutlet, onRoute, startRouter, currentPath, reload, navigate } from "./router.js";
 import { api, ApiError, getToken, setToken } from "./api.js";
 import { store, getState, subscribe } from "./store.js";
 import { buildLauncher } from "./views/launcher.js";
@@ -14,12 +14,10 @@ import { mountViewerWindow } from "./views/viewerWindow.js";
 import { initPalette } from "./commandPalette.js";
 import { promptModal } from "./views/promptModal.js";
 import { HomeView } from "./views/home.js";
-import { ProjectsView } from "./views/projects.js";
 import { SettingsView } from "./views/settings.js";
 import { MetricsView } from "./views/metrics.js";
 import { ViewerView } from "./views/viewer.js";
 import { JobsView } from "./views/jobs.js";
-import { JobDetailView } from "./views/jobDetail.js";
 import { CompareView } from "./views/compare.js";
 import { WorkflowsView } from "./views/workflows.js";
 import { AssistantView } from "./views/assistant.js";
@@ -29,8 +27,7 @@ const THEME_KEY = "hax_gui_theme";
 
 const NAV = [
   { path: "/", label: "Home", icon: "home", match: (p) => p === "/" },
-  { path: "/projects", label: "Projects", icon: "box", match: (p) => p.startsWith("/projects") },
-  { path: "/jobs", label: "Jobs", icon: "list", match: (p) => p.startsWith("/jobs") },
+  { path: "/project", label: "Project", icon: "box", match: (p) => p.startsWith("/project") || p.startsWith("/jobs") },
   { path: "/metrics", label: "Metrics", icon: "chart", match: (p) => p.startsWith("/metrics") },
   { path: "/viewer", label: "3D viewer", icon: "orbit", match: (p) => p.startsWith("/viewer") },
   { path: "/workflows", label: "Workflows", icon: "workflow", match: (p) => p.startsWith("/workflows") },
@@ -168,9 +165,11 @@ applyShellClasses();
 
 defineRoutes([
   { path: "/", view: HomeView },
-  { path: "/projects", view: ProjectsView },
+  { path: "/project", view: JobsView },
+  // Old bookmarks: the Projects page and the Jobs list are now one page.
+  { path: "/projects", view: () => { navigate("/project"); return null; } },
   { path: "/jobs", view: JobsView },
-  { path: "/jobs/:id", view: JobDetailView },
+  { path: "/jobs/:id", view: JobsView },
   { path: "/compare/:a/:b", view: CompareView },
   { path: "/metrics", view: MetricsView },
   { path: "/viewer", view: ViewerView },

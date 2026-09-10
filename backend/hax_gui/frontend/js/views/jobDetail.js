@@ -1,6 +1,8 @@
-// Live job view: streams the log over WebSocket into a terminal renderer
-// (ANSI colors + progress lines), with cancel / rerun / delete actions.
-import { h, mount, clear } from "../h.js";
+// The selected run, as shown on the right of the Jobs page: header with the
+// state-appropriate actions, the run's lineage (what fed it, what it feeds), then
+// Overview / Parameters / Log / Files. The log streams over WebSocket into a
+// terminal renderer (ANSI colors + progress lines).
+import { h, mount, clear, append } from "../h.js";
 import { poller } from "../poller.js";
 import { icon } from "../icons.js";
 import { confirmModal } from "./confirmModal.js";
@@ -8,7 +10,7 @@ import { api, subscribeLog } from "../api.js";
 import { navigate, reload } from "../router.js";
 import { store } from "../store.js";
 import { errorBox, formatSize } from "./ui.js";
-import { badge, staleBadge, jobDisplayName, fmtEta } from "./jobs.js";
+import { badge, staleBadge, jobDisplayName, fmtEta, jobTime, jobDuration, gpuLabel, copyJobToProject } from "./jobs.js";
 import { openContextMenu } from "./contextMenu.js";
 import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
@@ -19,20 +21,23 @@ import { openFileBrowser } from "./filePicker.js";
 import { loadProgramGroups, isPredictLatents } from "../programGroups.js";
 import { metricsTabInfo } from "./runBrowser.js";
 
-export function JobDetailView(params) {
-  const id = params.id;
-  const root = h("div", { class: "view" });
+// Route wrapper kept for callers that still mount the detail on its own.
+export function JobDetailView(params) { return jobDetailPanel(params.id); }
 
-  const head = h("div", { class: "row", style: { marginBottom: "8px" } });
+export function jobDetailPanel(id) {
+  const root = h("div", { class: "jd" });
+
+  const head = h("div", { class: "jd-head" });
   const progress = h("div", { class: "progress" });
+  const lineage = h("div", { class: "jd-lineage" });
   const cmd = h("pre", { class: "cmdline" }, "…");
-  const wdLine = h("div");
   // How much this run has written. Measured on demand (it walks the run folder), not
   // polled: a long training keeps growing, so there is a refresh rather than a number
   // that silently ages. Re-measured for free when the run reaches a terminal status.
   const diskVal = h("span", { class: "mono" }, "…");
-  const diskLine = h("div", { class: "row", style: { gap: "6px", marginTop: "2px" } });
-  const wd = h("div", { class: "muted small", style: { margin: "-8px 0 16px" } }, wdLine, diskLine);
+  const diskLine = h("div", { class: "row", style: { gap: "4px", minWidth: "0" } });
+  const overview = h("dl", { class: "jd-dl" });
+  const params = h("div", { class: "jd-params" });
   const inputs = h("div", { class: "job-maps" });
   const maps = h("div", { class: "job-maps" });
   const actionErr = h("div", { style: { marginBottom: "12px" } });
@@ -167,32 +172,38 @@ export function JobDetailView(params) {
   // The page had accreted everything in one vertical stack; the streams, the file
   // lists and the run's identity now live in tabs so each gets the full height.
   // Head, progress, errors and the diagnosis stay global — they matter on any tab.
+  const paneOverview = h("div", { style: { display: "none" } }, overview);
+  const paneParams = h("div", { style: { display: "none" } }, params);
   const paneLog = h("div", null, consoleTabs, outConsole, errConsole);
   const paneFiles = h("div", { style: { display: "none" } }, inputs, maps);
-  const paneDetails = h("div", { style: { display: "none" } }, cmd, wd);
-  const PANES = { log: paneLog, files: paneFiles, details: paneDetails };
+  const PANES = { overview: paneOverview, params: paneParams, log: paneLog, files: paneFiles };
   const pageTabs = {};
   const filesCount = h("span", { class: "tab-count", hidden: true });
+  const paramsCount = h("span", { class: "tab-count", hidden: true });
+  let activePane = "log";
   function selectPane(key) {
+    activePane = key;
     for (const [k, el] of Object.entries(PANES)) {
       el.style.display = k === key ? "" : "none";
       pageTabs[k].classList.toggle("active", k === key);
     }
   }
-  const pageTabbar = h("div", { class: "tabbar", style: { marginBottom: "10px" } },
+  const pageTabbar = h("div", { class: "tabbar jd-tabs" },
+    pageTabs.overview = h("div", { class: "tab", onclick: () => selectPane("overview") }, h("span", { class: "tab-label" }, "Overview")),
+    pageTabs.params = h("div", { class: "tab", onclick: () => selectPane("params") }, h("span", { class: "tab-label" }, "Parameters"), paramsCount),
     pageTabs.log = h("div", { class: "tab active", onclick: () => selectPane("log") }, h("span", { class: "tab-label" }, "Log")),
-    pageTabs.files = h("div", { class: "tab", onclick: () => selectPane("files") }, h("span", { class: "tab-label" }, "Files"), filesCount),
-    pageTabs.details = h("div", { class: "tab", onclick: () => selectPane("details") }, h("span", { class: "tab-label" }, "Details")));
+    pageTabs.files = h("div", { class: "tab", onclick: () => selectPane("files") }, h("span", { class: "tab-label" }, "Files"), filesCount));
 
-  root.appendChild(h("a", { class: "back", href: "#/jobs" }, icon("arrowLeft", 16), "Jobs"));
   root.appendChild(head);
   root.appendChild(progress);
   root.appendChild(actionErr);
   root.appendChild(diagPanel);
+  root.appendChild(lineage);
   root.appendChild(pageTabbar);
+  root.appendChild(paneOverview);
+  root.appendChild(paneParams);
   root.appendChild(paneLog);
   root.appendChild(paneFiles);
-  root.appendChild(paneDetails);
 
   const termOut = createTerminal(outConsole);
   const termErr = createTerminal(errConsole);
@@ -215,80 +226,159 @@ export function JobDetailView(params) {
 
   function renderHead() {
     clear(head);
-    const isNamed = job && job.name;
-    head.appendChild(h("h1", { style: { fontSize: "20px", color: "var(--accent)", fontFamily: "JetBrains Mono, monospace" } }, job ? jobDisplayName(job) : "…"));
-    if (job) head.appendChild(h("button", { class: "row-menu", title: "Rename run", onclick: rename }, icon("pencil", 15)));
-    if (isNamed) head.appendChild(h("span", { class: "muted mono", style: { fontSize: "12px" } }, job.program));
-    head.appendChild(badge(status));
-    if (job && job.stale) head.appendChild(staleBadge(job));
-    if (job && job.project_name) head.appendChild(h("span", { class: "proj-chip" }, icon("box", 12), job.project_name));
-    if (job) head.appendChild(jobLabelChips(job, { editable: true }));
+    if (!job) { head.appendChild(h("h1", { class: "jd-title" }, "…")); return; }
     const running = status === "running" || status === "pending";
     // Being torn down: no longer cancellable, not finished either — the final
     // status arrives over the WS once the process group has been reaped.
     const cancelling = status === "cancelling";
-    if (job && job.return_code != null && !running && !cancelling) {
-      head.appendChild(h("span", { class: "muted", style: { fontSize: "12px" } }, "exit " + job.return_code));
-    }
-    if (job && status === "saved") {
-      head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
-        h("button", { class: "btn", onclick: startSaved, title: "Launch this saved job now" }, icon("play", 15), "Run"),
-        viewable(job) ? viewerBtn() : null,
-        h("button", { class: "btn secondary", onclick: editRerun, title: "Open the form preloaded with these inputs to edit and save/launch a new run" }, icon("copy", 15), "Edit"),
-        h("button", { class: "btn ghost", style: { color: "var(--err)" }, onclick: del }, icon("trash", 15), "Delete")));
-    } else if (running && job) {
-      head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
+    const finished = !running && !cancelling && status !== "saved";
+
+    const sub = h("div", { class: "jd-sub" },
+      badge(status),
+      staleBadge(job),
+      job.name ? h("span", { class: "mono jd-program" }, job.program) : null,
+      job.return_code != null && finished ? h("span", { class: "muted small" }, "exit " + job.return_code) : null,
+      jobLabelChips(job, { editable: true }));
+    const title = h("div", { class: "jd-titleblock" },
+      h("div", { class: "jd-titlerow" },
+        h("h1", { class: "jd-title" }, jobDisplayName(job)),
+        h("button", { class: "row-menu", title: "Rename run", onclick: rename }, icon("pencil", 14))),
+      sub);
+
+    // Primary actions depend on the state; everything else is one menu away.
+    const actions = h("div", { class: "jd-actions" });
+    const canResume = job.resumable && (status === "failed" || status === "cancelled" || status === "interrupted");
+    const canDiagnose = assistantOk && (status === "failed" || status === "interrupted");
+    const canReport = assistantOk && status === "succeeded";
+    if (status === "saved") {
+      actions.append(h("button", { class: "btn", onclick: startSaved, title: "Launch this saved job now" }, icon("play", 15), "Run"));
+    } else if (running) {
+      actions.append(
         job.has_metrics ? watchBtn() : null,
-        job.has_metrics ? metricsBtn() : null,
-        viewable(job) ? viewerBtn() : null,
-        h("button", { class: "btn ghost", style: { color: "var(--warn)" }, onclick: (e) => {
+        h("button", { class: "btn secondary", style: { color: "var(--warn)" }, onclick: (e) => {
           // immediate feedback; the terminal status still arrives over the WS once
           // the process group has been torn down
           const b = e.currentTarget; b.disabled = true; b.lastChild.textContent = "Cancelling…";
           api.cancelJob(id).catch(() => { b.disabled = false; b.lastChild.textContent = "Cancel"; });
-        } }, icon("ban", 15), "Cancel")));
-    } else if (cancelling && job) {
-      head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
-        job.has_metrics ? metricsBtn() : null,
-        viewable(job) ? viewerBtn() : null,
-        h("button", { class: "btn ghost", style: { color: "var(--warn)" }, disabled: true,
-          title: "Stopping this run and its workers…" }, icon("ban", 15), "Cancelling…")));
-    } else if (job) {
+        } }, icon("ban", 15), "Cancel"));
+    } else if (cancelling) {
+      actions.append(h("button", { class: "btn secondary", style: { color: "var(--warn)" }, disabled: true,
+        title: "Stopping this run and its workers…" }, icon("ban", 15), "Cancelling…"));
+    } else {
       // A cancelled/failed/interrupted run that already committed an intermediate
       // checkpoint can be resumed in place (backend sets job.resumable). Paired
       // actions (Continue/Rerun + their "Edit &" variant) collapse into split buttons.
-      const canResume = job.resumable &&
-        (status === "failed" || status === "cancelled" || status === "interrupted");
-      const canDiagnose = assistantOk && (status === "failed" || status === "interrupted");
-      const canReport = assistantOk && status === "succeeded";
-      head.appendChild(h("div", { class: "row", style: { marginLeft: "auto", gap: "8px" } },
-        canDiagnose ? h("button", { class: "btn secondary",
-          title: "Ask the assistant why this run failed (classifier + model, from the log)",
-          onclick: (e) => diagnose(e.currentTarget) }, icon("chat", 15), "Diagnose") : null,
-        canReport ? h("button", { class: "btn secondary",
-          title: "Build a PDF report of this run: measured values and figures, plus the model's discussion (can take a while)",
-          onclick: (e) => report(e.currentTarget) }, icon("fileText", 15), "Report") : null,
-        job.project_id ? h("button", { class: "btn secondary",
-          title: "Compare this run's parameters and environment with another run",
-          onclick: (e) => pickCompare(e.currentTarget) }, icon("grid", 15), "Compare") : null,
-        job.has_metrics ? metricsBtn() : null,
-        viewable(job) ? viewerBtn() : null,
+      actions.append(
         canResume ? splitButton(
           { icon: "restore", label: "Continue", title: "Resume from the last saved checkpoint with the same inputs", onClick: continueRun },
           [{ icon: icon("sliders", 15), label: "Edit & continue", onClick: editContinue }]) : null,
         splitButton(
           { icon: "play", label: "Rerun", title: "Re-launch immediately with the same inputs (a fresh run)", onClick: rerun },
           [{ icon: icon("copy", 15), label: "Edit & rerun", onClick: editRerun },
-           { icon: icon("plus", 15), label: "Reproduce as new run", onClick: reproduce }]),
-        h("button", { class: "btn ghost", style: { color: "var(--err)" }, onclick: del }, icon("trash", 15), "Delete")));
+           { icon: icon("plus", 15), label: "Reproduce as new run", onClick: reproduce }]));
     }
+    if (job.has_metrics && status !== "saved") actions.append(metricsBtn());
+    if (viewable(job)) actions.append(viewerBtn());
+    if (canDiagnose) actions.append(h("button", { class: "btn secondary",
+      title: "Ask the assistant why this run failed (classifier + model, from the log)",
+      onclick: (e) => diagnose(e.currentTarget) }, icon("chat", 15), "Diagnose"));
+
+    // The overflow menu: every remaining action, in the same order on every run.
+    const more = [];
+    if (status === "saved") more.push({ label: "Edit", icon: icon("sliders", 15), onClick: editRerun });
+    if (canReport) more.push({ label: "Report (PDF)", icon: icon("fileText", 15), onClick: (e) => report(e) });
+    if (job.project_id && finished) more.push({ label: "Compare with…", icon: icon("grid", 15), onClick: () => pickCompare(moreBtn) });
+    more.push({ label: "Copy to project…", icon: icon("copy", 15), onClick: () => copyJobToProject(job) });
+    more.push({ label: "Rename", icon: icon("pencil", 15), onClick: rename });
+    if (job.workdir) more.push({ label: "Output folder…", icon: icon("folderOpen", 15), onClick: () => openFileBrowser(job.workdir) });
+    if (!running && !cancelling) more.push({ label: "Delete", icon: icon("trash", 15), danger: true, onClick: del });
+    const moreBtn = h("button", { class: "btn secondary jd-more", title: "More actions",
+      onclick: (e) => { e.stopPropagation(); openContextMenu(e.currentTarget, more); } }, icon("more", 16));
+    actions.append(moreBtn);
+
+    head.append(title, actions);
     renderProgress(running || cancelling);
   }
 
-  function editRerun() {
-    store.editFrom(job);
-    navigate("/projects");
+  // ── lineage: the runs whose outputs this one consumed, and the runs it feeds ──
+  const lineageCache = { parents: new Map(), deps: null, depsSig: null };
+  async function renderLineage() {
+    if (!job) return;
+    const chip = (j, label) => h("button", { class: "jd-ljob", title: j.program,
+      onclick: () => navigate(`/jobs/${j.id}`) }, h("i", { class: "jt-dot " + (j.status || "") }), label || j.label || jobDisplayName(j));
+    const parentIds = [...new Set(Object.values(job.bindings || {}).map((b) => b && b.job_id).filter(Boolean))];
+    const parents = await Promise.all(parentIds.map(async (pid) => {
+      if (!lineageCache.parents.has(pid)) {
+        try { lineageCache.parents.set(pid, await api.job(pid)); }
+        catch { lineageCache.parents.set(pid, null); }
+      }
+      return lineageCache.parents.get(pid);
+    }));
+    let deps = [];
+    try { deps = (await api.jobDependents(id)).jobs || []; } catch { /* none */ }
+    clear(lineage);
+    append(lineage, [
+      h("span", { class: "jd-llabel" }, "Inputs"),
+      parents.length ? parents.map((pj) => pj ? chip(pj) : h("span", { class: "jd-ljob gone" }, "deleted run")) : h("span", { class: "jd-lnone" }, "files on disk"),
+      h("span", { class: "jd-larr" }, icon("arrowRight", 14)),
+      h("span", { class: "jd-ljob me" }, h("i", { class: "jt-dot " + status }), "this run"),
+      h("span", { class: "jd-larr" }, icon("arrowRight", 14)),
+      h("span", { class: "jd-llabel" }, "Feeds"),
+      deps.length ? deps.map((d) => chip(d)) : h("span", { class: "jd-lnone" }, "nothing yet — drag this run onto a launcher field")]);
   }
+
+  // ── overview: the facts about the run that are not its parameters ──
+  function renderOverview() {
+    clear(overview);
+    if (!job) return;
+    const at = (t) => (t ? new Date(t).toLocaleString() : "—");
+    const row = (k, ...v) => overview.append(h("dt", null, k), h("dd", null, ...v));
+    const t = jobTime(job);
+    if (job.started_at) row("Started", at(job.started_at));
+    else row(t.label ? t.label[0].toUpperCase() + t.label.slice(1) : "Created", at(t.stamp));
+    if (job.finished_at && !job.active) row("Finished", at(job.finished_at));
+    const dur = jobDuration(job);
+    if (dur) row("Duration", dur);
+    row("Device", gpuLabel(job.gpu) || "not set");
+    if (job.produces && job.produces.length) row("Produces", h("span", { class: "jd-chips" }, ...job.produces.map((k) => h("span", { class: "jd-chip" }, k))));
+    if (job.workdir) {
+      renderDiskLine();
+      row("Run folder", diskLine);
+    }
+    if (job.cwd && job.cwd !== job.workdir) row("Working directory", h("span", { class: "mono small" }, job.cwd));
+    if (job.slurm_id) row("Slurm job", h("span", { class: "mono" }, String(job.slurm_id)));
+    cmd.textContent = (job.command || []).join(" ");
+    row("Command", cmd);
+    const pkgs = job.provenance && job.provenance.packages;
+    if (pkgs) row("Recorded versions", h("span", { class: "muted small" }, Object.entries(pkgs).map(([k, v]) => `${k} ${v}`).join(" · ")));
+  }
+
+  // ── parameters: the args as given, with inputs fed by another run linked to it ──
+  function renderParams() {
+    clear(params);
+    if (!job) return;
+    const entries = Object.entries(job.args || {});
+    paramsCount.hidden = !entries.length;
+    paramsCount.textContent = String(entries.length);
+    if (!entries.length) { params.appendChild(h("div", { class: "muted small" }, "No parameters recorded.")); return; }
+    const b = job.bindings || {};
+    params.appendChild(h("table", { class: "jd-table" }, ...entries.map(([k, v]) => {
+      const bound = b[k];
+      const val = v == null || v === "" ? h("span", { class: "faint" }, "—")
+        : typeof v === "boolean" ? String(v)
+        : Array.isArray(v) ? v.join(", ")
+        : String(v);
+      return h("tr", null,
+        h("td", { class: "mono" }, k),
+        h("td", null,
+          bound ? h("button", { class: "jd-bind", title: "Open the run that produced this input",
+            onclick: () => navigate(`/jobs/${bound.job_id}`) }, icon("link", 12), bound.label || bound.job_id) : null,
+          bound ? h("span", { class: "muted small mono", style: { marginLeft: "8px" } }, val) : val));
+    })));
+  }
+
+  // Edit flows open the launcher on the right, preloaded; the run stays on screen.
+  function editRerun() { store.editFrom(job); }
 
   // Resume this run in place: continue_job relaunches the same job (same folder), so
   // the program picks up its checkpoint. Re-render the current route to reset the view.
@@ -310,10 +400,7 @@ export function JobDetailView(params) {
 
   // Same resume, but open the form first so the user can change parameters (e.g. a
   // smaller batch size to get past an OOM) before continuing from the checkpoint.
-  function editContinue() {
-    store.editFrom(job, { resume: true });
-    navigate("/projects");
-  }
+  function editContinue() { store.editFrom(job, { resume: true }); }
 
   // Open the launcher preloaded with this run's parameters as a NEW job (unlike
   // "Edit & rerun", which replaces this one in place). Warns when the installed
@@ -338,7 +425,6 @@ export function JobDetailView(params) {
       projectId: job.project_id, projectName: job.project_name,
       bindings: job.bindings, notice,
     });
-    navigate("/projects");
   }
 
   // Pick another run of the same project to diff against (same program first —
@@ -362,16 +448,18 @@ export function JobDetailView(params) {
   // button shows progress and the PDF lands as a browser download.
   async function report(btn) {
     clear(actionErr);
-    btn.disabled = true;
-    btn.lastChild.textContent = "Building…";
+    if (!btn || !btn.lastChild) btn = null;
+    if (btn) { btn.disabled = true; btn.lastChild.textContent = "Building…"; }
+    else mount(actionErr, h("div", { class: "muted small" }, "Building the report…"));
     try {
       const pdf = await api.runReport(id);
       const url = URL.createObjectURL(pdf);
       const a = h("a", { href: url, download: `${jobDisplayName(job)}_report.pdf` });
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 30000);
+      clear(actionErr);
     } catch (err) { mount(actionErr, errorBox(err)); }
-    finally { btn.disabled = false; btn.lastChild.textContent = "Report"; }
+    finally { if (btn) { btn.disabled = false; btn.lastChild.textContent = "Report"; } }
   }
 
   function viewable(j) {
@@ -397,14 +485,13 @@ export function JobDetailView(params) {
     clear(diskLine);
     if (!job || !job.workdir) return;
     diskLine.append(
-      h("span", null, "Run folder: "),
       // shrinkable so a long path ellipsises instead of pushing the size off the row
       h("span", { class: "mono", title: job.workdir,
         style: { minWidth: "0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, job.workdir),
-      h("span", null, " · "),
-      diskVal,
-      h("button", { class: "btn-icon", title: "Re-measure this run's disk usage",
-        onclick: () => loadUsage(true) }, icon("refresh", 12)));
+      h("span", { class: "muted" }, " · "),
+      h("span", { class: "muted small" }, diskVal),
+      h("button", { class: "row-menu", title: "Re-measure this run's disk usage", onclick: () => loadUsage(true) }, icon("refresh", 12)),
+      h("button", { class: "row-menu", title: "Browse the run folder", onclick: () => openFileBrowser(job.workdir) }, icon("folderOpen", 12)));
   }
   async function loadUsage(refresh) {
     if (!job || !job.workdir) return;
@@ -543,7 +630,8 @@ export function JobDetailView(params) {
       termOut.reset(); termErr.reset();
       connectLog();      // re-open the stream now that the job is running
       renderHead();
-      renderDiskLine();
+      renderOverview();
+      selectPane("log");
     } catch (err) { mount(actionErr, errorBox(err)); }
   }
 
@@ -606,17 +694,13 @@ export function JobDetailView(params) {
   api.job(id)
     .then((j) => {
       job = j; status = j.status;
-      cmd.textContent = j.command.join(" ");
-      if (j.cwd) wdLine.textContent = "Working directory: " + j.cwd;
-      // Details tab: scheduler identity + the provenance stamp.
-      if (j.slurm_id) paneDetails.appendChild(h("div", { class: "muted small", style: { marginTop: "4px" } },
-        "Slurm job " + j.slurm_id));
-      const pkgs = j.provenance && j.provenance.packages;
-      if (pkgs) paneDetails.appendChild(h("div", { class: "muted small", style: { marginTop: "4px" } },
-        "Recorded versions: " + Object.entries(pkgs).map(([k, v]) => `${k} ${v}`).join(" · ")));
       renderHead();
-      renderDiskLine();
+      renderOverview();
+      renderParams();
+      renderLineage();
       loadUsage(false);
+      // A run that is still going opens on its log; a finished one on what it is.
+      selectPane(isActive() ? "log" : "overview");
       loadInputs();
       loadOutputs();
       updatePolling();
@@ -666,7 +750,7 @@ export function JobDetailView(params) {
         status = m.status;
         updatePolling();
         // A finished run's folder has stopped growing — worth one fresh measurement.
-        if (m.status !== "running") api.job(id).then((j) => { job = j; renderHead(); loadOutputs(); if (!isActive()) loadUsage(true); }).catch(() => renderHead());
+        if (m.status !== "running") api.job(id).then((j) => { job = j; renderHead(); renderOverview(); renderLineage(); loadOutputs(); if (!isActive()) loadUsage(true); }).catch(() => renderHead());
         else renderHead();
       }
     }, { shouldReconnect: isActive });

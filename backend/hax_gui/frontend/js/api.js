@@ -89,7 +89,7 @@ export const api = {
   files: (path, fallback) =>
     req(`/api/files${path ? `?path=${encodeURIComponent(path)}${fallback ? "&fallback=true" : ""}` : ""}`),
   mkdir: (path, name) => req("/api/files/mkdir", { method: "POST", body: JSON.stringify({ path: path || null, name }) }),
-  jobs: () => req("/api/jobs"),
+  jobs: (limit) => req("/api/jobs" + (limit ? `?limit=${limit}` : "")),
   job: (id) => req(`/api/jobs/${id}`),
   jobLog: (id) => req(`/api/jobs/${id}/log`),
   // Whole persisted log for one stream, uncapped — for a file too big for the
