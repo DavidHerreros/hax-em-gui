@@ -241,9 +241,24 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
     filterBtn.classList.toggle("on", n > 0);
   }
 
+  // Rebuilding the list fires a scroll event (an emptied box scrolls to 0) that would
+  // clobber the remembered offset; ignore scroll while rebuilding, then put the offset
+  // back — once now, once on the next frame for the case where the rail is rebuilt
+  // before the router has attached it to the document (setting scrollTop on a
+  // detached element does nothing).
+  let rebuilding = false;
+  function restoreScroll() {
+    list.scrollTop = memo.scroll;
+    requestAnimationFrame(() => { rebuilding = true; list.scrollTop = memo.scroll; rebuilding = false; });
+  }
   function renderList() {
     hideJobTip();
+    rebuilding = true;
     clear(list);
+    try { renderListBody(); } finally { rebuilding = false; }
+    restoreScroll();
+  }
+  function renderListBody() {
     const pid = getState().activeProjectId;
     if (!memo.all && !pid) {
       list.appendChild(h("div", { class: "jt-empty" },
@@ -280,7 +295,6 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
     } else {
       for (const n of treeNodes(jobs)) list.appendChild(n);
     }
-    list.scrollTop = memo.scroll;
   }
 
   // The tree keeps a node whose own row is filtered out when a descendant matches,
@@ -323,7 +337,7 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
     return el;
   }
 
-  list.addEventListener("scroll", () => { memo.scroll = list.scrollTop; });
+  list.addEventListener("scroll", () => { if (!rebuilding && list.isConnected) memo.scroll = list.scrollTop; });
 
   // ── lifecycle ──
   renderHead();
