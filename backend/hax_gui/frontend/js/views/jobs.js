@@ -127,14 +127,37 @@ export function jobTimeEl(job, cls = "time") {
     dur ? h("span", { class: "time-dur" }, " · " + dur) : null);
 }
 
+// One tree for the whole Project page. A selection is a route change, which tears the
+// view down and builds it again; rebuilding the rail each time made it visibly jump
+// (and replayed the page's fade-in over it). So the tree outlives a single view: the
+// outgoing view releases it, and if the incoming view claims it in the same turn (the
+// router runs cleanup and the next view back to back) the same element and its polling
+// carry on, with only the selected row repainted.
+let sharedTree = null;
+let releaseTimer = null;
+function acquireTree(opts) {
+  if (sharedTree && !sharedTree.stopped) {
+    clearTimeout(releaseTimer); releaseTimer = null;
+    sharedTree.setOptions(opts);
+    sharedTree.repaint();
+    return sharedTree;
+  }
+  sharedTree = jobTree(opts);
+  return sharedTree;
+}
+function releaseTree() {
+  releaseTimer = setTimeout(() => { sharedTree?.cleanup(); sharedTree = null; releaseTimer = null; }, 0);
+}
+
 export function JobsView(params = {}) {
   const id = params.id || null;
   if (id) store.setLastJob(id);
   store.setProjectRoute(id ? `/jobs/${id}` : "/project");   // the nav's "Project" link returns here
-  const tree = jobTree({
+  const tree = acquireTree({
     isSelected: (j) => j.id === id,
     onSelect: (j) => { if (j.id !== id) navigate(`/jobs/${j.id}`); },
   });
+  requestAnimationFrame(() => tree.onAttached());   // the router attaches the view right after this returns
   const stage = h("div", { class: "jw-stage" });
   let detail = null;
   function showProject() {
@@ -151,8 +174,10 @@ export function JobsView(params = {}) {
   // in place (the tree follows the store on its own).
   let lastPid = getState().activeProjectId;
   const unsub = subscribe(() => { const pid = getState().activeProjectId; if (!id && pid !== lastPid) { lastPid = pid; showProject(); } });
-  const el = h("div", { class: "view" }, jobWorkspace(tree.el, stage));
-  return { el, cleanup: () => { unsub(); tree.cleanup(); detail?.cleanup?.(); } };
+  // No page fade here: the rail persists across selections and must not animate; the
+  // stage has its own.
+  const el = h("div", { class: "jw-view" }, jobWorkspace(tree.el, stage));
+  return { el, cleanup: () => { unsub(); releaseTree(); detail?.cleanup?.(); } };
 }
 
 // Copy this run's recipe into another project: pick a destination, then open the New

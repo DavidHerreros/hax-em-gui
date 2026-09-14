@@ -68,7 +68,10 @@ function buildTree(jobs) {
 //   onSelect(job)               click on a row
 //   usable(job) -> bool         false dims the row (this page cannot open it)
 //   emptyText                   shown when the project has nothing usable
-export function jobTree({ isSelected, onSelect, usable = () => true, emptyText = "No runs in this project yet." } = {}) {
+export function jobTree(opts = {}) {
+  // Callbacks are swappable so a page can keep one tree across its own route changes
+  // (see acquireTree in jobs.js) and only tell it what "selected" means now.
+  const cfg = { isSelected: null, onSelect: null, usable: () => true, emptyText: "No runs in this project yet.", ...opts };
   const root = h("aside", { class: "jt" });
   const head = h("div", { class: "jt-head" });
   const list = h("div", { class: "jt-list" });
@@ -270,7 +273,7 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
     }
     const shown = jobs.filter(matches);
     count.textContent = jobs.length ? `${shown.length} of ${jobs.length}` : "";
-    if (!jobs.length) { list.appendChild(h("div", { class: "jt-empty" }, emptyText)); return; }
+    if (!jobs.length) { list.appendChild(h("div", { class: "jt-empty" }, cfg.emptyText)); return; }
     if (!shown.length) { list.appendChild(h("div", { class: "jt-empty" }, "Nothing matches these filters.")); return; }
 
     if (memo.all) {
@@ -317,12 +320,12 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
   }
 
   function row(j, nKids, open) {
-    const sel = isSelected && isSelected(j);
-    const ok = matches(j) && usable(j);
+    const sel = cfg.isSelected && cfg.isSelected(j);
+    const ok = matches(j) && cfg.usable(j);
     const p = j.progress;
     const el = h("div", {
       class: "jt-row" + (sel ? " sel" : "") + (ok ? "" : " dim"),
-      onclick: () => onSelect && onSelect(j),
+      onclick: () => cfg.onSelect && cfg.onSelect(j),
     },
       h("span", { class: "jt-tw" + (nKids ? (open ? " open" : "") : " leaf"),
         onclick: (e) => { e.stopPropagation(); open ? memo.collapsed.add(j.id) : memo.collapsed.delete(j.id); renderList(); } }, icon("chevronRight", 11)),
@@ -358,8 +361,13 @@ export function jobTree({ isSelected, onSelect, usable = () => true, emptyText =
     el: root,
     // Repaint rows from the cached list (a selection changed without a route change).
     repaint: renderList,
+    // Swap what selection / usability mean (a reused tree on a new route).
+    setOptions(o) { Object.assign(cfg, o); },
+    // A detached element forgets its scroll offset; call once it is back in the document.
+    onAttached: restoreScroll,
     kick: () => p.kick(),
     jobs: () => jobs,
+    get stopped() { return stop; },
     cleanup() { stop = true; p.stop(); offEvents(); unsub(); closePop(); hideJobTip(); },
   };
 }

@@ -1475,7 +1475,7 @@ body.vwin-dragging iframe { pointer-events: none; }
 
 /* ---- job workspace: tree rail + divider + stage (Jobs / Metrics / 3D viewer) ---- */
 .container:has(.jw) { max-width: none; padding: 0; height: 100%; }
-.container:has(.jw) > .view { height: 100%; }
+.container:has(.jw) > .view, .container:has(.jw) > .jw-view { height: 100%; }
 .jw { display: grid; grid-template-columns: var(--jw-rail, 300px) 6px minmax(0, 1fr); height: 100%; min-height: 0; }
 .jw-divider { cursor: col-resize; position: relative; z-index: 3; margin-left: -3px; }
 .jw-divider::after { content: ""; position: absolute; inset: 0 2px; transition: background .12s; }
