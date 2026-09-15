@@ -25,8 +25,8 @@ import { navigate, currentPath } from "../router.js";
 import { openContextMenu } from "./contextMenu.js";
 import { createProjectPrompt, projectMenuItems } from "./projectOverview.js";
 
-const STATUS_ORDER = ["running", "pending", "cancelling", "succeeded", "failed", "cancelled", "interrupted", "saved"];
-const STATUS_LABEL = { running: "Running", pending: "Queued", cancelling: "Cancelling", succeeded: "Done", failed: "Failed",
+const STATUS_ORDER = ["running", "queued", "pending", "cancelling", "succeeded", "failed", "cancelled", "interrupted", "saved"];
+const STATUS_LABEL = { running: "Running", queued: "Queued", pending: "Starting", cancelling: "Cancelling", succeeded: "Done", failed: "Failed",
                        cancelled: "Cancelled", interrupted: "Interrupted", saved: "Draft" };
 
 // Survives route re-renders; see the header comment.

@@ -1888,7 +1888,7 @@ export function WorkflowsView() {
       runState = wf.run_state || null;
       // The queued count is read back from the server: with cascade "queue" it also took
       // on the steps downstream, which is more than were asked for here.
-      const queued = runState ? Object.values(runState).filter((s) => s.status === "pending" || s.status === "running").length : (ids || graph.nodes).length;
+      const queued = runState ? Object.values(runState).filter((s) => s.status === "pending" || s.status === "queued" || s.status === "running").length : (ids || graph.nodes).length;
       flash(wasRunning
         ? `Queued onto the running workflow — ${queued} step(s) pending or running.`
         : (ids ? `Running ${queued} step(s)…` : "Running…"), "busy");

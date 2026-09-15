@@ -408,10 +408,16 @@ class JobManager:
         recreate_ssd: bool = False,
         resume: bool = False,
         dropped_args: list[str] | None = None,
+        hold: bool = False,
     ) -> dict[str, Any]:
         """Create a run. With ``launch=False`` the job is fully prepared (run
         folder, materialised inputs, validated command) but left in the ``saved``
         state to execute later via :meth:`start`.
+
+        With ``hold=True`` the job is prepared and parked as ``queued`` — a real row,
+        visible everywhere a queued job is — but the admission dispatcher leaves it
+        alone: the caller (a workflow scheduler holding a step back for a device slot)
+        launches it with :meth:`release` when it decides the step's turn has come.
 
         With ``replace_job_id`` set, the existing job row is updated in place
         (same id / list position) and its previous run folder is *reused* — cleared
@@ -600,8 +606,35 @@ class JobManager:
                 notice = (f"[hax-gui] {program} no longer accepts "
                           f"{', '.join('--' + a for a in dropped_args)}; re-running without "
                           f"{'it' if len(dropped_args) == 1 else 'them'}.\n\n")
-            await self._launch(job_id, command, str(log_path), cwd, append_out=resume, notice=notice)
+            if hold:
+                self._park(job_id, append_out=resume, notice=notice, held=True)
+            else:
+                await self._launch(job_id, command, str(log_path), cwd, append_out=resume, notice=notice)
         return self.get(job_id)
+
+    async def release(self, job_id: str) -> dict[str, Any]:
+        """Launch a job parked with ``hold=True``. Admission still applies: if its device
+        is full it stays ``queued``, now in the dispatcher's hands like any other."""
+        job = self.get(job_id)
+        if job is None:
+            raise JobNotFound(job_id)
+        if job["status"] != "queued":
+            return job                          # already moving (or gone): nothing to do
+        held = self._queue_held.pop(job_id, {})
+        self._exec("UPDATE jobs SET status='pending' WHERE id=?", (job_id,))
+        await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"),
+                           append_out=held.get("append_out", False), notice=held.get("notice"))
+        return self.get(job_id)
+
+    def _park(self, job_id: str, append_out: bool = False, notice: str | None = None,
+              held: bool = False) -> None:
+        """Set a job aside as ``queued``. Everything needed to launch later is already
+        in the row; only the launch niceties (append/notice) need holding on the side.
+        ``held`` marks a job whose dispatch belongs to its creator, not the admission
+        dispatcher."""
+        self._queue_held[job_id] = {"append_out": append_out, "notice": notice, "held": held}
+        self._exec("UPDATE jobs SET status='queued' WHERE id=?", (job_id,))
+        self._publish(job_id, {"type": "status", "status": "queued"})
 
     async def start(self, job_id: str) -> dict[str, Any]:
         """Launch a previously saved job using its stored command."""
@@ -1033,6 +1066,8 @@ class JobManager:
             job = self.get(r["id"])
             if job is None or not self._admit(job["id"]):
                 continue
+            if self._queue_held.get(job["id"], {}).get("held"):
+                continue                        # a workflow decides when this one goes
             held = self._queue_held.pop(job["id"], {})
             self._exec("UPDATE jobs SET status='pending' WHERE id=?", (job["id"],))
             await self._launch(job["id"], job["command"], job["log_path"], job.get("cwd"),
@@ -1045,11 +1080,7 @@ class JobManager:
             await self._launch_slurm(job_id, command, log_path, cwd, append_out, notice)
             return
         if not self._admit(job_id):
-            # Park it. Everything needed to launch later is already in the row;
-            # only the launch niceties (append/notice) need holding on the side.
-            self._queue_held[job_id] = {"append_out": append_out, "notice": notice}
-            self._exec("UPDATE jobs SET status='queued' WHERE id=?", (job_id,))
-            self._publish(job_id, {"type": "status", "status": "queued"})
+            self._park(job_id, append_out=append_out, notice=notice)
             return
         out_path, err_path = log_path, self._err_path(log_path)
         exit_path = _exit_path(log_path)

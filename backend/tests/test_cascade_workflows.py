@@ -154,3 +154,60 @@ def test_project_export_import_roundtrip(client, run, project, md_file):
         for j in run(client.get(f"/api/projects/{p2['id']}/jobs")).json():
             run(client.delete(f"/api/jobs/{j['id']}"))
         run(client.delete(f"/api/projects/{p2['id']}"))
+
+
+def test_workflow_step_waiting_for_device_is_a_queued_job(client, run, project, md_file):
+    """Two steps pinned to the same device with one slot: the second must exist as a
+    real job parked 'queued' (visible in the project's run list) while it waits, then
+    start once the first frees the slot. It used to be nothing at all — no row, and a
+    grey 'pending' on the canvas that reconcile later flattened to 'idle'."""
+    from conftest import GATE
+    import time
+
+    graph = {"nodes": [
+        {"id": "a", "program": "estimate_latent_covariances", "gpu": "0", "args": {"md": str(md_file)}},
+        {"id": "b", "program": "estimate_latent_covariances", "gpu": "0", "args": {"md": str(md_file)}},
+    ], "edges": []}
+    r = run(client.post("/api/workflows", json={"project_id": project["id"], "name": "gate", "graph": graph}))
+    assert r.status_code == 200, r.text
+    wid = r.json()["id"]
+    run(client.put(f"/api/workflows/{wid}", json={"max_per_device": 1}))
+
+    GATE.write_text("")                       # the stub blocks: 'a' will hold the slot
+    try:
+        r = run(client.post(f"/api/workflows/{wid}/run", json={}))
+        assert r.status_code == 200, r.text
+
+        def state():
+            return run(client.get(f"/api/workflows/{wid}")).json()["run_state"]
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            s = state()
+            if s["a"]["status"] == "running" and s["b"]["status"] == "queued" and s["b"]["job_id"]:
+                break
+            time.sleep(0.3)
+        else:
+            raise AssertionError(f"expected a running / b queued with a job, got {state()}")
+
+        # The waiting step is a real, listed job, parked as queued...
+        jobs = run(client.get(f"/api/projects/{project['id']}/jobs")).json()
+        by_id = {j["id"]: j for j in jobs}
+        assert by_id[s["b"]["job_id"]]["status"] == "queued"
+        # ...that the admission dispatcher does not launch behind the scheduler's back.
+        time.sleep(3)
+        assert run(client.get(f"/api/jobs/{s['b']['job_id']}")).json()["status"] == "queued"
+    finally:
+        GATE.unlink(missing_ok=True)
+
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        w = run(client.get(f"/api/workflows/{wid}")).json()
+        s = w["run_state"]
+        if s["a"]["status"] == "succeeded" and s["b"]["status"] == "succeeded":
+            break
+        time.sleep(0.3)
+    else:
+        raise AssertionError(f"steps did not both finish: {w['run_state']}")
+    assert w["status"] == "succeeded"
+    run(client.delete(f"/api/workflows/{wid}"))
