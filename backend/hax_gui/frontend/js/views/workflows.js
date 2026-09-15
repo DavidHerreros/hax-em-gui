@@ -6,6 +6,7 @@
 // drag-and-drop add + drop-to-connect, per-node + selection runs with live
 // per-node status, predict<->train parameter inheritance on wiring, file-browser
 // pickers for path args, and "import a project as a workflow".
+import { announceJobRename } from "./jobs.js";
 import { h, clear, mount } from "../h.js";
 import { poller } from "../poller.js";
 import { setNavGuard } from "../router.js";
@@ -1412,7 +1413,7 @@ export function WorkflowsView() {
     await save();
     const saved = ((wf.graph && wf.graph.nodes) || []).find((x) => x.id === n.id);
     const jid = (saved && saved.job_id) || (runState && runState[n.id] && runState[n.id].job_id);
-    if (jid) store.renameViewerForJob(jid, value.trim());
+    if (jid) announceJobRename(jid, value.trim());
   }
 
   // ── inspector (per-node args) ──

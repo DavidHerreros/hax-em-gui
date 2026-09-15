@@ -11,6 +11,7 @@ import { h, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
+import { announceJobRename } from "./jobs.js";
 import { promptModal } from "./promptModal.js";
 import { openFilePicker } from "./filePicker.js";
 import { toast } from "../toast.js";
@@ -202,7 +203,7 @@ export function mountViewerWindow() {
     const current = sep >= 0 ? v.title.slice(0, sep) : (v.title || "");
     const name = await promptModal({ title: "Rename run", label: "Run name", value: current, okText: "Rename" });
     if (name === null || !name) return;
-    try { const u = await api.renameJob(v.jobId, name); store.renameViewerForJob(v.jobId, u.name); }
+    try { const u = await api.renameJob(v.jobId, name); announceJobRename(v.jobId, u.name); }
     catch { /* ignore */ }
   }
 

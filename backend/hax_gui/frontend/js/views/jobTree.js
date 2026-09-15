@@ -17,7 +17,7 @@ import { store, getState, subscribe } from "../store.js";
 import { poller } from "../poller.js";
 import { onJobEvent } from "../events.js";
 import { errorBox } from "./ui.js";
-import { jobMenuButton, jobDisplayName, jobsSignature } from "./jobs.js";
+import { jobMenuButton, jobDisplayName, jobsSignature, onJobRenamed } from "./jobs.js";
 import { makeJobDraggable } from "./inputBinding.js";
 import { attachJobTip, hideJobTip } from "./jobTip.js";
 import { loadLabels } from "./labels.js";
@@ -324,7 +324,7 @@ export function jobTree(opts = {}) {
     const ok = matches(j) && cfg.usable(j);
     const p = j.progress;
     const el = h("div", {
-      class: "jt-row" + (sel ? " sel" : "") + (ok ? "" : " dim"),
+      class: "jt-row" + (sel ? " sel" : "") + (ok ? "" : " dim"), "data-id": j.id,
       onclick: () => cfg.onSelect && cfg.onSelect(j),
     },
       h("span", { class: "jt-tw" + (nKids ? (open ? " open" : "") : " leaf"),
@@ -333,7 +333,7 @@ export function jobTree(opts = {}) {
       h("span", { class: "jt-name" }, jobDisplayName(j)),
       (j.labels || []).length ? h("span", { class: "jt-ldots" }, ...j.labels.slice(0, 4).map((l) => h("i", { class: "jt-ldot", style: { background: l.color || "var(--faint)" }, title: l.name }))) : null,
       p ? h("span", { class: "jt-pct" }, `${Math.round(p.pct)}%`) : h("span", { class: "jt-prog mono" }, j.name ? j.program : ""),
-      jobMenuButton(j, { onRenamed: (u) => { j.name = u.name; el.querySelector(".jt-name").textContent = jobDisplayName(j); lastSig = sigOf(jobs); }, onDeleted: () => refresh(true) }),
+      jobMenuButton(j, { onDeleted: () => refresh(true) }),
       p ? h("span", { class: "jt-bar" }, h("i", { style: { width: Math.max(2, p.pct) + "%" } })) : null);
     makeJobDraggable(el, j);          // still a binding source for the launcher
     attachJobTip(el, () => jobs.find((x) => x.id === j.id) || j);
@@ -350,6 +350,18 @@ export function jobTree(opts = {}) {
   loadLabels().catch(() => {});
   const p = poller(() => refresh(false), 3000);
   const offEvents = onJobEvent(() => p.kick());
+  // A rename from anywhere: patch the cached job and its row in place (no rebuild, so
+  // nothing moves), and realign the signature so the next poll does not rebuild either.
+  const offRename = onJobRenamed((jid, name) => {
+    const j = jobs.find((x) => x.id === jid);
+    if (!j) return;
+    j.name = name;
+    const nm = list.querySelector(`.jt-row[data-id="${jid}"] .jt-name`);
+    if (nm) nm.textContent = jobDisplayName(j);
+    const pg = list.querySelector(`.jt-row[data-id="${jid}"] .jt-prog`);
+    if (pg) pg.textContent = j.name ? j.program : "";
+    lastSig = sigOf(jobs);
+  });
   let lastPid = getState().activeProjectId;
   const unsub = subscribe(() => {
     loadProjects();
@@ -368,6 +380,6 @@ export function jobTree(opts = {}) {
     kick: () => p.kick(),
     jobs: () => jobs,
     get stopped() { return stop; },
-    cleanup() { stop = true; p.stop(); offEvents(); unsub(); closePop(); hideJobTip(); },
+    cleanup() { stop = true; p.stop(); offEvents(); unsub(); offRename(); closePop(); hideJobTip(); },
   };
 }

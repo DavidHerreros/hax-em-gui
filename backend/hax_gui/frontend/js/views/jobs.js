@@ -219,6 +219,16 @@ export function jobsSignature(jobs) {
                          `${j.progress ? Math.round(j.progress.pct) : ""}:${relTime(jobTime(j).stamp)}`).join("|");
 }
 
+// A rename is announced page-wide so every place showing the run's name — the tree,
+// the open run page, a lineage chip — updates at once, instead of each waiting for
+// its own poll (or, for the run page, for the next route change).
+const renameSubs = new Set();
+export function onJobRenamed(fn) { renameSubs.add(fn); return () => renameSubs.delete(fn); }
+export function announceJobRename(id, name) {
+  store.renameViewerForJob(id, name);
+  for (const fn of [...renameSubs]) { try { fn(id, name); } catch { /* one listener must not break the rest */ } }
+}
+
 // What to show as a run's title: its custom name, falling back to the program.
 export function jobDisplayName(job) {
   return job.name || job.program;
@@ -270,7 +280,7 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
   async function rename() {
     const name = await promptModal({ title: "Rename run", label: "Run name", value: job.name || "", placeholder: job.program, okText: "Rename" });
     if (name === null) return;
-    try { const u = await api.renameJob(job.id, name); job.name = u.name; store.renameViewerForJob(job.id, u.name); if (onRenamed) onRenamed(u); } catch { /* ignore */ }
+    try { const u = await api.renameJob(job.id, name); job.name = u.name; announceJobRename(job.id, u.name); if (onRenamed) onRenamed(u); } catch { /* ignore */ }
   }
   async function cancel() {
     const queued = job.status === "queued";

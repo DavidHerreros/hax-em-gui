@@ -10,7 +10,7 @@ import { api, subscribeLog } from "../api.js";
 import { navigate, reload } from "../router.js";
 import { store } from "../store.js";
 import { errorBox, formatSize } from "./ui.js";
-import { badge, staleBadge, jobDisplayName, fmtEta, jobTime, jobDuration, gpuLabel, copyJobToProject } from "./jobs.js";
+import { badge, staleBadge, jobDisplayName, fmtEta, jobTime, jobDuration, gpuLabel, copyJobToProject, announceJobRename, onJobRenamed } from "./jobs.js";
 import { openContextMenu } from "./contextMenu.js";
 import { jobLabelChips } from "./labels.js";
 import { launchViewerForJob } from "./viewerLaunch.js";
@@ -645,7 +645,7 @@ export function jobDetailPanel(id) {
     if (!job) return;
     const name = await promptModal({ title: "Rename run", label: "Run name", value: job.name || "", placeholder: job.program, okText: "Rename" });
     if (name === null) return;
-    try { const u = await api.renameJob(id, name); job = { ...job, name: u.name }; store.renameViewerForJob(id, u.name); renderHead(); }
+    try { const u = await api.renameJob(id, name); job = { ...job, name: u.name }; renderHead(); announceJobRename(id, u.name); }
     catch (err) { mount(actionErr, errorBox(err)); }
   }
 
@@ -783,5 +783,12 @@ export function jobDetailPanel(id) {
     }).catch(() => {});
   });
 
-  return { el: root, cleanup: () => { offEvents(); if (closeLog) closeLog(); if (poll) poll.stop(); } };
+  // Renamed from the tree's row menu (or anywhere else) while this page is open.
+  const offRename = onJobRenamed((jid, name) => {
+    if (!job) return;
+    if (jid === id) { job = { ...job, name }; renderHead(); }   // unconditionally: the object may already carry it
+    else if (lineageCache.parents.has(jid) || lineage.textContent) { lineageCache.parents.delete(jid); renderLineage(); }
+  });
+
+  return { el: root, cleanup: () => { offRename(); offEvents(); if (closeLog) closeLog(); if (poll) poll.stop(); } };
 }
