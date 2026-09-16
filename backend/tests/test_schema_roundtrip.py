@@ -61,3 +61,29 @@ def test_output_arg_autofilled_not_required_from_user(client):
         build_command(name, {"md": "/x"}, gpu=None)   # output_path is required...
     argv = build_command(name, {"md": "/x", "output_path": "/tmp/out"}, gpu=None)
     assert "--output_path" in argv                     # ...and satisfied when filled
+
+
+def test_regenerate_keeps_previous_schema_when_introspection_fails(monkeypatch, tmp_path):
+    """A transient import error (hax mid-edit, a dependency one step behind) must not
+    empty the catalogue: the program keeps its last good schema and is reported under
+    ``kept``, not ``errors``."""
+    import json
+    from hax_gui import genschemas, introspect
+    from hax_gui.config import settings
+
+    cache = tmp_path / "program_schemas.json"
+    cache.write_text(json.dumps({"programs": {"hetsiren": {"name": "hetsiren", "fields": [{"name": "md"}]},
+                                              "preprocess_particles": {"name": "preprocess_particles", "fields": []}},
+                                 "errors": {}}))
+    monkeypatch.setattr(type(settings), "schema_cache", property(lambda self: cache))
+    monkeypatch.setattr(introspect, "extract_all", lambda: {
+        "programs": {"preprocess_particles": {"name": "preprocess_particles", "fields": [{"name": "box"}]}},
+        "errors": {"hetsiren": "ImportError: cannot import name 'tilt_rotation_matrices'",
+                   "brand_new": "ImportError: no module"},
+    })
+    result = genschemas.regenerate()
+    written = json.loads(cache.read_text())
+    assert written["programs"]["hetsiren"]["fields"] == [{"name": "md"}]          # kept
+    assert written["programs"]["preprocess_particles"]["fields"] == [{"name": "box"}]  # refreshed
+    assert "hetsiren" in result["kept"] and "hetsiren" not in result["errors"]
+    assert "brand_new" in result["errors"]                                        # nothing to keep

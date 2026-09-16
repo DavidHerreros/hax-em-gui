@@ -326,8 +326,12 @@ def cmd_schemas(args: argparse.Namespace) -> int:
         print(_err(f"schema generation failed: {exc}"))
         return 1
     print(_ok(f"Wrote {len(result['programs'])} program schemas") + f" → {result['_target']}")
+    if result.get("kept"):
+        print(_warn("Programs that failed to introspect (their previous schema was kept):"))
+        for name, err in result["kept"].items():
+            print(f"  - {name}: {err}")
     if result.get("errors"):
-        print(_warn("Programs that failed to introspect:"))
+        print(_warn("Programs that failed to introspect and have no cached schema:"))
         for name, err in result["errors"].items():
             print(f"  - {name}: {err}")
     return 0
