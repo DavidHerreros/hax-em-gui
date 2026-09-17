@@ -722,10 +722,18 @@ export function createCloud(canvas, onSelect) {
     return pickAt((cx - rect.left) * r, glY(cy - rect.top), 16 * r, true);   // selection pick: honor the pick filter
   }
 
-  window.addEventListener("resize", render);
+  // Held so destroy() can undo them. A listener on `window` keeps this whole closure
+  // alive for the life of the page — the WebGL2 context (preserveDrawingBuffer, so a
+  // full-size back buffer), every GPU buffer, and the CPU copies of positions, colours
+  // and density fields. One per viewer iframe is fine; a host that builds and discards
+  // clouds (the GUI's metrics panels) leaked a context per panel until the tab died.
+  let dead = false;
+  const onResize = () => { if (!dead) render(); };
+  window.addEventListener("resize", onResize);
   // Same reason as in plot.js: a canvas built while its tab is hidden has no size, so
   // whatever we drew went nowhere. Redraw when the box we actually occupy changes.
-  if (window.ResizeObserver) new ResizeObserver(() => render()).observe(canvas);
+  const ro = window.ResizeObserver ? new ResizeObserver(() => { if (!dead) render(); }) : null;
+  if (ro) ro.observe(canvas);
 
   // Hover, to match the 2D scatter. pick() is O(count), so coalesce to one test per
   // animation frame rather than one per mousemove event; and stay out of the way while
@@ -747,6 +755,18 @@ export function createCloud(canvas, onSelect) {
   canvas.addEventListener("mouseleave", () => setHover(-1));
 
   return {
+    // Release what outlives the canvas: the global listener, the observer, pending frames,
+    // and the GL context itself (browsers cap live contexts; waiting for GC is not a plan).
+    destroy() {
+      if (dead) return;
+      dead = true;
+      window.removeEventListener("resize", onResize);
+      if (ro) ro.disconnect();
+      if (hoverPending) { cancelAnimationFrame(hoverPending); hoverPending = 0; }
+      norm = null; colorData = null; count = 0;
+      const lose = gl.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();
+    },
     setPoints(pts) {
       norm = normalizePoints(pts); count = pts.length;
       hover = -1;                // the old hover index means nothing in a new cloud

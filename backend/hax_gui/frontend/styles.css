@@ -1492,6 +1492,9 @@ body.vwin-dragging iframe { pointer-events: none; }
 .jw-session-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .jw-session .tab-close { margin-left: auto; }
 .mx-tabs { margin-bottom: 14px; }
+.tab-pin { display: flex; background: none; border: none; color: var(--faint); padding: 2px; border-radius: 6px; opacity: .55; }
+.tab-pin:hover { color: var(--text); background: var(--hover); opacity: 1; }
+.tab-pin.on { color: var(--brand-300); opacity: 1; }
 
 /* ---- the job tree rail ---- */
 .jt { display: flex; flex-direction: column; min-height: 0; min-width: 0; height: 100%; background: var(--sidebar-bg); border-right: 1px solid var(--border); }

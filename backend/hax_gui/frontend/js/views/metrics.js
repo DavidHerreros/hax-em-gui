@@ -1,10 +1,10 @@
 // Metrics: the job tree on the left (runs without event files dimmed), the
 // selected run's curves / image panels / latent space on the right, rendered
 // natively by metricsPanel — the GUI parses the same tfevents/projector files
-// TensorBoard would, so there is no iframe. Panels stay mounted while the page is
-// open, so switching between runs keeps each one's state; with more than one open
-// a tab bar appears above the panel to switch and close them. A log directory
-// that is not a run can still be opened by hand.
+// TensorBoard would, so there is no iframe. Picking a run replaces the one on screen
+// unless that one is pinned (the tab's pin): panels are heavy and stay mounted while
+// open, so only the runs kept on purpose are. A log directory that is not a run can
+// still be opened by hand.
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
@@ -69,7 +69,7 @@ export function MetricsView() {
   function sync() {
     const { openMetrics, activeMetricsId } = getState();
     clear(tabbar);
-    tabbar.hidden = openMetrics.length < 2;
+    tabbar.hidden = !openMetrics.length;
     for (const m of openMetrics) {
       tabbar.appendChild(h("div", {
         class: "tab two-line" + (m.id === activeMetricsId ? " active" : ""),
@@ -79,6 +79,10 @@ export function MetricsView() {
         h("span", { class: "tab-lines" },
           h("span", { class: "tab-main" }, m.title),
           m.subtitle ? h("span", { class: "tab-sub mono" }, m.subtitle) : null),
+        h("button", { class: "tab-pin" + (m.pinned ? " on" : ""),
+          title: m.pinned ? "Pinned: stays open while you browse other runs. Click to unpin."
+                          : "Pin: keep this run open while you open others (otherwise the next run you pick replaces it)",
+          onclick: (e) => { e.stopPropagation(); store.togglePinMetrics(m.id); } }, icon("bookmark", 13)),
         h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); close(m.id); } }, icon("x", 14))));
     }
     for (const m of openMetrics) {

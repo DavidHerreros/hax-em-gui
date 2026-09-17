@@ -1407,6 +1407,12 @@ export function metricsPanel({ logdir, jobId }) {
       destroy() {
         if (ticker) clearInterval(ticker);
         for (const im of sprites.values()) URL.revokeObjectURL(im.src);
+        sprites.clear();
+        // Both renderers hang listeners on `window`; without this every panel ever opened
+        // stayed alive — points, layer canvases and, for 3D, a whole WebGL2 context.
+        scatter.destroy?.();
+        cloud?.destroy?.();
+        cloud = null;
       },
     };
   }

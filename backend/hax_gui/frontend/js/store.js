@@ -77,12 +77,23 @@ export const store = {
 
   // Metrics tabs are keyed by log directory, so opening the same run twice focuses
   // the tab that is already there instead of stacking duplicates.
+  //
+  // Opening a run *replaces* the ones that are not pinned. A panel is heavy — pollers,
+  // image sprites, a latent point cloud, possibly a WebGL context — and stays mounted
+  // while it is open; when picking a run became one click in the tree, browsing a
+  // project quietly stacked a panel per run until the browser tab ran out of memory.
+  // Pinning (the tab's pin) is how two runs are kept side by side on purpose.
   openMetrics({ logdir, title, subtitle, jobId }) {
     const existing = state.openMetrics.find((x) => x.id === logdir);
     if (existing) { if (jobId) existing.jobId = jobId; }
-    else state.openMetrics.push({ id: logdir, logdir, title: title || logdir, subtitle: subtitle || "", jobId: jobId || null });
+    else state.openMetrics.push({ id: logdir, logdir, title: title || logdir, subtitle: subtitle || "", jobId: jobId || null, pinned: false });
+    state.openMetrics = state.openMetrics.filter((x) => x.pinned || x.id === logdir);
     state.activeMetricsId = logdir;
     emit();
+  },
+  togglePinMetrics(id) {
+    const m = state.openMetrics.find((x) => x.id === id);
+    if (m) { m.pinned = !m.pinned; emit(); }
   },
   closeMetrics(id) {
     state.openMetrics = state.openMetrics.filter((x) => x.id !== id);
