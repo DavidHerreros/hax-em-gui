@@ -716,7 +716,8 @@ export function metricsPanel({ logdir, jobId }) {
         ctx.textAlign = "center"; ctx.textBaseline = "top";
         ctx.font = `${10.5 * r}px system-ui, sans-serif`; ctx.fillStyle = muted;
         const step = niceStep(x1 - x0, Math.max(2, Math.min(6, Math.round(w / (86 * r)))));
-        for (let v = Math.ceil(x0 / step) * step; v <= x1; v += step) ctx.fillText(fmtX(v), sx(v), H - BOT + 4 * r);
+        // counted, not accumulated: `v += step` stalls once step is below float spacing
+        for (let k = Math.ceil(x0 / step), n = 0; k * step <= x1 && n < 50; k++, n++) ctx.fillText(fmtX(k * step), sx(k * step), H - BOT + 4 * r);
         if (xlab) { ctx.textAlign = "right"; ctx.fillStyle = fg; ctx.fillText(xlab, W - 4 * r, H - BOT + 4 * r); }
       }
 
