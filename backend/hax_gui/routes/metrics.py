@@ -100,8 +100,9 @@ async def metrics_embedding(logdir: str, step: int, tag: str | None = None) -> d
 
 
 @router.get("/api/metrics/sprite", dependencies=[Depends(auth)])
-async def metrics_sprite(logdir: str, step: int, tag: str | None = None) -> Response:
-    png = await run_in_threadpool(_metrics_call, metrics_reader.sprite, logdir, step, tag)
+async def metrics_sprite(logdir: str, step: int, index: int, tag: str | None = None) -> Response:
+    """One point's thumbnail — the sheet itself is far too big to hand to a browser."""
+    png = await run_in_threadpool(_metrics_call, metrics_reader.sprite, logdir, step, index, tag)
     return Response(content=png, media_type="image/png")
 
 

@@ -1161,9 +1161,9 @@ export function metricsPanel({ logdir, jobId }) {
     let cloud = null;                    // built lazily: WebGL2 is only needed if 3D is asked for
     let selectedPoint = -1;
     const bases = { 2: null, 3: null };  // last basis per dimensionality — keeps the movie stable
-    const raws = new Map();              // step -> server payload (raw latent vectors)
+    const KEEP_EPOCHS = 8;
+    const raws = new Map();              // step -> server payload (raw latent vectors), newest KEEP_EPOCHS
     const projs = new Map();             // "step|k" -> { points, variance }
-    const sprites = new Map();           // step -> HTMLImageElement
 
     // The renderers only *report* a click — neither highlights the point on its own, that
     // is the caller's job. Drive both from one place so the selection survives a 2D↔3D
@@ -1266,6 +1266,13 @@ export function metricsPanel({ logdir, jobId }) {
       if (!raw) {
         raw = await api.metricsEmbedding(logdir, step, tagName);
         raws.set(step, raw);
+        // Keep the latest few epochs only: each holds thousands of vectors plus a metadata
+        // row per point, and a long movie would otherwise retain them all.
+        for (const old of raws.keys()) {
+          if (raws.size <= KEEP_EPOCHS) break;
+          raws.delete(old);
+          for (const k of [...projs.keys()]) if (k.startsWith(`${old}|`)) projs.delete(k);
+        }
       }
       const key = `${step}|${dims}`;
       let proj = projs.get(key);
@@ -1316,32 +1323,26 @@ export function metricsPanel({ logdir, jobId }) {
       cloud.setColors(buf);
     }
 
+    // One thumbnail at a time, cropped by the server. The sheet it comes from holds every
+    // point's tile and decodes to hundreds of MB, so it must never reach the browser —
+    // fetching it whole, once per epoch scrubbed, is what used to kill the tab.
+    let spriteSeq = 0;
     async function drawSprite() {
       const step = steps()[idx];
       const raw = raws.get(step);
       const ctx = spriteCanvas.getContext("2d");
+      const seq = ++spriteSeq;
       ctx.clearRect(0, 0, spriteCanvas.width, spriteCanvas.height);
       if (!raw?.sprite || selectedPoint < 0) { spriteBox.style.display = raw?.sprite ? "" : "none"; return; }
       spriteBox.style.display = "";
-      let im = sprites.get(step);
-      if (!im) {
-        try {
-          const url = URL.createObjectURL(await api.metricsSprite(logdir, step, tagName));
-          im = await new Promise((res, rej) => {
-            const x = new Image();
-            x.onload = () => res(x);
-            x.onerror = rej;
-            x.src = url;
-          });
-          sprites.set(step, im);
-        } catch { return; }
-      }
-      const { tile, per_side: per } = raw.sprite;
-      if (!tile || !per) return;
       const orig = raw.indices[selectedPoint] ?? 0;   // plotted index -> original row
-      const tx = (orig % per) * tile, ty = Math.floor(orig / per) * tile;
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(im, tx, ty, tile, tile, 0, 0, spriteCanvas.width, spriteCanvas.height);
+      let bmp;
+      try { bmp = await createImageBitmap(await api.metricsSprite(logdir, step, orig, tagName)); } catch { return; }
+      if (seq === spriteSeq && !destroyed) {
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(bmp, 0, 0, spriteCanvas.width, spriteCanvas.height);
+      }
+      bmp.close();
     }
 
     async function show() {
@@ -1406,13 +1407,12 @@ export function metricsPanel({ logdir, jobId }) {
       },
       destroy() {
         if (ticker) clearInterval(ticker);
-        for (const im of sprites.values()) URL.revokeObjectURL(im.src);
-        sprites.clear();
         // Both renderers hang listeners on `window`; without this every panel ever opened
         // stayed alive — points, layer canvases and, for 3D, a whole WebGL2 context.
         scatter.destroy?.();
         cloud?.destroy?.();
         cloud = null;
+        raws.clear(); projs.clear();
       },
     };
   }

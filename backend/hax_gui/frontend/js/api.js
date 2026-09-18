@@ -153,8 +153,8 @@ export const api = {
   metricsImage: (logdir, run, tag, frame) =>
     blob(`/api/metrics/image?logdir=${encodeURIComponent(logdir)}&run=${encodeURIComponent(run)}` +
       `&tag=${encodeURIComponent(tag)}${frame != null ? `&frame=${frame}` : ""}`),
-  metricsSprite: (logdir, step, tag) =>
-    blob(`/api/metrics/sprite?logdir=${encodeURIComponent(logdir)}&step=${step}` +
+  metricsSprite: (logdir, step, index, tag) =>
+    blob(`/api/metrics/sprite?logdir=${encodeURIComponent(logdir)}&step=${step}&index=${index}` +
       (tag ? `&tag=${encodeURIComponent(tag)}` : "")),
 
   // workflows (visual pipeline builder)

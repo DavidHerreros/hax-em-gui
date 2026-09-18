@@ -24,6 +24,7 @@ holding event files is one run — never assume a flat folder.
 
 from __future__ import annotations
 
+import io
 import math
 import os
 import struct
@@ -381,9 +382,40 @@ def embedding(logdir: str, step: int, tag: str | None = None, max_points: int = 
     }
 
 
-def sprite(logdir: str, step: int, tag: str | None = None) -> bytes:
+_sheet: tuple[tuple[str, int], Any] | None = None   # the one decoded sprite sheet kept warm
+_sheet_lock = threading.Lock()
+
+
+def sprite(logdir: str, step: int, index: int, tag: str | None = None) -> bytes:
+    """The thumbnail of ONE point, cropped out of the epoch's sprite sheet.
+
+    The sheet is never sent whole: tensorboardX packs every point's 128 px thumbnail into
+    one PNG of up to 8192 x 8192, which a browser decodes to ~268 MB of RGBA — per epoch.
+    Scrubbing a few epochs with a point selected was enough to kill the tab. Cropping here
+    costs one decode per sheet (the last one stays warm for the next click)."""
+    from PIL import Image
+
+    global _sheet
     root = _root(logdir)
     path = _find_embedding(root, step, tag) / "sprite.png"
     if not path.exists():
         raise FileNotFoundError("no sprite for this epoch")
-    return path.read_bytes()
+    with open(path.parent / "tensors.tsv", "r", errors="replace") as fh:
+        n_full = sum(1 for line in fh if line.strip())
+    per_side = math.ceil(math.sqrt(n_full))
+    if per_side < 1 or not 0 <= index < n_full:
+        raise FileNotFoundError("no thumbnail for that point")
+    key = (str(path), path.stat().st_mtime_ns)
+    with _sheet_lock:
+        if _sheet is None or _sheet[0] != key:
+            Image.MAX_IMAGE_PIXELS = None       # our own file, and legitimately huge
+            with Image.open(path) as im:
+                im.load()
+                _sheet = (key, im.copy())
+        sheet = _sheet[1]
+        tile = sheet.width // per_side
+        x, y = (index % per_side) * tile, (index // per_side) * tile
+        crop = sheet.crop((x, y, x + tile, y + tile))
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    return buf.getvalue()
