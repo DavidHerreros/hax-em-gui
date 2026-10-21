@@ -826,6 +826,7 @@ export function WorkflowsView() {
     }
     graph.edges.push({ id: "e" + (edgeSeq++), from: fromId, to: toId, field, kind });
     inheritParams(fromId, toId, kind);
+    inheritInputs(fromId, toId, field);
     dirty = true, touchHistory(); renderNodes(); renderInspector();
   }
   function removeEdge(id) { graph.edges = graph.edges.filter((e) => e.id !== id); dirty = true, touchHistory(); renderNodes(); renderInspector(); }
@@ -844,6 +845,21 @@ export function WorkflowsView() {
     }
     if (!("mode" in dst.args)) dst.args.mode = "predict";
     if (!("mode" in src.args)) src.args.mode = "train";
+  }
+
+  // Fill the target's empty `inherits` fields from the source: its wiring where the
+  // source is wired, its literal value otherwise (e.g. MoDART <- HetSIREN md/vol/mask/sr).
+  function inheritInputs(fromId, toId, field) {
+    const src = nodeById(fromId), dst = nodeById(toId);
+    const names = src && dst && byName[dst.program]?.inherits?.[field];
+    if (!names) return;
+    const bindable = byName[dst.program].bindable || {};
+    for (const name of names) {
+      if (name in dst.args || wiredInto(dst, name)) continue;
+      const wired = graph.edges.filter((e) => e.to === fromId && e.field === name && e.kind === bindable[name]);
+      for (const e of wired) graph.edges.push({ id: "e" + (edgeSeq++), from: e.from, to: toId, field: name, kind: e.kind });
+      if (!wired.length && name in src.args) dst.args[name] = src.args[name];
+    }
   }
 
   // A node's output kinds, narrowed by its mode: a moded network yields its trained

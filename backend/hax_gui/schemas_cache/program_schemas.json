@@ -343,7 +343,7 @@
           ],
           "flag": "--transport_mass",
           "required": false,
-          "help": "When set, HetSIREN will be able to \"move\" the mass inside the mask instead of just reconstructing the volume. This implies that HetSIREN will estimate the motion to be applied to the points within the provided mask, instead of considering them fixed in space. This approach is useful when working with large box sizes that do not fit in GPU memory, or when a more through analysis of motions is desired. NOTE: When this option is set and a reference volume is provided, we recommend changing the reference mask to a tight mask computed from the reference volume. This mask now tells the program which regions should be moved. Therefore, consider providing a mask that covers all the protein regions you would like to be analyzed by HetSIREN.",
+          "help": "Let HetSIREN move the mass inside the mask (learned displacements of the points) instead of reconstructing on a fixed lattice. With a reference volume, provide a tight mask covering the regions to analyse.",
           "default": false,
           "type": "boolean"
         },
@@ -354,7 +354,7 @@
           ],
           "flag": "--num_gaussians",
           "required": false,
-          "help": "Before training the network, HetSIREN fits a set of Gaussians to the reference volume to recreate it. By default the count is determined automatically: the fit starts deliberately coarse and grows the number of Gaussians until the map it renders correlates with your reference at FSC >= 0.5 across every shell the reference populates, so it lands on the FEWEST Gaussians that cost you no resolution (see --fit_resolution to stop somewhere coarser).\nSet this parameter to pin the count in advance from your own criterium instead (e.g. the number of residues in your protein). When set, HetSIREN fits exactly this many Gaussians and reproduces the reference as well as that count allows.\nNOTE: the count is not free. The Gaussian width is tied to the point spacing (half of it, which is what tiling costs), and the width in turn bounds the resolution the model can carry -- so too few Gaussians is a low-pass filter on everything the network can express, and too many just costs memory in every training step.",
+          "help": "Number of Gaussians fitted to the reference volume before training. By default it is grown until the fit reaches FSC >= 0.5 on every populated shell (see --fit_resolution).",
           "default": null,
           "type": "integer"
         },
@@ -365,7 +365,7 @@
           ],
           "flag": "--fit_resolution",
           "required": false,
-          "help": "Resolution (in Angstrom) the automatic Gaussian fit has to reproduce, and no more. Left unset (the default) the fit matches the reference out to the reference's OWN limit -- every shell that map actually populates -- which is the safe choice when the reference came from reconstruct_volume, since that map is FSC-denoised and therefore exactly zero past its resolution.\nSet a coarser value to trade resolution for a smaller point cloud: measured across three references the count needed scales as about the square of the resolution you ask for (N ~ d^-1.9), so relaxing the target from 4 to 8 A is roughly a 3.7x smaller cloud, and every per-particle tensor in training shrinks with it. Ignored when --num_gaussians is given.",
+          "help": "Resolution (in Angstrom) the automatic Gaussian fit has to reproduce.",
           "default": null,
           "type": "number"
         },
@@ -376,7 +376,7 @@
           ],
           "flag": "--lattice_stride",
           "required": false,
-          "help": "Sub-sample the fixed-point lattice by this factor along each axis, keeping 1 / lattice_stride^3 of the sample points. The fixed-point decoder places one point per masked voxel, so the point count grows with the CUBE of the box: a 600 px box is ~13x the points of a 256 px one, and every per-particle tensor in the decode and render chain scales with it. This is the knob that makes a large box affordable (--lattice_stride 2 is an 8x reduction).\nThis trades resolution for memory: the sample spacing bounds the finest density CHANGE the decoder can express, to roughly 2 x lattice_stride x sampling_rate Angstrom. The consensus map is not affected -- it is carried by the reference amplitudes at full box sampling -- so this limits the heterogeneity, not the map you started from. The render width grows with HALF the spacing, which is what tiling costs; strides 1 and 2 therefore render exactly as before. Ignored when the points come from a Gaussian fit (see --num_gaussians), which sets the point count directly.",
+          "help": "Keep one fixed-lattice point every this many voxels along each axis (trades resolution for memory).",
           "default": 1,
           "type": "integer"
         },
@@ -387,20 +387,9 @@
           ],
           "flag": "--bilinear_scatter",
           "required": false,
-          "help": "Deposit each fixed-lattice point over its four neighbouring pixels (bilinear) instead of into the single nearest one. This is what gives the render a gradient with respect to the point coordinates, and therefore what lets the pose-refinement head actually learn on the fixed-point path: the nearest-pixel kernel is flat in the pixel index, so the only force it produces pulls a point toward the centre of the pixel it already occupies, and never says that mass belongs in the next one.\nNOTE: costs ~2x the scatter FLOPs and ~1.5x its peak memory at a given point count -- pair it with --lattice_stride 2, whose 8x reduction more than pays for it (and which renders at the same 1 px width as stride 1). Has no effect with --transport_mass, which always scatters bilinearly.",
+          "help": "Spread each fixed-lattice point over its four neighbouring pixels instead of the nearest one.",
           "default": false,
           "type": "boolean"
-        },
-        {
-          "name": "render_chunk_size",
-          "flags": [
-            "--render_chunk_size"
-          ],
-          "flag": "--render_chunk_size",
-          "required": false,
-          "help": "Render the point cloud in blocks of this many points, summing the partial images and recomputing each block in the backward pass instead of keeping it live. The projection intermediates are the largest per-particle tensors in the training step -- they scale with batch_size x n_points -- and this caps them at batch_size x render_chunk_size instead. The rendered image is identical either way; the scatter is a sum over points, so this is exact and not an approximation. Costs roughly one extra render per step.\nUse this to fit a large box on a smaller GPU (e.g. --render_chunk_size 262144). 0 (the default) renders the whole cloud at once, exactly as before. Smaller blocks save more memory and compile more slowly.",
-          "default": 0,
-          "type": "integer"
         },
         {
           "name": "local_reconstruction",
@@ -409,7 +398,7 @@
           ],
           "flag": "--local_reconstruction",
           "required": false,
-          "help": "When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask. WARNING: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED. WARNING: IF PROVIDED, HAVING A REFERENCE VOLUME IS MANDATORY. OTHERWISE, THIS PARAMETER WILL BE NEGLECTED.",
+          "help": "Local heterogeneous reconstruction restricted to the region enclosed by the reference mask. Requires a reference volume and overrides mass transport.",
           "default": false,
           "type": "boolean"
         },
@@ -427,7 +416,8 @@
             "None",
             "apply",
             "wiener",
-            "precorrect"
+            "precorrect",
+            "premultiplied"
           ]
         },
         {
@@ -584,7 +574,7 @@
           ],
           "flag": "--denoising_strength",
           "required": false,
-          "help": "Determines how strongly HetSIREN will learn to remove noise from the resulting volumes. Increasing the value of this parameter will result in a stronger regularization of the noise, but it may affect the protein signal as well. (NOTE: We recommend setting this parameter in the range 0.0001 to 0.1)",
+          "help": "Weight of the L1 denoising on the decoded densities (recommended range 0.0001 to 0.1).",
           "default": 0.0001,
           "type": "number"
         },
@@ -595,7 +585,7 @@
           ],
           "flag": "--implicit_network",
           "required": false,
-          "help": "When set, HetSIREN will use an implicit neural network approach to recover conformational states. Implicit neural networks are more memory consuming, but they are also more accurate in the detection of very local motions. If this architecture is selected, we strongly recommend to set as well the parameter total_mass to limit the memory consumption of the network and increase its performance.",
+          "help": "Use an implicit (coordinate-based) decoder, more accurate for very local motions at a higher memory cost. Only with mass transport.",
           "default": false,
           "type": "boolean"
         },
@@ -606,13 +596,13 @@
           ],
           "flag": "--encoder_arch",
           "required": false,
-          "help": "Encoder that maps each image to its latent (set by default to convnn).\nconvnn / mlpnn both begin with a single dense layer over the FLATTENED image, Linear(box^2, ...), whose parameter count grows with the SQUARE of the box: at 320 px that one layer is ~105M parameters per encoder (~4.8 GiB once the two encoders, Adam and the EMA copy are counted), independent of batch size. This is what makes a large box run out of memory during training even when the batch is small.\nconvstem replaces that dense projection with a stack of strided convolutions that downsample the image to the same internal grid. Its parameter count is independent of the box (a few thousand), so training a 320 px box costs about what a 160 px box costs with convnn -- and it is translation-equivariant, which the dense projection is not. Recommended for large boxes on limited VRAM. NOTE: the three encoders are different architectures, so a checkpoint trained with one cannot be reloaded with another.",
+          "help": "Encoder architecture mapping each image to its latent. resmlp: residual MLP with LayerNorm on the Fourier-cropped image and a bounded latent.",
           "default": "convnn",
           "type": "enum",
           "choices": [
             "convnn",
-            "convstem",
-            "mlpnn"
+            "mlpnn",
+            "resmlp"
           ]
         },
         {
@@ -622,7 +612,7 @@
           ],
           "flag": "--pose_refine_reg",
           "required": false,
-          "help": "Strength of the hinge that keeps the per-image rigid pose refinement within --pose_refine_max_angle of the input poses. It penalizes only the excess beyond that angle, so a genuinely-needed small correction is not pushed back to zero. Set to 0 to disable it.",
+          "help": "Weight of the hinge penalising pose refinements beyond --pose_refine_max_angle. Set to 0 to disable.",
           "default": 0.1,
           "type": "number"
         },
@@ -633,7 +623,7 @@
           ],
           "flag": "--pose_refine_max_angle",
           "required": false,
-          "help": "Deadzone (in degrees) of the pose-refinement hinge: rotations up to this angle are free, beyond it they are penalized with weight --pose_refine_reg. This is what 'stay a refinement' should mean -- do not wander further than a plausible alignment error. NOTE: setting it to 0 recovers the old one-sided pull towards the identity, which penalizes even the sub-degree corrections you want and biases the model into letting the decoder absorb the pose instead.",
+          "help": "Rotation (degrees) the pose refinement may apply freely; the excess is penalised with --pose_refine_reg.",
           "default": 8.0,
           "type": "number"
         },
@@ -644,7 +634,7 @@
           ],
           "flag": "--shift_refine_reg",
           "required": false,
-          "help": "Strength of the hinge on the per-image in-plane shift refinement, the exact analogue of --pose_refine_reg for translations. Set to 0 to disable. (NOTE: the shift refinement previously had no prior at all, even though a 2D image shift is exactly a 3D translation of the decoded object and is therefore the most trivially absorbable part of the refinement)",
+          "help": "Weight of the hinge penalising shift refinements beyond --shift_refine_max. Set to 0 to disable.",
           "default": 0.1,
           "type": "number"
         },
@@ -655,7 +645,7 @@
           ],
           "flag": "--shift_refine_max",
           "required": false,
-          "help": "Deadzone (in pixels) of the shift-refinement hinge: shifts up to this magnitude are free, beyond it they are penalized with weight --shift_refine_reg.",
+          "help": "Shift (pixels) the refinement may apply freely; the excess is penalised with --shift_refine_reg.",
           "default": 4.0,
           "type": "number"
         },
@@ -666,7 +656,7 @@
           ],
           "flag": "--pose_refine_warmup_epochs",
           "required": false,
-          "help": "Number of initial epochs over which the rigid pose refinement is ramped in from the identity. NOTE: the refinement heads are zero-initialized, so the model already starts at exactly the input poses -- the ramp buys nothing at initialization and only scales the pose head's gradient towards zero during precisely the window in which the decoder is learning to absorb the misalignment. It now defaults to 0 (refine from the first step); the decoder is instead held at a consensus early on, see --latent_warmup_epochs.",
+          "help": "Epochs over which the pose refinement is ramped in from the input poses (0: refine from the first step).",
           "default": 0.0,
           "type": "number"
         },
@@ -677,7 +667,7 @@
           ],
           "flag": "--latent_warmup_epochs",
           "required": false,
-          "help": "Number of initial epochs over which the latent is ramped INTO the decoder (default: ~12%% of --epochs, so the schedule scales with the budget). For the first half of this window the decoder sees a zero latent, so it can only produce a single consensus volume -- and a consensus volume cannot absorb a per-particle pose error, so the whole misalignment has to be explained by the pose head. Over the second half the latent (and the KL term, which rides the same clock) ramps in linearly, against poses that have already been refined. This is the coarse-to-fine ordering a classical refinement uses -- consensus and poses first, heterogeneity after -- and it costs nothing. Set to 0 to feed the full latent from the first step.",
+          "help": "Epochs over which the latent is ramped into the decoder (default: 12%% of the epochs). The decoder sees a zero latent for the first half, so poses are refined against the consensus before heterogeneity is learned. Set to 0 to disable.",
           "default": null,
           "type": "number"
         },
@@ -688,7 +678,7 @@
           ],
           "flag": "--rigid_gauge",
           "required": false,
-          "help": "Pins the decoder's per-particle output to a canonical frame, so a pose error cannot be absorbed by the decoder and has nowhere to go except the pose head (rotating the decoded object and refining the image pose produce the SAME projection, so without this the two are interchangeable -- and since every geometric prior here is rigid-invariant while the pose head is anchored to the identity, the decoder is the cheaper place for the model to put a misalignment). With --transport_mass the deformed cloud is rigidly superposed back onto the rest cloud (a weighted Kabsch, one 3x3 solve per particle); without it, the linearized rigid perturbations of the reference density are projected out instead. It does NOT remove motion: the correction is an isometry of the decoded object, so internal distances, hinge angles and relative domain motions are preserved exactly -- what it fixes is the FRAME the motion is reported in, and that frame is chosen by the weights: core (default) reweights against the residual so the frame is set by the least-moving part of the structure (the rigid core), which leaves domain motions entirely in the deformation field. mass uses the mass-weighted optimal superposition instead, in which a large domain motion makes the 'stationary' domain appear to counter-rotate and lets the pose head absorb a slice of the conformational change. off disables the correction but still reports the diagnostic, so a run can be checked for pose absorption without changing its behaviour. NOTE: without mass transport the gauge needs a reference density to differentiate, so it is unavailable (and silently a no-op) on fully ab-initio runs with no --vol.",
+          "help": "Remove the global rigid motion from the decoder output so pose errors go to the pose head. core: frame fitted on the least-moving points; mass: mass-weighted fit; off: diagnostic only. Without mass transport it requires a reference volume.",
           "default": "core",
           "type": "enum",
           "choices": [
@@ -704,7 +694,7 @@
           ],
           "flag": "--train_inverse",
           "required": false,
-          "help": "When set, HetSIREN will additionally train an inverse decoder that maps the output Gaussian positions (the deformed point cloud produced by the decoder) back to latent vectors. This provides a direct point-cloud -> latent encoding that complements the image-based encoder. NOTE: this is only meaningful when mass transport is enabled (--transport_mass), since the Gaussian positions only move in that mode; if set without mass transport it is ignored.",
+          "help": "Additionally train an inverse decoder mapping the deformed point cloud back to the latent. Only meaningful with mass transport.",
           "default": false,
           "type": "boolean"
         },
@@ -715,7 +705,40 @@
           ],
           "flag": "--point_transformer",
           "required": false,
-          "help": "When set, HetSIREN will use a point transformer architecture in the decoder (operating directly on the Gaussian point cloud) instead of the default decoder. NOTE: this option and --implicit_network are mutually exclusive; if both are provided, the implicit network takes precedence and this flag is ignored. Like the implicit network, it only takes effect with mass transport (--transport_mass).",
+          "help": "Use a point transformer decoder on the Gaussian point cloud. Only with mass transport; ignored if --implicit_network is also set.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "pe_motion",
+          "flags": [
+            "--pe_motion"
+          ],
+          "flag": "--pe_motion",
+          "required": false,
+          "help": "Decode the motion with a DynaMight-like head (positional encoding + small ELU network) and the amplitudes with FiLM. Implies --implicit_network.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "motion_only",
+          "flags": [
+            "--motion_only"
+          ],
+          "flag": "--motion_only",
+          "required": false,
+          "help": "Estimate conformational changes only: the amplitudes stay at their reference values. Only with mass transport.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "film_heads",
+          "flags": [
+            "--film_heads"
+          ],
+          "flag": "--film_heads",
+          "required": false,
+          "help": "Replace the implicit SIREN heads (and the point transformer occupancy head) by a coordinate SIREN modulated by the latent through FiLM layers.",
           "default": false,
           "type": "boolean"
         },
@@ -726,7 +749,7 @@
           ],
           "flag": "--kl_lambda",
           "required": false,
-          "help": "Weight (beta) of the VAE KL divergence, which regularizes the latent posterior towards a standard normal prior. Increase it for a smoother, more regularized latent space at the cost of reconstruction detail; decrease it (or set to 0) to let the encoder use the latent more freely. (NOTE: because the reduction changed, this is not comparable to any previously used constant). Setting it to 0 disables the variational machinery outright and trains a deterministic autoencoder. Pair any non-zero value with --kl_free_bits: on low-SNR data the KL's own optimum is an uninformative latent, and it will collapse to it.",
+          "help": "Weight of the VAE KL divergence towards a standard normal prior. 0 disables the VAE and uses a deterministic latent.",
           "default": 0.001,
           "type": "number"
         },
@@ -737,7 +760,7 @@
           ],
           "flag": "--kl_free_bits",
           "required": false,
-          "help": "Free-bits floor for the KL, in nats per latent dimension (default 0.5). A dimension whose KL has fallen below this stops being penalised, which removes the incentive to squeeze the last information out of the latent -- the failure mode (posterior collapse) where the encoder stops distinguishing particles and every one of them decodes to the consensus. It is a floor on the penalty, not on the information: a dimension the model has no use for is still free to stay unused, so a genuinely low-dimensional landscape is not forced to spread out. Raise it if the latent collapses, lower it (0 reproduces a plain KL) if the latent is noisy. Only used when --kl_lambda > 0.",
+          "help": "KL floor (nats per latent dimension) below which a dimension is not penalised, to avoid posterior collapse. 0 gives a plain KL.",
           "default": 0.5,
           "type": "number"
         },
@@ -748,7 +771,7 @@
           ],
           "flag": "--grad_clip_norm",
           "required": false,
-          "help": "Global-norm gradient clipping threshold for the HetSIREN optimizer. Gradients whose global norm exceeds this value are rescaled down, which prevents occasional gradient spikes. Set to 0 to disable clipping.",
+          "help": "Global-norm gradient clipping threshold. Set to 0 to disable.",
           "default": 1.0,
           "type": "number"
         },
@@ -759,7 +782,7 @@
           ],
           "flag": "--loss_type",
           "required": false,
-          "help": "Reconstruction (representation) loss. mse (default): image-space L2 (robust on noise but blurs high frequencies). frc: Fourier Ring Correlation (sharp on clean data, but weights noise-dominated shells equally, so on experimental data it must be band-limited to a trusted resolution to avoid overfitting noise - see --freq_anneal_epochs and --sigma_anneal_factor, which together reproduce the EMAN2/e2gmm recipe of a band-limited FRC over a band-limited Gaussian representation). NOTE: the point transformer decoder always uses a Fourier-space loss (frc) regardless of this setting.",
+          "help": "Reconstruction loss: mse in image space or frc (Fourier ring correlation). The point transformer always uses frc.",
           "default": "mse",
           "type": "enum",
           "choices": [
@@ -768,13 +791,46 @@
           ]
         },
         {
+          "name": "whiten_loss",
+          "flags": [
+            "--whiten_loss"
+          ],
+          "flag": "--whiten_loss",
+          "required": false,
+          "help": "Weight every Fourier ring of the reconstruction loss by the inverse of the residual power, as DynaMight does: unweighted until 10 epochs after the latent warmup, then updated every epoch from a running average of the residual, keeping the overall loss scale. Only changes the mse loss.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "particle_diameter",
+          "flags": [
+            "--particle_diameter"
+          ],
+          "flag": "--particle_diameter",
+          "required": false,
+          "help": "Particle diameter in A: background for --normalize_images and soft circular mask of the images. Default: the extent of the mask.",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "normalize_images",
+          "flags": [
+            "--normalize_images"
+          ],
+          "flag": "--normalize_images",
+          "required": false,
+          "help": "Normalize each particle as RELION does (zero mean, unit std in the background outside 0.375 * box) before the encoder, the losses and the contrast fit of the Gaussians. Stored in the network, so prediction reuses it.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "per_image_contrast",
           "flags": [
             "--per_image_contrast"
           ],
           "flag": "--per_image_contrast",
           "required": false,
-          "help": "Fit a gray level per particle inside the reconstruction loss, instead of relying on the single global contrast that --vol pins once before training. The slope is the closed-form least-squares fit of the image on the prediction (two sums per image, no extra decode, ~1%% of a step) and is held fixed by a stop-gradient, which is exact rather than an approximation. Use it when the particle set was merged from more than one acquisition or extraction run: two halves can match in pixel mean and variance and still differ by ~20%% in the particle signal they carry, and that difference is a systematic residual the encoder will happily read out as conformation. relative (recommended) normalizes the slopes by their batch mean, so only the spread across particles is absorbed and the absolute density scale stays pinned. absolute applies the raw slopes, making the loss fully scale-invariant per image - stronger, but the overall amplitude is then unconstrained by the data term, so only use it with --denoising_strength 0 and --occupancy_l1 0. off (default) keeps the previous behaviour. Has no effect with --loss_type frc, which is already contrast invariant.",
+          "help": "Fit a gray level per particle inside the reconstruction loss instead of relying on the global contrast fixed before training.",
           "default": "off",
           "type": "enum",
           "choices": [
@@ -784,80 +840,14 @@
           ]
         },
         {
-          "name": "freq_anneal_epochs",
+          "name": "amplitude_strength",
           "flags": [
-            "--freq_anneal_epochs"
+            "--amplitude_strength"
           ],
-          "flag": "--freq_anneal_epochs",
+          "flag": "--amplitude_strength",
           "required": false,
-          "help": "Coarse-to-fine annealing: number of initial epochs over which the effective resolution is ramped in. During this window the decoder's first-SIREN-layer frequency (w0) and the upper limit of the FRC loss band are scaled up from --freq_anneal_start to full resolution (and, if --sigma_anneal_factor > 1, the Gaussian render width is annealed on the same clock). This forces the network to fit low-frequency structure before high-frequency detail, which strongly stabilizes training on noisy data (it prevents the SIREN from overfitting high-frequency noise early). Set to 0 to disable (train at full resolution from the first step). NOTE: does not affect the point transformer decoder's w0 (it has no SIREN first layer), but still anneals its loss band.",
-          "default": 0.0,
-          "type": "number"
-        },
-        {
-          "name": "freq_anneal_start",
-          "flags": [
-            "--freq_anneal_start"
-          ],
-          "flag": "--freq_anneal_start",
-          "required": false,
-          "help": "Starting fraction (in (0, 1]) for --freq_anneal_epochs: freq_alpha begins at this value and ramps linearly to 1.0. Smaller values start coarser (lower resolution). Ignored when --freq_anneal_epochs is 0.",
-          "default": 0.2,
-          "type": "number"
-        },
-        {
-          "name": "sigma_anneal_factor",
-          "flags": [
-            "--sigma_anneal_factor"
-          ],
-          "flag": "--sigma_anneal_factor",
-          "required": false,
-          "help": "EMAN2/e2gmm-style band-limited representation for the FRC loss. The Gaussian render width used in the training loss starts at sigma_anneal_factor x base_sigma (broad, low-resolution blobs) and shrinks back to the base width on the SAME coarse-to-fine clock as --freq_anneal_epochs. Broadening the Gaussians makes the density itself intrinsically band-limited early on, so the amplitude-invariant FRC cannot pour gradient into high-resolution noise shells the model is not yet allowed to represent (this is the safeguard that lets EMAN2 use FRC on experimental data). Only affects mass-transport rendering. Requires --freq_anneal_epochs > 0 (it shares that clock). Set to 1.0 to disable (default; fixed base width). Typical: 2-2.5 - the render blur uses a fixed 9-px kernel, so a broadened width beyond ~2.5x the base sigma is progressively truncated (still broadens, just sub-linearly), which bounds the useful range.",
-          "default": 1.0,
-          "type": "number"
-        },
-        {
-          "name": "schedule_recon_split",
-          "flags": [
-            "--schedule_recon_split"
-          ],
-          "flag": "--schedule_recon_split",
-          "required": false,
-          "help": "Ramp the reconstruction split over training instead of holding it fixed. When set, the weight of the amplitude term ramps linearly from --recon_split_start to --recon_split_final over --recon_split_epochs (the motion term takes the complement). Starting near 0 makes early training explain the data almost purely by transport, so large motions organise before occupancy is allowed in. Only meaningful with mass transport (--transport_mass). Default: off (fixed --recon_split_final throughout).",
-          "default": false,
-          "type": "boolean"
-        },
-        {
-          "name": "recon_split_start",
-          "flags": [
-            "--recon_split_start"
-          ],
-          "flag": "--recon_split_start",
-          "required": false,
-          "help": "Amplitude-term weight at the START of training when --schedule_recon_split is on. 0.0 (default) means the data is explained purely by mass transport at the beginning.",
-          "default": 0.0,
-          "type": "number"
-        },
-        {
-          "name": "recon_split_final",
-          "flags": [
-            "--recon_split_final"
-          ],
-          "flag": "--recon_split_final",
-          "required": false,
-          "help": "Amplitude-term weight at the END of the ramp (and the fixed weight used throughout when --schedule_recon_split is off). The reconstruction loss is w x L(learned amplitudes, frozen coords) + (1-w) x L(reference amplitudes, learned coords). The second term can only be reduced by moving mass, so it is what forces motion to be modelled as transport; the first lets occupancy explain the residual transport cannot, without being able to leak gradient into the coordinate head. Default 0.1 (90%% transport). Raise it toward 0.5 if genuine compositional change is being forced into motion; lower it toward 0 for pure transport.",
+          "help": "Weight of the amplitude (occupancy) reconstruction term relative to the motion one: the loss is L(motion) + w x L(amplitude). Both terms are the same loss on the same images, so the ratio means the same on every dataset. Only with mass transport and a reference; ignored with --motion_only.",
           "default": 0.1,
-          "type": "number"
-        },
-        {
-          "name": "recon_split_epochs",
-          "flags": [
-            "--recon_split_epochs"
-          ],
-          "flag": "--recon_split_epochs",
-          "required": false,
-          "help": "Number of initial epochs over which the amplitude-term weight ramps from --recon_split_start to --recon_split_final. Only used with --schedule_recon_split; if left at 0 the ramp falls back to the --freq_anneal_epochs clock.",
-          "default": 0.0,
           "type": "number"
         },
         {
@@ -867,7 +857,7 @@
           ],
           "flag": "--occupancy_l1",
           "required": false,
-          "help": "Weight of the shrinkage half of the occupancy prior. Occupancy is what lets HetSIREN model compositional heterogeneity (a domain/ligand appearing or disappearing between particles) rather than forcing everything through the deformation field: each Gaussian carries a per-particle amplitude change on top of the reference. This term penalises how much of it there is, with a scale-normalised L1 (cost = fold change where the reference has density, so modulating existing density is cheap, while creating mass where the reference is empty costs |occ|/--occupancy_kappa -- possible but expensive). It is a mean over points, so it is on the same scale as --occupancy_tv. Only meaningful with mass transport (--transport_mass) and a reference. NOTE: this term only ever shrinks occupancy -- if the occ_fraction diagnostic collapses towards 0, this is too high.",
+          "help": "Weight of the L1 shrinkage on the per-particle amplitude change, normalised by the reference density plus --occupancy_kappa. Requires mass transport and a reference.",
           "default": 0.0,
           "type": "number"
         },
@@ -878,7 +868,7 @@
           ],
           "flag": "--occupancy_tv",
           "required": false,
-          "help": "Weight of the spatial-coherence half of the occupancy prior (graph total variation). It penalises occupancy differences between neighbouring Gaussians, so a whole domain switching on together pays only at its boundary while scattered per-Gaussian noise pays everywhere -- this is what separates a genuine compositional domain from amplitude noise, and it is the term to reach for if occupancy is coming out incoherent. Raise it for blockier occupancy, lower it toward 0 to allow finer-grained occupancy. Weighted independently of --occupancy_l1: coherent-but-large occupancy is a perfectly reasonable thing to ask for, so setting this alone (L1 at 0) is a normal configuration. Occupancy is active when either weight is > 0; with both at 0 (default) the amplitudes stay at the reference (pure mass transport).",
+          "help": "Weight of the graph total variation on the per-particle amplitude change, favouring spatially coherent occupancy.",
           "default": 0.0,
           "type": "number"
         },
@@ -889,9 +879,31 @@
           ],
           "flag": "--occupancy_kappa",
           "required": false,
-          "help": "Creation threshold of the occupancy prior (as a density, in the reference's gray scale; default 0.05). It is added to the reference amplitude in the L1 denominator, so it sets how much evidence it takes to invent mass where the reference is (near) empty: smaller = harder to create mass, larger = easier. Where the reference already has substantial density it has little effect (the cost is a fold change). Only used when --occupancy_l1 > 0.",
+          "help": "Density added to the reference in the --occupancy_l1 denominator: sets how costly it is to create mass where the reference is empty.",
           "default": 0.05,
           "type": "number"
+        },
+        {
+          "name": "occupancy_hold_epochs",
+          "flags": [
+            "--occupancy_hold_epochs"
+          ],
+          "flag": "--occupancy_hold_epochs",
+          "required": false,
+          "help": "Epochs the amplitude change is held at zero before --occupancy_warmup_epochs ramps it in, so motion forms first (default: the latent warmup).",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "consensus_update_epochs",
+          "flags": [
+            "--consensus_update_epochs"
+          ],
+          "flag": "--consensus_update_epochs",
+          "required": false,
+          "help": "Every this many epochs, move the consensus Gaussians to the mean of the least-deformed particles so motion is measured from its centre. 0 disables it.",
+          "default": 0,
+          "type": "integer"
         },
         {
           "name": "occupancy_warmup_epochs",
@@ -900,35 +912,20 @@
           ],
           "flag": "--occupancy_warmup_epochs",
           "required": false,
-          "help": "Number of initial epochs over which occupancy is ramped in (default 3.0). While it ramps, the amplitudes stay at the reference so the data is explained purely by transport -- large motions organise first -- and occupancy is then released to explain only the residual that motion cannot (compositional change). Feeding occupancy from step 0 lets it short-circuit the motion (it is a strictly easier way to fit any image), so a non-zero warmup is recommended. Set to 0 to use occupancy from the first step. This ramp is independent of the occupancy priors -- it controls how occupancy enters the density, not how it is penalised -- so it applies whether or not --occupancy_l1/--occupancy_tv are set.",
+          "help": "Epochs over which the per-particle amplitude change is ramped in, so motion is learned before occupancy. 0 disables the ramp.",
           "default": 3.0,
           "type": "number"
         },
         {
-          "name": "arap_lambda",
+          "name": "rigid_drift_lambda",
           "flags": [
-            "--arap_lambda"
+            "--rigid_drift_lambda"
           ],
-          "flag": "--arap_lambda",
+          "flag": "--rigid_drift_lambda",
           "required": false,
-          "help": "Weight of the as-rigid-as-possible (ARAP) deformation prior. Unlike the distance-preservation term, ARAP factors out the best local rotation per Gaussian before penalizing the deformation, so locally rigid motions (hinges, domain rotations) are NOT over-stiffened while noise-driven non-rigid shear is still resisted. Only active with mass transport and a reference volume. Set to 0 to disable (default); a small value (e.g. 0.05-0.2) is a good starting point, tuned together with --deformation_lambda/--distance_preservation_lambda.",
-          "default": 0.0,
+          "help": "Weight of the penalty on the rigid motion the gauge removes from the decoder displacement field.",
+          "default": 1.0,
           "type": "number"
-        },
-        {
-          "name": "arap_rotation",
-          "flags": [
-            "--arap_rotation"
-          ],
-          "flag": "--arap_rotation",
-          "required": false,
-          "help": "How the per-Gaussian optimal rotation in the ARAP prior (--arap_lambda) is recovered. polar (default) uses a matmul-only scaled polar iteration that is ~15-20x faster than the SVD path on GPU (batched 3x3 SVD is a severe XLA:GPU bottleneck) and numerically matches it to ~1e-6. svd uses the exact SVD; keep it as a reference/fallback (run both and compare the ARAP loss to self-check). No effect unless --arap_lambda > 0.",
-          "default": "polar",
-          "type": "enum",
-          "choices": [
-            "polar",
-            "svd"
-          ]
         },
         {
           "name": "geometric_lambda",
@@ -937,7 +934,7 @@
           ],
           "flag": "--geometric_lambda",
           "required": false,
-          "help": "Weight of the geometric-correction loss. It penalises the local volume distortion of the heterogeneity decoder via the Gram determinant det(J_D(z)^T J_D(z)) of its Jacobian (the derivative of the decoded deformation w.r.t. the latent), pushing the decoded latent-to-shape map towards a locally volume-preserving (isometric) embedding. Set to 0 to disable (default). NOTE: computing the decoder Jacobian is expensive (it runs the decoder once per latent dimension and is differentiated again by the optimizer), so only enable it when the geometric term is actually needed.",
+          "help": "Weight of the geometric-correction loss on the decoder Jacobian (Gram determinant), pushing towards a locally volume-preserving latent-to-shape map. Expensive; 0 disables it.",
           "default": 0.0,
           "type": "number"
         },
@@ -948,7 +945,7 @@
           ],
           "flag": "--lr_schedule",
           "required": false,
-          "help": "Use a warmup + cosine-decay learning-rate schedule for the HetSIREN optimizer instead of a constant learning rate. The LR ramps linearly from 1e-5 to --learning_rate over the first 10%% of training, then follows a cosine decay down to 0 by the final epoch. This warms up the SIREN safely (avoiding early high-frequency instabilities) and anneals the step size at the end for a sharper, more stable final model. Resumes correctly from a checkpoint (the schedule follows the optimizer step count). Default: off (constant learning rate).",
+          "help": "Use a linear warmup (10%% of training) plus cosine-decay learning-rate schedule instead of a constant learning rate.",
           "default": false,
           "type": "boolean"
         },
@@ -959,18 +956,18 @@
           ],
           "flag": "--ema_decay",
           "required": false,
-          "help": "Exponential moving average (Polyak averaging) of the trainable weights. When > 0 (typical: 0.999), a running average ema = decay*ema + (1-decay)*weights is maintained during training and the AVERAGED weights (not the last raw ones) are exported as the final model. This smooths out the noise in the late-training weight trajectory and typically yields a cleaner, higher-resolution reconstruction on noisy data. The averaged forward model is also used as the (frozen) target when training the decoder inverse. Set to 0 to disable (default). NOTE: the EMA buffer is checkpointed, so a training resume restores the running average exactly (legacy checkpoints without an EMA buffer fall back to re-seeding it from the resumed weights).",
+          "help": "Decay of the exponential moving average of the weights (typical 0.999); the averaged weights are exported as the final model. 0 disables it.",
           "default": 0.0,
           "type": "number"
         },
         {
-          "name": "deformation_lambda",
+          "name": "deformation_strength",
           "flags": [
-            "--deformation_lambda"
+            "--deformation_strength"
           ],
-          "flag": "--deformation_lambda",
+          "flag": "--deformation_strength",
           "required": false,
-          "help": "Weight of the graph-based deformation regularization (deformation regularity + repulsion) that keeps the local geometry of the moving Gaussians consistent during mass transport. Lower it (e.g. 0.3-0.5) to allow sharper/larger motions at the risk of less regular deformations, raise it for stiffer, more regular motions. Only active with mass transport and a reference volume; ignored otherwise.",
+          "help": "Strength of the graph deformation priors (relative edge strain + repulsion) with respect to the reconstruction loss, as DynaMight's regularization factor: after the latent warmup, the prior weight is recalibrated every epoch so its gradient on the decoder is this fraction of the reconstruction gradient. The same value acts alike on every dataset; lower for larger motions, higher for stiffer ones, 0 disables it. Only with mass transport and a reference.",
           "default": 0.9,
           "type": "number"
         },
@@ -981,7 +978,7 @@
           ],
           "flag": "--decoupling_lambda",
           "required": false,
-          "help": "Weight of the decoupling regularization (encourages the latent/conformation representation to be invariant to pose and CTF). Increase it to enforce stronger pose/CTF decoupling, decrease it (or set to 0) to relax it.",
+          "help": "Weight of the decoupling regularization that makes the latent invariant to pose and CTF.",
           "default": 0.0001,
           "type": "number"
         },
@@ -992,7 +989,7 @@
           ],
           "flag": "--distance_preservation_lambda",
           "required": false,
-          "help": "Weight of the local distance preservation regularization (penalizes deviations of the mass-weighted point positions from the consensus/mean state, keeping local distances consistent). Increase it for stiffer, more locally rigid deformations, decrease it (or set to 0) for more flexibility.",
+          "help": "Weight of the local distance preservation regularization between the deformed and the mean state. Higher values give stiffer deformations.",
           "default": 0.0001,
           "type": "number"
         },
@@ -1161,7 +1158,7 @@
           ],
           "flag": "--num_gaussians",
           "required": false,
-          "help": "Before training the network, Zernike3Deep fits a set of Gaussians to the reference volume to recreate it. By default the count is determined automatically: the fit searches for the FEWEST Gaussians whose render still reproduces your reference shell by shell (see --fit_resolution).\nSet this parameter to pin the count in advance from your own criterium instead (e.g. the number of residues in your protein). When set, Zernike3Deep fits exactly this many Gaussians and reproduces the reference as well as that count allows.",
+          "help": "Number of Gaussians fitted to the reference volume before training. By default it is grown until the fit reaches FSC >= 0.5 on every populated shell (see --fit_resolution).",
           "default": null,
           "type": "integer"
         },
@@ -1172,9 +1169,155 @@
           ],
           "flag": "--fit_resolution",
           "required": false,
-          "help": "Resolution (in Angstrom) the automatic Gaussian fit has to reproduce, and no more. Left unset (the default) the fit matches the reference out to the reference's own limit. Set a coarser value to trade resolution for a smaller point cloud -- measured, the count scales as about the SQUARE of the resolution asked for (N ~ d^-1.9), so relaxing the target from 4 to 8 A is roughly a 3.7x smaller cloud. Ignored when --num_gaussians is given.",
+          "help": "Resolution (in Angstrom) the automatic Gaussian fit has to reproduce.",
           "default": null,
           "type": "number"
+        },
+        {
+          "name": "rigid_gauge",
+          "flags": [
+            "--rigid_gauge"
+          ],
+          "flag": "--rigid_gauge",
+          "required": false,
+          "help": "Remove the global rigid motion from the deformation field so pose errors go to the pose head. core: frame fitted on the least-moving points; mass: mass-weighted fit; off: diagnostic only.",
+          "default": "core",
+          "type": "enum",
+          "choices": [
+            "core",
+            "mass",
+            "off"
+          ]
+        },
+        {
+          "name": "rigid_drift_lambda",
+          "flags": [
+            "--rigid_drift_lambda"
+          ],
+          "flag": "--rigid_drift_lambda",
+          "required": false,
+          "help": "Weight of the penalty on the rigid motion the gauge removes from the deformation field.",
+          "default": 1.0,
+          "type": "number"
+        },
+        {
+          "name": "pose_refine_reg",
+          "flags": [
+            "--pose_refine_reg"
+          ],
+          "flag": "--pose_refine_reg",
+          "required": false,
+          "help": "Weight of the hinge penalising pose refinements beyond --pose_refine_max_angle. Set to 0 to disable.",
+          "default": 0.1,
+          "type": "number"
+        },
+        {
+          "name": "pose_refine_max_angle",
+          "flags": [
+            "--pose_refine_max_angle"
+          ],
+          "flag": "--pose_refine_max_angle",
+          "required": false,
+          "help": "Rotation (degrees) the pose refinement may apply freely; the excess is penalised with --pose_refine_reg.",
+          "default": 8.0,
+          "type": "number"
+        },
+        {
+          "name": "shift_refine_reg",
+          "flags": [
+            "--shift_refine_reg"
+          ],
+          "flag": "--shift_refine_reg",
+          "required": false,
+          "help": "Weight of the hinge penalising shift refinements beyond --shift_refine_max. Set to 0 to disable.",
+          "default": 0.1,
+          "type": "number"
+        },
+        {
+          "name": "shift_refine_max",
+          "flags": [
+            "--shift_refine_max"
+          ],
+          "flag": "--shift_refine_max",
+          "required": false,
+          "help": "Shift (pixels) the refinement may apply freely; the excess is penalised with --shift_refine_reg.",
+          "default": 4.0,
+          "type": "number"
+        },
+        {
+          "name": "per_image_contrast",
+          "flags": [
+            "--per_image_contrast"
+          ],
+          "flag": "--per_image_contrast",
+          "required": false,
+          "help": "Fit one contrast scale per image before the reconstruction loss. relative: scales normalised to a unit batch mean; absolute: raw least-squares scale.",
+          "default": "off",
+          "type": "enum",
+          "choices": [
+            "off",
+            "relative",
+            "absolute"
+          ]
+        },
+        {
+          "name": "particle_diameter",
+          "flags": [
+            "--particle_diameter"
+          ],
+          "flag": "--particle_diameter",
+          "required": false,
+          "help": "Particle diameter in A: background for --normalize_images and soft circular mask of the images. Default: the extent of the mask.",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "normalize_images",
+          "flags": [
+            "--normalize_images"
+          ],
+          "flag": "--normalize_images",
+          "required": false,
+          "help": "Normalize each particle (zero mean, unit std in the background outside the particle) before the encoder, the loss and the contrast fit of the Gaussians.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "kl_lambda",
+          "flags": [
+            "--kl_lambda"
+          ],
+          "flag": "--kl_lambda",
+          "required": false,
+          "help": "Weight of the VAE KL divergence towards a standard normal prior (summed over the batch and the latent dimensions; 1e-6 was the previous built-in value). 0 disables the VAE and uses a deterministic latent.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "deformation_strength",
+          "flags": [
+            "--deformation_strength"
+          ],
+          "flag": "--deformation_strength",
+          "required": false,
+          "help": "Strength of the graph deformation priors (relative edge strain + repulsion) with respect to the reconstruction loss, as DynaMight's regularization factor: after the first epoch, the prior weight is set once (then kept fixed) so its gradient on the decoder is this fraction of the reconstruction gradient. Lower for larger motions, higher for stiffer ones, 0 disables it.",
+          "default": 0.3,
+          "type": "number"
+        },
+        {
+          "name": "strain_penalty",
+          "flags": [
+            "--strain_penalty"
+          ],
+          "flag": "--strain_penalty",
+          "required": false,
+          "help": "Penalty on the relative edge strain. huber: grows without limit with the strain; bounded: saturates, so domains stay rigid while a contact between them can open at a fixed cost.",
+          "default": "huber",
+          "type": "enum",
+          "choices": [
+            "huber",
+            "bounded"
+          ]
         },
         {
           "name": "epochs",
@@ -2315,7 +2458,7 @@
           ],
           "flag": "--no-decode_motion",
           "required": false,
-          "help": "Include the deformation field (mass transport) when decoding. With --no-decode_motion the Gaussians are held at their consensus positions, so the decoded volume shows only what the occupancy pathway contributes. Combined with --decode_occupancy this gives the four ablations (both / motion only / occupancy only / consensus) needed to tell a genuine domain motion from an amplitude change: a real motion survives --no-decode_occupancy, real compositional change survives --no-decode_motion. Only meaningful for networks trained with mass transport.",
+          "help": "Apply the deformation field when decoding. With --no-decode_motion only the occupancy change is decoded (mass transport networks only).",
           "default": true,
           "type": "string"
         },
@@ -2327,7 +2470,7 @@
           ],
           "flag": "--no-decode_occupancy",
           "required": false,
-          "help": "Include the per-Gaussian occupancy (amplitude) change when decoding. With --no-decode_occupancy the amplitudes are pinned to the consensus, so the decoded volume is the deformation field acting alone and is exactly mass-conserving -- any density that moves between two sites is genuine transport, not a fade-out/fade-in. See --decode_motion.",
+          "help": "Apply the per-Gaussian occupancy change when decoding. With --no-decode_occupancy only the motion is decoded (mass transport networks only).",
           "default": true,
           "type": "string"
         },
@@ -2339,7 +2482,7 @@
           ],
           "flag": "--no-export_deformation",
           "required": false,
-          "help": "Also export the decoder's per-state deformation field (the deformed point cloud + per-point occupancy relative to the consensus) under <output_path>/deformation/. This is the exact correspondence data downstream tools (e.g. the hax-em assistant's regional-motion analysis) use to characterise domain motions \u2014 hinges, rotations, coordinated motion and compositional/occupancy change \u2014 rigorously rather than guessing from the maps. Best-effort: skipped with a warning if the loaded network exposes no deformation field. Use --no-export_deformation to disable.",
+          "help": "Also save the per-state deformed point cloud and occupancy under <output_path>/deformation/ (skipped with a warning if the network has no deformation field).",
           "default": true,
           "type": "string"
         },
@@ -2622,8 +2765,8 @@
           ],
           "flag": "--num_gaussians",
           "required": false,
-          "help": "Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians so that the reproduce the reference volume as well as possible.",
-          "default": 10000,
+          "help": "Number of Gaussians in the point cloud. With a reference volume the Gaussians are fitted to it before training (default 10000). Fully ab initio (no --vol) the default is derived from the estimated particle extent so the cloud can tile the particle at the splat width; set this parameter to override either default (e.g. from the number of residues in your protein).",
+          "default": null,
           "type": "integer"
         },
         {
@@ -2701,6 +2844,161 @@
           "required": false,
           "help": "Number of candidate pose hypotheses the pose encoder proposes per image during the ab initio search. For every image the network evaluates this many orientations (anchored on a spherical grid), renders a projection for each and keeps the best-matching one. A larger value covers orientation space more densely, making the pose search more robust to local minima, but increases GPU memory and compute roughly linearly (this is the main driver of ReconSIREN's training footprint). Set it lower to fit a smaller GPU at the cost of a coarser pose search. Default: 18.",
           "default": 18,
+          "type": "integer"
+        },
+        {
+          "name": "candidate_coverage_weight",
+          "flags": [
+            "--candidate_coverage_weight"
+          ],
+          "flag": "--candidate_coverage_weight",
+          "required": false,
+          "help": "Weight of the bank-aware spherical occupancy KL, which spreads the pose hypotheses over the projection sphere during the first 10 epochs of the ab initio search. Set it to 0 to disable the loss entirely.",
+          "default": 0.01,
+          "type": "number"
+        },
+        {
+          "name": "reconstruction_mode",
+          "flags": [
+            "--reconstruction_mode"
+          ],
+          "flag": "--reconstruction_mode",
+          "required": false,
+          "help": "joint (default): learn a consensus map and a heterogeneity decoder that deviates from it. het_only: skip the consensus part altogether, making the heterogeneous volume its own ab initio map.",
+          "default": "joint",
+          "type": "enum",
+          "choices": [
+            "joint",
+            "het_only"
+          ]
+        },
+        {
+          "name": "heterogeneity_profile",
+          "flags": [
+            "--heterogeneity_profile"
+          ],
+          "flag": "--heterogeneity_profile",
+          "required": false,
+          "help": "Heterogeneity training profile. anti_collapse enables staged residual training with decoder centering, a masked/normalized multiscale loss and bank-backed latent variance/covariance statistics; legacy preserves the historical objective.",
+          "default": "anti_collapse",
+          "type": "enum",
+          "choices": [
+            "legacy",
+            "anti_collapse"
+          ]
+        },
+        {
+          "name": "lat_dim",
+          "flags": [
+            "--lat_dim"
+          ],
+          "flag": "--lat_dim",
+          "required": false,
+          "help": "Dimension of the heterogeneity latent space.",
+          "default": 8,
+          "type": "integer"
+        },
+        {
+          "name": "het_start_epoch",
+          "flags": [
+            "--het_start_epoch"
+          ],
+          "flag": "--het_start_epoch",
+          "required": false,
+          "help": "First epoch that trains heterogeneity, providing a consensus-only warm-up. Profile defaults: legacy heterogeneity=0, anti-collapse=5.",
+          "default": null,
+          "type": "integer"
+        },
+        {
+          "name": "consensus_parameterization",
+          "flags": [
+            "--consensus_parameterization"
+          ],
+          "flag": "--consensus_parameterization",
+          "required": false,
+          "help": "Consensus Gaussian delta parameterization. Default: direct.",
+          "default": null,
+          "type": "enum",
+          "choices": [
+            "network",
+            "direct"
+          ]
+        },
+        {
+          "name": "whiten_loss_weight",
+          "flags": [
+            "--whiten_loss_weight"
+          ],
+          "flag": "--whiten_loss_weight",
+          "required": false,
+          "help": "Weight in [0,1] for the noise-whitened consensus reconstruction loss. The dataset noise spectrum is estimated once from the particle solvent corners; whitening equalises the per-frequency-shell SNR so high-resolution shells receive real gradient instead of being drowned by the low-frequency power. 0 disables.",
+          "default": 0.5,
+          "type": "number"
+        },
+        {
+          "name": "no_extent_estimation",
+          "flags": [
+            "--no_extent_estimation"
+          ],
+          "flag": "--no_extent_estimation",
+          "required": false,
+          "help": "Disable the ab initio particle-extent estimation from the raw images (per-pixel variance excess over the noise floor) and fall back to the fixed quarter-box initialization ball and the default Gaussian count.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "support_weight",
+          "flags": [
+            "--support_weight"
+          ],
+          "flag": "--support_weight",
+          "required": false,
+          "help": "Weight of the shrink-wrap support penalty: mass outside a spherical support re-derived every epoch from the converging cloud itself (no mask needed). The term is zero inside the support, so it only suppresses background dust. 0 disables.",
+          "default": 1.0,
+          "type": "number"
+        },
+        {
+          "name": "spacing_prior_weight",
+          "flags": [
+            "--spacing_prior_weight"
+          ],
+          "flag": "--spacing_prior_weight",
+          "required": false,
+          "help": "Weight of the kNN spacing prior: penalizes mass-carrying neighbours further apart than ~2 splat widths (density visually fragments) or closer than ~0.7 (redundant stacking). Active once the pose warm-up finishes. 0 disables.",
+          "default": 0.05,
+          "type": "number"
+        },
+        {
+          "name": "amplitude_smoothness_weight",
+          "flags": [
+            "--amplitude_smoothness_weight"
+          ],
+          "flag": "--amplitude_smoothness_weight",
+          "required": false,
+          "help": "Weight of the kNN amplitude-smoothness prior (graph Laplacian on Gaussian masses) so one iso-surface threshold traces the whole chain instead of beading. Active once the pose warm-up finishes. 0 disables.",
+          "default": 0.01,
+          "type": "number"
+        },
+        {
+          "name": "no_point_recycling",
+          "flags": [
+            "--no_point_recycling"
+          ],
+          "flag": "--no_point_recycling",
+          "required": false,
+          "help": "Disable periodic recycling of amplitude-dead Gaussians next to mass-carrying ones.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "recycle_every",
+          "flags": [
+            "--recycle_every"
+          ],
+          "flag": "--recycle_every",
+          "required": false,
+          "help": "Epoch cadence for point recycling after the warm-up",
+          "default": 5,
           "type": "integer"
         },
         {
@@ -3320,7 +3618,7 @@
           ],
           "flag": "--reconstruct_halves",
           "required": false,
-          "help": "If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts, and report the half-map FSC. NOTE: without this there is no FSC and therefore no way to tell whether the reconstruction improved anything.",
+          "help": "If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts.",
           "default": false,
           "type": "boolean"
         },
@@ -3334,72 +3632,6 @@
           "help": "If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed.  NOTE : When providing this parameter, you MUST give the path to a trained  HetSIREN (with transport of mass)  or  Zernike3Deep  neural network.",
           "default": null,
           "type": "string"
-        },
-        {
-          "name": "epochs",
-          "flags": [
-            "--epochs"
-          ],
-          "flag": "--epochs",
-          "required": false,
-          "help": "Number of reconstruction epochs (default 20). The learning-rate schedule is annealed over exactly this many, so the fit settles at the end instead of being cut off at full step size.",
-          "default": 20,
-          "type": "integer"
-        },
-        {
-          "name": "refine_positions",
-          "flags": [
-            "--refine_positions"
-          ],
-          "flag": "--refine_positions",
-          "required": false,
-          "help": "Let MoDART move the mass as well as re-weight it. Each voxel gets a displacement bounded to half a voxel and penalised by --coord_reg. NOTE: off by default. A free per-voxel displacement lets the model match any image by moving mass rather than by getting the density right, and sub-voxel jitter over every voxel is itself a blur kernel.",
-          "default": false,
-          "type": "boolean"
-        },
-        {
-          "name": "l1_delta",
-          "flags": [
-            "--l1_delta"
-          ],
-          "flag": "--l1_delta",
-          "required": false,
-          "help": "Weight of the L1 sparsity prior on the amplitude CORRECTION (default 1e-3), normalised by the reference RMS. It penalises the departure from the reference map, not the map itself -- an L1 on the total density shrinks the reference and costs a flat slice of low-frequency contrast.",
-          "default": 0.001,
-          "type": "number"
-        },
-        {
-          "name": "tv_lambda",
-          "flags": [
-            "--tv_lambda"
-          ],
-          "flag": "--tv_lambda",
-          "required": false,
-          "help": "Weight of the total-variation (spatial smoothness) prior on the density (default 1e-3).",
-          "default": 0.001,
-          "type": "number"
-        },
-        {
-          "name": "coord_reg",
-          "flags": [
-            "--coord_reg"
-          ],
-          "flag": "--coord_reg",
-          "required": false,
-          "help": "Weight of the quadratic penalty on the per-voxel displacement (default 1e-2). Only used with --refine_positions.",
-          "default": 0.01,
-          "type": "number"
-        },
-        {
-          "name": "field_chunk",
-          "flags": [
-            "--field_chunk"
-          ],
-          "flag": "--field_chunk",
-          "required": false,
-          "help": "Number of reconstruction voxels evaluated per chunk when querying the motion field (default 131072). Lower it if the field query runs out of memory; it only trades speed for peak VRAM and does not change the result.",
-          "default": 131072,
-          "type": "integer"
         },
         {
           "name": "output_path",
@@ -3528,7 +3760,7 @@
           ],
           "flag": "--tau",
           "required": false,
-          "help": "Wiener floor of the reconstruction quotient (set by default to 0.05). This is only a numerical regularizer to keep the shells with little CTF power from blowing up -- the resolution of the map is set by the data, not by this. Raise it if the map looks noisy at high frequency, lower it if it looks over-smoothed.",
+          "help": "Wiener floor of the reconstruction quotient, as a fraction of the low-resolution denominator (set by default to 0.05). This is only a numerical regularizer to keep the shells with little CTF (or, for tilt series, little dose-weight) power from blowing up -- the resolution of the map is set by the data, not by this. Raise it if the map looks noisy at high frequency, lower it if it looks over-smoothed.",
           "default": 0.05,
           "type": "number"
         },
@@ -3544,6 +3776,39 @@
           "type": "boolean"
         },
         {
+          "name": "symmetry_group",
+          "flags": [
+            "--symmetry_group"
+          ],
+          "flag": "--symmetry_group",
+          "required": false,
+          "help": "Point-group symmetry to impose on the map (set by default to c1, i.e. none; c* and d* are supported).",
+          "default": "c1",
+          "type": "string"
+        },
+        {
+          "name": "fsc_diameter",
+          "flags": [
+            "--fsc_diameter"
+          ],
+          "flag": "--fsc_diameter",
+          "required": false,
+          "help": "(optional) Diameter, in Angstrom, of a soft spherical mask applied to the half maps before their FSC is measured. Without it the FSC is taken over the whole box.",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "no_dose_weighting",
+          "flags": [
+            "--no_dose_weighting"
+          ],
+          "flag": "--no_dose_weighting",
+          "required": false,
+          "help": "(optional) Do not fold the tilt-series dose/tilt weighting into the Wiener denominator. Tomography images are pre-multiplied by CTF*W, so W belongs there; turning this off leaves a large B-factor in the map. Ignored when the metadata has no preExposure column.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
           "name": "no_gray_scale_calibration",
           "flags": [
             "--no_gray_scale_calibration"
@@ -3551,6 +3816,17 @@
           "flag": "--no_gray_scale_calibration",
           "required": false,
           "help": "Skip the global gray-scale calibration. By default the finished map is forward-projected at a subset of the real poses and least-squares scaled against the input images, so that re-projecting it reproduces their contrast and value range. Pass this flag to keep the raw amplitudes.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "write_half_maps",
+          "flags": [
+            "--write_half_maps"
+          ],
+          "flag": "--write_half_maps",
+          "required": false,
+          "help": "Also write the two unfiltered half maps (consensus_half1.mrc, consensus_half2.mrc",
           "default": false,
           "type": "boolean"
         },
@@ -3594,11 +3870,9 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "How many images are read and inserted at once. The images are read on a thread pool while the GPU accumulates, so peak RAM tracks this value rather than the number of particles.\nLeft at auto (the default) the largest memory-safe batch is measured for your box and GPU before the pass starts - the measurement only compiles the kernel, so it allocates nothing and cannot itself run you out of memory. This matters because the cost per particle grows with the square of the box: a batch that is comfortable at 128 px needs ~7x the memory at 320 px. Pass an integer to pin it instead.",
-          "default": "auto",
-          "type": "string",
-          "custom_type": "batch_size_or_auto",
-          "widget": "csv"
+          "help": "How many images are read and inserted at once (set by default to 1024). The images are read on a thread pool while the GPU accumulates, so peak RAM tracks this value rather than the number of particles - lower it if you run out of memory, raise it to read fewer, larger chunks.",
+          "default": 1024,
+          "type": "integer"
         },
         {
           "name": "threads",
@@ -3650,261 +3924,6 @@
         }
       ]
     },
-    "reconstruct_motion_corrected": {
-      "name": "reconstruct_motion_corrected",
-      "module": "hax.programs.reconstruct_motion_corrected",
-      "description": "Motion-corrected volume reconstruction by Fourier gridding, given a trained HetSIREN (single pass, with half maps and FSC) - the non-iterative alternative to modart",
-      "summary": "",
-      "fields": [
-        {
-          "name": "md",
-          "flags": [
-            "--md"
-          ],
-          "flag": "--md",
-          "required": true,
-          "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
-          "default": null,
-          "type": "string",
-          "widget": "path",
-          "path_kind": "file"
-        },
-        {
-          "name": "sr",
-          "flags": [
-            "--sr"
-          ],
-          "flag": "--sr",
-          "required": true,
-          "help": "Sampling rate of the images/volume",
-          "default": null,
-          "type": "number"
-        },
-        {
-          "name": "ctf_type",
-          "flags": [
-            "--ctf_type"
-          ],
-          "flag": "--ctf_type",
-          "required": true,
-          "help": "Whether the images carry a CTF. The reconstruction only needs to know if they do: apply, wiener and precorrect all mean they do, while None means they do not.",
-          "default": null,
-          "type": "enum",
-          "choices": [
-            "None",
-            "apply",
-            "wiener",
-            "precorrect"
-          ]
-        },
-        {
-          "name": "motion_correction",
-          "flags": [
-            "--motion_correction"
-          ],
-          "flag": "--motion_correction",
-          "required": true,
-          "help": "Path to a trained HetSIREN with mass transport (--transport_mass) checkpoint. Its encoder supplies each particle's latent and its decoder the displacement field that is removed from the image.",
-          "default": null,
-          "type": "string"
-        },
-        {
-          "name": "tau",
-          "flags": [
-            "--tau"
-          ],
-          "flag": "--tau",
-          "required": false,
-          "help": "Wiener floor of the reconstruction quotient (default 0.05). A numerical regularizer only -- the resolution is set by the data, not by this.",
-          "default": 0.05,
-          "type": "number"
-        },
-        {
-          "name": "correction",
-          "flags": [
-            "--correction"
-          ],
-          "flag": "--correction",
-          "required": false,
-          "help": "WHERE the modelled motion is removed (default image).\n  image warps each 2D image and then inserts it normally. Fast -- one pass, a couple of operations per pixel -- but a projection ray gets ONE displacement, the density-weighted mean of the motion along it, because a single-valued 2D field cannot carry more. On the ribosome the part of the field that varies ALONG a ray measured ~95% of the part that does not, so this is a real approximation, not a rounding error.\n  backprojection bends the backprojection rays in 3D instead: each canonical voxel reads the image where its own material landed, so two voxels at different depths on one ray read different pixels. This is what DynaMight does (Nat Methods 21, 1855-1862) and it is the geometrically correct version. It costs ~15-20x more (box x mask-fraction gathers per particle instead of one image warp).\n  Both modes share the CTF weighting, the parity halves and the gray scale, so their maps are directly comparable and the difference between them IS the depth-resolved part of the motion.",
-          "default": "image",
-          "type": "enum",
-          "choices": [
-            "image",
-            "backprojection"
-          ]
-        },
-        {
-          "name": "jacobian",
-          "flags": [
-            "--jacobian"
-          ],
-          "flag": "--jacobian",
-          "required": false,
-          "help": "Multiply the resampled density by the Jacobian determinant of the deformation, making the correction conserve mass rather than values. Resampling alone moves intensities around; where a deformation compresses a region the same material lands on fewer pixels and must be scaled up for the line integral to survive. Second order for the near-isometric deformations the elastic priors produce -- measured at 1.2% (median) and 30% (p99) on the ribosome -- but it grows in proportion to the size of the motion. DynaMight does not do this. Off by default so the two correction modes reproduce their published behaviour unless asked.",
-          "default": false,
-          "type": "boolean"
-        },
-        {
-          "name": "mask_radius",
-          "flags": [
-            "--mask_radius"
-          ],
-          "flag": "--mask_radius",
-          "required": false,
-          "help": "Voxels within this many voxels of a consensus point that carries mass take part in the deformed backprojection (default 5.0); only used with --correction backprojection. Cost is linear in the number of selected voxels, and the model has nothing to say outside its own point cloud. The selected fraction is printed at startup.",
-          "default": 5.0,
-          "type": "number"
-        },
-        {
-          "name": "mask_taper",
-          "flags": [
-            "--mask_taper"
-          ],
-          "flag": "--mask_taper",
-          "required": false,
-          "help": "Width, in voxels, over which the correction is faded out as it approaches the edge of that region (default 2.0, raised cosine). Do not set this to 0 unless you want to see why it exists: the correction is a difference, so ending it at a hard boundary leaves a step of its full size, and that step rings through the Fourier division. Measured with no taper, 71.6% of the entire difference between the corrected map and the consensus sat in a +-1.5 voxel shell at the mask edge -- 5.1% of the box by volume, where it was 1.43x the size of the density itself. The interpolated field does not fade on its own (its outermost band is the largest of any), so the window has to impose it. Full-strength correction therefore reaches to --mask_radius minus this.",
-          "default": 2.0,
-          "type": "number"
-        },
-        {
-          "name": "warp_sigma",
-          "flags": [
-            "--warp_sigma"
-          ],
-          "flag": "--warp_sigma",
-          "required": false,
-          "help": "Width, in pixels, of the smoothing applied when the scattered per-point displacements are turned into a dense image-plane warp (default 2.0). It should be comparable to the spacing between the model's points in projection; too small leaves gaps between them, too large washes out the boundary between a moving domain and a static one.",
-          "default": 2.0,
-          "type": "number"
-        },
-        {
-          "name": "min_coverage",
-          "flags": [
-            "--min_coverage"
-          ],
-          "flag": "--min_coverage",
-          "required": false,
-          "help": "Pixels whose splat coverage falls below this fraction of the mean are left UNWARPED rather than having a warp extrapolated into them (default 0.05). Doing nothing where the model has no support is the safe default; dividing by a near-zero coverage is how the previous 3D field transfer produced displacements thousands of Angstrom long.",
-          "default": 0.05,
-          "type": "number"
-        },
-        {
-          "name": "no_denoise",
-          "flags": [
-            "--no_denoise"
-          ],
-          "flag": "--no_denoise",
-          "required": false,
-          "help": "Skip the FSC-based denoising of the combined map. The FSC is still measured and reported.",
-          "default": false,
-          "type": "boolean"
-        },
-        {
-          "name": "no_gray_scale_calibration",
-          "flags": [
-            "--no_gray_scale_calibration"
-          ],
-          "flag": "--no_gray_scale_calibration",
-          "required": false,
-          "help": "Skip the global gray-scale calibration against the input images.",
-          "default": false,
-          "type": "boolean"
-        },
-        {
-          "name": "also_consensus",
-          "flags": [
-            "--also_consensus"
-          ],
-          "flag": "--also_consensus",
-          "required": false,
-          "help": "Also reconstruct the ordinary (uncorrected) consensus from the same particles and print both resolutions. Strongly recommended: it is the control that says whether the motion correction changed anything, and it is the only way to attribute a difference to the correction rather than to any other part of the pipeline.",
-          "default": false,
-          "type": "boolean"
-        },
-        {
-          "name": "write_mask",
-          "flags": [
-            "--write_mask"
-          ],
-          "flag": "--write_mask",
-          "required": false,
-          "help": "Also write a binary mask of the protein region derived from the reconstructed map.",
-          "default": false,
-          "type": "boolean"
-        },
-        {
-          "name": "batch_size",
-          "flags": [
-            "--batch_size"
-          ],
-          "flag": "--batch_size",
-          "required": false,
-          "help": "How many images are read per chunk (default 512). Peak RAM tracks this rather than the particle count.",
-          "default": 512,
-          "type": "integer"
-        },
-        {
-          "name": "field_batch",
-          "flags": [
-            "--field_batch"
-          ],
-          "flag": "--field_batch",
-          "required": false,
-          "help": "How many particles are pushed through the motion decoder at once (default 32). This is the VRAM-sensitive number -- the decoder holds (particles x points x hidden) activations -- so lower it if the field decode runs out of memory. It does not change the result.",
-          "default": 32,
-          "type": "integer"
-        },
-        {
-          "name": "threads",
-          "flags": [
-            "--threads"
-          ],
-          "flag": "--threads",
-          "required": false,
-          "help": "Number of reader threads feeding the GPU (default 8). On a spinning disk a lower value can be faster.",
-          "default": 8,
-          "type": "integer"
-        },
-        {
-          "name": "output_path",
-          "flags": [
-            "--output_path"
-          ],
-          "flag": "--output_path",
-          "required": true,
-          "help": "Path to save the results (trained neural network, new metadata...)",
-          "default": null,
-          "type": "string",
-          "widget": "path",
-          "path_kind": "directory"
-        },
-        {
-          "name": "ssd_scratch_folder",
-          "flags": [
-            "--ssd_scratch_folder"
-          ],
-          "flag": "--ssd_scratch_folder",
-          "required": false,
-          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
-          "default": null,
-          "type": "string",
-          "widget": "path",
-          "path_kind": "directory"
-        },
-        {
-          "name": "config",
-          "flags": [
-            "--config"
-          ],
-          "flag": "--config",
-          "required": false,
-          "help": "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). Values from the file act as defaults; any argument also given on the command line overrides them. NOTE: the fully-resolved parameters (file + command line) are written to <output_path>/run_config.json on every run, and that file can be reused as a --config to reproduce the run.",
-          "default": null,
-          "type": "string"
-        }
-      ]
-    },
     "update": {
       "name": "update",
       "module": "hax.cli.updater",
@@ -3937,5 +3956,6 @@
       ]
     }
   },
-  "errors": {}
+  "errors": {},
+  "kept": {}
 }

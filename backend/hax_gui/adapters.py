@@ -66,6 +66,18 @@ MULTI_BINDABLE: dict[str, set[str]] = {
 }
 
 
+# Fields a program takes over from the run wired into one of its inputs: MoDART
+# corrects the particles its motion model was trained on, with the same map and mask.
+INHERITED_FIELDS: dict[str, dict[str, list[str]]] = {
+    "modart": {"motion_correction": ["md", "vol", "mask", "sr", "ctf_type"]},
+}
+
+
+def inherited_fields(program: str) -> dict[str, list[str]]:
+    """{bindable field: [fields copied from the run wired into it]} for `program`."""
+    return INHERITED_FIELDS.get(program, {})
+
+
 def multi_bindable_fields(program: str) -> list[str]:
     """Bindable fields of `program` that accept multiple wired sources."""
     return sorted(MULTI_BINDABLE.get(program, set()))

@@ -27,6 +27,7 @@ def workflow_catalog() -> list[dict[str, Any]]:
             **p,
             "bindable": adapters.bindable_fields(p["name"]),
             "bindable_multi": adapters.multi_bindable_fields(p["name"]),
+            "inherits": adapters.inherited_fields(p["name"]),
             "produces": adapters.produces(p["name"]),
         })
     return out
