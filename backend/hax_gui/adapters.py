@@ -40,8 +40,8 @@ BINDABLE_FIELDS: dict[str, dict[str, str]] = {
     # *multi-valued* input: wire one latents source per program you want included.
     "flexconsensus": {"reload": "flexconsensus_model", "input_space": "latents"},
     "latent_space_deconvolution": {"reload": "deconvolver_model", "md": "particles"},
-    "image_gray_scale_adjustment": {"reload": "image_adjust_model", "md": "particles", "vol": "volume"},
-    "volume_gray_scale_adjustment": {"reload": "volume_adjust_model", "md": "particles", "vol": "volume"},
+    "image_gray_scale_adjustment": {"md": "particles", "vol": "volume"},
+    "volume_gray_scale_adjustment": {"md": "particles", "vol": "volume"},
     "estimate_latent_covariances": {"md": "particles"},
     # `motion_correction` is a --reload in disguise: MoDART loads a trained motion
     # decoder (HetSIREN w/ transport of mass, or Zernike3Deep) to correct particles
@@ -96,8 +96,6 @@ _CHECKPOINT_DIR: dict[str, str] = {
     "reconsiren_het_only": "ReconSIREN",   # het-only variant saves under the same subfolder
     "flexconsensus": "FlexConsensus",
     "latent_space_deconvolution": "deconvolver",
-    "image_gray_scale_adjustment": "imageAdjustment",
-    "volume_gray_scale_adjustment": "volumeAdjustment",
 }
 
 # Each `*_model` kind -> the producer programs whose checkpoint a consumer can
@@ -116,8 +114,6 @@ _MODEL_KINDS: dict[str, dict[str, Any]] = {
     "reconsiren_het_only_model": {"programs": ["reconsiren_het_only"], "form": "parent"},
     "flexconsensus_model": {"programs": ["flexconsensus"], "form": "parent"},
     "deconvolver_model": {"programs": ["latent_space_deconvolution"], "form": "parent"},
-    "image_adjust_model": {"programs": ["image_gray_scale_adjustment"], "form": "parent"},
-    "volume_adjust_model": {"programs": ["volume_gray_scale_adjustment"], "form": "parent"},
     "decoder_model": {"programs": ["hetsiren", "zernike3deep", "reconsiren", "reconsiren_het_only"], "form": "dir"},
     # MoDART's motion_correction loads the checkpoint path directly and calls
     # decode_field on it, which only HetSIREN and Zernike3Deep implement -- so this
@@ -159,6 +155,12 @@ _ARTIFACT_PRODUCERS: dict[str, list[dict[str, Any]]] = {
             "globs": ["predicted_latents.xmd", "predicted_latents.star",
                       "predicted_pose_shifts.xmd", "predicted_pose_shifts.star"],
         },
+        {
+            # The rescaled particles of an image gray-scale adjustment (a new stack)
+            "style": "path",
+            "programs": {"image_gray_scale_adjustment"},
+            "globs": ["adjusted_images.xmd", "adjusted_images.star"],
+        },
     ],
     "volume": [
         {
@@ -175,6 +177,11 @@ _ARTIFACT_PRODUCERS: dict[str, list[dict[str, Any]]] = {
             "style": "unique_glob",
             "programs": {"reconstruct_volume"},
             "globs": ["consensus_reconstruction.mrc"],
+        },
+        {
+            "style": "unique_glob",
+            "programs": {"volume_gray_scale_adjustment"},
+            "globs": ["adjusted_volume.mrc"],
         },
     ],
 }
