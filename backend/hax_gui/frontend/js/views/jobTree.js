@@ -304,10 +304,12 @@ export function jobTree(opts = {}) {
   // so a filtered view still shows where the matching run sits.
   function treeNodes(set) {
     const { roots, kids, all } = buildTree(set);
-    const visited = new Set();
+    // Reachability ignores collapse: a collapsed node's descendants are hidden, not orphans.
+    const reached = new Set();
+    const reach = (j) => { if (!reached.has(j.id)) { reached.add(j.id); (kids.get(j.id) || []).forEach(reach); } };
+    roots.forEach(reach);
     const subtreeMatch = (j) => matches(j) || (kids.get(j.id) || []).some(subtreeMatch);
     const node = (j, last) => {
-      visited.add(j.id);
       const children = (kids.get(j.id) || []).filter(subtreeMatch);
       const open = !memo.collapsed.has(j.id);
       return h("div", { class: "jt-node" + (last ? " last" : "") },
@@ -315,7 +317,7 @@ export function jobTree(opts = {}) {
         children.length && open ? h("div", { class: "jt-kids" }, ...children.map((c, i) => node(c, i === children.length - 1))) : null);
     };
     const out = roots.filter(subtreeMatch).map((r, i, arr) => node(r, i === arr.length - 1));
-    for (const j of all) if (!visited.has(j.id) && subtreeMatch(j)) out.push(node(j, true));
+    for (const j of all) if (!reached.has(j.id) && subtreeMatch(j)) { reach(j); out.push(node(j, true)); }
     return out;
   }
 
