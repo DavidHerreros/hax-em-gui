@@ -183,6 +183,12 @@ _ARTIFACT_PRODUCERS: dict[str, list[dict[str, Any]]] = {
             "programs": {"volume_gray_scale_adjustment"},
             "globs": ["adjusted_volume.mrc"],
         },
+        {
+            # MoDART's final FSC-weighted map (not its halves or the consensus it may write)
+            "style": "unique_glob",
+            "programs": {"modart"},
+            "globs": ["modart_map.mrc"],
+        },
     ],
 }
 
