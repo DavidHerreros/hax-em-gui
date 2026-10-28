@@ -39,10 +39,11 @@ BINDABLE_FIELDS: dict[str, dict[str, str]] = {
     # FlexConsensus consensuates many input latent spaces, so `--input_space` is a
     # *multi-valued* input: wire one latents source per program you want included.
     "flexconsensus": {"reload": "flexconsensus_model", "input_space": "latents"},
-    "latent_space_deconvolution": {"reload": "deconvolver_model", "md": "particles"},
+    "latent_space_deconvolution": {"reload": "deconvolver_model", "md": "particles",
+                                   "nn_path": "latent_model", "covariances": "covariances"},
     "image_gray_scale_adjustment": {"md": "particles", "vol": "volume"},
     "volume_gray_scale_adjustment": {"md": "particles", "vol": "volume"},
-    "estimate_latent_covariances": {"md": "particles"},
+    "estimate_latent_covariances": {"md": "particles", "nn_path": "latent_model"},
     # `motion_correction` is a --reload in disguise: MoDART loads a trained motion
     # decoder (HetSIREN w/ transport of mass, or Zernike3Deep) to correct particles
     # while reconstructing, so it auto-wires from such a run just like a reload.
@@ -70,6 +71,8 @@ MULTI_BINDABLE: dict[str, set[str]] = {
 # corrects the particles its motion model was trained on, with the same map and mask.
 INHERITED_FIELDS: dict[str, dict[str, list[str]]] = {
     "modart": {"motion_correction": ["md", "vol", "mask", "sr", "ctf_type"]},
+    # The covariances are row-aligned with their run's particles, in its network's latent space.
+    "latent_space_deconvolution": {"covariances": ["md", "nn_path"]},
 }
 
 
@@ -125,6 +128,8 @@ _MODEL_KINDS: dict[str, dict[str, Any]] = {
     # Hence a kind narrower than motion_model, further filtered on --transport_mass by
     # `job_produces` so only a run that actually trained one is offered.
     "transport_motion_model": {"programs": ["hetsiren"], "form": "dir"},
+    # `--nn_path` needs an encoder returning latents (ReconSIREN's returns poses).
+    "latent_model": {"programs": ["hetsiren", "zernike3deep"], "form": "dir"},
 }
 
 # Artifacts referenced *in place* (no copy): the consumer is handed the producer's
@@ -188,6 +193,13 @@ _ARTIFACT_PRODUCERS: dict[str, list[dict[str, Any]]] = {
             "style": "unique_glob",
             "programs": {"modart"},
             "globs": ["modart_map.mrc"],
+        },
+    ],
+    "covariances": [
+        {
+            "style": "path",
+            "programs": {"estimate_latent_covariances"},
+            "globs": ["covariance_matrices.npy"],
         },
     ],
 }
