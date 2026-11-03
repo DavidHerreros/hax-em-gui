@@ -568,6 +568,39 @@
           "path_kind": "file"
         },
         {
+          "name": "refit_reference",
+          "flags": [
+            "--refit_reference"
+          ],
+          "flag": "--refit_reference",
+          "required": false,
+          "help": "With --reload in train mode: fit the Gaussians to --vol (e.g. a MoDART map) and fine tune the reloaded network on them. Needs a network trained with mass transport and an implicit or point transformer decoder.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "learn_reference_epochs",
+          "flags": [
+            "--learn_reference_epochs"
+          ],
+          "flag": "--learn_reference_epochs",
+          "required": false,
+          "help": "Learn the positions of the reference Gaussians during the first N epochs, then freeze them. Needs mass transport and an implicit decoder.",
+          "default": 0,
+          "type": "integer"
+        },
+        {
+          "name": "reference_lr",
+          "flags": [
+            "--reference_lr"
+          ],
+          "flag": "--reference_lr",
+          "required": false,
+          "help": "Step size of --learn_reference_epochs (default: 2e-4 * sqrt(batch_size / 128))",
+          "default": null,
+          "type": "number"
+        },
+        {
           "name": "denoising_strength",
           "flags": [
             "--denoising_strength"
@@ -650,28 +683,6 @@
           "type": "number"
         },
         {
-          "name": "pose_refine_warmup_epochs",
-          "flags": [
-            "--pose_refine_warmup_epochs"
-          ],
-          "flag": "--pose_refine_warmup_epochs",
-          "required": false,
-          "help": "Epochs over which the pose refinement is ramped in from the input poses (0: refine from the first step).",
-          "default": 0.0,
-          "type": "number"
-        },
-        {
-          "name": "latent_warmup_epochs",
-          "flags": [
-            "--latent_warmup_epochs"
-          ],
-          "flag": "--latent_warmup_epochs",
-          "required": false,
-          "help": "Epochs over which the latent is ramped into the decoder (default: 12%% of the epochs). The decoder sees a zero latent for the first half, so poses are refined against the consensus before heterogeneity is learned. Set to 0 to disable.",
-          "default": null,
-          "type": "number"
-        },
-        {
           "name": "rigid_gauge",
           "flags": [
             "--rigid_gauge"
@@ -710,17 +721,6 @@
           "type": "boolean"
         },
         {
-          "name": "pe_motion",
-          "flags": [
-            "--pe_motion"
-          ],
-          "flag": "--pe_motion",
-          "required": false,
-          "help": "Decode the motion with a DynaMight-like head (positional encoding + small ELU network) and the amplitudes with FiLM. Implies --implicit_network.",
-          "default": false,
-          "type": "boolean"
-        },
-        {
           "name": "motion_only",
           "flags": [
             "--motion_only"
@@ -750,7 +750,7 @@
           "flag": "--kl_lambda",
           "required": false,
           "help": "Weight of the VAE KL divergence towards a standard normal prior. 0 disables the VAE and uses a deterministic latent.",
-          "default": 0.001,
+          "default": 0.0,
           "type": "number"
         },
         {
@@ -797,7 +797,7 @@
           ],
           "flag": "--whiten_loss",
           "required": false,
-          "help": "Weight every Fourier ring of the reconstruction loss by the inverse of the residual power, as DynaMight does: unweighted until 10 epochs after the latent warmup, then updated every epoch from a running average of the residual, keeping the overall loss scale. Only changes the mse loss.",
+          "help": "Weight every Fourier ring of the reconstruction loss by the inverse of the residual power: unweighted for the first 10 epochs, then updated every epoch from a running average of the residual, keeping the overall loss scale. Only changes the mse loss.",
           "default": false,
           "type": "boolean"
         },
@@ -819,7 +819,7 @@
           ],
           "flag": "--normalize_images",
           "required": false,
-          "help": "Normalize each particle as RELION does (zero mean, unit std in the background outside 0.375 * box) before the encoder, the losses and the contrast fit of the Gaussians. Stored in the network, so prediction reuses it.",
+          "help": "Normalize each particle (zero mean, unit std in the background outside 0.375 * box) before the encoder, the losses and the contrast fit of the Gaussians.",
           "default": false,
           "type": "boolean"
         },
@@ -840,70 +840,26 @@
           ]
         },
         {
-          "name": "amplitude_strength",
+          "name": "recon_split_final",
           "flags": [
-            "--amplitude_strength"
+            "--recon_split_final"
           ],
-          "flag": "--amplitude_strength",
+          "flag": "--recon_split_final",
           "required": false,
-          "help": "Weight of the amplitude (occupancy) reconstruction term relative to the motion one: the loss is L(motion) + w x L(amplitude). Both terms are the same loss on the same images, so the ratio means the same on every dataset. Only with mass transport and a reference; ignored with --motion_only.",
+          "help": "Amplitude-term weight of the reconstruction loss, from the first step. The loss is w x L(learned amplitudes, frozen coords) + (1-w) x L(reference amplitudes, learned coords). Only with mass transport.",
           "default": 0.1,
           "type": "number"
         },
         {
-          "name": "occupancy_l1",
+          "name": "occupancy_strength",
           "flags": [
-            "--occupancy_l1"
+            "--occupancy_strength"
           ],
-          "flag": "--occupancy_l1",
+          "flag": "--occupancy_strength",
           "required": false,
-          "help": "Weight of the L1 shrinkage on the per-particle amplitude change, normalised by the reference density plus --occupancy_kappa. Requires mass transport and a reference.",
+          "help": "Weight of the occupancy prior on the per-particle amplitude change: an L1 shrinkage (stronger where the reference is empty) plus a graph total variation favouring spatially coherent occupancy, both relative to the mean reference density so the value means the same on every dataset. Requires mass transport and a reference; 0 disables it.",
           "default": 0.0,
           "type": "number"
-        },
-        {
-          "name": "occupancy_tv",
-          "flags": [
-            "--occupancy_tv"
-          ],
-          "flag": "--occupancy_tv",
-          "required": false,
-          "help": "Weight of the graph total variation on the per-particle amplitude change, favouring spatially coherent occupancy.",
-          "default": 0.0,
-          "type": "number"
-        },
-        {
-          "name": "occupancy_kappa",
-          "flags": [
-            "--occupancy_kappa"
-          ],
-          "flag": "--occupancy_kappa",
-          "required": false,
-          "help": "Density added to the reference in the --occupancy_l1 denominator: sets how costly it is to create mass where the reference is empty.",
-          "default": 0.05,
-          "type": "number"
-        },
-        {
-          "name": "occupancy_hold_epochs",
-          "flags": [
-            "--occupancy_hold_epochs"
-          ],
-          "flag": "--occupancy_hold_epochs",
-          "required": false,
-          "help": "Epochs the amplitude change is held at zero before --occupancy_warmup_epochs ramps it in, so motion forms first (default: the latent warmup).",
-          "default": null,
-          "type": "number"
-        },
-        {
-          "name": "consensus_update_epochs",
-          "flags": [
-            "--consensus_update_epochs"
-          ],
-          "flag": "--consensus_update_epochs",
-          "required": false,
-          "help": "Every this many epochs, move the consensus Gaussians to the mean of the least-deformed particles so motion is measured from its centre. 0 disables it.",
-          "default": 0,
-          "type": "integer"
         },
         {
           "name": "occupancy_warmup_epochs",
@@ -967,8 +923,30 @@
           ],
           "flag": "--deformation_strength",
           "required": false,
-          "help": "Strength of the graph deformation priors (relative edge strain + repulsion) with respect to the reconstruction loss, as DynaMight's regularization factor: after the latent warmup, the prior weight is recalibrated every epoch so its gradient on the decoder is this fraction of the reconstruction gradient. The same value acts alike on every dataset; lower for larger motions, higher for stiffer ones, 0 disables it. Only with mass transport and a reference.",
-          "default": 0.9,
+          "help": "Strength of the graph deformation priors (relative edge strain + repulsion) with respect to the reconstruction loss: after the first epoch, the prior weight is recalibrated every epoch so its gradient on the decoder is this fraction of the reconstruction gradient. The same value acts alike on every dataset; lower for larger motions, higher for stiffer ones, 0 disables it. Only with mass transport and a reference.",
+          "default": 0.3,
+          "type": "number"
+        },
+        {
+          "name": "nested_dropout",
+          "flags": [
+            "--nested_dropout"
+          ],
+          "flag": "--nested_dropout",
+          "required": false,
+          "help": "Nested dropout on the decoded latent: each training sample keeps only its first k dimensions, k ~ Geometric(p), so the dimensions are ordered by importance (PCA-like). Typical 0.1 to 0.5; 0 disables it.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "noise_invariance_strength",
+          "flags": [
+            "--noise_invariance_strength"
+          ],
+          "flag": "--noise_invariance_strength",
+          "required": false,
+          "help": "Strength of the penalty 1 - correlation, per latent dimension, between the latents of the image and of the image with a second draw of noise coloured like its background: after the first epoch, its weight is recalibrated every epoch so its encoder gradient is this fraction of the reconstruction one. Typical 0.1 to 0.5; 0 disables it.",
+          "default": 0.0,
           "type": "number"
         },
         {
@@ -1100,7 +1078,8 @@
             "None",
             "apply",
             "wiener",
-            "precorrect"
+            "precorrect",
+            "premultiplied"
           ]
         },
         {
@@ -1135,6 +1114,54 @@
           "help": "Degree of Zernike3D angular component (increasing this value might help finding more localized motions at the expense of higher memory consumption)",
           "default": 7,
           "type": "integer"
+        },
+        {
+          "name": "basis",
+          "flags": [
+            "--basis"
+          ],
+          "flag": "--basis",
+          "required": false,
+          "help": "Deformation basis. zernike: global Zernike3D polynomials (--L1, --L2); patches: blended local affine patches over the Gaussians, more local motion per coefficient (e.g. domain motions around hinges).",
+          "default": "zernike",
+          "type": "enum",
+          "choices": [
+            "zernike",
+            "patches"
+          ]
+        },
+        {
+          "name": "num_patches",
+          "flags": [
+            "--num_patches"
+          ],
+          "flag": "--num_patches",
+          "required": false,
+          "help": "Number of patches of --basis patches (4 coefficients per patch and axis).",
+          "default": 30,
+          "type": "integer"
+        },
+        {
+          "name": "patch_width",
+          "flags": [
+            "--patch_width"
+          ],
+          "flag": "--patch_width",
+          "required": false,
+          "help": "Width of the patch blending weights of --basis patches, as a fraction of the mean spacing between patch centres.",
+          "default": 0.4,
+          "type": "number"
+        },
+        {
+          "name": "patch_rigidity",
+          "flags": [
+            "--patch_rigidity"
+          ],
+          "flag": "--patch_rigidity",
+          "required": false,
+          "help": "Weight, relative to the edge strain, of a penalty on the stretch and shear of each patch of --basis patches (Green strain of its local affine fit), so patches move rigidly. Part of the deformation prior scaled by --deformation_strength; 0 disables it.",
+          "default": 0.0,
+          "type": "number"
         },
         {
           "name": "mode",
@@ -1300,8 +1327,41 @@
           ],
           "flag": "--deformation_strength",
           "required": false,
-          "help": "Strength of the graph deformation priors (relative edge strain + repulsion) with respect to the reconstruction loss, as DynaMight's regularization factor: after the first epoch, the prior weight is set once (then kept fixed) so its gradient on the decoder is this fraction of the reconstruction gradient. Lower for larger motions, higher for stiffer ones, 0 disables it.",
+          "help": "Strength of the graph deformation priors (relative edge strain + repulsion) with respect to the reconstruction loss: after the first epoch, the prior weight is set once (then kept fixed) so its gradient on the decoder is this fraction of the reconstruction gradient. Lower for larger motions, higher for stiffer ones, 0 disables it.",
           "default": 0.3,
+          "type": "number"
+        },
+        {
+          "name": "nested_dropout",
+          "flags": [
+            "--nested_dropout"
+          ],
+          "flag": "--nested_dropout",
+          "required": false,
+          "help": "Nested dropout on the decoded latent: each training sample keeps only its first k dimensions, k ~ Geometric(p), so the dimensions are ordered by importance (PCA-like). Typical 0.1 to 0.5; 0 disables it.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "noise_invariance_strength",
+          "flags": [
+            "--noise_invariance_strength"
+          ],
+          "flag": "--noise_invariance_strength",
+          "required": false,
+          "help": "Strength of the penalty 1 - correlation, per latent dimension, between the latents of the image and of the image with a second draw of noise coloured like its background: after the first epoch, its weight is recalibrated every epoch so its encoder gradient is this fraction of the reconstruction one. Typical 0.1 to 0.5; 0 disables it.",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "decoupling_lambda",
+          "flags": [
+            "--decoupling_lambda"
+          ],
+          "flag": "--decoupling_lambda",
+          "required": false,
+          "help": "Weight of the decoupling regularization that makes the latent invariant to pose and CTF.",
+          "default": 0.0001,
           "type": "number"
         },
         {
@@ -1450,6 +1510,17 @@
           "type": "string",
           "widget": "path",
           "path_kind": "file"
+        },
+        {
+          "name": "refit_reference",
+          "flags": [
+            "--refit_reference"
+          ],
+          "flag": "--refit_reference",
+          "required": false,
+          "help": "With --reload in train mode: fit the Gaussians to --vol (e.g. a MoDART map) and fine tune the reloaded network on them.",
+          "default": false,
+          "type": "boolean"
         },
         {
           "name": "ssd_scratch_folder",
@@ -1798,8 +1869,8 @@
     },
     "image_gray_scale_adjustment": {
       "name": "image_gray_scale_adjustment",
-      "module": "hax.networks.image_gray_scale_adjustment",
-      "description": "Adjustment of volume projections to match a set of images",
+      "module": "hax.programs.image_gray_scale_adjustment",
+      "description": "Per-image gray scale adjustment of the particles to the projections of a map (closed form)",
       "summary": "",
       "fields": [
         {
@@ -1822,7 +1893,7 @@
           ],
           "flag": "--vol",
           "required": true,
-          "help": "Volume needed to generate the projections to be adjusted",
+          "help": "Reference map whose projections set the gray scale of each image. It must have the same box and sampling rate as the images.",
           "default": null,
           "type": "string",
           "widget": "path",
@@ -1835,22 +1906,11 @@
           ],
           "flag": "--mask",
           "required": false,
-          "help": "This helps focusing the adjustment on a region of interest (if not provided, a inscribed spherical mask will be used)",
+          "help": "(optional) Binary mask of the region to match. The fit then only uses the pixels inside the projection of the mask. Without it, the whole image is used.",
           "default": null,
           "type": "string",
           "widget": "path",
           "path_kind": "file"
-        },
-        {
-          "name": "load_images_to_ram",
-          "flags": [
-            "--load_images_to_ram"
-          ],
-          "flag": "--load_images_to_ram",
-          "required": false,
-          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
-          "default": false,
-          "type": "boolean"
         },
         {
           "name": "sr",
@@ -1870,63 +1930,42 @@
           ],
           "flag": "--ctf_type",
           "required": true,
-          "help": "Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)",
+          "help": "Whether the images carry a CTF. apply, wiener and precorrect all mean the images are the raw observations, so the CTF is applied to the projections; premultiplied means the images were already multiplied by their CTF; None means they carry no CTF at all.",
           "default": null,
           "type": "enum",
           "choices": [
             "None",
             "apply",
             "wiener",
-            "precorrect"
+            "precorrect",
+            "premultiplied"
           ]
         },
         {
-          "name": "predict_value",
+          "name": "per_image_contrast",
           "flags": [
-            "--predict_value"
+            "--per_image_contrast"
           ],
-          "flag": "--predict_value",
+          "flag": "--per_image_contrast",
           "required": false,
-          "help": "If not provided, the adjustment will be estimated per pixel - otherwise, adjustment will be estimated per projection",
-          "default": false,
-          "type": "boolean"
-        },
-        {
-          "name": "lat_dim",
-          "flags": [
-            "--lat_dim"
-          ],
-          "flag": "--lat_dim",
-          "required": false,
-          "help": "Dimensionality of the latent space of the network (set by default to 3)",
-          "default": 3,
-          "type": "integer"
-        },
-        {
-          "name": "mode",
-          "flags": [
-            "--mode"
-          ],
-          "flag": "--mode",
-          "required": true,
-          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the adjustment for the input images/volume (reload parameter is mandatory in this case)",
-          "default": null,
+          "help": "relative (default): divide each image by its gray scale relative to the mean of the data set, so the contrast becomes even across particles while the overall gray level is kept. absolute: divide each image by its own gray scale, which puts every particle on the gray scale of the map.",
+          "default": "relative",
           "type": "enum",
           "choices": [
-            "train",
-            "predict"
+            "relative",
+            "absolute"
           ]
         },
         {
-          "name": "epochs",
+          "name": "fit_offset",
           "flags": [
-            "--epochs"
+            "--fit_offset"
           ],
-          "flag": "--epochs",
+          "flag": "--fit_offset",
           "required": false,
-          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
-          "default": 50,
-          "type": "integer"
+          "help": "Also fit a per-image offset (image = scale * projection + offset) and subtract it. By default only the scale is fitted, which assumes images normalized to a zero-mean background.",
+          "default": false,
+          "type": "boolean"
         },
         {
           "name": "batch_size",
@@ -1935,38 +1974,20 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
-          "default": 64,
-          "type": "string",
-          "custom_type": "batch_size_or_auto",
-          "widget": "csv"
+          "help": "How many images are read and projected at once (set by default to 256). Lower it if the GPU runs out of memory; it does not change the result.",
+          "default": 256,
+          "type": "integer"
         },
         {
-          "name": "learning_rate",
+          "name": "threads",
           "flags": [
-            "--learning_rate"
+            "--threads"
           ],
-          "flag": "--learning_rate",
+          "flag": "--threads",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
-          "default": 1e-05,
-          "type": "number"
-        },
-        {
-          "name": "dataset_split_fraction",
-          "flags": [
-            "--dataset_split_fraction"
-          ],
-          "flag": "--dataset_split_fraction",
-          "required": false,
-          "help": "Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: training_fraction,validation_fraction. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. NOTE: the sum of training_fraction and validation_fraction must be equal to one.",
-          "default": [
-            0.8,
-            0.2
-          ],
-          "type": "string",
-          "custom_type": "list_of_floats",
-          "widget": "csv"
+          "help": "Number of reader threads feeding the GPU with image chunks (set by default to 8). On a spinning disk (HDD) a lower value (1 or 2) can be faster.",
+          "default": 8,
+          "type": "integer"
         },
         {
           "name": "output_path",
@@ -1982,63 +2003,17 @@
           "path_kind": "directory"
         },
         {
-          "name": "reload",
-          "flags": [
-            "--reload"
-          ],
-          "flag": "--reload",
-          "required": false,
-          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)",
-          "default": null,
-          "type": "string",
-          "widget": "path",
-          "path_kind": "file"
-        },
-        {
           "name": "ssd_scratch_folder",
           "flags": [
             "--ssd_scratch_folder"
           ],
           "flag": "--ssd_scratch_folder",
           "required": false,
-          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "help": "Path to a folder on a fast (SSD/NVMe) disk. The images are cached there as a float16 copy and read from it, the same cache the other hax programs build in that folder.",
           "default": null,
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
-        },
-        {
-          "name": "log_checkpoint_every",
-          "flags": [
-            "--log_checkpoint_every"
-          ],
-          "flag": "--log_checkpoint_every",
-          "required": false,
-          "help": "How often (in epochs) to write the intermediate checkpoint used to resume an interrupted training (set by default to 5 - set to 0 to disable). This is deliberately independent from --log_landscape_every: how often you can resume should not be tied to how often you want pictures",
-          "default": 5,
-          "type": "integer"
-        },
-        {
-          "name": "log_time_budget",
-          "flags": [
-            "--log_time_budget"
-          ],
-          "flag": "--log_time_budget",
-          "required": false,
-          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
-          "default": 0.0,
-          "type": "number"
-        },
-        {
-          "name": "log_sync",
-          "flags": [
-            "--log_sync"
-          ],
-          "flag": "--log_sync",
-          "required": false,
-          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
-          "default": false,
-          "type": "boolean"
         },
         {
           "name": "config",
@@ -2055,8 +2030,8 @@
     },
     "volume_gray_scale_adjustment": {
       "name": "volume_gray_scale_adjustment",
-      "module": "hax.networks.volume_gray_scale_adjustment",
-      "description": "Volume gray level adjustment towards a set of images",
+      "module": "hax.programs.volume_gray_scale_adjustment",
+      "description": "Global gray scale adjustment of a map to a set of particles (closed form)",
       "summary": "",
       "fields": [
         {
@@ -2065,7 +2040,7 @@
             "--md"
           ],
           "flag": "--md",
-          "required": false,
+          "required": true,
           "help": "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed",
           "default": null,
           "type": "string",
@@ -2079,7 +2054,7 @@
           ],
           "flag": "--vol",
           "required": true,
-          "help": "Volume to be adjusted according to the images",
+          "help": "Map to adjust. It must have the same box and sampling rate as the images.",
           "default": null,
           "type": "string",
           "widget": "path",
@@ -2092,22 +2067,11 @@
           ],
           "flag": "--mask",
           "required": false,
-          "help": "This helps focusing the adjustment on a region of interest (if not provided, a inscribed spherical mask will be used)",
+          "help": "(optional) Binary mask of the region to match. The fit then only uses the pixels inside the projection of the mask. Without it, the whole image is used. The mask only restricts the fit: the scale is applied to the whole map.",
           "default": null,
           "type": "string",
           "widget": "path",
           "path_kind": "file"
-        },
-        {
-          "name": "load_images_to_ram",
-          "flags": [
-            "--load_images_to_ram"
-          ],
-          "flag": "--load_images_to_ram",
-          "required": false,
-          "help": "If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.",
-          "default": false,
-          "type": "boolean"
         },
         {
           "name": "sr",
@@ -2127,63 +2091,27 @@
           ],
           "flag": "--ctf_type",
           "required": true,
-          "help": "Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)",
+          "help": "Whether the images carry a CTF. apply, wiener and precorrect all mean the images are the raw observations, so the CTF is applied to the projections; premultiplied means the images were already multiplied by their CTF; None means they carry no CTF at all.",
           "default": null,
           "type": "enum",
           "choices": [
             "None",
             "apply",
             "wiener",
-            "precorrect"
+            "precorrect",
+            "premultiplied"
           ]
         },
         {
-          "name": "predicts_value",
+          "name": "fit_offset",
           "flags": [
-            "--predicts_value"
+            "--fit_offset"
           ],
-          "flag": "--predicts_value",
+          "flag": "--fit_offset",
           "required": false,
-          "help": "If not provided, the adjustment will be estimated per voxel - otherwise, adjustment will be estimated for the whole volume",
+          "help": "Allow a per-image offset (image = scale * projection + offset) while fitting the scale. Use it when the images are not normalized to a zero-mean background. The offsets are not applied to the map.",
           "default": false,
           "type": "boolean"
-        },
-        {
-          "name": "lat_dim",
-          "flags": [
-            "--lat_dim"
-          ],
-          "flag": "--lat_dim",
-          "required": false,
-          "help": "Dimensionality of the latent space of the network (set by default to 3)",
-          "default": 3,
-          "type": "integer"
-        },
-        {
-          "name": "mode",
-          "flags": [
-            "--mode"
-          ],
-          "flag": "--mode",
-          "required": true,
-          "help": "train: train a neural network from scratch or from a previous execution if reload is provided\npredict: predict the adjustment for the input volume (reload parameter is mandatory in this case)",
-          "default": null,
-          "type": "enum",
-          "choices": [
-            "train",
-            "predict"
-          ]
-        },
-        {
-          "name": "epochs",
-          "flags": [
-            "--epochs"
-          ],
-          "flag": "--epochs",
-          "required": false,
-          "help": "Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it",
-          "default": 50,
-          "type": "integer"
         },
         {
           "name": "batch_size",
@@ -2192,38 +2120,20 @@
           ],
           "flag": "--batch_size",
           "required": false,
-          "help": "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like nvidia-smi to monitor and/or measure memory usage and adjust this value",
-          "default": 64,
-          "type": "string",
-          "custom_type": "batch_size_or_auto",
-          "widget": "csv"
+          "help": "How many images are read and projected at once (set by default to 256). Lower it if the GPU runs out of memory; it does not change the result.",
+          "default": 256,
+          "type": "integer"
         },
         {
-          "name": "learning_rate",
+          "name": "threads",
           "flags": [
-            "--learning_rate"
+            "--threads"
           ],
-          "flag": "--learning_rate",
+          "flag": "--threads",
           "required": false,
-          "help": "The learning rate (lr) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the lr is the size of the step it takes on each attempt. A large lr (e.g., 0.01) is like taking huge leaps \u2014 it's fast but can be unstable, overshoot the lowest point, or cause NAN errors. A small lr (e.g., 1e-6) is like taking tiny shuffles \u2014 it's stable but very slow and might get stuck before reaching the bottom. A good default is often 0.0001. If training fails or errors explode, try making the lr 10 times smaller (e.g., 0.001 --> 0.0001).",
-          "default": 1e-05,
-          "type": "number"
-        },
-        {
-          "name": "dataset_split_fraction",
-          "flags": [
-            "--dataset_split_fraction"
-          ],
-          "flag": "--dataset_split_fraction",
-          "required": false,
-          "help": "Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: training_fraction,validation_fraction. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. NOTE: the sum of training_fraction and validation_fraction must be equal to one.",
-          "default": [
-            0.8,
-            0.2
-          ],
-          "type": "string",
-          "custom_type": "list_of_floats",
-          "widget": "csv"
+          "help": "Number of reader threads feeding the GPU with image chunks (set by default to 8). On a spinning disk (HDD) a lower value (1 or 2) can be faster.",
+          "default": 8,
+          "type": "integer"
         },
         {
           "name": "output_path",
@@ -2232,24 +2142,11 @@
           ],
           "flag": "--output_path",
           "required": true,
-          "help": "Path to save the results (trained neural network, adjusted volume...)",
+          "help": "Path to save the results (trained neural network, new metadata...)",
           "default": null,
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
-        },
-        {
-          "name": "reload",
-          "flags": [
-            "--reload"
-          ],
-          "flag": "--reload",
-          "required": false,
-          "help": "Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)",
-          "default": null,
-          "type": "string",
-          "widget": "path",
-          "path_kind": "file"
         },
         {
           "name": "ssd_scratch_folder",
@@ -2258,44 +2155,11 @@
           ],
           "flag": "--ssd_scratch_folder",
           "required": false,
-          "help": "When the parameter load_images_to_ram is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from the default disk.",
+          "help": "Path to a folder on a fast (SSD/NVMe) disk. The images are cached there as a float16 copy and read from it, the same cache the other hax programs build in that folder.",
           "default": null,
           "type": "string",
           "widget": "path",
           "path_kind": "directory"
-        },
-        {
-          "name": "log_checkpoint_every",
-          "flags": [
-            "--log_checkpoint_every"
-          ],
-          "flag": "--log_checkpoint_every",
-          "required": false,
-          "help": "How often (in epochs) to write the intermediate checkpoint used to resume an interrupted training (set by default to 5 - set to 0 to disable). This is deliberately independent from --log_landscape_every: how often you can resume should not be tied to how often you want pictures",
-          "default": 5,
-          "type": "integer"
-        },
-        {
-          "name": "log_time_budget",
-          "flags": [
-            "--log_time_budget"
-          ],
-          "flag": "--log_time_budget",
-          "required": false,
-          "help": "Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. 0.05 for 5%%). When the logging carried out so far exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)",
-          "default": 0.0,
-          "type": "number"
-        },
-        {
-          "name": "log_sync",
-          "flags": [
-            "--log_sync"
-          ],
-          "flag": "--log_sync",
-          "required": false,
-          "help": "Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, .mrc files, plots) is moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with training (e.g. while debugging)",
-          "default": false,
-          "type": "boolean"
         },
         {
           "name": "config",
@@ -2856,21 +2720,6 @@
           "help": "Weight of the bank-aware spherical occupancy KL, which spreads the pose hypotheses over the projection sphere during the first 10 epochs of the ab initio search. Set it to 0 to disable the loss entirely.",
           "default": 0.01,
           "type": "number"
-        },
-        {
-          "name": "reconstruction_mode",
-          "flags": [
-            "--reconstruction_mode"
-          ],
-          "flag": "--reconstruction_mode",
-          "required": false,
-          "help": "joint (default): learn a consensus map and a heterogeneity decoder that deviates from it. het_only: skip the consensus part altogether, making the heterogeneous volume its own ab initio map.",
-          "default": "joint",
-          "type": "enum",
-          "choices": [
-            "joint",
-            "het_only"
-          ]
         },
         {
           "name": "heterogeneity_profile",
@@ -3529,7 +3378,7 @@
           ],
           "flag": "--vol",
           "required": false,
-          "help": "If provided, MoDART will perform a refinement of this volume",
+          "help": "If provided, MoDART starts from this volume, after matching its contrast to the images",
           "default": null,
           "type": "string",
           "widget": "path",
@@ -3542,7 +3391,7 @@
           ],
           "flag": "--mask",
           "required": false,
-          "help": "Determines the initial position of the mass available to MoDART to reconstruct a volume. This mask can be tight to the input volume (if provided). WARNING: The mask provided here MUST be BINARY.",
+          "help": "Determines the voxels MoDART reconstructs. If not provided, it is derived from --vol, or from a consensus reconstruction of the particles. WARNING: The mask provided here MUST be BINARY.",
           "default": null,
           "type": "string",
           "widget": "path",
@@ -3618,7 +3467,7 @@
           ],
           "flag": "--reconstruct_halves",
           "required": false,
-          "help": "If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts.",
+          "help": "Also write the two unfiltered half maps (even/odd particles). They are always reconstructed: their FSC filters the final map.",
           "default": false,
           "type": "boolean"
         },
@@ -3629,7 +3478,132 @@
           ],
           "flag": "--motion_correction",
           "required": false,
-          "help": "If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed.  NOTE : When providing this parameter, you MUST give the path to a trained  HetSIREN (with transport of mass)  or  Zernike3Deep  neural network.",
+          "help": "If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed.  NOTE : When providing this parameter, you MUST give the path to a trained  HetSIREN (with transport of mass)  or  Zernike3Deep  neural network. Two paths (gold standard): the first network moves the even particles (first half), the second the odd ones.",
+          "default": null,
+          "type": "string",
+          "multiple": true,
+          "nargs": "+"
+        },
+        {
+          "name": "field_smoothing",
+          "flags": [
+            "--field_smoothing"
+          ],
+          "flag": "--field_smoothing",
+          "required": false,
+          "help": "Width (in Angstrom) of a local-linear Gaussian smoothing of each particle's motion field: it removes non-rigid jitter while keeping rigid (and affine) motions exact. 0 disables it (default).",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "remove_mean_field",
+          "flags": [
+            "--remove_mean_field"
+          ],
+          "flag": "--remove_mean_field",
+          "required": false,
+          "help": "Subtract each network's particle-average motion field, so the map is reconstructed in the frame of the network's reference. It removes a static deformation the network may learn (e.g. to sharpen a blurred reference by moving its points), which otherwise distorts the map.",
+          "default": false,
+          "type": "boolean"
+        },
+        {
+          "name": "poses_refined_by",
+          "flags": [
+            "--poses_refined_by"
+          ],
+          "flag": "--poses_refined_by",
+          "required": false,
+          "help": "Network whose pose refinement the input poses already include (e.g. the particles written by its predict). MoDART removes it before applying the refinement of --motion_correction, so it is not applied twice.",
+          "default": null,
+          "type": "string"
+        },
+        {
+          "name": "iterations",
+          "flags": [
+            "--iterations"
+          ],
+          "flag": "--iterations",
+          "required": false,
+          "help": "Conjugate gradient iterations, one pass over the particles each (default 10). More iterations recover finer detail and also fit more noise.",
+          "default": 10,
+          "type": "integer"
+        },
+        {
+          "name": "regularization",
+          "flags": [
+            "--regularization"
+          ],
+          "flag": "--regularization",
+          "required": false,
+          "help": "Tikhonov weight, relative to the mean diagonal of the normal equations (default 0).",
+          "default": 0.0,
+          "type": "number"
+        },
+        {
+          "name": "chunk_size",
+          "flags": [
+            "--chunk_size"
+          ],
+          "flag": "--chunk_size",
+          "required": false,
+          "help": "Voxels projected at a time (default 65536). Lower it if the GPU runs out of memory; it does not change the result.",
+          "default": 65536,
+          "type": "integer"
+        },
+        {
+          "name": "refine_iterations",
+          "flags": [
+            "--refine_iterations"
+          ],
+          "flag": "--refine_iterations",
+          "required": false,
+          "help": "Iterative refinement with a single --motion_correction network trained on all the particles: each iteration reconstructs a map and fine tunes the network on it (the parameters of its training, with the map as --vol, --reload and --refit_reference), written to <output_path>/iteration_N. The final map, from the refined network, is written to --output_path. 0 disables it (default).",
+          "default": 0,
+          "type": "integer"
+        },
+        {
+          "name": "refine_epochs",
+          "flags": [
+            "--refine_epochs"
+          ],
+          "flag": "--refine_epochs",
+          "required": false,
+          "help": "Epochs of each refinement fine tune. By default, the ones of the network's training.",
+          "default": null,
+          "type": "integer"
+        },
+        {
+          "name": "refine_learning_rate",
+          "flags": [
+            "--refine_learning_rate"
+          ],
+          "flag": "--refine_learning_rate",
+          "required": false,
+          "help": "Learning rate of the refinement fine tunes. By default, the one of the network's training.",
+          "default": null,
+          "type": "number"
+        },
+        {
+          "name": "refine_batch_size",
+          "flags": [
+            "--refine_batch_size"
+          ],
+          "flag": "--refine_batch_size",
+          "required": false,
+          "help": "Batch size of the refinement fine tunes. By default, the one of the network's training.",
+          "default": null,
+          "type": "string",
+          "custom_type": "batch_size_or_auto",
+          "widget": "csv"
+        },
+        {
+          "name": "refine_config",
+          "flags": [
+            "--refine_config"
+          ],
+          "flag": "--refine_config",
+          "required": false,
+          "help": "run_config.json of the network's training, whose parameters the refinement fine tunes reuse. By default, the one next to the network folder (written by the training in its --output_path).",
           "default": null,
           "type": "string"
         },
