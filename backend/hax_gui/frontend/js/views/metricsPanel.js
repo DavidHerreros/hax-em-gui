@@ -16,6 +16,7 @@
 // sync — and a latent space looks the same here as it does in the full landscape.
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
+import { sanitizedHtml } from "../markdown.js";
 import { api } from "../api.js";
 import { errorBox } from "./ui.js";
 import { pca } from "../pca.js";
@@ -516,6 +517,10 @@ export function metricsPanel({ logdir, jobId }) {
     function ensureRenderer(entry, n) {
       const mode = optsFor(entry.tag).mode;
       if (entry.builtMode === mode && (mode !== "split" || entry.builtN === n)) return;
+      // Swapping renderers must release the old one's ResizeObserver, or every
+      // mode toggle left an observer (and its canvas + series closure) alive.
+      entry.strips?.destroy?.();
+      entry.plot?.destroy?.();
       clear(entry.body);
       entry.plot = entry.strips = null;
       const canvas = h("canvas", { class: "mx-canvas" });
@@ -711,15 +716,18 @@ export function metricsPanel({ logdir, jobId }) {
         ctx.textAlign = "center"; ctx.textBaseline = "top";
         ctx.font = `${10.5 * r}px system-ui, sans-serif`; ctx.fillStyle = muted;
         const step = niceStep(x1 - x0, Math.max(2, Math.min(6, Math.round(w / (86 * r)))));
-        for (let v = Math.ceil(x0 / step) * step; v <= x1; v += step) ctx.fillText(fmtX(v), sx(v), H - BOT + 4 * r);
+        // counted, not accumulated: `v += step` stalls once step is below float spacing
+        for (let k = Math.ceil(x0 / step), n = 0; k * step <= x1 && n < 50; k++, n++) ctx.fillText(fmtX(k * step), sx(k * step), H - BOT + 4 * r);
         if (xlab) { ctx.textAlign = "right"; ctx.fillStyle = fg; ctx.fillText(xlab, W - 4 * r, H - BOT + 4 * r); }
       }
 
-      if (window.ResizeObserver) new ResizeObserver(() => draw()).observe(canvas);
+      let ro = null;
+      if (window.ResizeObserver) { ro = new ResizeObserver(() => draw()); ro.observe(canvas); }
 
       return {
         setSeries(ss, lbls) { series = ss || []; xlab = (lbls && lbls.x) || ""; draw(); },
         redraw: draw,
+        destroy() { if (ro) { ro.disconnect(); ro = null; } },
         setFocus() { /* nothing to spotlight: every curve already has its own strip */ },
         async snapshot({ scale = 2, transparent = false } = {}) {
           const ow = canvas.width, oh = canvas.height;
@@ -749,6 +757,7 @@ export function metricsPanel({ logdir, jobId }) {
     return {
       el,
       onShow() { for (const e of plots.values()) (e.strips || e.plot)?.redraw(); },
+      destroy() { for (const e of plots.values()) { e.strips?.destroy?.(); e.plot?.destroy?.(); } },
       async poll() { await load(); },
       onManifest() {
         // A tag first logged mid-run (HetSIREN's inverse phase, say) should appear
@@ -1153,9 +1162,9 @@ export function metricsPanel({ logdir, jobId }) {
     let cloud = null;                    // built lazily: WebGL2 is only needed if 3D is asked for
     let selectedPoint = -1;
     const bases = { 2: null, 3: null };  // last basis per dimensionality — keeps the movie stable
-    const raws = new Map();              // step -> server payload (raw latent vectors)
+    const KEEP_EPOCHS = 8;
+    const raws = new Map();              // step -> server payload (raw latent vectors), newest KEEP_EPOCHS
     const projs = new Map();             // "step|k" -> { points, variance }
-    const sprites = new Map();           // step -> HTMLImageElement
 
     // The renderers only *report* a click — neither highlights the point on its own, that
     // is the caller's job. Drive both from one place so the selection survives a 2D↔3D
@@ -1258,6 +1267,13 @@ export function metricsPanel({ logdir, jobId }) {
       if (!raw) {
         raw = await api.metricsEmbedding(logdir, step, tagName);
         raws.set(step, raw);
+        // Keep the latest few epochs only: each holds thousands of vectors plus a metadata
+        // row per point, and a long movie would otherwise retain them all.
+        for (const old of raws.keys()) {
+          if (raws.size <= KEEP_EPOCHS) break;
+          raws.delete(old);
+          for (const k of [...projs.keys()]) if (k.startsWith(`${old}|`)) projs.delete(k);
+        }
       }
       const key = `${step}|${dims}`;
       let proj = projs.get(key);
@@ -1308,32 +1324,26 @@ export function metricsPanel({ logdir, jobId }) {
       cloud.setColors(buf);
     }
 
+    // One thumbnail at a time, cropped by the server. The sheet it comes from holds every
+    // point's tile and decodes to hundreds of MB, so it must never reach the browser —
+    // fetching it whole, once per epoch scrubbed, is what used to kill the tab.
+    let spriteSeq = 0;
     async function drawSprite() {
       const step = steps()[idx];
       const raw = raws.get(step);
       const ctx = spriteCanvas.getContext("2d");
+      const seq = ++spriteSeq;
       ctx.clearRect(0, 0, spriteCanvas.width, spriteCanvas.height);
       if (!raw?.sprite || selectedPoint < 0) { spriteBox.style.display = raw?.sprite ? "" : "none"; return; }
       spriteBox.style.display = "";
-      let im = sprites.get(step);
-      if (!im) {
-        try {
-          const url = URL.createObjectURL(await api.metricsSprite(logdir, step, tagName));
-          im = await new Promise((res, rej) => {
-            const x = new Image();
-            x.onload = () => res(x);
-            x.onerror = rej;
-            x.src = url;
-          });
-          sprites.set(step, im);
-        } catch { return; }
-      }
-      const { tile, per_side: per } = raw.sprite;
-      if (!tile || !per) return;
       const orig = raw.indices[selectedPoint] ?? 0;   // plotted index -> original row
-      const tx = (orig % per) * tile, ty = Math.floor(orig / per) * tile;
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(im, tx, ty, tile, tile, 0, 0, spriteCanvas.width, spriteCanvas.height);
+      let bmp;
+      try { bmp = await createImageBitmap(await api.metricsSprite(logdir, step, orig, tagName)); } catch { return; }
+      if (seq === spriteSeq && !destroyed) {
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(bmp, 0, 0, spriteCanvas.width, spriteCanvas.height);
+      }
+      bmp.close();
     }
 
     async function show() {
@@ -1398,7 +1408,12 @@ export function metricsPanel({ logdir, jobId }) {
       },
       destroy() {
         if (ticker) clearInterval(ticker);
-        for (const im of sprites.values()) URL.revokeObjectURL(im.src);
+        // Both renderers hang listeners on `window`; without this every panel ever opened
+        // stayed alive — points, layer canvases and, for 3D, a whole WebGL2 context.
+        scatter.destroy?.();
+        cloud?.destroy?.();
+        cloud = null;
+        raws.clear(); projs.clear();
       },
     };
   }
@@ -1432,11 +1447,16 @@ export function metricsPanel({ logdir, jobId }) {
     for (const v of Object.values(views)) v.onManifest?.();
   }
 
-  // The colour legends hax logs with add_text (what blue/red mean on the variation map).
+  // The colour legends hax logs with add_text (what blue/red mean on the variation
+  // map). The payload comes straight out of a run's event files — an arbitrary
+  // server directory the user pointed the Metrics page at — so it is UNTRUSTED
+  // HTML: sanitize it, never hand it to an `html:` prop (that was an XSS).
   function legends(texts) {
     const box = h("details", { class: "mx-legends" }, h("summary", null, "Colour legends"));
-    for (const [tag, html] of Object.entries(texts)) {
-      box.appendChild(h("div", { class: "mx-legendtext", html }));
+    for (const html of Object.values(texts)) {
+      const div = h("div", { class: "mx-legendtext" });
+      div.appendChild(sanitizedHtml(html));
+      box.appendChild(div);
     }
     return box;
   }

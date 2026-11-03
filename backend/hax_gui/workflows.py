@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import adapters, projects, registry
+from . import adapters, db, projects, registry
 from .command import strip_obsolete
 from .config import settings
 from .jobs import ACTIVE, manager as jobs
@@ -73,13 +73,12 @@ class StepsRunning(Exception):
 
 class WorkflowManager:
     def __init__(self) -> None:
-        self._db: sqlite3.Connection | None = None
+        self._db: db.LockedConnection | None = None
         self._running: dict[str, asyncio.Task] = {}
 
     def init(self) -> None:
         settings.ensure_dirs()
-        self._db = sqlite3.connect(settings.db_path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
+        self._db = db.connect(settings.db_path)
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS workflows (
@@ -180,10 +179,10 @@ class WorkflowManager:
                 continue
             st = job["status"]
             if st in ACTIVE:                  # incl. 'cancelling' — not final yet
-                st = "running"                # still in flight; the scheduler adopts it
+                st = self._node_status(st)    # still in flight; the scheduler adopts it
             state[nid] = {
                 "job_id": jid, "status": st, "stale": bool(job.get("stale")),
-                "error": None if st in ("running", "succeeded")
+                "error": None if st in ("queued", "running", "succeeded")
                 else s.get("error") or "step did not finish (see the job log)",
             }
         self._db.execute("UPDATE workflows SET run_state=? WHERE id=?", (json.dumps(state), wid))
@@ -323,6 +322,12 @@ class WorkflowManager:
             task.cancel()
         self._db.execute("DELETE FROM workflows WHERE id=?", (wid,))
         self._db.commit()
+
+    def delete_for_project(self, project_id: str) -> None:
+        """Drop a deleted project's workflows (rows *and* any live scheduler task);
+        orphaned rows used to accumulate forever and their schedulers kept running."""
+        for wf in self.list(project_id):
+            self.delete(wf["id"])
 
     def seed_state(self, wid: str, state: dict) -> dict[str, Any]:
         """Attach a run_state to a workflow without marking it running. Used when
@@ -509,7 +514,7 @@ class WorkflowManager:
         graph, state = self._synced_graph(wf["graph"], wf["project_id"], wf.get("run_state"))
         statuses = [s.get("status") for s in state.values()]
         overall = ("failed" if "failed" in statuses
-                   else "running" if any(s in ("pending", "running", "cancelling") for s in statuses)
+                   else "running" if any(s in ("pending", "queued", "running", "cancelling") for s in statuses)
                    else "succeeded" if statuses and all(s == "succeeded" for s in statuses)
                    else "idle")
         self._db.execute(
@@ -585,7 +590,11 @@ class WorkflowManager:
             # instead; the next launch that does produce a job replaces it.
             prior = (prior_state or {}).get(n["id"]) or {}
             if prior.get("status") == "failed" and not prior.get("job_id"):
-                state[n["id"]] = {"job_id": None, "status": "failed", "error": prior.get("error")}
+                # error_fields rides along: a canvas poll runs seconds after the failure,
+                # and dropping it here would wipe the per-field detail just as the client
+                # renders it. Absent on entries written before it existed — that is fine.
+                state[n["id"]] = {"job_id": None, "status": "failed", "error": prior.get("error"),
+                                  "error_fields": prior.get("error_fields")}
             elif jid and jid in by_job:
                 state[n["id"]] = {"job_id": jid, "status": by_job[jid]["status"],
                                   "stale": bool(by_job[jid].get("stale")), "error": None}
@@ -782,7 +791,7 @@ class WorkflowManager:
     # kept: run_state is re-read from the DB immediately before every write, with no
     # `await` in between. That makes each read-modify-write atomic with respect to the
     # event loop, so two steps finishing at once cannot clobber each other's status.
-    WAITING = ("pending", "running")
+    WAITING = ("pending", "queued", "running")
     CPU_DEVICE = "cpu"
     # How long the scheduler may sit on a stale reading of the graph / device caps.
     TICK_INTERVAL = 2.0
@@ -886,7 +895,8 @@ class WorkflowManager:
                     if job is None:
                         s = {**s, "status": "idle"}            # never launched: a stale queue entry
                     elif job["status"] in ACTIVE:
-                        s = {**s, "status": "running"}         # still training: adopt, don't relaunch
+                        # still in flight: adopt, don't relaunch (a parked job stays parked)
+                        s = {**s, "status": "queued" if job["status"] == "queued" else "running"}
                     else:
                         s = {**s, "status": job["status"]}     # it did finish — keep its result
                 state[nid] = s
@@ -914,8 +924,8 @@ class WorkflowManager:
         state = self._fresh_state(wid)
         for nid, s in list(state.items()):
             st = s.get("status")
-            if st == "running" and s.get("job_id"):
-                await jobs.cancel(s["job_id"])
+            if st in ("running", "queued") and s.get("job_id"):
+                await jobs.cancel(s["job_id"])           # a queued job is simply unqueued
                 state[nid] = {**s, "status": "cancelled", "error": None}
             elif st == "pending":
                 state[nid] = {"job_id": None, "status": "idle", "error": None}   # dequeued
@@ -938,7 +948,7 @@ class WorkflowManager:
             return False
         jid = s.get("job_id")
         if not jid:
-            return s.get("status") == "pending"     # queued, awaiting its turn
+            return s.get("status") == "pending"     # waiting, no job yet
         job = jobs.get(jid)
         return job is not None and job["status"] in ACTIVE
 
@@ -1000,6 +1010,15 @@ class WorkflowManager:
 
                 ready, blocked = self._partition(graph, state)
 
+                # Steps whose job is parked as 'queued' — held back by this scheduler for a
+                # device slot (see below), or parked by the job manager's own admission
+                # after a launch. Not watched yet: give each its turn when a slot is free,
+                # and notice when someone moved it meanwhile (unqueued from the Jobs page,
+                # or dispatched by the manager after a restart).
+                held = [nid for nid in self.topo_order(graph["nodes"], edges)
+                        if state.get(nid, {}).get("status") == "queued"
+                        and state[nid].get("job_id") and nid not in inflight]
+
                 if blocked:
                     state = self._fresh_state(wid)
                     for nid in blocked:
@@ -1015,6 +1034,32 @@ class WorkflowManager:
                 used: dict[str, int] = {}
                 for nid in inflight:
                     used[device[nid]] = used.get(device[nid], 0) + 1
+                for nid in held:
+                    jid = state[nid]["job_id"]
+                    job = jobs.get(jid)
+                    dev = self._device_of(nodes[nid])
+                    if job is None or job["status"] not in ACTIVE:
+                        # Gone, or settled without us (unqueued from the Jobs page): record it.
+                        final = job["status"] if job else "failed"
+                        fresh = self._fresh_state(wid)
+                        fresh[nid] = {"job_id": jid, "status": final,
+                                      "error": None if final == "succeeded" else "step did not run (see the job)"}
+                        self._set_run(wid, "running", fresh)
+                        executed.add(nid)
+                        continue
+                    if job["status"] != "queued":
+                        # Already moving (the manager dispatched it): just watch it.
+                        executed.add(nid)
+                        device[nid] = dev
+                        used[dev] = used.get(dev, 0) + 1
+                        inflight[nid] = asyncio.create_task(self._guarded(wid, nid, self._await_node(wid, nid, jid)))
+                        continue
+                    if used.get(dev, 0) >= cap:
+                        continue                   # still no slot: it keeps its place in the queue
+                    used[dev] = used.get(dev, 0) + 1
+                    executed.add(nid)
+                    device[nid] = dev
+                    inflight[nid] = asyncio.create_task(self._guarded(wid, nid, self._release_node(wid, nid, jid)))
                 for nid in ready:
                     # A step stays 'pending' until its _run_node gets past jobs.create —
                     # which suspends, since it launches a subprocess. A sibling finishing
@@ -1026,12 +1071,17 @@ class WorkflowManager:
                     if nid in inflight:
                         continue
                     dev = self._device_of(nodes[nid])
+                    deps = [e for e in edges if e["to"] == nid]
                     if used.get(dev, 0) >= cap:
-                        continue                   # that device is busy; it waits its turn
+                        # That device is busy: the step waits its turn — as a real job,
+                        # parked 'queued', so it exists in the project's run list and its
+                        # place in the queue is visible, instead of as nothing at all.
+                        await self._hold_node(wid, nid, nodes[nid], deps, wf["project_id"],
+                                              wf.get("kind") == "project")
+                        continue
                     used[dev] = used.get(dev, 0) + 1
                     executed.add(nid)
                     device[nid] = dev
-                    deps = [e for e in edges if e["to"] == nid]
                     inflight[nid] = asyncio.create_task(self._guarded(
                         wid, nid,
                         self._run_node(wid, nid, nodes[nid], deps, wf["project_id"],
@@ -1105,6 +1155,26 @@ class WorkflowManager:
         """Launch one step and wait for it out. run_state is re-read from the DB after
         every await: a step may have been queued onto this live run while we waited, and
         writing back a stale copy would silently drop it."""
+        jid = await self._create_node_job(wid, nid, node, deps, project_id, is_project, hold=False)
+        if jid:
+            await self._await_node(wid, nid, jid)
+
+    async def _hold_node(self, wid: str, nid: str, node: dict[str, Any], deps: list[dict[str, Any]],
+                         project_id: str | None, is_project: bool) -> None:
+        """Create a step's job without launching it: parked 'queued' until this scheduler
+        finds it a device slot (:meth:`_release_node`)."""
+        await self._create_node_job(wid, nid, node, deps, project_id, is_project, hold=True)
+
+    async def _release_node(self, wid: str, nid: str, jid: str) -> None:
+        """A held step's turn: launch its parked job and wait it out."""
+        await jobs.release(jid)
+        await self._await_node(wid, nid, jid)
+
+    async def _create_node_job(self, wid: str, nid: str, node: dict[str, Any], deps: list[dict[str, Any]],
+                               project_id: str | None, is_project: bool, hold: bool) -> str | None:
+        """Build the step's job (bindings from its upstream steps' jobs) and record it in
+        run_state with the job's real status. Returns the job id, or None when the step
+        failed to build (recorded as failed) or was adopted (already waited out)."""
         state = self._fresh_state(wid)
         # Never launch a step whose job is already running — adopt it and wait it out.
         # Without this, a workflow resumed while its step was still training would start a
@@ -1114,10 +1184,10 @@ class WorkflowManager:
         if alive:
             existing = jobs.get(alive)
             if existing and existing["status"] in ACTIVE:
-                state[nid] = {"job_id": alive, "status": "running", "error": None}
+                state[nid] = {"job_id": alive, "status": self._node_status(existing["status"]), "error": None}
                 self._set_run(wid, "running", state)
                 await self._await_node(wid, nid, alive)
-                return
+                return None
         args = dict(node.get("args", {}))
         for auto in (registry.output_arg(node["program"]), registry.ssd_arg(node["program"])):
             if auto:
@@ -1142,12 +1212,17 @@ class WorkflowManager:
         try:
             job = await jobs.create(node["program"], args, node.get("gpu"), project_id,
                                     name=node.get("name"), bindings=bindings, replace_job_id=replace,
-                                    dropped_args=dropped)
+                                    dropped_args=dropped, hold=hold)
         except Exception as exc:  # noqa: BLE001 - surface build/validation failures per node
             state = self._fresh_state(wid)
-            state[nid] = {"job_id": None, "status": "failed", "error": str(exc)}
+            # A ValidationError knows *which* parameters it objected to, and flattening it
+            # to one sentence threw that away: the canvas could only say the step failed.
+            # Keeping the per-field dict is what lets it highlight the offending inputs in
+            # the step's own form. Anything else reaching here has no `.errors`.
+            state[nid] = {"job_id": None, "status": "failed", "error": str(exc),
+                          "error_fields": getattr(exc, "errors", None) or None}
             self._set_run(wid, "running", state)
-            return
+            return None
 
         jid = job["id"]
         if is_project:
@@ -1159,31 +1234,54 @@ class WorkflowManager:
                 pass
 
         state = self._fresh_state(wid)
-        state[nid] = {"job_id": jid, "status": "running", "error": None}
+        # The job's real status, not an assumed 'running': the manager's admission may
+        # have parked it 'queued' (its device is full with a job this workflow does not
+        # own), and a step held back on purpose is 'queued' by construction.
+        state[nid] = {"job_id": jid, "status": self._node_status(job["status"]), "error": None}
         self._set_run(wid, "running", state)
+        return jid
 
-        await self._await_node(wid, nid, jid)
+    @staticmethod
+    def _node_status(job_status: str) -> str:
+        """What a step shows while its job is in flight: 'queued' while the job waits for
+        a device slot, 'running' for anything actually moving (incl. the moments before
+        the process is up and while it is being torn down)."""
+        return "queued" if job_status == "queued" else "running"
 
     async def _await_node(self, wid: str, nid: str, jid: str) -> None:
-        """Wait a step's job out and record how it ended. Split out of :meth:`_run_node` so
-        a scheduler resumed after a restart can adopt a job it never launched."""
-        final = await self._wait_job(jid)
+        """Wait a step's job out and record how it ended, keeping the step's status in
+        step with the job's on the way (queued -> running). Split out of
+        :meth:`_run_node` so a scheduler resumed after a restart can adopt a job it
+        never launched."""
+        final = await self._wait_job(jid, on_change=lambda st: self._note_status(wid, nid, jid, st))
         state = self._fresh_state(wid)
         state[nid] = {"job_id": jid, "status": final,
                       "error": None if final == "succeeded" else "step failed (see the job log)"}
         self._set_run(wid, "running", state)
 
-    async def _wait_job(self, job_id: str) -> str:
+    def _note_status(self, wid: str, nid: str, jid: str, job_status: str) -> None:
+        state = self._fresh_state(wid)
+        shown = self._node_status(job_status)
+        if state.get(nid, {}).get("status") != shown:
+            state[nid] = {"job_id": jid, "status": shown, "error": None}
+            self._set_run(wid, "running", state)
+
+    async def _wait_job(self, job_id: str, on_change=None) -> str:
         """Poll until the job reaches a terminal status; return it. ``cancelling``
         is transitional (the process is still being torn down), so keep waiting
         through it — otherwise the step would be recorded as 'cancelling' forever
-        instead of its real terminal 'cancelled'."""
+        instead of its real terminal 'cancelled'. ``on_change`` is told each time the
+        in-flight status moves (queued -> pending/running)."""
+        last = None
         while True:
             job = jobs.get(job_id)
             if job is None:
                 return "failed"
             if job["status"] not in ACTIVE:   # ACTIVE covers the transitional 'cancelling'
                 return job["status"]
+            if on_change and job["status"] != last:
+                last = job["status"]
+                on_change(last)
             await asyncio.sleep(2.0)
 
     def _fresh_state(self, wid: str) -> dict[str, Any]:

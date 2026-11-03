@@ -9,6 +9,8 @@
 // and you see the ongoing answering process — or the finished answer.
 import { h } from "../h.js";
 import { icon } from "../icons.js";
+import { toastError } from "../toast.js";
+import { confirmModal } from "./confirmModal.js";
 import { assistantChat, api } from "../api.js";
 import { renderMarkdown } from "../markdown.js";
 import { store } from "../store.js";
@@ -27,14 +29,17 @@ const ctrl = {
   currentChatId: null,     // persisted chat id (null = unsaved new chat)
   currentChatProject: "",  // project_id of the active chat (scopes the run picker)
   newChatProject: "",      // project_id for the next new chat
-  attachedRun: null,       // {job_id,label,has_*} attached-run context
+  attachedRun: null,       // {job_id,label,has_*} attached-run context (primary: full artifacts)
+  extraRuns: [],           // up to 2 more runs: measured facts + parameter diff only
   grounded: true,
   // live turn state (an in-flight answer)
   streaming: false,
+  turn: 0,                 // client turn id (echoed on the server's done)
   liveRaw: "",             // partial assistant answer accumulated so far
   liveSteps: [],           // activity-trace step texts for the current turn
   liveActions: [],         // proposed-action records for this turn
   stopped: false,
+  liveError: null,         // transient transport/model error — shown, never persisted
   socket: null,            // one WebSocket for the app's lifetime (reused per turn)
   hooks: null,             // set by the mounted view; null while unmounted
 };
@@ -48,6 +53,7 @@ function ensureSocket() {
       if (ctrl.hooks) ctrl.hooks.onStep(text);
     },
     onAction: (action) => {
+      if (!ctrl.streaming) return;   // a late action from a stopped turn
       const rec = { action };
       ctrl.liveActions.push(rec);
       if (ctrl.hooks) ctrl.hooks.onAction(rec);
@@ -57,10 +63,25 @@ function ensureSocket() {
       ctrl.liveRaw += t;
       if (ctrl.hooks) ctrl.hooks.onToken();
     },
-    onDone: () => { if (ctrl.streaming) completeTurn(); },
+    // Ignore a done that belongs to an earlier (stopped) turn: after
+    // stop-then-ask, the cancelled turn's done can land while the new
+    // question is already streaming and must not complete it.
+    onDone: (turn) => {
+      if (ctrl.streaming && (turn == null || turn === ctrl.turn)) completeTurn();
+    },
     onError: (err) => {
       if (!ctrl.streaming) return;
-      ctrl.liveRaw += (ctrl.liveRaw ? "\n\n" : "") + `⚠ ${err}`;
+      // Shown in the transcript but NEVER pushed into history: a transport
+      // error used to become a permanent assistant turn, re-sent to the model
+      // as context on every later message in the chat.
+      ctrl.liveError = String(err);
+      completeTurn();
+    },
+    onClose: () => {
+      // The socket dropped (server restart, network). The turn is lost
+      // server-side; unlock the composer instead of staying on "Stop" forever.
+      if (!ctrl.streaming) return;
+      ctrl.liveError = "connection lost — the server went away mid-answer";
       completeTurn();
     },
   });
@@ -70,23 +91,30 @@ function ensureSocket() {
 function sendMessage(text) {
   ctrl.history.push({ role: "user", content: text });
   ctrl.streaming = true;
+  ctrl.turn = (ctrl.turn || 0) + 1;
   ctrl.liveRaw = "";
   ctrl.liveSteps = [];
   ctrl.liveActions = [];
   ctrl.stopped = false;
-  const payload = { messages: ctrl.history, grounded: ctrl.grounded };
+  ctrl.liveError = null;
+  const payload = { messages: ctrl.history, grounded: ctrl.grounded, turn: ctrl.turn };
   if (ctrl.attachedRun) payload.run_job_id = ctrl.attachedRun.job_id;
+  if (ctrl.extraRuns.length) payload.extra_run_job_ids = ctrl.extraRuns.map((r) => r.job_id);
   ensureSocket().send(payload);
   if (ctrl.hooks) ctrl.hooks.onSend();
 }
 
 function completeTurn() {
-  if (ctrl.liveRaw) ctrl.history.push({ role: "assistant", content: ctrl.liveRaw });
+  const pushed = Boolean(ctrl.liveRaw);
+  if (pushed) ctrl.history.push({ role: "assistant", content: ctrl.liveRaw });
   else if (!ctrl.stopped && ctrl.history.length &&
            ctrl.history[ctrl.history.length - 1].role === "user") ctrl.history.pop();
   ctrl.streaming = false;
   ctrl.liveRaw = "";
-  if (ctrl.hooks) ctrl.hooks.onDone();
+  // `pushed` tells the view whether the live bubble has an answer to show:
+  // rendering "the last assistant message" unconditionally used to duplicate
+  // the PREVIOUS answer into the new bubble on an empty turn.
+  if (ctrl.hooks) ctrl.hooks.onDone(pushed);
   persistCurrent();
 }
 
@@ -103,16 +131,26 @@ function deriveTitle() {
   const u = ctrl.history.find((m) => m.role === "user");
   return u ? u.content.slice(0, 60) : "New chat";
 }
-async function persistCurrent() {
-  if (!ctrl.history.length) return;
-  try {
+// Serialised: two overlapping persists used to both see currentChatId === null
+// and both POST a new chat (one duplicate, one empty); and re-reading the
+// globals after an await could write chat A's messages into chat B after a
+// switch. Each persist snapshots the conversation (array identity marks a
+// switch — selectChat/newChat replace ctrl.history wholesale) and runs after
+// the previous one has settled.
+let persistChain = Promise.resolve();
+function persistCurrent() {
+  const hist = ctrl.history;
+  persistChain = persistChain.then(async () => {
+    if (!hist.length || ctrl.history !== hist) return;   // empty, or switched away
     if (!ctrl.currentChatId) {
       const c = await api.createChat(ctrl.newChatProject || null, deriveTitle());
+      if (ctrl.history !== hist) return;   // switched while creating — don't adopt/write
       ctrl.currentChatId = c.id;
     }
-    await api.updateChat(ctrl.currentChatId, { messages: ctrl.history });
+    await api.updateChat(ctrl.currentChatId, { messages: hist });
     if (ctrl.hooks && ctrl.hooks.onChatsChanged) ctrl.hooks.onChatsChanged();
-  } catch { /* persistence is best-effort */ }
+  }).catch(() => { /* persistence is best-effort */ });
+  return persistChain;
 }
 
 // ── the route view (rebuilds from ctrl on mount; detaches on unmount) ────────
@@ -244,6 +282,18 @@ export function AssistantView() {
         reportBtn,
         h("button", { class: "chat-item-btn", title: "Detach run", onclick: detachRun }, icon("x", 14)));
       attachRow.appendChild(chip);
+      // Extra runs (cross-run reasoning): facts + parameter diff, no artifacts.
+      ctrl.extraRuns.forEach((er, i) => {
+        attachRow.appendChild(h("div", { class: "chat-attach-chip extra", title: "Compared against the primary run: the model sees its measured facts and the flags that differ" },
+          icon("grid", 13),
+          h("span", { class: "chat-attach-name" }, er.label),
+          h("button", { class: "chat-item-btn", title: "Detach", onclick: () => { ctrl.extraRuns.splice(i, 1); renderAttachRow(); } }, icon("x", 13))));
+      });
+      if (ctrl.extraRuns.length < 2) {
+        attachRow.appendChild(h("button", { class: "chat-attach-btn",
+          title: "Attach another run to compare against — the model gets its measured facts and the parameter differences",
+          onclick: openRunPicker }, icon("plus", 13), "Compare with…"));
+      }
       return;
     }
     attachRow.appendChild(h("span", { class: "muted chat-attach-lead" }, icon("paperclip", 13), "Run"));
@@ -254,19 +304,27 @@ export function AssistantView() {
     }, icon("paperclip", 13), "Attach a run…"));
   }
   async function attachJob(id) {
-    if (!id) { ctrl.attachedRun = null; renderAttachRow(); return; }
-    try { ctrl.attachedRun = await api.assistantRunPreview(id); }
-    catch { ctrl.attachedRun = { job_id: id, label: "run", has_metrics: false, has_latents: false, has_volumes: false }; }
+    if (!id) { ctrl.attachedRun = null; ctrl.extraRuns = []; renderAttachRow(); return; }
+    let preview;
+    try { preview = await api.assistantRunPreview(id); }
+    catch { preview = { job_id: id, label: "run", has_metrics: false, has_latents: false, has_volumes: false }; }
+    if (ctrl.attachedRun && ctrl.attachedRun.job_id !== id) {
+      // A second/third pick becomes a comparison run rather than replacing the primary.
+      if (!ctrl.extraRuns.some((r) => r.job_id === id) && ctrl.extraRuns.length < 2) ctrl.extraRuns.push(preview);
+    } else {
+      ctrl.attachedRun = preview;
+    }
     renderAttachRow();
   }
-  function detachRun() { ctrl.attachedRun = null; renderAttachRow(); }
+  // Detaching the primary promotes the first comparison run (its artifacts load next turn).
+  function detachRun() { ctrl.attachedRun = ctrl.extraRuns.shift() || null; renderAttachRow(); }
   async function downloadReport() {
     if (!ctrl.attachedRun || reportBusy) return;
     reportBusy = true; renderAttachRow();
     try {
       await api.assistantRunReport(ctrl.attachedRun.job_id, true);
     } catch (e) {
-      window.alert("Report generation failed: " + (e && (e.detail || e.message) || "unknown error"));
+      toastError(e, "Report generation failed.");
     } finally {
       reportBusy = false; renderAttachRow();
     }
@@ -336,19 +394,44 @@ export function AssistantView() {
       h("span", { class: "chat-step-dot" }), h("span", null, text)));
     log.scrollTop = log.scrollHeight;
   }
+  // Re-parsing the whole accumulated answer on every animation frame was
+  // O(n²) across a long reply and visibly janked. Throttle to one full render
+  // per RENDER_MS; finishRender always does a final exact pass.
+  const RENDER_MS = 150;
+  let lastRender = 0;
   function scheduleRender() {
     if (raf || !current) return;
     raf = requestAnimationFrame(() => {
       raf = 0;
+      const now = performance.now();
+      if (now - lastRender < RENDER_MS) { scheduleLate(); return; }
+      lastRender = now;
       if (current) current.replaceChildren(renderMarkdown(ctrl.liveRaw));
       log.scrollTop = log.scrollHeight;
     });
   }
-  function finishRender() {
+  let lateTimer = 0;
+  function scheduleLate() {
+    // Tokens stopped arriving before the throttle window closed: make sure the
+    // tail still gets painted.
+    if (lateTimer) return;
+    lateTimer = setTimeout(() => { lateTimer = 0; scheduleRender(); }, RENDER_MS);
+  }
+  function finishRender(pushed) {
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    if (lateTimer) { clearTimeout(lateTimer); lateTimer = 0; }
     if (current) {
-      current.replaceChildren(renderMarkdown(ctrl.history.length && ctrl.history[ctrl.history.length - 1].role === "assistant"
-        ? ctrl.history[ctrl.history.length - 1].content : ""));
+      // Only show an answer this turn actually produced. Reading "the last
+      // assistant message" unconditionally re-rendered the PREVIOUS answer
+      // into the new bubble whenever a turn ended empty.
+      const content = pushed && ctrl.history.length &&
+        ctrl.history[ctrl.history.length - 1].role === "assistant"
+        ? ctrl.history[ctrl.history.length - 1].content : "";
+      current.replaceChildren(renderMarkdown(content));
+      if (ctrl.liveError) {
+        current.appendChild(h("div", { class: "chat-error muted" }, `⚠ ${ctrl.liveError}`));
+        ctrl.liveError = null;
+      }
       current.classList.remove("streaming");
     }
     if (currentActivity && currentActivity.lastElementChild) currentActivity.lastElementChild.classList.remove("live");
@@ -516,7 +599,7 @@ export function AssistantView() {
     onStep(text) { appendStep(text); },
     onToken() { scheduleRender(); },
     onAction(rec) { renderActionCard(rec.action); },
-    onDone() { finishRender(); },
+    onDone(pushed) { finishRender(pushed); },
     onChatsChanged() { refreshChats(); },
   };
 
@@ -603,6 +686,7 @@ export function AssistantView() {
       ctrl.currentChatId = c.id;
       ctrl.currentChatProject = c.project_id || "";
       ctrl.attachedRun = null;
+      ctrl.extraRuns = [];
       ctrl.liveActions = [];
       ctrl.history = Array.isArray(c.messages) ? c.messages.slice() : [];
       renderConversation();
@@ -615,6 +699,7 @@ export function AssistantView() {
     ctrl.currentChatId = null;
     ctrl.currentChatProject = ctrl.newChatProject || "";
     ctrl.attachedRun = null;
+    ctrl.extraRuns = [];
     ctrl.liveActions = [];
     ctrl.history = [];
     renderConversation();
@@ -628,7 +713,8 @@ export function AssistantView() {
     try { await api.updateChat(c.id, { title: name.trim() || c.title }); await refreshChats(); } catch { /* ignore */ }
   }
   async function removeChat(c) {
-    if (!window.confirm(`Delete chat "${c.title}"?`)) return;
+    if (!(await confirmModal({ title: "Delete chat?", danger: true, okText: "Delete",
+        message: `“${c.title}” will be removed.` }))) return;
     try {
       await api.deleteChat(c.id);
       if (c.id === ctrl.currentChatId) { ctrl.currentChatId = null; ctrl.history = []; ctrl.liveActions = []; renderConversation(); }

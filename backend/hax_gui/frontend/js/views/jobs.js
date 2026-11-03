@@ -1,14 +1,21 @@
-// Jobs list with light polling. The detail view streams live instead.
-import { h, mount, clear } from "../h.js";
+// Project page: the shared job tree on the left; on the right the selected run
+// (/jobs/:id) or, with none selected, the project itself (/project). Row helpers
+// used by every run list live here too.
+import { h, mount } from "../h.js";
 import { icon } from "../icons.js";
+import { toastError } from "../toast.js";
+import { confirmModal } from "./confirmModal.js";
 import { api } from "../api.js";
-import { errorBox, skeleton } from "./ui.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
 import { pickProject } from "./pickProject.js";
 import { openFileBrowser } from "./filePicker.js";
-import { jobLabelChips, loadLabels } from "./labels.js";
-import { store } from "../store.js";
+import { store, getState, subscribe } from "../store.js";
+import { navigate } from "../router.js";
+import { jobTree } from "./jobTree.js";
+import { jobWorkspace, stageEmpty } from "./jobWorkspace.js";
+import { jobDetailPanel } from "./jobDetail.js";
+import { projectOverview, createProjectPrompt } from "./projectOverview.js";
 
 export function badge(status) {
   const animated = status === "running" || status === "pending";
@@ -74,6 +81,43 @@ export function jobTimeTitle(job) {
   return lines.join("\n");
 }
 
+// "~2h 10m left" from a seconds estimate. Coarse on purpose: an ETA that ticks
+// every second promises a precision the estimate does not have.
+export function fmtEta(s) {
+  if (!(s > 0)) return null;
+  if (s < 90) return "~1m left";
+  const m = Math.round(s / 60);
+  if (m < 90) return `~${m}m left`;
+  const hr = Math.floor(m / 60);
+  if (hr < 48) return `~${hr}h ${m % 60}m left`;
+  return `~${Math.round(hr / 24)}d left`;
+}
+
+// Coarse "how long ago" for the jobs-list card, deliberately imprecise like fmtEta:
+// a live clock next to a 3s poll would tick out of sync with the row's actual age.
+export function relTime(stamp) {
+  if (!stamp) return null;
+  const s = (Date.now() - new Date(stamp)) / 1000;
+  if (s < 90) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m}m ago`;
+  const hr = Math.round(m / 60);
+  if (hr < 48) return `${hr}h ago`;
+  const d = Math.round(hr / 24);
+  if (d < 14) return `${d}d ago`;
+  return new Date(stamp).toLocaleDateString();
+}
+
+// Line-1 right-hand time for the jobs-list card: relative, with the same full-history
+// tooltip as jobTimeEl. "finished" drops its own label since the relative stamp alone
+// already reads as past tense.
+export function jobRelTimeEl(job) {
+  const { label, stamp } = jobTime(job);
+  const rel = relTime(stamp);
+  return h("span", { class: "jr-when", title: jobTimeTitle(job) },
+    rel ? (label === "finished" ? rel : `${label} ${rel}`) : "—");
+}
+
 // The one-line form used in every run list: "finished 25/07/2026, 14:32:10 · 2h 14m".
 export function jobTimeEl(job, cls = "time") {
   const { label, stamp } = jobTime(job);
@@ -83,145 +127,80 @@ export function jobTimeEl(job, cls = "time") {
     dur ? h("span", { class: "time-dur" }, " · " + dur) : null);
 }
 
-export function JobsView() {
-  const root = h("div", { class: "view" }, h("h1", { style: { marginBottom: "16px" } }, "Jobs"));
-  const filterBar = h("div", { class: "jobs-filters" });
-  const body = h("div");
-  root.appendChild(filterBar);
-  root.appendChild(body);
-  mount(body, skeleton("260px"));
-
-  const filters = { project: "", program: "", status: "", label: "" };
-  const projectSel = filterSelect("All projects", (v) => { filters.project = v; renderBody(); });
-  const programSel = filterSelect("All programs", (v) => { filters.program = v; renderBody(); });
-  const statusSel = filterSelect("All statuses", (v) => { filters.status = v; renderBody(); });
-  const labelSel = filterSelect("All labels", (v) => { filters.label = v; renderBody(); });
-  const clearBtn = h("button", { class: "btn ghost filter-clear", title: "Clear filters", onclick: () => {
-    filters.project = filters.program = filters.status = filters.label = "";
-    projectSel.value = programSel.value = statusSel.value = labelSel.value = "";
-    renderBody();
-  } }, icon("x", 14), "Clear");
-  filterBar.append(
-    h("div", { class: "filter-group" }, icon("box", 14), projectSel),
-    h("div", { class: "filter-group" }, icon("sliders", 14), programSel),
-    h("div", { class: "filter-group" }, icon("list", 14), statusSel),
-    h("div", { class: "filter-group" }, icon("more", 14), labelSel),
-    clearBtn);
-
-  let allJobs = [];
-  let stop = false;
-  let lastSig = null;
-  let animatedOnce = false;
-
-  // A rename mutates the job object in place (which lives in `allJobs`), so realign
-  // the signature to what we already show — otherwise the next 3s poll sees the name
-  // change, rebuilds the whole list, and the scroll jumps back to the top.
-  const hooks = { afterLocalRename() { lastSig = jobsSignature(allJobs); } };
-
-  function renderBody() {
-    let content;
-    if (!allJobs.length) content = h("p", { class: "muted" }, "No jobs yet. Pick a program from the right menu.");
-    else {
-      const jobs = allJobs.filter((j) =>
-        (!filters.project || projectKey(j) === filters.project) &&
-        (!filters.program || j.program === filters.program) &&
-        (!filters.status || j.status === filters.status) &&
-        (!filters.label || (j.labels || []).some((l) => l.id === filters.label)));
-      content = jobs.length ? groupedList(jobs, hooks) : h("p", { class: "muted" }, "No jobs match the current filters.");
-    }
-    mount(body, content);
-    // Animate the row entrance only on the first paint; later refreshes (every 3s)
-    // rebuild the list, and re-animating them makes the list visibly "jump".
-    body.classList.toggle("no-anim", animatedOnce);
-    animatedOnce = true;
+// One tree for the whole Project page. A selection is a route change, which tears the
+// view down and builds it again; rebuilding the rail each time made it visibly jump
+// (and replayed the page's fade-in over it). So the tree outlives a single view: the
+// outgoing view releases it, and if the incoming view claims it in the same turn (the
+// router runs cleanup and the next view back to back) the same element and its polling
+// carry on, with only the selected row repainted.
+let sharedTree = null;
+let releaseTimer = null;
+function acquireTree(opts) {
+  if (sharedTree && !sharedTree.stopped) {
+    clearTimeout(releaseTimer); releaseTimer = null;
+    sharedTree.setOptions(opts);
+    sharedTree.repaint();
+    return sharedTree;
   }
-
-  function syncFilters() {
-    syncOptions(projectSel, distinct(allJobs.map(projectKey)), filters, "project");
-    syncOptions(programSel, distinct(allJobs.map((j) => j.program)), filters, "program");
-    syncOptions(statusSel, distinct(allJobs.map((j) => j.status)), filters, "status");
-    syncLabelOptions();
-  }
-
-  // The label filter maps id -> name (a job carries label objects, not strings).
-  function syncLabelOptions() {
-    const seen = new Map();
-    for (const j of allJobs) for (const l of j.labels || []) seen.set(l.id, l.name);
-    const sig = JSON.stringify([...seen]);
-    if (labelSel._sig === sig) return;
-    labelSel._sig = sig;
-    if (filters.label && !seen.has(filters.label)) filters.label = "";
-    clear(labelSel);
-    labelSel.appendChild(h("option", { value: "" }, "All labels"));
-    for (const [id, name] of [...seen].sort((a, b) => a[1].localeCompare(b[1])))
-      labelSel.appendChild(h("option", { value: id, selected: id === filters.label }, name));
-    labelSel.value = filters.label;
-  }
-
-  async function refresh() {
-    try {
-      const jobs = await api.jobs();
-      if (stop) return;
-      const sig = jobsSignature(jobs);
-      if (sig === lastSig) return; // nothing changed -> don't rebuild (avoids flicker)
-      lastSig = sig;
-      allJobs = jobs;
-      syncFilters();
-      renderBody();
-    } catch (err) {
-      if (!stop) mount(body, errorBox(err));
-    }
-  }
-  loadLabels().catch(() => {});
-  refresh();
-  const timer = setInterval(refresh, 3000);
-
-  return { el: root, cleanup: () => { stop = true; clearInterval(timer); } };
+  sharedTree = jobTree(opts);
+  return sharedTree;
+}
+function releaseTree() {
+  releaseTimer = setTimeout(() => { sharedTree?.cleanup(); sharedTree = null; releaseTimer = null; }, 0);
 }
 
-function projectKey(job) { return job.project_name || "(no project)"; }
-function distinct(arr) { return [...new Set(arr)].sort((a, b) => String(a).localeCompare(String(b))); }
-
-function filterSelect(allLabel, onChange) {
-  const sel = h("select", { class: "input filter-select", onchange: (e) => onChange(e.target.value) },
-    h("option", { value: "" }, allLabel));
-  sel._allLabel = allLabel;
-  return sel;
-}
-
-// Rebuild a select's options only when the value set changes, preserving (or
-// clearing) the current selection.
-function syncOptions(sel, values, filters, key) {
-  const want = JSON.stringify(values);
-  if (sel._sig === want) return;
-  sel._sig = want;
-  if (filters[key] && !values.includes(filters[key])) filters[key] = "";
-  clear(sel);
-  sel.appendChild(h("option", { value: "" }, sel._allLabel));
-  for (const v of values) sel.appendChild(h("option", { value: v, selected: v === filters[key] }, v));
-  sel.value = filters[key];
-}
-
-// Group jobs under their project (alphabetical; "(no project)" last).
-function groupedList(jobs, hooks) {
-  const groups = new Map();
-  for (const j of jobs) {
-    const k = projectKey(j);
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(j);
+export function JobsView(params = {}) {
+  const id = params.id || null;
+  if (id) store.setLastJob(id);
+  store.setProjectRoute(id ? `/jobs/${id}` : "/project");   // the nav's "Project" link returns here
+  const tree = acquireTree({
+    isSelected: (j) => j.id === id,
+    onSelect: (j) => { if (j.id !== id) navigate(`/jobs/${j.id}`); },
+  });
+  requestAnimationFrame(() => tree.onAttached());   // the router attaches the view right after this returns
+  const stage = h("div", { class: "jw-stage" });
+  let detail = null;
+  function showProject() {
+    detail?.cleanup?.();
+    const proj = store.activeProject();
+    detail = proj ? projectOverview(proj) : null;
+    mount(stage, detail ? detail.el : stageEmpty("No project open",
+      h("span", null, "Choose one from the switcher on the left, or ",
+        h("button", { class: "jt-link", onclick: () => createProjectPrompt() }, "create a project"), ".")));
   }
-  const keys = [...groups.keys()].sort((a, b) =>
-    a === "(no project)" ? 1 : b === "(no project)" ? -1 : a.localeCompare(b));
-  return h("div", null, ...keys.map((k) => {
-    const items = groups.get(k);
-    return h("div", { class: "jobs-group" },
-      h("div", { class: "jobs-group-head" },
-        icon("box", 14),
-        h("span", { class: "jobs-group-name" }, k),
-        h("span", { class: "jobs-group-count" }, String(items.length))),
-      h("div", null, ...items.map((j, i) => row(j, i, hooks))));
-  }));
+  if (id) { detail = jobDetailPanel(id); stage.appendChild(detail.el); }
+  else showProject();
+  // With no run selected the page is the project: a project switch repaints the stage
+  // in place (the tree follows the store on its own).
+  let lastPid = getState().activeProjectId;
+  const unsub = subscribe(() => { const pid = getState().activeProjectId; if (!id && pid !== lastPid) { lastPid = pid; showProject(); } });
+  // No page fade here: the rail persists across selections and must not animate; the
+  // stage has its own.
+  const el = h("div", { class: "jw-view" }, jobWorkspace(tree.el, stage));
+  return { el, cleanup: () => { unsub(); releaseTree(); detail?.cleanup?.(); } };
 }
+
+// Copy this run's recipe into another project: pick a destination, then open the New
+// Run form there preloaded with the program + parameters (data inputs cleared, to be
+// set in the target project). Nothing runs until the user saves/launches it there.
+export async function copyJobToProject(job) {
+  const target = await pickProject({
+    title: "Copy run to project", okText: "copy here", excludeId: job.project_id,
+    hint: "Opens the New Run form in the chosen project, preloaded with this run's program and settings. Data inputs are cleared for you to set there.",
+  });
+  if (!target) return;
+  try {
+    const pf = await api.jobCopyPrefill(job.id);
+    store.prefillProgram({ program: pf.program, values: pf.values, gpu: pf.gpu, name: pf.name,
+                           projectId: target.id, projectName: target.name });
+  } catch (err) {
+    toastError(err, "Could not copy this run.");
+  }
+}
+
+
+
+
 
 // A change signature for a job list: re-render only when ids/statuses/names change.
 // Signature to decide whether a background refresh needs to rebuild the list.
@@ -232,13 +211,33 @@ export function jobsSignature(jobs) {
   // `stale` is in here because it changes with no status change of its own: a run goes
   // stale when a *different* run is re-made, and without it the badge would only appear
   // the next time something else about the list moved.
-  return jobs.map((j) => `${j.id}:${j.status}:${j.stale ? "s" : ""}:${j.name || ""}`).join("|");
+  // Whole-percent progress is in the signature so a training run's bar advances
+  // on the poll, without sub-percent noise rebuilding the list constantly.
+  // The card's line 1 now prints a relative time ("2h ago"); it has to be in here too,
+  // or a poll that changes nothing else lets that label go stale until something else moves.
+  return jobs.map((j) => `${j.id}:${j.status}:${j.stale ? "s" : ""}:${j.name || ""}:` +
+                         `${j.progress ? Math.round(j.progress.pct) : ""}:${relTime(jobTime(j).stamp)}`).join("|");
+}
+
+// A rename is announced page-wide so every place showing the run's name — the tree,
+// the open run page, a lineage chip — updates at once, instead of each waiting for
+// its own poll (or, for the run page, for the next route change).
+const renameSubs = new Set();
+export function onJobRenamed(fn) { renameSubs.add(fn); return () => renameSubs.delete(fn); }
+export function announceJobRename(id, name) {
+  store.renameViewerForJob(id, name);
+  for (const fn of [...renameSubs]) { try { fn(id, name); } catch { /* one listener must not break the rest */ } }
 }
 
 // What to show as a run's title: its custom name, falling back to the program.
 export function jobDisplayName(job) {
   return job.name || job.program;
 }
+
+// Two-click compare across the whole list (works across projects and pages):
+// "Select for compare" marks a run, "Compare with <it>" on any other run opens
+// the diff view. One pending mark, module-wide — sweeps are the main customer.
+let comparePick = null;   // { id, label }
 
 // Shared "⋮" options menu for a job row (Open / Rename / Delete).
 export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
@@ -255,40 +254,45 @@ export function jobMenuButton(job, { onRenamed, onDeleted } = {}) {
       { label: "Rename", icon: icon("pencil", 15), onClick: rename },
       { label: "Copy to project…", icon: icon("copy", 15), onClick: copyToProject },
     );
+    if (comparePick && comparePick.id !== job.id) {
+      items.push({ label: `Compare with ${comparePick.label}`, icon: icon("grid", 15),
+        onClick: () => { const other = comparePick.id; comparePick = null; location.hash = `#/compare/${other}/${job.id}`; } });
+    }
+    items.push(comparePick && comparePick.id === job.id
+      ? { label: "Cancel compare", icon: icon("x", 15), onClick: () => { comparePick = null; } }
+      : { label: "Select for compare", icon: icon("grid", 15),
+          onClick: () => { comparePick = { id: job.id, label: jobDisplayName(job) }; } });
     // Straight into the run folder, without going through the detail view first.
     // A saved-but-never-run job has no folder yet.
     if (job.workdir) items.push({ label: "Output folder…", icon: icon("folderOpen", 15), onClick: () => openFileBrowser(job.workdir) });
+    // Active runs can be stopped from here without opening them; a queued job is
+    // simply dropped from the queue. Delete is only offered once the run is over.
+    if (job.status === "queued") items.push({ label: "Unqueue", icon: icon("ban", 15), danger: true, onClick: cancel });
+    else if (job.status === "running" || job.status === "pending") items.push({ label: "Cancel", icon: icon("ban", 15), danger: true, onClick: cancel });
     if (!job.active) items.push({ label: "Delete", icon: icon("trash", 15), danger: true, onClick: del });
     openContextMenu(anchor, items);
   }
-  // Copy this run's recipe into another project: pick a destination, then open the New
-  // Run form there preloaded with the program + parameters (data inputs cleared, to be
-  // set in the target project). Nothing runs until the user saves/launches it there.
-  async function copyToProject() {
-    const target = await pickProject({
-      title: "Copy run to project", okText: "copy here", excludeId: job.project_id,
-      hint: "Opens the New Run form in the chosen project, preloaded with this run's program and settings. Data inputs are cleared for you to set there.",
-    });
-    if (!target) return;
-    try {
-      const pf = await api.jobCopyPrefill(job.id);
-      store.prefillProgram({ program: pf.program, values: pf.values, gpu: pf.gpu, name: pf.name,
-                             projectId: target.id, projectName: target.name });
-    } catch (err) {
-      alert(err && err.detail ? (typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail)) : "Could not copy this run.");
-    }
-  }
+  const copyToProject = () => copyJobToProject(job);
   async function run() {
     try { await api.startJob(job.id); location.hash = "#/jobs/" + job.id; }
-    catch (err) { alert(err && err.detail ? (typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail)) : "Failed to start job."); }
+    catch (err) { toastError(err, "Failed to start job."); }
   }
   async function rename() {
     const name = await promptModal({ title: "Rename run", label: "Run name", value: job.name || "", placeholder: job.program, okText: "Rename" });
     if (name === null) return;
-    try { const u = await api.renameJob(job.id, name); job.name = u.name; store.renameViewerForJob(job.id, u.name); if (onRenamed) onRenamed(u); } catch { /* ignore */ }
+    try { const u = await api.renameJob(job.id, name); job.name = u.name; announceJobRename(job.id, u.name); if (onRenamed) onRenamed(u); } catch { /* ignore */ }
+  }
+  async function cancel() {
+    const queued = job.status === "queued";
+    if (!(await confirmModal({ title: queued ? "Remove from queue?" : "Cancel run?", danger: true,
+        okText: queued ? "Unqueue" : "Cancel run",
+        message: queued ? "This job will be taken out of the queue. You can re-run it later."
+                        : "The run and its workers will be stopped. Intermediate checkpoints are kept." }))) return;
+    try { await api.cancelJob(job.id); } catch (err) { toastError(err, queued ? "Could not unqueue this job." : "Could not cancel this run."); }
   }
   async function del() {
-    if (!window.confirm("Delete this job and its run folder (outputs + log)? This cannot be undone.")) return;
+    if (!(await confirmModal({ title: "Delete run?", danger: true, okText: "Delete run",
+        message: "This job and its run folder — outputs and log — will be removed.\nThis cannot be undone." }))) return;
     try { await api.deleteJob(job.id); if (onDeleted) onDeleted(); } catch { /* ignore */ }
   }
   return btn;
@@ -300,19 +304,3 @@ export function gpuLabel(gpu) {
   return gpu === "cpu" ? "CPU" : "GPU " + gpu;
 }
 
-function row(job, i, hooks) {
-  const title = h("span", { class: "prog" }, jobDisplayName(job));
-  const a = h(
-    "a",
-    { class: "job-row", href: "#/jobs/" + job.id, style: { animationDelay: `${i * 0.02}s` } },
-    badge(job.status),
-    staleBadge(job),
-    title,
-    job.name ? h("span", { class: "prog-sub mono" }, job.program) : null,
-    jobLabelChips(job, { editable: true, max: 2 }),
-    gpuLabel(job.gpu) ? h("span", { class: "muted", style: { fontSize: "12px" } }, gpuLabel(job.gpu)) : null,
-    jobTimeEl(job),
-    jobMenuButton(job, { onRenamed: (u) => { title.textContent = jobDisplayName(u); hooks?.afterLocalRename?.(); }, onDeleted: () => a.remove() })
-  );
-  return a;
-}

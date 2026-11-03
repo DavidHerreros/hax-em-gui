@@ -30,6 +30,7 @@ import codecs
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -40,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import adapters, mdpaths, projects, registry, settings_store, usage
+from . import adapters, db, events, mdpaths, projects, registry, settings_store, slurm, usage
 from .command import ValidationError, build_command, strip_obsolete
 from .config import settings
 
@@ -49,11 +50,17 @@ from .config import settings
 # reconstruct progress lines exactly.
 LIVE_BUFFER_CHARS = 256_000
 
+# Default window read from the end of a persisted log file (see read_log); the GUI
+# offers a "load full log" action once a file exceeds this.
+LOG_RAW_CAP = 16_000_000
+
 # Statuses a job can still move out of on its own. 'cancelling' belongs here: the
 # process group has been signalled but nothing is final until the supervisor reaps it
 # and writes 'cancelled'. Leaving it out made the log WS treat a cancelling job as
 # finished and hang up, so the client never saw that final status.
-ACTIVE = {"pending", "running", "cancelling"}
+# "queued" is admission control (see _admit): created and ready to run, but its
+# GPU already has its full complement of jobs; dispatched FIFO as slots free up.
+ACTIVE = {"pending", "queued", "running", "cancelling"}
 
 # The subprocess' output streams, kept separate so the UI can show one tab each.
 STREAMS = ("out", "err")
@@ -122,38 +129,9 @@ def _now() -> str:
 TAIL_INTERVAL = 0.2
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True   # exists, just not ours to signal
-    return True
-
-
-def _proc_key(pid: int) -> str | None:
-    """A cheap identity for a pid: its start time, in clock ticks since boot.
-
-    A pid on its own is *not* safe to signal across a restart — the kernel recycles
-    them, so a pid stored yesterday may name something else entirely today, and
-    `killpg` on it would take out an innocent process group. Pairing the pid with its
-    start time makes reuse detectable: a recycled pid is necessarily younger than the
-    one we recorded.
-    """
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as f:
-            data = f.read()
-    except OSError:
-        return None
-    # Field 2 (comm) is parenthesised and may itself contain spaces and ')', so split
-    # only what follows the *last* ')'. starttime is field 22 overall, i.e. index 19
-    # of the remainder.
-    try:
-        rest = data[data.rindex(b")") + 2:].split()
-        return rest[19].decode()
-    except (ValueError, IndexError):
-        return None
+# Shared with children.py (viewer/TensorBoard reaping): pids are only ever
+# signalled after their recorded identity is re-verified.
+from .procs import pid_alive as _pid_alive, proc_key as _proc_key  # noqa: E402
 
 
 def _group_alive(pgid: int, key: str | None) -> bool:
@@ -206,6 +184,89 @@ def _read_exit(path: str) -> int | None:
         return None
 
 
+_VERSIONS: dict[str, str] | None = None
+
+
+def _pkg_versions() -> dict[str, str]:
+    """Installed versions of the packages that determine what a run computes.
+    Cached: they cannot change under a running server (an update restarts it)."""
+    global _VERSIONS
+    if _VERSIONS is None:
+        import importlib.metadata as md
+        out = {}
+        for pkg in ("hax-em", "hax-em-gui", "jax", "flax"):
+            try:
+                out[pkg] = md.version(pkg)
+            except md.PackageNotFoundError:
+                pass
+        _VERSIONS = out
+    return _VERSIONS
+
+
+# ── live progress, parsed from the log tail ────────────────────────────────
+# hax training loops print tqdm bars with "Epoch N/M" descriptions; the last
+# such frame in the log tail is the run's position. Overall fraction folds the
+# in-epoch percentage into the epoch count; ETA is scaled from elapsed wall time
+# (started_at), which absorbs setup cost better than tqdm's per-epoch estimate.
+_PROGRESS_RX = re.compile(rb"Epoch\s+(\d+)\s*/\s*(\d+)\D{0,60}?(\d{1,3})%")
+_PCT_RX = re.compile(rb"(\d{1,3})%\|")
+_PROGRESS_CACHE: dict[str, tuple[int, dict[str, Any] | None]] = {}
+
+
+def job_progress(job: dict[str, Any]) -> dict[str, Any] | None:
+    """{pct, epoch?, epochs?, eta_s?} for a running job, from its log tail.
+    None when the job isn't running or nothing parseable has been printed yet.
+    One cached 8 KB read per log-file growth — cheap enough for every list poll."""
+    if job.get("status") != "running":
+        return None
+    path = job.get("log_path")
+    if not path:
+        return None
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    cached = _PROGRESS_CACHE.get(path)
+    if cached and cached[0] == size:
+        parsed = cached[1]
+    else:
+        try:
+            with open(path, "rb") as f:
+                f.seek(max(0, size - 8192))
+                tail = f.read()
+        except OSError:
+            return None
+        m = None
+        for m in _PROGRESS_RX.finditer(tail):
+            pass
+        if m:
+            epoch, epochs, pct = int(m[1]), int(m[2]), min(100, int(m[3]))
+            frac = ((epoch - 1) + pct / 100.0) / max(epochs, 1)
+            parsed = {"epoch": epoch, "epochs": epochs, "frac": min(max(frac, 0.0), 1.0)}
+        else:
+            m2 = None
+            for m2 in _PCT_RX.finditer(tail):
+                pass
+            parsed = {"frac": min(100, int(m2[1])) / 100.0} if m2 else None
+        if len(_PROGRESS_CACHE) > 512:      # bound: one entry per log path ever seen
+            _PROGRESS_CACHE.clear()
+        _PROGRESS_CACHE[path] = (size, parsed)
+    if not parsed:
+        return None
+    out = dict(parsed)
+    started = job.get("started_at")
+    if started:
+        try:
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(started)).total_seconds()
+            # Too early, the estimate is noise; past that it's simple proportionality.
+            if out["frac"] >= 0.02 and elapsed > 30:
+                out["eta_s"] = int(elapsed * (1.0 - out["frac"]) / out["frac"])
+        except ValueError:
+            pass
+    out["pct"] = round(out.pop("frac") * 100.0, 1)
+    return out
+
+
 def _wrap(command: list[str], exit_path: str) -> list[str]:
     """Run `command`, then leave its exit status somewhere a future server can read it.
 
@@ -218,18 +279,25 @@ def _wrap(command: list[str], exit_path: str) -> list[str]:
 
 class JobManager:
     def __init__(self) -> None:
-        self._db: sqlite3.Connection | None = None
+        self._db: db.LockedConnection | None = None
         self._procs: dict[str, asyncio.subprocess.Process] = {}
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
         # Recent raw text tail per job, split by stream: job_id -> {stream: deque}.
         self._buffers: dict[str, dict[str, deque[str]]] = {}
         self._buflens: dict[str, dict[str, int]] = {}
+        # Byte offset each stream's tailer has *published* up to, per job. This is
+        # the cut point a log-WebSocket snapshot must stop at: everything past it
+        # arrives through the subscriber queue, so reading the file further would
+        # duplicate those chunks (see tail_positions / read_log's `upto`).
+        self._tail_pos: dict[str, dict[str, int]] = {}
+        # Launch details of admission-queued jobs (append/notice flags only; the
+        # command itself lives in the row, so a restart can still dispatch them).
+        self._queue_held: dict[str, dict[str, Any]] = {}
 
     # -- lifecycle ---------------------------------------------------------
     def init(self) -> None:
         settings.ensure_dirs()
-        self._db = sqlite3.connect(settings.db_path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
+        self._db = db.connect(settings.db_path)
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -255,7 +323,8 @@ class JobManager:
         )
         # Add columns to pre-existing databases (idempotent).
         for col in ("project_id TEXT", "workdir TEXT", "cwd TEXT", "name TEXT", "bindings TEXT",
-                    "pgid INTEGER", "proc_key TEXT", "stale INTEGER NOT NULL DEFAULT 0"):
+                    "pgid INTEGER", "proc_key TEXT", "stale INTEGER NOT NULL DEFAULT 0",
+                    "provenance TEXT", "slurm_id TEXT"):
             try:
                 self._db.execute(f"ALTER TABLE jobs ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -273,11 +342,18 @@ class JobManager:
         """
         assert self._db is not None
         rows = self._db.execute(
-            "SELECT id, pgid, proc_key, status, log_path FROM jobs "
+            "SELECT id, pgid, proc_key, status, log_path, slurm_id FROM jobs "
             "WHERE status IN ('pending','running','cancelling')"
         ).fetchall()
         self._reattach: list[dict[str, Any]] = []
         for r in rows:
+            if r["slurm_id"]:
+                # Scheduled by Slurm: no local process to test — its life is the
+                # cluster's business. reattach() resumes polling; if it finished
+                # while we were down, the poll sees it gone and finalises from
+                # the exit file exactly like the local path.
+                self._reattach.append(dict(r))
+                continue
             pgid = int(r["pgid"] or 0)
             if _group_alive(pgid, r["proc_key"]):
                 self._reattach.append(dict(r))     # outlived us; reattach() resumes it
@@ -304,10 +380,19 @@ class JobManager:
             err_path = self._err_path(out_path)
             # Tail from the current end: the UI replays the history from the file itself
             # (read_log), so re-publishing it over the socket would only duplicate it.
+            if r.get("slurm_id"):
+                asyncio.create_task(self._supervise_slurm(
+                    r["id"], r["slurm_id"], out_path, err_path,
+                    _size(out_path), _size(err_path),
+                ))
+                continue
             asyncio.create_task(self._supervise_detached(
                 r["id"], int(r["pgid"] or 0), r["proc_key"], out_path, err_path,
                 _size(out_path), _size(err_path),
             ))
+        # Jobs the previous server left admission-queued still hold their command
+        # in the row; launch whichever now fit on their device.
+        await self._dispatch_queued()
 
     # -- creation / launch -------------------------------------------------
     async def create(
@@ -323,10 +408,16 @@ class JobManager:
         recreate_ssd: bool = False,
         resume: bool = False,
         dropped_args: list[str] | None = None,
+        hold: bool = False,
     ) -> dict[str, Any]:
         """Create a run. With ``launch=False`` the job is fully prepared (run
         folder, materialised inputs, validated command) but left in the ``saved``
         state to execute later via :meth:`start`.
+
+        With ``hold=True`` the job is prepared and parked as ``queued`` — a real row,
+        visible everywhere a queued job is — but the admission dispatcher leaves it
+        alone: the caller (a workflow scheduler holding a step back for a device slot)
+        launches it with :meth:`release` when it decides the step's turn has come.
 
         With ``replace_job_id`` set, the existing job row is updated in place
         (same id / list position) and its previous run folder is *reused* — cleared
@@ -401,7 +492,11 @@ class JobManager:
         existed = workdir.is_dir()
         workdir.mkdir(parents=True, exist_ok=True)
         try:
-            values = self._resolve_bindings(values, bindings, workdir)
+            # Off the event loop: materialising a binding can parse a million-row
+            # metadata file into an .npy (tens of seconds). Blocking here froze the
+            # entire server — every request, every log WebSocket, the scheduler —
+            # for the duration, indistinguishable from a hang.
+            values = await asyncio.to_thread(self._resolve_bindings, values, bindings, workdir)
             command = build_command(program, values, gpu)  # raises ValidationError
         except (ValidationError, adapters.AdapterError):
             if not existed:
@@ -413,7 +508,11 @@ class JobManager:
             # an intermediate checkpoint found in their own output folder (adapters.
             # _RESUMABLE), so a leftover one would silently turn this fresh run into a
             # continue. A brand-new folder makes this a no-op.
-            self._clear_run_folder(workdir, keep=self._materialised(values, workdir))
+            #
+            # Off the loop: this rmtree walks a whole previous run (checkpoints,
+            # decoded volume series) — minutes on a big one.
+            await asyncio.to_thread(
+                self._clear_run_folder, workdir, self._materialised(values, workdir))
         if ssd_dir is not None:
             # The SSD scratch is shared per project and reused across runs (the generator
             # skips rebuilding when cached shards exist). Optionally discard it so it's
@@ -424,7 +523,12 @@ class JobManager:
             # caches of every dataset in the project, and wiping it would throw away hours of
             # rebuilding for datasets this run has nothing to do with.
             if recreate_ssd and launch and ssd_dir.exists():
-                self._purge_dataset_cache(ssd_dir, values.get(registry.working_dir_arg(program)))
+                # Off the loop: the array-record cache is enormous (the module
+                # comment above sizes it at 410 GB for 1M particles) — deleting
+                # it inline blocked the whole server for up to an hour.
+                await asyncio.to_thread(
+                    self._purge_dataset_cache, ssd_dir,
+                    values.get(registry.working_dir_arg(program)))
             ssd_dir.mkdir(parents=True, exist_ok=True)
 
         # Launch from the metadata file's folder so relative image references in
@@ -444,6 +548,14 @@ class JobManager:
         # Persist the input bindings so a later rerun can re-materialise them into
         # the rebuilt run folder (the produced files live in this job's workdir).
         bindings_val = json.dumps(bindings) if bindings else None
+        # Provenance: what produced this run. The versions answer "which hax was
+        # this?" months later; dropped_args records what strip_obsolete removed
+        # on a rerun instead of only mentioning it in the log.
+        provenance_val = json.dumps({
+            "packages": _pkg_versions(),
+            "dropped_args": list(dropped_args or []),
+            "stamped_at": _now(),
+        })
         if replace_job_id:
             # Replace in place: keep the same id (and created_at, so the row stays put in
             # lists). The run folder is normally the same one, already cleared above.
@@ -459,10 +571,10 @@ class JobManager:
             # a merely-saved replacement correctly ends up with neither.
             self._exec(
                 "UPDATE jobs SET program=?, name=?, args=?, gpu=?, command=?, status=?, log_path=?, "
-                "workdir=?, cwd=?, bindings=?, stale=0, return_code=NULL, started_at=NULL, "
+                "workdir=?, cwd=?, bindings=?, provenance=?, stale=0, slurm_id=NULL, return_code=NULL, started_at=NULL, "
                 "finished_at=NULL WHERE id=?",
                 (program, name_val, json.dumps(values), gpu or None, json.dumps(command),
-                 status, str(log_path), str(workdir), cwd, bindings_val, replace_job_id),
+                 status, str(log_path), str(workdir), cwd, bindings_val, provenance_val, replace_job_id),
             )
             # A different folder only happens when this job's *name* changed under it: a
             # run made before folders were named after the job (legacy `<program>_<stamp>_
@@ -471,20 +583,21 @@ class JobManager:
             if old and old.get("workdir"):
                 old_wd = Path(old["workdir"])
                 if old_wd != workdir and old_wd.exists():
-                    shutil.rmtree(old_wd, ignore_errors=True)
+                    # A whole orphaned run folder — delete it off the loop.
+                    await asyncio.to_thread(shutil.rmtree, old_wd, ignore_errors=True)
                     usage.forget(str(old_wd))
         else:
             self._exec(
-                "INSERT INTO jobs (id, program, name, args, gpu, command, status, log_path, created_at, project_id, workdir, cwd, bindings) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO jobs (id, program, name, args, gpu, command, status, log_path, created_at, project_id, workdir, cwd, bindings, provenance) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, program, name_val, json.dumps(values), gpu or None,
-                 json.dumps(command), status, str(log_path), _now(), project_id, str(workdir), cwd, bindings_val),
+                 json.dumps(command), status, str(log_path), _now(), project_id, str(workdir), cwd, bindings_val, provenance_val),
             )
         self._init_buffers(job_id)
         if launch:
             if resume:
                 # Reused folder: clear metrics and mark the resume point in the kept log.
-                self._prepare_resume(program, str(workdir), str(log_path))
+                await asyncio.to_thread(self._prepare_resume, program, str(workdir), str(log_path))
             # Say so in the run's own log rather than only in the reply: this is the
             # record someone reads months later when asking why a repeated run differs
             # from the original.
@@ -493,8 +606,35 @@ class JobManager:
                 notice = (f"[hax-gui] {program} no longer accepts "
                           f"{', '.join('--' + a for a in dropped_args)}; re-running without "
                           f"{'it' if len(dropped_args) == 1 else 'them'}.\n\n")
-            await self._launch(job_id, command, str(log_path), cwd, append_out=resume, notice=notice)
+            if hold:
+                self._park(job_id, append_out=resume, notice=notice, held=True)
+            else:
+                await self._launch(job_id, command, str(log_path), cwd, append_out=resume, notice=notice)
         return self.get(job_id)
+
+    async def release(self, job_id: str) -> dict[str, Any]:
+        """Launch a job parked with ``hold=True``. Admission still applies: if its device
+        is full it stays ``queued``, now in the dispatcher's hands like any other."""
+        job = self.get(job_id)
+        if job is None:
+            raise JobNotFound(job_id)
+        if job["status"] != "queued":
+            return job                          # already moving (or gone): nothing to do
+        held = self._queue_held.pop(job_id, {})
+        self._exec("UPDATE jobs SET status='pending' WHERE id=?", (job_id,))
+        await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"),
+                           append_out=held.get("append_out", False), notice=held.get("notice"))
+        return self.get(job_id)
+
+    def _park(self, job_id: str, append_out: bool = False, notice: str | None = None,
+              held: bool = False) -> None:
+        """Set a job aside as ``queued``. Everything needed to launch later is already
+        in the row; only the launch niceties (append/notice) need holding on the side.
+        ``held`` marks a job whose dispatch belongs to its creator, not the admission
+        dispatcher."""
+        self._queue_held[job_id] = {"append_out": append_out, "notice": notice, "held": held}
+        self._exec("UPDATE jobs SET status='queued' WHERE id=?", (job_id,))
+        self._publish(job_id, {"type": "status", "status": "queued"})
 
     async def start(self, job_id: str) -> dict[str, Any]:
         """Launch a previously saved job using its stored command."""
@@ -513,7 +653,7 @@ class JobManager:
         if job.get("stale"):
             return await self.rerun(job_id)
         self._init_buffers(job_id)
-        self._exec("UPDATE jobs SET status='pending', stale=0, return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
+        self._exec("UPDATE jobs SET status='pending', stale=0, slurm_id=NULL, return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
         await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"))
         return self.get(job_id)
 
@@ -658,6 +798,51 @@ class JobManager:
                 raise ValidationError({field: str(exc)})
         return values
 
+    def precheck(self, program: str, values: dict[str, Any], gpu: str | None,
+                 bindings: dict[str, Any] | None = None) -> None:
+        """Validate a submission as far as possible *without side effects*.
+
+        The rerun/edit endpoints invalidate everything downstream — cancelling
+        runs, flagging staleness — before rebuilding this job, so a submission
+        that is going to be refused with a 422 must be refused *before* that
+        cascade, not after it has already done its damage. Auto-filled and
+        binding-fed fields can't be validated without materialising them, so they
+        are stubbed with the placeholders create() will overwrite; what remains is
+        exactly the user-typed surface that produces 422s, plus an existence check
+        on each binding's source job (the other common late failure). Adapter
+        errors while materialising can still surface later — this is a best-effort
+        gate, not a guarantee.
+        """
+        values = dict(values)
+        for field, binding in (bindings or {}).items():
+            many = isinstance(binding, list)
+            for one in (binding if many else [binding]):
+                if self.get((one or {}).get("job_id", "")) is None:
+                    raise ValidationError({field: "source job no longer exists"})
+            values[field] = ["/placeholder"] if many else "/placeholder"
+        for arg in (registry.output_arg(program), registry.ssd_arg(program)):
+            if arg:
+                values[arg] = "/placeholder"
+        build_command(program, values, gpu)   # raises ValidationError
+
+    def precheck_rerun(self, job_id: str) -> None:
+        """`precheck` for an existing job, preparing its stored args exactly the
+        way :meth:`rerun` will."""
+        job = self.get(job_id)
+        if job is None:
+            raise JobNotFound(job_id)
+        program = job["program"]
+        args = dict(job["args"])
+        for arg in (registry.output_arg(program), registry.ssd_arg(program)):
+            if arg:
+                args.pop(arg, None)
+        args, _ = strip_obsolete(program, args)
+        bindings = job.get("bindings")
+        if bindings:
+            for field in bindings:
+                args.pop(field, None)
+        self.precheck(program, args, job["gpu"], bindings)
+
     async def rerun(self, job_id: str) -> dict[str, Any]:
         """Re-launch a job in place: the same job is replaced with a fresh run — its own
         run folder cleared and rebuilt, keeping the path — rather than creating a new job."""
@@ -770,7 +955,7 @@ class JobManager:
             raise JobNotResumable(job_id)
         self._prepare_resume(job["program"], job.get("workdir"), job["log_path"])
         self._init_buffers(job_id)
-        self._exec("UPDATE jobs SET status='pending', return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
+        self._exec("UPDATE jobs SET status='pending', slurm_id=NULL, return_code=NULL, finished_at=NULL WHERE id=?", (job_id,))
         await self._launch(job_id, job["command"], job["log_path"], job.get("cwd"), append_out=True)
         return self.get(job_id)
 
@@ -854,8 +1039,49 @@ class JobManager:
                 return str(md.parent)
         return str(workdir)
 
+    def _admit(self, job_id: str) -> bool:
+        """May this job start now, or is its device full?
+
+        Two launches on the same GPU used to both start and OOM together; now the
+        device (the job's `gpu` string; unpinned jobs share the "" pool) admits
+        `max_jobs_per_gpu` (settings, default 1) at a time. 0 disables admission.
+        """
+        limit = settings_store.max_jobs_per_gpu()
+        if limit <= 0:
+            return True
+        job = self.get(job_id)
+        device = job.get("gpu") or ""
+        # Slurm-scheduled jobs don't occupy a local GPU, so they never fill a slot
+        # (matters when switching backends while cluster jobs are still running).
+        row = self._exec(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status IN ('pending','running','cancelling') "
+            "AND COALESCE(gpu,'')=? AND slurm_id IS NULL AND id != ?", (device, job_id), fetch="one")
+        return int(row["n"]) < limit
+
+    async def _dispatch_queued(self) -> None:
+        """Launch queued jobs whose device now has a free slot (FIFO)."""
+        rows = self._exec(
+            "SELECT id FROM jobs WHERE status='queued' ORDER BY created_at", fetch="all")
+        for r in rows:
+            job = self.get(r["id"])
+            if job is None or not self._admit(job["id"]):
+                continue
+            if self._queue_held.get(job["id"], {}).get("held"):
+                continue                        # a workflow decides when this one goes
+            held = self._queue_held.pop(job["id"], {})
+            self._exec("UPDATE jobs SET status='pending' WHERE id=?", (job["id"],))
+            await self._launch(job["id"], job["command"], job["log_path"], job.get("cwd"),
+                               append_out=held.get("append_out", False), notice=held.get("notice"))
+
     async def _launch(self, job_id: str, command: list[str], log_path: str, cwd: str | None = None,
                       append_out: bool = False, notice: str | None = None) -> None:
+        if slurm.enabled():
+            # Slurm owns scheduling: no local admission queue, no process group.
+            await self._launch_slurm(job_id, command, log_path, cwd, append_out, notice)
+            return
+        if not self._admit(job_id):
+            self._park(job_id, append_out=append_out, notice=notice)
+            return
         out_path, err_path = log_path, self._err_path(log_path)
         exit_path = _exit_path(log_path)
         with contextlib.suppress(OSError):
@@ -907,11 +1133,109 @@ class JobManager:
         key = _proc_key(proc.pid)
         self._procs[job_id] = proc
         self._exec(
-            "UPDATE jobs SET status='running', pid=?, pgid=?, proc_key=?, started_at=? WHERE id=?",
+            "UPDATE jobs SET status='running', pid=?, pgid=?, proc_key=?, slurm_id=NULL, started_at=? WHERE id=?",
             (proc.pid, proc.pid, key, _now(), job_id),
         )
         self._publish(job_id, {"type": "status", "status": "running", "pid": proc.pid})
         asyncio.create_task(self._supervise(job_id, proc, out_path, err_path, out_off, 0))
+
+    async def _launch_slurm(self, job_id: str, command: list[str], log_path: str,
+                            cwd: str | None = None, append_out: bool = False,
+                            notice: str | None = None) -> None:
+        """Submit the job to Slurm instead of spawning it locally.
+
+        The contract with the rest of the manager is unchanged: the job writes the
+        same stdout/stderr files (sbatch -o/-e), records its exit code to the same
+        exit file, and a supervisor task streams the logs and finalises the row.
+        Only the "process" is different — a Slurm job id instead of a pgid.
+        """
+        out_path, err_path = log_path, self._err_path(log_path)
+        exit_path = _exit_path(log_path)
+        with contextlib.suppress(OSError):
+            os.remove(exit_path)
+        # sbatch opens the logs in append mode (see build_script), so prepare them
+        # here exactly as the local path does: truncate for a fresh run, keep for an
+        # in-place continue; the submission notice leads the file either way.
+        out_off = _size(out_path) if append_out else 0   # before the notice: it streams too
+        try:
+            with open(out_path, "ab" if append_out else "wb") as f:
+                if notice:
+                    f.write(notice.encode())
+            open(err_path, "wb").close()
+        except OSError as exc:
+            self._fail_launch(job_id, exc)
+            return
+
+        job = self.get(job_id) or {}
+        script = slurm.build_script(command, exit_path, out_path, err_path,
+                                    name=f"hax-{job.get('name') or job.get('program') or job_id}",
+                                    cwd=cwd)
+        try:
+            sid = await slurm.submit(script)
+        except slurm.SlurmError as exc:
+            self._fail_launch(job_id, OSError(f"sbatch failed: {exc}"))
+            return
+        # Stays 'pending' until squeue reports RUNNING — in the UI that reads exactly
+        # like Slurm's own PENDING (waiting for resources).
+        self._exec("UPDATE jobs SET status='pending', slurm_id=?, pid=NULL, pgid=NULL, "
+                   "proc_key=NULL WHERE id=?", (sid, job_id))
+        # Into the log FILE (sbatch appends after it), so it survives in the replay
+        # and the /log endpoint; the supervisor's tail streams it to live sockets.
+        with contextlib.suppress(OSError):
+            with open(out_path, "ab") as f:
+                f.write(f"[hax-gui] submitted to Slurm as job {sid}\n".encode())
+        self._publish(job_id, {"type": "status", "status": "pending"})
+        asyncio.create_task(self._supervise_slurm(job_id, sid, out_path, err_path, out_off, 0))
+
+    async def _supervise_slurm(self, job_id: str, slurm_id: str,
+                               out_path: str, err_path: str,
+                               out_off: int, err_off: int) -> None:
+        """Watch a Slurm job: stream its logs, mirror queue→run, finalise when it
+        leaves the queue. Survives server restarts by construction — the state is
+        the cluster's, and reattach() simply starts this loop again."""
+        stop = asyncio.Event()
+        tails = [
+            asyncio.create_task(self._tail(job_id, out_path, "out", out_off, stop)),
+            asyncio.create_task(self._tail(job_id, err_path, "err", err_off, stop)),
+        ]
+        running = False
+        try:
+            while True:
+                try:
+                    state = await slurm.state(slurm_id)
+                except slurm.SlurmError as exc:
+                    # squeue itself unusable (cluster unreachable?): keep the job
+                    # alive and keep trying — declaring it dead would be a lie.
+                    self._publish(job_id, {"type": "chunk", "stream": "err",
+                                           "data": f"[hax-gui] squeue failed: {exc}\n"})
+                    await asyncio.sleep(15.0)
+                    continue
+                if state is None:
+                    break                            # left the queue: finished one way or another
+                if not running and state not in slurm.PENDING_STATES:
+                    running = True
+                    self._exec("UPDATE jobs SET status='running', started_at=? "
+                               "WHERE id=? AND status IN ('pending','running')", (_now(), job_id))
+                    if (self.get(job_id) or {}).get("status") == "running":
+                        self._publish(job_id, {"type": "status", "status": "running"})
+                await asyncio.sleep(3.0)
+        finally:
+            stop.set()
+        await asyncio.gather(*tails, return_exceptions=True)
+        rc = _read_exit(_exit_path(out_path))
+        if rc is None:
+            # Never got to write its exit file: cancelled while queued, killed by the
+            # scheduler (timeout, OOM), or the node died. Accounting knows which.
+            final = await slurm.final_state(slurm_id)
+            if final and final.startswith("CANCELLED"):
+                current = self.get(job_id)
+                if current is not None and current["status"] != "cancelling":
+                    # scancel'd from outside the GUI: mark it cancelled, not interrupted.
+                    self._exec("UPDATE jobs SET status='cancelling' WHERE id=?", (job_id,))
+            elif final:
+                self._publish(job_id, {"type": "chunk", "stream": "err",
+                                       "data": f"[hax-gui] Slurm reports {final}\n"})
+        self._finalize(job_id, rc)
 
     def _fail_launch(self, job_id: str, exc: OSError) -> None:
         self._exec(
@@ -971,6 +1295,7 @@ class JobManager:
         """
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         pos = offset
+        self._tail_pos.setdefault(job_id, {})[kind] = pos
         while True:
             data = b""
             try:
@@ -985,6 +1310,7 @@ class JobManager:
                 if text:
                     self._buffer_append(job_id, text, kind)
                     self._publish(job_id, {"type": "chunk", "stream": kind, "data": text})
+                    self._tail_pos.setdefault(job_id, {})[kind] = pos
                 continue                      # keep draining while there is more
             if stop.is_set():
                 return                        # the job is gone and the file is drained
@@ -1007,6 +1333,9 @@ class JobManager:
             (status, return_code, _now(), job_id),
         )
         self._publish(job_id, {"type": "status", "status": status, "return_code": return_code})
+        # A slot on this job's device just freed: hand it to the next queued job.
+        with contextlib.suppress(RuntimeError):        # no loop: nothing can be queued either
+            asyncio.get_running_loop().create_task(self._dispatch_queued())
 
     async def _reap_group(self, job_id: str, pgid: int) -> None:
         """Kill whatever is left in a finished job's process group.
@@ -1017,6 +1346,16 @@ class JobManager:
         waiting for an EOF they were still holding open. Once the leader has exited,
         anything still in its group is exactly that debris.
         """
+        # The leader has exited, so its pid slot is free the moment it is reaped — and
+        # a fresh process that lands on it and starts its own session would make this
+        # pgid name *that stranger's* group. Every other path that signals a group
+        # re-verifies identity (_group_alive); this one must too: if a process with
+        # pid == pgid is alive again but is not the one we launched, walk away.
+        key = (self.get(job_id) or {}).get("proc_key")
+        if key and _pid_alive(pgid):
+            now = _proc_key(pgid)
+            if now is not None and now != key:
+                return
         left = [p for p in _group_members(pgid) if p != pgid]
         if not left:
             return
@@ -1052,6 +1391,20 @@ class JobManager:
         """
         job = self.get(job_id)
         if job is None or job["status"] not in ACTIVE:
+            return
+        if job["status"] == "queued":
+            # Never launched: nothing to signal, just take it out of the queue.
+            self._queue_held.pop(job_id, None)
+            self._exec("UPDATE jobs SET status='cancelled', finished_at=? WHERE id=?",
+                       (_now(), job_id))
+            self._publish(job_id, {"type": "status", "status": "cancelled"})
+            return
+        if job.get("slurm_id"):
+            # Scheduled by Slurm: scancel it (queued or running alike) and let the
+            # supervisor's poll observe the disappearance and finalise the row.
+            self._exec("UPDATE jobs SET status='cancelling' WHERE id=?", (job_id,))
+            self._publish(job_id, {"type": "status", "status": "cancelling"})
+            await slurm.cancel(job["slurm_id"])
             return
         pgid, key = int(job.get("pgid") or 0), job.get("proc_key")
         if not _group_alive(pgid, key):
@@ -1131,34 +1484,81 @@ class JobManager:
         if subs:
             subs.discard(queue)
 
-    def read_log(self, job_id: str, stream: str = "out", cap: int = 4_000_000, raw_cap: int = 64_000_000) -> str:
-        """Full persisted log for one stream ("out"/"err"), tqdm frames collapsed.
+    def tail_positions(self, job_id: str) -> dict[str, int]:
+        """Byte offset each stream's tailer has published up to (may be empty).
+
+        Captured in the same event-loop tick as :meth:`subscribe`, this is the
+        exact cut for a replay snapshot: bytes below it are read from the file,
+        bytes at/after it arrive as live chunks — nothing duplicated, nothing
+        lost, even when the file read itself happens later in a worker thread.
+        """
+        return dict(self._tail_pos.get(job_id, {}))
+
+    def read_log(self, job_id: str, stream: str = "out", cap: int | None = 4_000_000,
+                 raw_cap: int | None = LOG_RAW_CAP, upto: int | None = None) -> str:
+        """Persisted log for one stream ("out"/"err"), tqdm frames collapsed.
 
         The in-memory buffer is only a recent tail, so reopening a job (running or
         finished) replays from the file to keep the earliest lines. We read up to
-        ``raw_cap`` bytes from the end (enough for any realistic run in full),
+        ``raw_cap`` bytes from the end (a truncation notice marks anything beyond),
         collapse repeated ``\\r`` progress frames to their final state, then cap the
         result to ``cap`` characters — so early lines survive even when a run has
-        written megabytes of progress output.
+        written megabytes of progress output. Pass ``cap=None``/``raw_cap=None`` for
+        an unbounded read of the whole file (no seek-window, no truncation notice).
+
+        ``upto`` stops the read at that byte offset (the tailer's published
+        position): a live subscriber gets everything past it as queued chunks, so
+        reading further here would replay those bytes twice. This is a blocking
+        read of up to ``raw_cap`` bytes — call it from a worker thread, never on
+        the event loop.
         """
         job = self.get(job_id)
         if not job:
             return ""
         log_path = job["log_path"] if stream == "out" else self._err_path(job["log_path"])
+        truncated = False
         try:
             p = Path(log_path)
-            size = p.stat().st_size
+            end = p.stat().st_size
+            if upto is not None:
+                end = min(end, upto)
+            start = 0 if raw_cap is None else max(0, end - raw_cap)
+            truncated = start > 0
             with open(p, "rb") as f:
-                if size > raw_cap:
-                    f.seek(size - raw_cap)
-                data = f.read()
+                f.seek(start)
+                data = f.read(end - start)
         except OSError:
             return "".join(self._buffers.get(job_id, {}).get(stream, ()))
-        return _collapse_progress(data.decode("utf-8", errors="replace"))[-cap:]
+        text = _collapse_progress(data.decode("utf-8", errors="replace"))
+        if cap is not None:
+            text = text[-cap:]
+        if truncated:
+            text = f"[hax-gui] log truncated: showing the last {raw_cap // 1_000_000} MB\n" + text
+        return text
+
+    def log_info(self, job_id: str, stream: str = "out") -> dict[str, Any]:
+        """Byte size of the persisted log file and whether it exceeds the truncated-read window."""
+        job = self.get(job_id)
+        if not job:
+            return {"size": 0, "truncated": False}
+        log_path = job["log_path"] if stream == "out" else self._err_path(job["log_path"])
+        try:
+            size = Path(log_path).stat().st_size
+        except OSError:
+            size = 0
+        return {"size": size, "truncated": size > LOG_RAW_CAP}
 
     def _publish(self, job_id: str, message: dict[str, Any]) -> None:
         for queue in self._subscribers.get(job_id, set()):
             queue.put_nowait(message)
+        # Status transitions also fan out on the global /ws/events channel so the
+        # UI updates immediately (and can notify) instead of waiting out a poll.
+        if message.get("type") == "status":
+            job = self.get(job_id) or {}
+            events.publish({"kind": "job", "job_id": job_id, "status": message.get("status"),
+                            "return_code": message.get("return_code"),
+                            "program": job.get("program"), "name": job.get("name"),
+                            "project_id": job.get("project_id")})
 
     # -- reads -------------------------------------------------------------
     def get(self, job_id: str) -> dict[str, Any] | None:
@@ -1186,23 +1586,59 @@ class JobManager:
         )
         return int(row["n"]) if row else 0
 
-    def list_for_project(self, project_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    def count_by_project(self) -> dict[str, int]:
+        """Run count per project — one GROUP BY for all of them (project cards)."""
         rows = self._exec(
-            "SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
-            (project_id, limit), fetch="all",
+            "SELECT project_id, COUNT(*) AS n FROM jobs WHERE project_id IS NOT NULL "
+            "GROUP BY project_id", fetch="all",
         )
+        return {r["project_id"]: r["n"] for r in rows}
+
+    def list_for_project(self, project_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+        """All of a project's jobs (newest first), unlimited by default.
+
+        This feeds the dependency graph (cascade invalidation, workflow sync) and
+        the project's ACTIVE check on delete — a row cap here silently broke all
+        three past that many runs, so a cap is now strictly opt-in (UI pagination).
+        """
+        if limit is not None:
+            rows = self._exec(
+                "SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
+                (project_id, limit), fetch="all",
+            )
+        else:
+            rows = self._exec(
+                "SELECT * FROM jobs WHERE project_id=? ORDER BY created_at DESC",
+                (project_id,), fetch="all",
+            )
         return [self._row(r) for r in rows]
 
     def tail(self, job_id: str, max_lines: int | None = None, stream: str = "out") -> list[str]:
+        """The last ``max_lines`` of a job's log, reading only the end of the file.
+
+        The old ``read().splitlines()`` slurped the whole log — a 500 MB
+        progress-bar log was a >1 GB allocation per request, and forty threadpool
+        slots of that is an OOM. Seek to a bounded window from the end instead
+        (generous 4 KB/line, 8 MB floor/ceiling) and drop the first, possibly
+        partial, line when the window didn't reach the start.
+        """
         job = self.get(job_id)
         if not job:
             return []
         log_path = job["log_path"] if stream == "out" else self._err_path(job["log_path"])
+        window = min(32_000_000, max(8_000_000, (max_lines or 0) * 4096))
         try:
-            with open(log_path, encoding="utf-8") as log:
-                lines = log.read().splitlines()
+            with open(log_path, "rb") as log:
+                size = os.fstat(log.fileno()).st_size
+                start = max(0, size - window)
+                log.seek(start)
+                text = log.read().decode("utf-8", errors="replace")
         except FileNotFoundError:
             lines = list(self._buffers.get(job_id, {}).get(stream, ()))
+            return lines[-max_lines:] if max_lines else lines
+        lines = text.splitlines()
+        if start > 0 and lines:
+            lines = lines[1:]                       # first line is likely cut mid-way
         return lines[-max_lines:] if max_lines else lines
 
     # -- helpers -----------------------------------------------------------
@@ -1211,6 +1647,7 @@ class JobManager:
         data["args"] = json.loads(data["args"])
         data["command"] = json.loads(data["command"])
         data["bindings"] = json.loads(data["bindings"]) if data.get("bindings") else None
+        data["provenance"] = json.loads(data["provenance"]) if data.get("provenance") else None
         data["active"] = data["status"] in ACTIVE
         # Its inputs were re-made after it ran, so its outputs no longer correspond to
         # anything that exists (see :meth:`mark_stale`).
@@ -1225,7 +1662,11 @@ class JobManager:
         assert self._db is not None, "JobManager.init() not called"
         cur = self._db.execute(sql, params)
         result = cur.fetchone() if fetch == "one" else cur.fetchall() if fetch == "all" else None
-        self._db.commit()
+        # Commit only what needs it: committing after every SELECT took the
+        # write lock for reads, which is what made the 3-second list polls
+        # contend with the scheduler's writes.
+        if not sql.lstrip().upper().startswith("SELECT"):
+            self._db.commit()
         return result
 
 

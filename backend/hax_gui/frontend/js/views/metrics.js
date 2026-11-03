@@ -1,77 +1,65 @@
-// Metrics: pick a run that has event files (auto-listed) or enter a log directory
-// manually, then read it. Each run opens as a tab, rendered natively by metricsPanel —
-// the GUI parses the same tfevents/projector files TensorBoard would, so there is no
-// iframe. Real TensorBoard is still one click away inside each panel.
+// Metrics: the job tree on the left (runs without event files dimmed), the
+// selected run's curves / image panels / latent space on the right, rendered
+// natively by metricsPanel — the GUI parses the same tfevents/projector files
+// TensorBoard would, so there is no iframe. Picking a run replaces the one on screen
+// unless that one is pinned (the tab's pin): panels are heavy and stay mounted while
+// open, so only the runs kept on purpose are. A log directory that is not a run can
+// still be opened by hand.
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
 import { openFilePicker } from "./filePicker.js";
-import { jobLabelChips } from "./labels.js";
 import { metricsPanel } from "./metricsPanel.js";
-import { runBrowser, folderName, metricsTabInfo } from "./runBrowser.js";
-import { jobTimeEl } from "./jobs.js";
+import { metricsTabInfo } from "./runBrowser.js";
+import { onJobEvent } from "../events.js";
+import { jobTree } from "./jobTree.js";
+import { jobWorkspace, stageEmpty } from "./jobWorkspace.js";
 
 export function MetricsView() {
-  const root = h("div", { class: "view metrics-view" });
+  // Which runs have event files: the list endpoint does not say, so ask once and
+  // again whenever a job changes state (a training writes its first events early).
+  let withMetrics = new Set();
+  let byId = new Map();          // job id -> the metrics-jobs row (workdir + names)
 
+  const tree = jobTree({
+    isSelected: (j) => { const m = getState().activeMetricsId; return !!m && byId.get(j.id)?.workdir === m; },
+    onSelect: (j) => { if (withMetrics.has(j.id)) open(j.workdir, j); else showNoMetrics(j); },
+    usable: (j) => withMetrics.has(j.id),
+    emptyText: "No runs in this project yet.",
+  });
+
+  // ── manual open: a log directory that is not a run of this project ──
   let logdir = "";
-  const input = h("input", { class: "input", placeholder: "server log directory (manual)", oninput: (e) => (logdir = e.target.value) });
+  const input = h("input", { class: "input", placeholder: "server log directory", oninput: (e) => (logdir = e.target.value) });
   const browse = h("button", { class: "btn-icon", title: "Browse server", onclick: () => openFilePicker("directory", (p) => { input.value = p; logdir = p; }, input.value) }, icon("folderOpen", 16));
-  const openBtn = h("button", { class: "btn", onclick: () => open(logdir.trim()) }, icon("plus", 18), "Open");
+  const openBtn = h("button", { class: "btn secondary", onclick: () => open(logdir.trim()) }, icon("plus", 16), "Open");
+  const manual = h("div", { class: "jw-manual" },
+    h("div", { class: "muted small", style: { marginBottom: "6px" } }, "Or open a log directory by hand"),
+    h("div", { class: "launch-row" }, h("div", { class: "path-row", style: { flex: "1" } }, input, browse), openBtn));
   const launchErr = h("div");
 
-  root.appendChild(h("header", { class: "page-head" }, h("h1", null, "Metrics"),
-    h("p", { class: "subtitle" }, "Training curves, image panels and the latent space, read straight from a run's logs.")));
-
-  // -- available runs (jobs with event files), grouped by project + filterable -------
-  const runsBox = h("div", { style: { marginBottom: "20px" } });
-  root.appendChild(runsBox);
-
-  const browser = runBrowser({
-    renderRow: (j) => h("button", { class: "run-row", onclick: () => open(j.workdir, j) },
-      h("span", { class: "run-prog mono" }, j.name || j.program),
-      j.name ? h("span", { class: "run-sub mono" }, j.program) : null,
-      h("span", { class: "run-folder mono" }, folderName(j.workdir)),
-      (j.labels && j.labels.length) ? jobLabelChips(j) : null,
-      jobTimeEl(j, "run-time"),
-      h("span", { class: "run-open" }, icon("chart", 14), "Open")),
-    emptyText: "No runs with metrics yet. Train a model, then refresh.",
-  });
-  mount(runsBox, h("div", null,
-    h("div", { class: "row section-head" },
-      h("h2", { class: "section", style: { margin: 0 } }, "Available runs"),
-      h("button", { class: "btn-icon", title: "Refresh", style: { marginLeft: "auto" }, onclick: loadRuns }, icon("refresh", 15))),
-    browser.el));
-
-  function loadRuns() {
-    browser.setStatus(h("p", { class: "muted small", style: { margin: "8px 0" } }, "Loading available runs…"));
-    api.metricsJobs()
-      .then((jobs) => browser.setJobs(jobs))
-      .catch((err) => browser.setStatus(errorBox(err)));
-  }
-
-  // -- manual launch ----------------------------------------------------
-  root.appendChild(h("h2", { class: "section" }, "Or open a folder manually"));
-  root.appendChild(h("div", { class: "launch-row" }, h("div", { class: "path-row", style: { flex: "1" } }, input, browse), openBtn));
-  root.appendChild(launchErr);
-
-  const tabbar = h("div", { class: "tabbar", style: { marginTop: "20px" } });
+  const tabbar = h("div", { class: "tabbar mx-tabs", hidden: true });
   const panelsWrap = h("div", { class: "mx-wrap" });
-  root.appendChild(tabbar);
-  root.appendChild(panelsWrap);
+  const noteBox = h("div");
+  const stage = h("div", { class: "jw-stage" }, tabbar, noteBox, launchErr, panelsWrap, manual);
+  const root = h("div", { class: "view metrics-view" }, jobWorkspace(tree.el, stage));
 
-  const panels = new Map();   // logdir -> panel instance (kept mounted so state survives tab switches)
-  let shownId = null;         // which panel is currently on screen
+  const panels = new Map();   // logdir -> panel instance (kept mounted so state survives switches)
+  let shownId = null;
 
   function open(dir, job) {
-    if (!dir) { mount(launchErr, h("div", { style: { marginTop: "12px" } }, errorBox("Choose a log directory first."))); return; }
-    clear(launchErr);
+    if (!dir) { mount(launchErr, h("div", { style: { marginBottom: "12px" } }, errorBox("Choose a log directory first."))); return; }
+    clear(launchErr); clear(noteBox);
     const { title, subtitle } = metricsTabInfo(dir, job);
+    if (job) store.setLastJob(job.id);
     store.openMetrics({ logdir: dir, title, subtitle, jobId: job ? job.id : null });
   }
-
+  function showNoMetrics(j) {
+    mount(noteBox, h("div", { class: "jw-note" },
+      h("strong", null, j.name || j.program), j.status === "saved" ? " has not run yet." : " has not written any metrics — nothing to plot."));
+  }
   function close(id) {
     const p = panels.get(id);
     if (p) { p.destroy(true); p.el.remove(); panels.delete(id); }
@@ -81,10 +69,8 @@ export function MetricsView() {
   function sync() {
     const { openMetrics, activeMetricsId } = getState();
     clear(tabbar);
+    tabbar.hidden = !openMetrics.length;
     for (const m of openMetrics) {
-      // Two lines, capped width: a run called "… copy copy copy" glued to its folder is
-      // wider than the tab bar, and truncating it to one line hides exactly the part
-      // (the run id) that tells two of them apart.
       tabbar.appendChild(h("div", {
         class: "tab two-line" + (m.id === activeMetricsId ? " active" : ""),
         onclick: () => store.setActiveMetrics(m.id),
@@ -93,6 +79,10 @@ export function MetricsView() {
         h("span", { class: "tab-lines" },
           h("span", { class: "tab-main" }, m.title),
           m.subtitle ? h("span", { class: "tab-sub mono" }, m.subtitle) : null),
+        h("button", { class: "tab-pin" + (m.pinned ? " on" : ""),
+          title: m.pinned ? "Pinned: stays open while you browse other runs. Click to unpin."
+                          : "Pin: keep this run open while you open others (otherwise the next run you pick replaces it)",
+          onclick: (e) => { e.stopPropagation(); store.togglePinMetrics(m.id); } }, icon("bookmark", 13)),
         h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); close(m.id); } }, icon("x", 14))));
     }
     for (const m of openMetrics) {
@@ -113,20 +103,33 @@ export function MetricsView() {
       shownId = activeMetricsId;
       panels.get(activeMetricsId)?.onShow?.();
     }
-
-    const empty = panelsWrap.querySelector(".mx-none");
+    const empty = panelsWrap.querySelector(".jw-empty");
     if (!openMetrics.length && !empty) {
-      panelsWrap.appendChild(h("p", { class: "muted mx-none", style: { padding: "24px 0" } }, "No run open. Pick one above."));
+      panelsWrap.appendChild(stageEmpty("Select a run", "Runs with training curves are the bright ones in the tree; the rest are dimmed."));
     } else if (openMetrics.length && empty) empty.remove();
+    tree.repaint();
+  }
+
+  async function loadMetricsJobs() {
+    try {
+      const rows = await api.metricsJobs();
+      withMetrics = new Set(rows.map((j) => j.id));
+      byId = new Map(rows.map((j) => [j.id, j]));
+      tree.repaint();
+      // First visit with nothing open: land on the run last selected elsewhere, if it has metrics.
+      const last = getState().lastJobId;
+      if (!getState().openMetrics.length && last && byId.has(last)) open(byId.get(last).workdir, byId.get(last));
+    } catch (err) { mount(launchErr, errorBox(err)); }
   }
 
   const unsub = subscribe(sync);
-  loadRuns();
+  const offEvents = onJobEvent(() => loadMetricsJobs());
+  loadMetricsJobs();
   sync();
   return {
     el: root,
     cleanup() {
-      unsub();
+      unsub(); offEvents(); tree.cleanup();
       for (const p of panels.values()) p.destroy();   // stop pollers / free object URLs
       panels.clear();
     },

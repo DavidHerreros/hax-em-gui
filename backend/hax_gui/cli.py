@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from .config import settings
+from .config import is_loopback_host, settings
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -166,12 +166,31 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(_err(f"Port {port} on {host} is already in use") + " by another process. Pick a free --port.")
         return 1
 
-    cmd = [sys.executable, "-m", "uvicorn", "hax_gui.app:app", "--host", host, "--port", str(port)]
+    cmd = [sys.executable, "-m", "uvicorn", "hax_gui.app:app", "--host", host, "--port", str(port),
+           # On SIGTERM, uvicorn normally waits for open connections to drain before
+           # running lifespan shutdown — but our WS handlers (log stream, /ws/events)
+           # only exit when app.state.shutdown is set, which lifespan shutdown itself
+           # does. With a browser tab attached that's a circular wait that never
+           # resolves on its own; this cap lets uvicorn cancel the handlers and proceed.
+           "--timeout-graceful-shutdown", "3"]
     if args.reload:
         cmd.append("--reload")
 
+    # Tell the server what it is bound to (drives the Host allowlist), and never
+    # start open on a public interface: without HAX_GUI_TOKEN, mint/reuse the
+    # persisted token and say where it lives. The job API is command execution
+    # as this user — exposing it unauthenticated was the old (bad) default.
+    env = {**os.environ, "HAX_GUI_BIND_HOST": host}
+    if not is_loopback_host(host) and not os.environ.get("HAX_GUI_TOKEN"):
+        env["HAX_GUI_TOKEN"] = settings.load_or_create_token()
+        print(_warn("Public bind: an access token is now required.") +
+              f" Token file: {settings.token_path}")
+        print("Browsers will prompt for it; set " + _bold("HAX_GUI_TOKEN") +
+              " to use a different one.")
+
     if args.foreground:
         print(_bold(f"Starting hax-gui (foreground) on http://{_connect_host(host)}:{port}") + " — Ctrl-C to stop.")
+        os.environ.update(env)
         os.execvp(cmd[0], cmd)   # replace this process; never returns
         return 0                 # unreachable
 
@@ -182,6 +201,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     proc = subprocess.Popen(
         cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
         start_new_session=True,   # survive the CLI exiting / terminal close
+        env=env,
     )
     _write_state({"pid": proc.pid, "host": host, "port": port,
                   "started_at": datetime.now(timezone.utc).isoformat()})
@@ -204,32 +224,57 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_unmanaged(host: str, port: int, prefix: str) -> None:
+    """Say plainly that a server hax-gui does not own is answering on the port.
+
+    A server launched by hand (``uvicorn …``, an IDE, an old shell) never enters
+    the state file, so ``stop`` cannot reach it — and reporting "stopped" while
+    the GUI still answers reads as a broken stop. Name the situation and how to
+    resolve it instead."""
+    url = f"http://{_connect_host(host)}:{port}"
+    print(_warn(prefix) + f" at {url} — it was started outside " + _bold("hax-gui start") +
+          " (e.g. `uvicorn` by hand), so hax-gui does not know its pid.")
+    print("Find and stop it with: " + _bold(f"ss -tlnp | grep ':{port} '") +
+          "  then kill that pid; " + _bold("hax-gui start") + " will manage the next one.")
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     running = _running()
     if not running:
+        # Nothing on record — but is the port still serving? Claiming "not
+        # running" while the GUI answers is exactly the confusing case.
+        if _health(DEFAULT_HOST, DEFAULT_PORT):
+            _warn_unmanaged(DEFAULT_HOST, DEFAULT_PORT, "No server on record, but one is answering")
+            return 1
         print(_warn("hax-gui is not running."))
         return 0
     pid = running["pid"]
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        _clear_state()
-        print(_warn("hax-gui is not running."))
-        return 0
-
-    # Wait for a graceful exit, then force-kill.
-    for _ in range(40):   # ~10s
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.25)
-    else:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        pid = None
+    if pid is not None:
+        # Wait for a graceful exit, then force-kill.
+        for _ in range(40):   # ~10s
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.25)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     _clear_state()
-    print(_ok("hax-gui stopped.") + f" (pid {pid})")
+    # The tracked server is gone; make sure nothing ELSE kept the address before
+    # declaring victory (an unmanaged twin holding the port was reported as a
+    # successful stop, with the GUI still reachable in the browser).
+    host, port = running.get("host", DEFAULT_HOST), running.get("port", DEFAULT_PORT)
+    time.sleep(0.3)   # let the dying server actually release the socket
+    if _health(host, port):
+        _warn_unmanaged(host, port, f"Stopped pid {running['pid']}, but another server still answers")
+        return 1
+    print(_ok("hax-gui stopped.") + (f" (pid {pid})" if pid is not None else ""))
     return 0
 
 
@@ -250,6 +295,10 @@ def cmd_restart(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     running = _running()
     if not running:
+        if _health(DEFAULT_HOST, DEFAULT_PORT):
+            print(_warn("● hax-gui has no server on record, but one is answering."))
+            _warn_unmanaged(DEFAULT_HOST, DEFAULT_PORT, "Unmanaged server")
+            return 1
         print(_err("● hax-gui is not running."))
         print("Start it with " + _bold("hax-gui start") + ".")
         return 1
@@ -277,8 +326,12 @@ def cmd_schemas(args: argparse.Namespace) -> int:
         print(_err(f"schema generation failed: {exc}"))
         return 1
     print(_ok(f"Wrote {len(result['programs'])} program schemas") + f" → {result['_target']}")
+    if result.get("kept"):
+        print(_warn("Programs that failed to introspect (their previous schema was kept):"))
+        for name, err in result["kept"].items():
+            print(f"  - {name}: {err}")
     if result.get("errors"):
-        print(_warn("Programs that failed to introspect:"))
+        print(_warn("Programs that failed to introspect and have no cached schema:"))
         for name, err in result["errors"].items():
             print(f"  - {name}: {err}")
     return 0

@@ -482,12 +482,28 @@ export function createScatter(canvas, onSelect) {
   canvas.addEventListener("mouseleave", () => { if (hover !== -1) { hover = -1; scheduleDraw(); } });
   canvas.addEventListener("wheel", (e) => { e.preventDefault(); zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * 0.0015)); }, { passive: false });
   canvas.addEventListener("dblclick", () => { view = { ...bounds }; scheduleDraw(); });
-  window.addEventListener("resize", scheduleDraw);
+  // Held so destroy() can undo them: a listener on `window` keeps this whole closure —
+  // the points, the label arrays, every cached layer canvas — alive for the life of the
+  // page, which is fine for the viewer app (one scatter per iframe) and a leak for a host
+  // that builds and discards scatters (the GUI's metrics panels).
+  let dead = false;
+  const onResize = () => { if (!dead) scheduleDraw(); };
+  window.addEventListener("resize", onResize);
   // Same reason as in plot.js: a canvas built while its tab is hidden has no size, so
   // whatever we drew went nowhere. Redraw when the box we actually occupy changes.
-  if (window.ResizeObserver) new ResizeObserver(() => scheduleDraw()).observe(canvas);
+  const ro = window.ResizeObserver ? new ResizeObserver(() => { if (!dead) scheduleDraw(); }) : null;
+  if (ro) ro.observe(canvas);
 
   return {
+    // Release everything that outlives the canvas: global listener, observer, pending frames.
+    destroy() {
+      dead = true;
+      window.removeEventListener("resize", onResize);
+      if (ro) ro.disconnect();
+      if (drawPending) { cancelAnimationFrame(drawPending); drawPending = 0; }
+      if (hoverPending) { cancelAnimationFrame(hoverPending); hoverPending = 0; }
+      points = []; labels = null; pointColors = null;
+    },
     setPoints(p) { points = p; setBounds(); draw(); },
     setPickFilter(fn) { pickFilter = typeof fn === "function" ? fn : null; },   // restrict click/hover to points where fn(i) is true
     setLabels(l) { labels = l; baseVer++; scheduleDraw(); },

@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from . import db
 from .config import settings
 
 # A pleasant default palette offered when creating a label (the UI may override).
@@ -27,12 +28,11 @@ def _now() -> str:
 
 class LabelManager:
     def __init__(self) -> None:
-        self._db: sqlite3.Connection | None = None
+        self._db: db.LockedConnection | None = None
 
     def init(self) -> None:
         settings.ensure_dirs()
-        self._db = sqlite3.connect(settings.db_path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
+        self._db = db.connect(settings.db_path)
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS labels (
@@ -94,8 +94,18 @@ class LabelManager:
         return self.get(lid)
 
     def delete(self, lid: str) -> None:
-        self._db.execute("DELETE FROM job_labels WHERE label_id=?", (lid,))
-        self._db.execute("DELETE FROM labels WHERE id=?", (lid,))
+        with self._db.transaction():   # both DELETEs land in one commit
+            self._db.execute("DELETE FROM job_labels WHERE label_id=?", (lid,))
+            self._db.execute("DELETE FROM labels WHERE id=?", (lid,))
+            self._db.commit()
+
+    def remove_jobs(self, job_ids: list[str]) -> None:
+        """Drop the associations of deleted jobs (their labels themselves stay).
+        Without this every deleted job left its job_labels rows behind forever."""
+        if not job_ids:
+            return
+        marks = ",".join("?" for _ in job_ids)
+        self._db.execute(f"DELETE FROM job_labels WHERE job_id IN ({marks})", tuple(job_ids))
         self._db.commit()
 
     # -- job <-> label associations ---------------------------------------

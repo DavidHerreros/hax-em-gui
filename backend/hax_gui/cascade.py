@@ -27,6 +27,7 @@ expected to have warned the user first — every entry point goes through a dial
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from .jobs import manager as jobs
@@ -81,8 +82,10 @@ async def invalidate(dependents: list[dict[str, Any]], cancel_running: bool = Fa
     running = [d for d in dependents if d.get("active")]
     if running and not cancel_running:
         raise DependentsRunning([dict(r) for r in running])
-    for job in running:
-        await jobs.cancel(job["id"])
+    if running:
+        # In parallel: each cancel waits out a 5 s SIGTERM grace, and doing them
+        # one after another held the caller's HTTP request for 5 s x N.
+        await asyncio.gather(*(jobs.cancel(job["id"]) for job in running))
     marked = jobs.mark_stale([d["id"] for d in dependents])
     return {"stale": marked, "cancelled": [r["id"] for r in running]}
 

@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [gui-improvements, main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        # The GUI backend is deliberately light (no JAX); numpy/scikit-image/mrcfile
+        # are only for the viewer meshing tests.
+        run: |
+          python -m pip install -U pip
+          pip install -e .
+          pip install pytest numpy scikit-image mrcfile
+      - name: Run tests
+        run: python -m pytest backend/tests -q
+
+  frontend-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Syntax-check every ES module
+        run: |
+          set -e
+          for f in $(find backend/hax_gui/frontend/js backend/hax_gui/viewer_app/static -name '*.js'); do
+            node --check --input-type=module < "$f" || { echo "FAILED: $f"; exit 1; }
+          done
+      - name: Cross-file import/export resolution
+        # node --check is per-file; an import of a missing export passes it and
+        # still blank-pages the whole SPA. See backend/tests/check_js_imports.py.
+        run: python3 backend/tests/check_js_imports.py

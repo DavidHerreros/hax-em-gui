@@ -8,7 +8,7 @@ const state = {
   leftCollapsed: false,
   pmCollapsed: false,   // project-manager (flash-card) rail collapsed?
   rightOpen: true,
-  openProjects: [],     // [{id, name}]
+  openProjects: [],     // [{id, name, path}] projects seen so far; only activeProjectId has a UI now
   activeProjectId: null,
   openMetrics: [],      // [{id, logdir, title, jobId}] — native metrics tabs, not persisted
   activeMetricsId: null,
@@ -17,6 +17,8 @@ const state = {
   selectedProgram: null, // program name shown in the right menu (null = catalog list)
   prefill: null,        // { program, values, gpu } to preload a form from a past job
   formNonce: 0,         // bumped whenever the launcher form should rebuild
+  lastJobId: null,      // run last selected in the job tree; Metrics / Viewer preselect it
+  projectRoute: "/project",   // where the Project tab was left (a run, or the overview), so the nav goes back there
 };
 
 (function restore() {
@@ -75,12 +77,23 @@ export const store = {
 
   // Metrics tabs are keyed by log directory, so opening the same run twice focuses
   // the tab that is already there instead of stacking duplicates.
+  //
+  // Opening a run *replaces* the ones that are not pinned. A panel is heavy — pollers,
+  // image sprites, a latent point cloud, possibly a WebGL context — and stays mounted
+  // while it is open; when picking a run became one click in the tree, browsing a
+  // project quietly stacked a panel per run until the browser tab ran out of memory.
+  // Pinning (the tab's pin) is how two runs are kept side by side on purpose.
   openMetrics({ logdir, title, subtitle, jobId }) {
     const existing = state.openMetrics.find((x) => x.id === logdir);
     if (existing) { if (jobId) existing.jobId = jobId; }
-    else state.openMetrics.push({ id: logdir, logdir, title: title || logdir, subtitle: subtitle || "", jobId: jobId || null });
+    else state.openMetrics.push({ id: logdir, logdir, title: title || logdir, subtitle: subtitle || "", jobId: jobId || null, pinned: false });
+    state.openMetrics = state.openMetrics.filter((x) => x.pinned || x.id === logdir);
     state.activeMetricsId = logdir;
     emit();
+  },
+  togglePinMetrics(id) {
+    const m = state.openMetrics.find((x) => x.id === id);
+    if (m) { m.pinned = !m.pinned; emit(); }
   },
   closeMetrics(id) {
     state.openMetrics = state.openMetrics.filter((x) => x.id !== id);
@@ -113,6 +126,9 @@ export const store = {
     if (changed) emit();
   },
 
+  setLastJob(id) { state.lastJobId = id || null; },   // no emit: nothing re-renders on it
+  setProjectRoute(path) { state.projectRoute = path || "/project"; },   // no emit: read on the next route change
+
   selectProgram(name) { state.selectedProgram = name; state.rightOpen = true; state.formNonce++; persist(); emit(); },
   clearProgram() { state.selectedProgram = null; state.formNonce++; emit(); },
 
@@ -143,10 +159,13 @@ export const store = {
   clearPrefill() { state.prefill = null; }, // consumed by the launcher; no emit
 
   // Open the launcher for `program` preloaded with `values` (an assistant
-  // proposal). No jobId → a NEW job: the user completes any required fields and
-  // launches it themselves. Nothing runs from this call.
-  prefillProgram({ program, values, gpu, name, projectId, projectName }) {
-    state.prefill = { program, values: { ...(values || {}) }, gpu: gpu || "", name: name || "" };
+  // proposal, or "reproduce as new run"). No jobId → a NEW job: the user completes
+  // any required fields and launches it themselves. Nothing runs from this call.
+  // `bindings` keeps inputs fed by another run bound rather than frozen to paths;
+  // `notice` is a warning banner the form shows (e.g. package-version mismatch).
+  prefillProgram({ program, values, gpu, name, projectId, projectName, bindings, notice }) {
+    state.prefill = { program, values: { ...(values || {}) }, gpu: gpu || "", name: name || "",
+                      bindings: bindings || null, notice: notice || "" };
     state.selectedProgram = program;
     state.rightOpen = true;
     state.formNonce++;

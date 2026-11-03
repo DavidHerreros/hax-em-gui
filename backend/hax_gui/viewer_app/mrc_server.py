@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
+import subprocess
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -33,15 +35,16 @@ import numpy as np
 # Be a good GPU citizen even though this backend never touches the GPU.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-# Run as a plain script (the GUI spawns `python mrc_server.py`), so the sibling
-# `server.py` is importable as a top-level module for the shared mesh/grid helpers.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Run as a plain script (the GUI spawns `python mrc_server.py`); the script's own
+# directory is on sys.path, so the sibling `meshing.py` imports as a top-level module.
 
 from fastapi import FastAPI, HTTPException, Query, Response  # noqa: E402
 from fastapi.responses import FileResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
-from server import _downsample, grid_box, level_for_mass, level_for_sigma, mesh_at  # noqa: E402
+from meshing import (_downsample, grid_box, level_for_mass, level_for_sigma, mesh_at,  # noqa: E402
+                     painted_mesh_at, remove_dust)
+import wirefmt  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -51,18 +54,102 @@ STATIC = Path(__file__).resolve().parent / "static"
 PALETTE = ["#c8c8c8", "#7fb3ff", "#ff9e7a", "#8fe08f", "#e79aff", "#ffd166", "#6fdccf", "#ff8fa8"]
 
 
-def _load_mrc(path: str) -> np.ndarray:
-    """Read a .mrc/.vol into a writable float32 3D grid (via xmipp ImageHandler)."""
-    from xmipp_metadata.image_handler import ImageHandler
+def _read_scale(path: str) -> tuple[float, list[float]]:
+    """(voxel size in A, origin in A) from the MRC/CCP4 header, best-effort.
 
-    vol = np.asarray(ImageHandler(path).getData(), dtype=np.float32)
+    These used to be discarded outright, which is what made the viewer purely
+    qualitative: no A scale, and multi-map comparison assumed identical
+    sampling. 1.0 / (0,0,0) when the header can't be read (e.g. Spider .vol)."""
+    try:
+        import mrcfile
+        with mrcfile.open(path, mode="r", permissive=True, header_only=True) as m:
+            vs = float(m.voxel_size.x) or 1.0
+            o = m.header.origin
+            origin = [float(o.x), float(o.y), float(o.z)]
+            return (round(vs, 5), origin)
+    except Exception:  # noqa: BLE001 - unsupported container: fall back to unscaled
+        return (1.0, [0.0, 0.0, 0.0])
+
+
+# Above this size the volume is memory-mapped read-only instead of loaded into
+# RAM: a 512³ float32 map is 512 MB, and several open viewers used to stack those
+# up. Everything downstream (stats, histogram, strided drafts, marching cubes,
+# dust labelling, morph blends) only READS the base array — the operations that
+# need writable data (blends, dust) allocate their own copies. The mrcfile
+# handles are kept alive for the process lifetime; the viewer is per-session.
+_MMAP_BYTES = int(os.environ.get("HAX_VIEWER_MMAP_MB", "512")) * 1024 * 1024
+_OPEN_MMAPS: list[Any] = []
+
+# How much encoded /api/grid payload the process may keep. Packing one is a strided copy plus
+# a normalize, a clip and a float16 conversion over the whole volume — measured at about a
+# second for a native 320³ f16 payload, against ~50 ms to hand the cached bytes back — and the
+# answer never changes, because a model's volume never changes. What made that worth caching is
+# the viewer's grid prefetch: it now asks for every map on the scene, and a mode flip or a
+# re-open asks for all of them again.
+#
+# The cap is global rather than per model because it is the process's memory that is at
+# stake, not any one map's: ten native f16 payloads are ~650 MB sitting on top of the
+# volumes they were cut from. Set HAX_VIEWER_GRID_CACHE_MB=0 to switch the cache off.
+#
+# Read as a float and then floored, unlike _MMAP_BYTES above, for two reasons: a fractional
+# megabyte is the only way to exercise eviction in a test without allocating a real gigabyte,
+# and `int("512.0")` raises — an env var with a decimal point in it should not take the
+# server down before it has served a request.
+_GRID_CACHE_BYTES = int(float(os.environ.get("HAX_VIEWER_GRID_CACHE_MB", "512")) * 1024 * 1024)
+
+
+def _load_mrc(path: str) -> np.ndarray:
+    """Read a volume into a writable float32 3D grid.
+
+    `.mrc`/`.vol` go through xmipp's ImageHandler like everywhere else in hax.
+    `.map`/`.ccp4` (and gzipped variants) are the *same* on-disk format, but
+    ImageHandler does not dispatch those suffixes (BINARIES stays None and
+    getData() returns None) — and `.map` is the extension every EMDB deposition
+    ships under, so anyone comparing against a reference map hit a dead end.
+    Read them with mrcfile directly: read-only + permissive, which also avoids
+    ImageHandler's habit of rewriting the header of a file it fails to parse
+    (deposited maps often live on read-only mounts)."""
+    name = Path(path).name.lower()
+    is_mrc_family = name.endswith((".mrc", ".map", ".ccp4"))
+    # Big MRC-convention file: map it instead of reading it. (Gzipped variants
+    # can't be mapped; ImageHandler formats have their own reader below.)
+    if is_mrc_family and os.path.getsize(path) > _MMAP_BYTES:
+        import mrcfile
+
+        m = mrcfile.mmap(path, mode="r", permissive=True)
+        if m.data is None or m.data.ndim not in (3, 4):
+            m.close()
+            raise ValueError(f"{path}: could not read volume data")
+        _OPEN_MMAPS.append(m)                  # the array dies with the handle
+        vol = m.data[0] if m.data.ndim == 4 else m.data
+        if vol.dtype != np.float32:
+            vol = np.asarray(vol, dtype=np.float32)   # non-float map: one real copy
+        return vol
+    if name.endswith((".map", ".ccp4", ".map.gz", ".mrc.gz", ".ccp4.gz")):
+        import mrcfile
+
+        with mrcfile.open(path, mode="r", permissive=True) as m:
+            if m.data is None:
+                raise ValueError(f"{path}: could not read volume data")
+            vol = np.asarray(m.data, dtype=np.float32)
+    else:
+        from xmipp_metadata.image_handler import ImageHandler
+
+        data = ImageHandler(path).getData()
+        if data is None:
+            raise ValueError(f"{path}: unsupported volume format")
+        vol = np.asarray(data, dtype=np.float32)
     vol = np.squeeze(vol)
     if vol.ndim == 4:
         vol = vol[0]
     if vol.ndim != 3:
         raise ValueError(f"{path} is not a 3D volume (got shape {vol.shape})")
-    # ImageHandler may hand back a read-only view; mesh_at / slicing need a copy.
-    return np.ascontiguousarray(vol, dtype=np.float32)
+    # Both readers can hand back a read-only view (mrcfile flags its data
+    # read-only; ImageHandler can return an mmap view), and mesh_at / slicing
+    # need a writable buffer. ascontiguousarray alone does NOT guarantee a
+    # copy, so force one when needed.
+    vol = np.ascontiguousarray(vol, dtype=np.float32)
+    return vol if vol.flags.writeable else vol.copy()
 
 
 class _Model:
@@ -73,6 +160,8 @@ class _Model:
         self.path = path
         self.name = path.name
         self.vol = vol
+        self.voxel_size, self.origin = _read_scale(str(path))
+        self._hist: dict[int, dict] = {}   # per-bins histogram cache (the volume never changes)
         self.stats = {
             "min": float(vol.min()), "max": float(vol.max()),
             "mean": float(vol.mean()), "std": float(vol.std()),
@@ -132,6 +221,45 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
+    # Encoded /api/grid payloads, newest last, under a lock because the sync endpoints run in
+    # starlette's threadpool and several tabs (or the viewer's own prefetch queue) can be in
+    # `grid` at once. Only /api/grid is cached: /api/paint/grid depends on the pair AND on the
+    # ± range the caller picked, /api/morph/grid on the blend fraction, and neither is issued
+    # in the volume the prefetch is. Nothing here has to think about dust or paint either —
+    # those are surface endpoints and never produce a grid payload.
+    grid_cache: OrderedDict[tuple[int, int, int], bytes] = OrderedDict()
+    grid_lock = threading.Lock()
+    # Exposed on the app so a test can tell a hit from a miss without timing it.
+    app.state.grid_cache_stats = {"hits": 0, "misses": 0, "bytes": 0, "entries": 0}
+
+    def _grid_cache_get(key: tuple[int, int, int]) -> bytes | None:
+        stats = app.state.grid_cache_stats
+        with grid_lock:
+            payload = grid_cache.get(key)
+            if payload is None:
+                stats["misses"] += 1
+                return None
+            grid_cache.move_to_end(key)      # least recently used first, for the eviction below
+            stats["hits"] += 1
+            return payload
+
+    def _grid_cache_put(key: tuple[int, int, int], payload: bytes) -> None:
+        # A payload too big for the whole budget is simply not cached: evicting everything
+        # else to hold one map would be worse than re-encoding it.
+        if _GRID_CACHE_BYTES <= 0 or len(payload) > _GRID_CACHE_BYTES:
+            return
+        stats = app.state.grid_cache_stats
+        with grid_lock:
+            old = grid_cache.pop(key, None)
+            if old is not None:
+                stats["bytes"] -= len(old)
+            grid_cache[key] = payload
+            stats["bytes"] += len(payload)
+            while stats["bytes"] > _GRID_CACHE_BYTES and len(grid_cache) > 1:
+                _, dead = grid_cache.popitem(last=False)
+                stats["bytes"] -= len(dead)
+            stats["entries"] = len(grid_cache)
+
     @app.get("/api/health")
     def health() -> dict:
         return {"ok": True, "models": len(scene.models)}
@@ -141,6 +269,10 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
         return {
             "title": title,
             "full_size": scene.full,
+            # What the viewer's morph pool is allowed to hold, in the only terms anything here
+            # can measure. Queried per request rather than at import because free memory is
+            # what the number is for and it moves.
+            "gpu_mem": _gpu_mem(),
             # Same grid everywhere => the frontend may offer to morph. None => it must not.
             "morph_shape": list(scene.morph_shape()) if scene.morph_shape() else None,
             "models": [
@@ -149,6 +281,8 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
                     "name": m.name,
                     "filename": str(m.path),
                     "shape": [int(s) for s in m.vol.shape],   # (nz, ny, nx), NumPy order
+                    "voxel_size": m.voxel_size,               # A per voxel (1.0 = unknown)
+                    "origin": m.origin,                       # A, from the header
                     "color": PALETTE[m.index % len(PALETTE)],
                     **m.stats,
                     "sigma_level": level_for_sigma(m.vol, 2.5),
@@ -160,13 +294,18 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
     @app.get("/api/histogram")
     def histogram(m: int = Query(0), bins: int = Query(96)) -> dict:
         model = scene.get(m)
-        counts, edges = np.histogram(model.vol.ravel(), bins=int(max(8, min(256, bins))))
-        return {
-            "counts": counts.astype(int).tolist(),
-            "edges": edges.astype(float).tolist(),
-            **model.stats,
-            "sigma_level": level_for_sigma(model.vol, 2.5),
-        }
+        nb = int(max(8, min(256, bins)))
+        cached = model._hist.get(nb)
+        if cached is None:
+            # A full-volume histogram is a whole-array pass (seconds at 512^3);
+            # the volume never changes, so pay it once per bin count.
+            counts, edges = np.histogram(model.vol.ravel(), bins=nb)
+            cached = model._hist[nb] = {
+                "counts": counts.astype(int).tolist(),
+                "edges": edges.astype(float).tolist(),
+                "sigma_level": level_for_sigma(model.vol, 2.5),
+            }
+        return {**cached, **model.stats}
 
     @app.get("/api/decode")
     def decode(
@@ -175,27 +314,104 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
         mass: float = Query(-1.0),     # >=0 -> contour at constant enclosed mass
         smooth: int = Query(0),        # Taubin smoothing iterations on the surface
         size: int = Query(0),          # >0 -> draft mesh from a strided grid this big
+        dust: int = Query(0),          # >0 -> hide components smaller than this (full-grid voxels)
     ) -> Response:
         model = scene.get(m)
         grid, step = model.grid_at(int(size))
         level = (level_for_mass(grid, mass / float(step) ** 3) if mass >= 0
                  else level_for_sigma(grid, sigma))
+        if dust > 0:
+            # The threshold is in full-resolution voxels; a strided draft's
+            # components hold step³ fewer of them.
+            grid = remove_dust(grid, level, max(1, int(dust) // step ** 3))
         full, off = scene.norm(model)
         return Response(content=mesh_at(grid, level, smooth=max(0, min(50, smooth)),
                                         step=step, full_size=full, offset=off),
                         media_type="application/octet-stream")
 
+    @app.get("/api/paint")
+    def paint(
+        m: int = Query(...),           # the map whose surface is contoured
+        other: int = Query(...),       # the map subtracted from it
+        sigma: float = Query(2.5),
+        smooth: int = Query(0),
+        size: int = Query(0),
+        prange: float = Query(-1.0),   # ± range of the ramp; <=0 -> 3× diff std
+    ) -> Response:
+        """Surface of map `m`, coloured by the local value of (m − other) — ChimeraX's
+        `color sample` applied to a difference map. Red = density lost, near-white =
+        unchanged, blue = gained. Same-grid only, like every voxel-wise op here."""
+        ma, mb = scene.get(m), scene.get(other)
+        if ma.vol.shape != mb.vol.shape:
+            raise HTTPException(status_code=400,
+                                detail=f"maps are on different grids: {ma.vol.shape} vs {mb.vol.shape}")
+        grid, step = ma.grid_at(int(size))
+        gb, step_b = mb.grid_at(int(size))
+        if step_b != step:             # same shapes stride identically; belt and braces
+            raise HTTPException(status_code=500, detail="draft strides diverged")
+        diff = grid - gb
+        level = level_for_sigma(grid, sigma)
+        full, off = scene.norm(ma)
+        return Response(content=painted_mesh_at(grid, diff, level,
+                                                smooth=max(0, min(50, smooth)), step=step,
+                                                full_size=full, offset=off,
+                                                prange=prange if prange > 0 else None),
+                        media_type="application/octet-stream")
+
+    @app.get("/api/paint/grid")
+    def paint_grid(m: int = Query(...), other: int = Query(...),
+                   size: int = Query(96), prange: float = Query(-1.0)) -> Response:
+        """The difference m − other as a 3D-texture payload on a SYMMETRIC range
+        (vmin = −r, vmax = +r), so the uint8 midpoint is exactly zero difference.
+        The volume ray-marcher renders it signed (red = lost, blue = gained) and
+        the slice view maps it through a diverging colormap — the same reading the
+        painted surface gives, in the other two modes."""
+        ma, mb = scene.get(m), scene.get(other)
+        if ma.vol.shape != mb.vol.shape:
+            raise HTTPException(status_code=400,
+                                detail=f"maps are on different grids: {ma.vol.shape} vs {mb.vol.shape}")
+        ga, step = ma.grid_at(int(max(16, min(256, size))))
+        gb, _ = mb.grid_at(int(max(16, min(256, size))))
+        diff = np.asarray(ga, dtype=np.float32) - gb
+        r = float(prange) if prange > 0 else (3.0 * float(diff.std()) or 1.0)
+        full, off = scene.norm(ma)
+        lo, hi = grid_box(ma.vol.shape, diff.shape, step, full_size=full, offset=off)
+        stats = {"mean": float(diff.mean()), "std": float(diff.std())}
+        return Response(content=_grid_payload(diff, stats, lo, hi, vrange=(-r, r)),
+                        media_type="application/octet-stream")
+
     @app.get("/api/grid")
-    def grid(m: int = Query(0), size: int = Query(96)) -> Response:
+    def grid(m: int = Query(0), size: int = Query(96), bits: int = Query(8)) -> Response:
         """Density as a compact uint8 3D-texture payload (same layout as server.py):
         int32 nx, ny, nz, then float32 vmin, vmax, mean, std, then float32 boxLo[3],
-        boxHi[3] (the model-space cube the grid occupies), then nx*ny*nz uint8."""
+        boxHi[3] (the model-space cube the grid occupies), then nx*ny*nz uint8.
+
+        `bits=16` returns the same thing with float16 samples under the GRID16 tag, and
+        raises the size cap to 384 so the shaded-isosurface mode can ask for the map at its
+        native resolution (a `size` at or above the box strides by 1, i.e. no downsampling
+        at all). Everything else keeps the uint8 payload and the 256 cap.
+
+        The bytes are cached per (model, requested size, sample width) — see the LRU above
+        the endpoints — because packing them is the expensive half of this and the volume
+        they are packed from never changes."""
         model = scene.get(m)
-        ds, step = _downsample(model.vol, int(max(16, min(256, size))))
-        full, off = scene.norm(model)
-        lo, hi = grid_box(model.vol.shape, ds.shape, step, full_size=full, offset=off)
-        return Response(content=_grid_payload(ds, model.stats, lo, hi),
-                        media_type="application/octet-stream")
+        cap = 384 if int(bits) == 16 else 256
+        want = int(max(16, min(cap, size)))
+        # Any size at or above the box strides by 1 and hands back the map itself, so a
+        # 384 request and a 200 request against a 200³ map are the same bytes. Folding them
+        # onto one key keeps the cache from holding the native payload twice — which is
+        # exactly what the viewer would cause, asking 256 in one mode and 384 in another.
+        want = min(want, int(max(model.vol.shape)))
+        wide = 16 if int(bits) == 16 else 8
+        key = (model.index, want, wide)
+        payload = _grid_cache_get(key)
+        if payload is None:
+            ds, step = _downsample(model.vol, want)
+            full, off = scene.norm(model)
+            lo, hi = grid_box(model.vol.shape, ds.shape, step, full_size=full, offset=off)
+            payload = _grid_payload(ds, model.stats, lo, hi, bits=bits)
+            _grid_cache_put(key, payload)
+        return Response(content=payload, media_type="application/octet-stream")
 
     @app.get("/api/morph/grid")
     def morph_grid(a: int = Query(...), b: int = Query(...), t: float = Query(0.5),
@@ -237,6 +453,120 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
                                         step=step, full_size=full, offset=off),
                         media_type="application/octet-stream")
 
+    @app.get("/api/morph/export")
+    def morph_export(seq: str = Query(...), per: int = Query(24)) -> FileResponse:
+        """Every frame of a morph as real full-resolution ``.mrc`` files, zipped.
+
+        For figures and analyses made outside the GUI: the in-app recording is a
+        webm of the rendered view, whereas this is the density itself, one map per
+        frame, on the maps' own grid with the voxel size stamped.
+        """
+        try:
+            idx = [int(s) for s in seq.split(",") if s.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="seq must be comma-separated model indices")
+        if len(idx) < 2:
+            raise HTTPException(status_code=400, detail="a morph needs at least two maps")
+        mods = [scene.get(i) for i in idx]
+        if len({m.vol.shape for m in mods}) != 1:
+            raise HTTPException(status_code=400, detail="cannot morph maps on different grids")
+        per = int(max(2, min(120, per)))
+        n = (len(mods) - 1) * per + 1
+        if n * mods[0].vol.nbytes > 2 * 1024 ** 3:
+            raise HTTPException(status_code=400,
+                                detail=f"{n} frames of this box would exceed 2 GB — reduce frames per leg")
+
+        import tempfile
+        import zipfile
+
+        import mrcfile
+
+        pad = max(3, len(str(n - 1)))
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        frame = tempfile.NamedTemporaryFile(suffix=".mrc", delete=False)
+        try:
+            with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as z:
+                for k in range(n):
+                    leg = min(k // per, len(mods) - 2)
+                    t = (k - leg * per) / per
+                    blend = np.ascontiguousarray(
+                        (1.0 - t) * mods[leg].vol + t * mods[leg + 1].vol, dtype=np.float32)
+                    with mrcfile.new(frame.name, overwrite=True) as f:
+                        f.set_data(blend)
+                        f.voxel_size = mods[0].voxel_size
+                    z.write(frame.name, arcname=f"morph_{k:0{pad}d}.mrc")
+        finally:
+            os.unlink(frame.name)
+        return FileResponse(tmp.name, media_type="application/zip", filename="morph_frames.zip")
+
+    @app.post("/api/compute")
+    def compute(op: str = Query(...), a: int = Query(...), b: int = Query(...)) -> dict:
+        """Map arithmetic: add a derived model (A−B / A+B / A×B) to the scene.
+
+        Same-grid only, like the morph — blending mismatched grids voxel-wise would
+        be silently wrong. The result is written to a real temp .mrc (voxel size
+        stamped from A) so the download button works on it like on any other map.
+        """
+        ma, mb = scene.get(a), scene.get(b)
+        if ma.vol.shape != mb.vol.shape:
+            raise HTTPException(status_code=400,
+                                detail=f"maps are on different grids: {ma.vol.shape} vs {mb.vol.shape}")
+        stem = lambda m_: m_.name.rsplit(".", 1)[0]  # noqa: E731
+        if op == "diffpm":
+            # Two-sided difference: the (+) model is the density A gained over B, the
+            # (−) model the density it lost (i.e. B − A). Each is an ordinary map
+            # contoured at a positive level, which is exactly the green/red pair a
+            # difference-map figure uses — the frontend colours them accordingly.
+            plus = _add_derived(scene, ma.vol - mb.vol, f"{stem(ma)} − {stem(mb)} (+).mrc", ma)
+            minus = _add_derived(scene, mb.vol - ma.vol, f"{stem(ma)} − {stem(mb)} (−).mrc", ma)
+            return {"index": plus.index, "name": plus.name, "pair": [plus.index, minus.index]}
+        ops = {"diff": (np.subtract, "−"), "sum": (np.add, "+"), "mult": (np.multiply, "×")}
+        if op not in ops:
+            raise HTTPException(status_code=400, detail=f"unknown op {op!r} (diff/diffpm/sum/mult)")
+        fn, sym = ops[op]
+        model = _add_derived(scene, fn(ma.vol, mb.vol), f"{stem(ma)} {sym} {stem(mb)}.mrc", ma)
+        return {"index": model.index, "name": model.name}
+
+    @app.get("/api/pdb")
+    def pdb(path: str = Query(...)) -> dict:
+        """Backbone trace of a PDB file: CA (protein) / P (nucleic) atoms per chain,
+        in Å. The frontend places it over the maps using voxel size + origin."""
+        p, chains = _read_backbone(path)
+        return {"name": p.name,
+                "chains": [{"id": cid, "xyz": [c for xyz in pts for c in xyz]}
+                           for cid, pts in chains.items()]}
+
+    @app.get("/api/fit")
+    def fit(path: str = Query(...), m: int = Query(0)) -> dict:
+        """How well the model sits in the map: the density (in σ units) sampled at
+        each backbone atom. A cheap, honest sanity number — mean σ well above 0
+        and most atoms above 1σ means the fit is at least plausible; it is not a
+        cross-correlation refinement score and does not pretend to be."""
+        model = scene.get(m)
+        _, chains = _read_backbone(path)
+        xyz = np.array([pt for pts in chains.values() for pt in pts], dtype=np.float64)
+        vs = model.voxel_size or 1.0
+        org = np.asarray(model.origin, dtype=np.float64)
+        # Å -> voxel indices; the volume is (z, y, x) so the sample coordinates flip.
+        vox = (xyz - org[None, :]) / vs
+        from scipy.ndimage import map_coordinates
+        vals = map_coordinates(model.vol, [vox[:, 2], vox[:, 1], vox[:, 0]],
+                               order=1, mode="constant", cval=np.nan)
+        inside = np.isfinite(vals)
+        n_in = int(inside.sum())
+        if n_in == 0:
+            raise HTTPException(status_code=400,
+                                detail="no atoms fall inside this map — wrong map, or the "
+                                       "model is in a different coordinate frame")
+        sig = (vals[inside] - model.stats["mean"]) / (model.stats["std"] or 1.0)
+        return {
+            "n_atoms": int(len(xyz)),
+            "n_inside": n_in,
+            "mean_sigma": round(float(sig.mean()), 2),
+            "median_sigma": round(float(np.median(sig)), 2),
+            "frac_above_1sigma": round(float((sig > 1.0).mean()), 3),
+        }
+
     @app.get("/api/mrc")
     def mrc(m: int = Query(0)) -> FileResponse:
         model = scene.get(m)
@@ -254,6 +584,57 @@ def build_app(scene: _Scene, title: str = "Map") -> FastAPI:
     return app
 
 
+def _read_backbone(path: str) -> tuple[Path, dict[str, list[list[float]]]]:
+    """CA/P atoms per chain from a PDB file, in Å — shared by the overlay and the
+    fit score so the two always agree on which atoms they mean."""
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail=f"not found: {path}")
+    if p.stat().st_size > 200 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="file too large for a PDB")
+    chains: dict[str, list[list[float]]] = {}
+    try:
+        opener = __import__("gzip").open if p.name.endswith(".gz") else open
+        with opener(p, "rt", errors="replace") as f:
+            for line in f:
+                if not line.startswith(("ATOM  ", "HETATM")):
+                    continue
+                atom = line[12:16].strip()
+                if atom not in ("CA", "P"):
+                    continue
+                if line[16] not in (" ", "A"):     # altloc: keep the first conformer
+                    continue
+                chain = line[21].strip() or "?"
+                chains.setdefault(chain, []).append(
+                    [float(line[30:38]), float(line[38:46]), float(line[46:54])])
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=f"could not parse {p.name}: {exc}")
+    if not chains:
+        raise HTTPException(status_code=400,
+                            detail=f"no CA/P atoms in {p.name} — is it a PDB-format file?")
+    return p, chains
+
+
+def _add_derived(scene: _Scene, vol: np.ndarray, name: str, like: _Model) -> _Model:
+    """Append a computed grid as a new model, backed by a real temp .mrc so the
+    download button works on it like on any loaded map. Scale is inherited from
+    the map it was derived from."""
+    import tempfile
+
+    import mrcfile
+
+    vol = np.ascontiguousarray(vol, dtype=np.float32)
+    tmp = tempfile.NamedTemporaryFile(suffix=".mrc", delete=False)
+    with mrcfile.new(tmp.name, overwrite=True) as f:
+        f.set_data(vol)
+        f.voxel_size = like.voxel_size
+    model = _Model(len(scene.models), Path(tmp.name), vol)
+    model.name = name                      # display name, not the temp path
+    model.voxel_size, model.origin = like.voxel_size, list(like.origin)
+    scene.models.append(model)
+    return model
+
+
 def _morph_pair(scene: _Scene, a: int, b: int) -> tuple[np.ndarray, np.ndarray]:
     """The two maps to blend, refusing the pairs that cannot be blended honestly."""
     va, vb = scene.get(a).vol, scene.get(b).vol
@@ -264,17 +645,55 @@ def _morph_pair(scene: _Scene, a: int, b: int) -> tuple[np.ndarray, np.ndarray]:
     return va, vb
 
 
-def _grid_payload(ds: np.ndarray, stats: dict[str, Any], lo, hi) -> bytes:
-    """Pack a downsampled grid into the binary layout the ray-marcher parses."""
-    vmin, vmax = float(ds.min()), float(ds.max())
-    u8 = np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8)
+def _gpu_mem() -> dict[str, int] | None:
+    """Total and free memory of the first GPU, or None if that cannot be established.
+
+    Advisory, and the frontend treats it that way: this is the SERVER's card. It is the right
+    number when the browser is on the same machine (the usual case — the viewer is normally
+    opened next to the job that produced the maps) or when both render against the same GPU,
+    and it is merely a plausible one otherwise. Which is why the viewer exposes a manual
+    override next to the value it derives from this: a remote user with a laptop GPU and a
+    compute node's A100 in this field would otherwise be handed a budget it cannot honour.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2.0, check=True).stdout
+        total, free = (int(v.strip()) for v in out.splitlines()[0].split(","))
+        return {"total_mb": total, "free_mb": free}
+    except Exception:      # noqa: BLE001 - no nvidia-smi, no GPU, a timeout, odd output: all "unknown"
+        return None
+
+
+def _grid_payload(ds: np.ndarray, stats: dict[str, Any], lo, hi, vrange=None,
+                  bits: int = 8) -> bytes:
+    """Pack a downsampled grid into the binary layout the ray-marcher parses.
+
+    `vrange` fixes the (vmin, vmax) window instead of using the data's own extrema —
+    difference grids use a symmetric window so uint8 128 lands on zero; values
+    outside it clip, exactly as the painted surface's ramp clips.
+
+    `bits=16` swaps the uint8 samples for IEEE float16 under a different wire tag
+    (wirefmt.GRID16). Same header, same 0..1 normalization, same everything else: only the
+    shaded-isosurface mode asks for it, because it is the only mode that shades the grid
+    rather than integrating along it. The uint8 branch is byte-for-byte what it always was."""
+    vmin, vmax = (float(ds.min()), float(ds.max())) if vrange is None else (float(vrange[0]), float(vrange[1]))
     nx, ny, nz = ds.shape[2], ds.shape[1], ds.shape[0]
+    if int(bits) == 16:
+        data = np.ascontiguousarray(
+            np.clip((ds - vmin) / (vmax - vmin + 1e-9), 0.0, 1.0), dtype="<f2")
+        tag = wirefmt.GRID16
+    else:
+        data = np.ascontiguousarray(
+            np.clip((ds - vmin) / (vmax - vmin + 1e-9) * 255.0, 0, 255).astype(np.uint8))
+        tag = wirefmt.GRID
     header = (
-        np.array([nx, ny, nz], dtype="<i4").tobytes()
+        wirefmt.header(tag)
+        + np.array([nx, ny, nz], dtype="<i4").tobytes()
         + np.array([vmin, vmax, stats["mean"], stats["std"]], dtype="<f4").tobytes()
         + np.array(list(lo) + list(hi), dtype="<f4").tobytes()
     )
-    return header + np.ascontiguousarray(u8).tobytes()
+    return header + data.tobytes()
 
 
 def main() -> None:

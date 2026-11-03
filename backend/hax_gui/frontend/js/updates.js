@@ -108,7 +108,15 @@ export function UpdateBanner() {
       )
     );
   };
-  subscribeUpdates(render);
+  // HomeView returns a bare node (no cleanup), so this used to leak one
+  // subscription + a detached banner tree per visit to Home. Self-prune: once
+  // the banner has been in the document and no longer is, unsubscribe.
+  let wasConnected = false;
+  const unsub = subscribeUpdates((s) => {
+    wasConnected = wasConnected || el.isConnected;
+    if (wasConnected && !el.isConnected) { unsub(); return; }
+    render(s);
+  });
   return el;
 }
 

@@ -247,8 +247,10 @@ export function paramForm(schema, fields, opts = {}) {
   return {
     el,
     /** Show server-side (422) validation errors, opening and revealing the first
-     *  offending field — otherwise an error inside a collapsed group is invisible. */
-    setErrors(map) {
+     *  offending field — otherwise an error inside a collapsed group is invisible.
+     *  `scroll: false` keeps the marks and the opened groups but leaves the panel where
+     *  it is, for a caller that re-flags the same form on every re-render. */
+    setErrors(map, { scroll = true } = {}) {
       errors = { ...map };
       const names = Object.keys(errors);
       if (names.length) {
@@ -257,7 +259,7 @@ export function paramForm(schema, fields, opts = {}) {
         for (const f of fields) if (errors[f.name]) ui.open.add(f.group || "General");
       }
       renderGroups();
-      const first = names.length && groupsEl.querySelector(`.field[data-field="${CSS.escape(names[0])}"]`);
+      const first = scroll && names.length && groupsEl.querySelector(`.field[data-field="${CSS.escape(names[0])}"]`);
       if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
     },
     clearErrors() {

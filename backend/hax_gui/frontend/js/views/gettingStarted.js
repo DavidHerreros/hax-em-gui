@@ -30,7 +30,7 @@ import { navigate } from "../router.js";
 import { store, getState, subscribe } from "../store.js";
 import { coachmark } from "../coachmark.js";
 import { requestSettingsHighlight } from "./settings.js";
-import { openProjectChooser } from "./projects.js";
+import { openProjectChooser } from "./projectOverview.js";
 import { rememberWorkflowToOpen } from "./workflows.js";
 
 const HIDE_KEY = "hax_gui_getting_started_hidden";

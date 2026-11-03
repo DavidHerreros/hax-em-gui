@@ -14,6 +14,9 @@ const CMAPS = {
   magma: [[0, 0, 4], [81, 18, 124], [183, 55, 121], [252, 137, 97], [252, 253, 191]],
   inferno: [[0, 0, 4], [87, 16, 110], [188, 55, 84], [249, 142, 9], [252, 255, 164]],
   hot: [[10, 0, 0], [230, 0, 0], [255, 210, 0], [255, 255, 255]],
+  // Difference maps: red = below zero (lost density), white = zero, blue = above
+  // (gained) — assumes the grid was normalized on a symmetric range so mid = 0.
+  diverging: [[212, 63, 63], [242, 242, 242], [63, 112, 212]],
 };
 
 function makeLUT(name) {
@@ -34,6 +37,7 @@ export function createSlices(container) {
   let lut = makeLUT("gray");
   let crosshair = true;
   let bg = "#04060f";
+  let angPerVox = 0;                      // Å per *grid* voxel (0 = unknown → no Å anywhere)
   const pos = { x: 0, y: 0, z: 0 };       // current slice indices
 
   // One panel per cut. `w`/`h` map a slice to its (col,row); `set` turns a click
@@ -111,19 +115,33 @@ export function createSlices(container) {
   let drag = null;
   function onDown(p, e) {
     if (!grid) return;
+    // Shift+drag measures an in-plane distance instead of panning. A plain
+    // shift+click (no drag) clears the panel's measurement.
+    if (e.shiftKey) {
+      const { px, py } = devPos(p, e);
+      const v = voxelAt(p, px, py);
+      if (v) { drag = { p, measure: true, moved: false, c0: v.c, r0: v.r }; p.measure = null; drawPanel(p); }
+      try { p.canvas.setPointerCapture(e.pointerId); } catch {}
+      return;
+    }
     drag = { p, ...devPos(p, e), moved: false, panx: p.view.panx, pany: p.view.pany };
     try { p.canvas.setPointerCapture(e.pointerId); } catch {}
   }
   function onMove(p, e) {
     if (!drag || drag.p !== p) return;
     const { px, py } = devPos(p, e);
+    if (drag.measure) {
+      const v = voxelAt(p, px, py);
+      if (v) { drag.moved = true; p.measure = { c0: drag.c0, r0: drag.r0, c1: v.c, r1: v.r }; drawPanel(p); }
+      return;
+    }
     const dx = px - drag.px, dy = py - drag.py;
     if (!drag.moved && Math.hypot(dx, dy) > 3) drag.moved = true;
     if (drag.moved) { p.view.panx = drag.panx + dx; p.view.pany = drag.pany + dy; drawPanel(p); }
   }
   function onUp(p, e) {
     try { p.canvas.releasePointerCapture(e.pointerId); } catch {}
-    if (drag && drag.p === p && !drag.moved) { const { px, py } = devPos(p, e); recenter(p, px, py); }
+    if (drag && drag.p === p && !drag.moved && !drag.measure) { const { px, py } = devPos(p, e); recenter(p, px, py); }
     drag = null;
   }
   function onWheel(p, e) {
@@ -186,6 +204,44 @@ export function createSlices(container) {
       ctx.moveTo(ox, cy); ctx.lineTo(ox + w * s, cy);
       ctx.stroke();
     }
+
+    // Scale bar (bottom-left): a round-number length (1/2/5×10^k Å) that fits in
+    // ~a third of the panel. Exact — s is pixels per grid voxel and angPerVox is
+    // Å per grid voxel, both known, no projection involved.
+    if (angPerVox > 0) {
+      const angPerPx = angPerVox / s;
+      const target = cw * 0.28 * angPerPx;              // Å in ~28% of the panel width
+      const pow = Math.pow(10, Math.floor(Math.log10(target)));
+      const nice = [5, 2, 1].map((k) => k * pow).find((v) => v <= target) || pow;
+      const px = nice / angPerPx;
+      const y = ch - 14 * r, x0 = 12 * r;
+      ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = Math.max(2, r);
+      ctx.beginPath();
+      ctx.moveTo(x0, y); ctx.lineTo(x0 + px, y);
+      ctx.moveTo(x0, y - 4 * r); ctx.lineTo(x0, y + 4 * r);
+      ctx.moveTo(x0 + px, y - 4 * r); ctx.lineTo(x0 + px, y + 4 * r);
+      ctx.stroke();
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.font = `${11 * r}px system-ui, sans-serif`;
+      ctx.fillText(`${nice} Å`, x0 + px + 6 * r, y + 4 * r);
+    }
+
+    // Measurement (shift+drag): line + in-plane distance. Å when the header gave a
+    // voxel size, plain voxels otherwise — never a number in fake units.
+    if (p.measure) {
+      const mm = p.measure;
+      const x0 = ox + mm.c0 * s, y0 = oy + mm.r0 * s, x1 = ox + mm.c1 * s, y1 = oy + mm.r1 * s;
+      ctx.strokeStyle = "rgba(255,209,102,0.95)"; ctx.lineWidth = Math.max(1.5, r);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      for (const [xx, yy] of [[x0, y0], [x1, y1]]) {
+        ctx.beginPath(); ctx.arc(xx, yy, 3 * r, 0, 2 * Math.PI); ctx.stroke();
+      }
+      const dvox = Math.hypot(mm.c1 - mm.c0, mm.r1 - mm.r0);
+      const label = angPerVox > 0 ? `${(dvox * angPerVox).toFixed(1)} Å` : `${dvox.toFixed(1)} vox`;
+      ctx.fillStyle = "rgba(255,209,102,0.95)";
+      ctx.font = `${11 * r}px system-ui, sans-serif`;
+      ctx.fillText(label, (x0 + x1) / 2 + 8 * r, (y0 + y1) / 2 - 6 * r);
+    }
     p.idx.textContent = `${cut.axis} = ${pos[cut.axis]} / ${(cut.axis === "z" ? grid.nz : cut.axis === "y" ? grid.ny : grid.nx) - 1}`;
   }
 
@@ -219,10 +275,15 @@ export function createSlices(container) {
         const n = p.cut.axis === "z" ? g.nz : p.cut.axis === "y" ? g.ny : g.nx;
         p.slider.max = String(n - 1);
       }
+      if (!same) for (const k in panels) panels[k].measure = null;   // stale coordinates
       syncSliders();
-      info.textContent = `${g.nx} × ${g.ny} × ${g.nz} voxels · click = re-center · wheel = zoom · drag = pan · slider = scroll`;
+      const phys = angPerVox > 0 ? ` · ${(g.nx * angPerVox).toFixed(0)} × ${(g.ny * angPerVox).toFixed(0)} × ${(g.nz * angPerVox).toFixed(0)} Å` : "";
+      info.textContent = `${g.nx} × ${g.ny} × ${g.nz} voxels${phys} · click = re-center · shift+drag = measure · wheel = zoom · drag = pan`;
       drawAll();
     },
+    // Å per grid voxel (already including any downsampling stride). 0/undefined
+    // means unknown: no scale bar, distances reported in voxels.
+    setScale(ang) { angPerVox = +ang > 0 ? +ang : 0; drawAll(); },
     setContrast(l, h) { lo = Math.max(0, Math.min(1, l)); hi = Math.max(lo + 1e-3, Math.min(1, h)); drawAll(); },
     setColormap(name) { lut = makeLUT(name); drawAll(); },
     setCrosshair(on) { crosshair = !!on; drawAll(); },

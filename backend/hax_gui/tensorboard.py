@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from . import children
 from .files import AccessDenied, resolve
 
 
@@ -33,6 +34,9 @@ class TensorBoardManager:
         # logdir(str) -> instance dict; reused so we don't spawn duplicates.
         self._by_logdir: dict[str, dict[str, Any]] = {}
         self._by_id: dict[str, dict[str, Any]] = {}
+        # ensure() is check-then-spawn; without this two concurrent requests for
+        # the same logdir each spawned a TensorBoard and one leaked untracked.
+        self._spawn_locks: dict[str, Any] = {}
 
     def get(self, tb_id: str) -> dict[str, Any] | None:
         return self._by_id.get(tb_id)
@@ -47,33 +51,51 @@ class TensorBoardManager:
             raise FileNotFoundError(f"log directory not found: {target}")
         key = str(target)
 
-        existing = self._by_logdir.get(key)
-        if existing and existing["proc"].poll() is None:
-            return self._public(existing)
+        async with self._spawn_locks.setdefault(key, _lock()):
+            existing = self._by_logdir.get(key)
+            if existing and existing["proc"].poll() is None:
+                return self._public(existing)
 
-        tb_id = secrets.token_urlsafe(9)
-        port = _free_port()
-        prefix = f"/tb/{tb_id}"
-        proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "tensorboard.main",
-                "--logdir", str(target),
-                "--host", "127.0.0.1",
-                "--port", str(port),
-                "--path_prefix", prefix,
-                # Poll the event files often: a live training run should show up on the
-                # curves promptly, not on TB's 5s-ish default cadence behind a writer
-                # that only flushes periodically.
-                "--reload_interval", "5",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-        )
-        instance = {"id": tb_id, "port": port, "prefix": prefix, "logdir": key, "proc": proc}
-        await self._wait_ready(instance)
-        self._by_logdir[key] = instance
-        self._by_id[tb_id] = instance
-        return self._public(instance)
+            tb_id = secrets.token_urlsafe(9)
+            prefix = f"/tb/{tb_id}"
+            last_exc: BaseException | None = None
+            # The probed port can be taken between the probe and TB's own bind.
+            # TB's output goes to /dev/null, so a startup exit can't be classified —
+            # a fresh port is cheap enough to retry on any startup death.
+            for _ in range(3):
+                port = _free_port()
+                proc = subprocess.Popen(
+                    [
+                        sys.executable, "-m", "tensorboard.main",
+                        "--logdir", str(target),
+                        "--host", "127.0.0.1",
+                        "--port", str(port),
+                        "--path_prefix", prefix,
+                        # Poll the event files often: a live training run should show up on the
+                        # curves promptly, not on TB's 5s-ish default cadence behind a writer
+                        # that only flushes periodically.
+                        "--reload_interval", "5",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.STDOUT,
+                )
+                children.register("tb", proc.pid)
+                instance = {"id": tb_id, "port": port, "prefix": prefix, "logdir": key, "proc": proc}
+                try:
+                    await self._wait_ready(instance)
+                    break
+                except BaseException as exc:
+                    # Never tracked, so nothing else would ever reap it.
+                    children.release(proc)
+                    if isinstance(exc, RuntimeError):
+                        last_exc = exc
+                        continue
+                    raise
+            else:
+                raise last_exc
+            self._by_logdir[key] = instance
+            self._by_id[tb_id] = instance
+            return self._public(instance)
 
     async def _wait_ready(self, instance: dict[str, Any], timeout: float = 40.0) -> None:
         url = f"http://127.0.0.1:{instance['port']}{instance['prefix']}/"
@@ -96,10 +118,7 @@ class TensorBoardManager:
         if not inst:
             return False
         self._by_logdir.pop(inst["logdir"], None)
-        try:
-            inst["proc"].terminate()
-        except OSError:
-            pass
+        children.release(inst["proc"])
         return True
 
     async def restart(self, tb_id: str) -> dict[str, Any] | None:
@@ -119,10 +138,7 @@ class TensorBoardManager:
 
     def shutdown(self) -> None:
         for inst in list(self._by_id.values()):
-            try:
-                inst["proc"].terminate()
-            except OSError:
-                pass
+            children.release(inst["proc"])
 
     @staticmethod
     def _public(instance: dict[str, Any]) -> dict[str, Any]:
@@ -140,6 +156,10 @@ import asyncio  # noqa: E402
 
 def _loop_time() -> float:
     return asyncio.get_event_loop().time()
+
+
+def _lock() -> "asyncio.Lock":
+    return asyncio.Lock()
 
 
 async def _sleep(seconds: float) -> None:

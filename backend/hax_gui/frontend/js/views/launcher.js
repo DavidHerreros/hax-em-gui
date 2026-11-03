@@ -3,7 +3,12 @@
 import { h, mount, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api, ApiError } from "../api.js";
-import { navigate } from "../router.js";
+import { navigate, currentPath, reload } from "../router.js";
+
+// Go to `path`, or rebuild the page when it is already the one on screen: setting an
+// unchanged hash fires no hashchange, so "open the run you just relaunched" used to
+// leave the old, finished view in place.
+function goTo(path) { if (currentPath() === path) reload(); else navigate(path); }
 import { store, getState, subscribe } from "../store.js";
 import { errorBox } from "./ui.js";
 import { initialValues, visibleFields } from "./formFields.js";
@@ -13,15 +18,27 @@ import { confirmJobCascade } from "./cascadeModal.js";
 
 const CATEGORY_ORDER = ["Preprocessing", "Networks", "Post-processing", "Metrics", "Viewers", "Other"];
 
+// Per-program page on the docs site (mkdocs: docs/programs/<name>.md → /programs/<name>/).
+// Programs without a page yet land on the programs index rather than a 404.
+const DOCS_BASE = "https://davidherreros.github.io/hax-em-docs/";
+const DOCS_MISSING = new Set(["reconsiren_het_only", "reconstruct_motion_corrected"]);
+const docsUrlFor = (name) => DOCS_BASE + "programs/" + (DOCS_MISSING.has(name) ? "" : name + "/");
+
 export function buildLauncher() {
   const content = h("div", { class: "launcher-content" });
   let programsCache = null;
   let formCleanup = null;
   let lastNonce;
+  // Generation counter: buildForm resolves asynchronously, and a fast program
+  // switch used to let a stale buildForm append into a detached body and
+  // register a store subscription nothing would ever clean up (one leaked
+  // subscription + retained form tree per switch).
+  let renderGen = 0;
 
   const programs = () => programsCache || (programsCache = api.programs());
 
   function render() {
+    renderGen += 1;
     if (formCleanup) { formCleanup(); formCleanup = null; }
     clear(content);
     const sel = getState().selectedProgram;
@@ -71,7 +88,11 @@ export function buildLauncher() {
   function renderProgram(name) {
     const head = h("div", { class: "launcher-head" },
       h("button", { class: "btn-icon", style: { border: "none", padding: "0 8px 0 0" }, title: "Back", onclick: () => store.clearProgram() }, icon("arrowLeft", 18)),
-      h("span", { class: "mono", style: { color: "var(--accent)" } }, name));
+      h("span", { class: "mono", style: { color: "var(--accent)" } }, name),
+      h("a", { class: "btn-icon", style: { marginLeft: "auto", border: "none" }, href: docsUrlFor(name),
+               target: "_blank", rel: "noreferrer",
+               title: "Open this program's documentation (parameters explained, examples, workflows)" },
+        icon("book", 16)));
     content.appendChild(head);
     const body = h("div", { class: "launcher-body" });
     content.appendChild(body);
@@ -85,9 +106,10 @@ export function buildLauncher() {
     const jobsP = wantNames && getState().activeProjectId
       ? api.projectJobs(getState().activeProjectId).catch(() => [])
       : Promise.resolve([]);
+    const gen = renderGen;
     Promise.all([api.program(name), api.gpus().catch(() => []), jobsP])
-      .then(([schema, gpus, projJobs]) => buildForm(body, schema, gpus, projJobs))
-      .catch((err) => mount(body, errorBox(err)));
+      .then(([schema, gpus, projJobs]) => { if (gen === renderGen) buildForm(body, schema, gpus, projJobs); })
+      .catch((err) => { if (gen === renderGen) mount(body, errorBox(err)); });
   }
 
   function buildForm(body, schema, gpus, projJobs = []) {
@@ -110,7 +132,9 @@ export function buildLauncher() {
     // Preload from a past job ("Edit" / "Edit & rerun"), keeping only visible fields
     // so the auto-managed output/SSD dirs regenerate. Editing reuses the source job.
     const prefill = getState().prefill;
+    let prefillNotice = "";     // warning banner carried by the prefill (version drift)
     if (prefill && prefill.program === schema.name) {
+      prefillNotice = prefill.notice || "";
       const visible = new Set(visibleFields(schema).map((f) => f.name));
       for (const [k, v] of Object.entries(prefill.values || {})) if (visible.has(k)) values[k] = v;
       if (prefill.gpu) gpu = String(prefill.gpu);
@@ -140,6 +164,7 @@ export function buildLauncher() {
     // settings that aren't program parameters at all.
     const intro = h("div", { class: "pf-intro" });
     intro.appendChild(h("p", { class: "field-help", style: { margin: "0 0 12px" } }, schema.description));
+    if (prefillNotice) intro.appendChild(h("div", { class: "prefill-notice" }, prefillNotice));
 
     // Optional custom run name (makes executions easy to identify).
     intro.appendChild(h("div", { class: "field" },
@@ -197,7 +222,10 @@ export function buildLauncher() {
           ...gpus.map((g) => h("option", { value: String(g.index), selected: String(g.index) === gpu }, `GPU ${g.index}`)))
       : null;
     const runBtn = h("button", { class: "btn", style: { flex: "1" }, onclick: () => submit(true) }, icon("play", 18), h("span", null, "Run"));
-    const saveBtn = h("button", { class: "btn secondary", style: { width: "100%", justifyContent: "center" }, title: "Prepare this job and save it to run later", onclick: () => submit(false) }, icon("save", 16), h("span", null, "Save job"));
+    const saveBtn = h("button", { class: "btn secondary", style: { flex: "1", justifyContent: "center" }, title: "Prepare this job and save it to run later", onclick: () => submit(false) }, icon("save", 16), h("span", null, "Save job"));
+    const sweepBtn = h("button", { class: "btn secondary", style: { flex: "1", justifyContent: "center" },
+      title: "Launch several runs at once, varying ONE parameter over a list of values — the GPU queue runs them in turn",
+      onclick: () => sweep() }, icon("sliders", 16), h("span", null, "Sweep…"));
     const runBar = h("div", { class: "launcher-run" });
     body.appendChild(runBar);
 
@@ -207,14 +235,14 @@ export function buildLauncher() {
       if (!proj) {
         runBar.appendChild(h("div", { class: "run-hint" },
           h("span", { class: "muted" }, "Open a project to run programs."),
-          h("button", { class: "btn secondary", onclick: () => navigate("/projects") }, "Go to Projects")));
+          h("button", { class: "btn secondary", onclick: () => navigate("/project") }, "Open a project")));
         return;
       }
       runBtn.disabled = false;
       saveBtn.disabled = false;
       runBar.appendChild(h("div", { class: "run-target" }, "Run in ", h("strong", null, proj.name)));
       runBar.appendChild(h("div", { class: "row", style: { gap: "8px" } }, gpuSel, runBtn));
-      runBar.appendChild(h("div", { class: "row", style: { marginTop: "8px" } }, saveBtn));
+      runBar.appendChild(h("div", { class: "row", style: { marginTop: "8px", gap: "8px" } }, saveBtn, sweepBtn));
     }
     formCleanup = subscribe(refreshRunBar);
     refreshRunBar();
@@ -257,7 +285,8 @@ export function buildLauncher() {
         // it (e.g. Save job → Run launches that saved job rather than a new one).
         if (created && created.id) targetJobId = created.id;
         store.setActiveProject(proj.id);
-        navigate("/projects");
+        // Land on the run just created (or saved) rather than on a list.
+        goTo(created && created.id ? `/jobs/${created.id}` : "/project");
       } catch (err) {
         if (err instanceof ApiError && err.status === 422 && err.detail && err.detail.errors) {
           // Opens the groups holding the offending fields and scrolls to the first.
@@ -273,6 +302,102 @@ export function buildLauncher() {
         runBtn.lastChild.textContent = "Run";
         saveBtn.lastChild.textContent = "Save job";
       }
+    }
+
+    // -- parameter sweep: N runs varying one flag over a list of values -------
+    // Every run beyond the GPU's slot limit parks as `queued` and dispatches as
+    // slots free up (jobs.py admission control) — which is what makes launching
+    // a handful at once safe rather than an OOM festival.
+    async function sweep() {
+      const proj = store.activeProject();
+      if (!proj) return;
+      // A field is sweepable when the user can type it: visible and not bound.
+      const fields = visibleFields(schema).filter((f) => !bindings[f.name]);
+      if (!fields.length) return;
+      const choice = await sweepModal(fields, values);
+      if (!choice) return;
+      const { field, vals } = choice;
+      clear(formErr);
+      form.clearErrors();
+      sweepBtn.disabled = true;
+      const base = runName || schema.name;
+      let launched = 0;
+      try {
+        for (const v of vals) {
+          const payload = { ...values, [field]: v };
+          for (const f of Object.keys(bindings)) delete payload[f];
+          sweepBtn.lastChild.textContent = `Launching ${launched + 1}/${vals.length}…`;
+          // Each call creates a NEW job (no replace target): a sweep must never
+          // overwrite the run the form was editing.
+          await api.createProjectJob(proj.id, schema.name, payload, gpu || null,
+                                     `${base} [${field}=${v}]`, bindings, true, recreateSsd);
+          launched += 1;
+        }
+        store.setActiveProject(proj.id);
+        goTo("/project");     // a sweep: several runs, so the project's tree is the place
+      } catch (err) {
+        const done = launched ? ` (${launched} of ${vals.length} runs were already launched)` : "";
+        if (err instanceof ApiError && err.status === 422 && err.detail && err.detail.errors) {
+          form.setErrors(err.detail.errors);
+          if (done) mount(formErr, errorBox(new Error("Sweep stopped on a validation error" + done + ".")));
+        } else {
+          mount(formErr, errorBox(new Error((err && err.message) || "sweep failed" + done)));
+        }
+      } finally {
+        sweepBtn.disabled = false;
+        sweepBtn.lastChild.textContent = "Sweep…";
+      }
+    }
+
+    // Small dedicated modal: pick the parameter and type its values. Resolves to
+    // { field, vals } or null on cancel.
+    function sweepModal(fields, current) {
+      return new Promise((resolve) => {
+        const sel = h("select", { class: "input", onchange: () => preview() },
+          ...fields.map((f) => h("option", { value: f.name }, "--" + f.name)));
+        const valsIn = h("input", { class: "input", placeholder: "e.g. 1e-4, 5e-4, 1e-3",
+                                    oninput: () => preview() });
+        const previewEl = h("div", { class: "muted small", style: { minHeight: "18px" } });
+        const okBtn = h("button", { class: "btn", disabled: true, onclick: () => commit() }, "Launch sweep");
+
+        function parsed() {
+          return valsIn.value.split(",").map((s) => s.trim()).filter((s) => s.length);
+        }
+        function preview() {
+          const vals = parsed();
+          okBtn.disabled = vals.length < 2;
+          const cur = current[sel.value];
+          previewEl.textContent = vals.length < 2
+            ? `Give at least two comma-separated values${cur != null && cur !== "" ? ` (current: ${cur})` : ""}.`
+            : `${vals.length} runs: ` + vals.map((v) => `--${sel.value}=${v}`).join("  ·  ");
+        }
+        function commit() {
+          const vals = parsed();
+          if (vals.length < 2) return;
+          done({ field: sel.value, vals });
+        }
+        const onKey = (e) => {
+          e.stopPropagation();
+          if (e.key === "Enter" && !okBtn.disabled) { e.preventDefault(); commit(); }
+          else if (e.key === "Escape") { e.preventDefault(); done(null); }
+        };
+        const modal = h("div", { class: "modal prompt-modal", onclick: (e) => e.stopPropagation(), onkeydown: onKey },
+          h("div", { class: "modal-head" }, h("span", null, "Parameter sweep"),
+            h("button", { class: "btn-icon", style: { border: "none" }, onclick: () => done(null) }, icon("x", 18))),
+          h("div", { class: "prompt-body" },
+            h("p", { class: "field-help", style: { margin: "0 0 10px" } },
+              "One run per value, everything else exactly as configured in the form. Runs beyond the per-GPU limit queue and start as slots free up."),
+            h("label", { class: "field-label" }, "Parameter"), sel,
+            h("label", { class: "field-label", style: { marginTop: "10px" } }, "Values (comma-separated)"), valsIn,
+            previewEl),
+          h("div", { class: "modal-foot", style: { gap: "8px" } },
+            h("button", { class: "btn ghost", onclick: () => done(null) }, "Cancel"), okBtn));
+        const overlay = h("div", { class: "overlay", onclick: () => done(null) }, modal);
+        document.body.appendChild(overlay);
+        queueMicrotask(() => valsIn.focus());
+        preview();
+        function done(v) { overlay.remove(); resolve(v); }
+      });
     }
   }
 

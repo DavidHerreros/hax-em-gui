@@ -89,6 +89,9 @@ const VERT = `#version 300 es
 precision highp float;
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
+// Optional per-vertex colour (surfaces painted by another map). When the attribute
+// array is disabled the generic attribute feeds a constant and uUseVColor gates it off.
+layout(location=2) in vec3 aColor;
 uniform mat4 uProj;
 uniform mat4 uView;
 uniform mat4 uModel;
@@ -96,6 +99,7 @@ out vec3 vNormal;
 out vec3 vViewPos;
 out vec3 vModelPos;
 out vec3 vModelNormal;
+out vec3 vColor;
 void main() {
   vec4 vp = uView * uModel * vec4(aPos, 1.0);
   vViewPos = vp.xyz;
@@ -104,20 +108,52 @@ void main() {
   vNormal = normalize(mat3(uView * uModel) * aNormal);
   vModelPos = aPos;
   vModelNormal = aNormal;
+  vColor = aColor;
   gl_Position = uProj * vp;
 }`;
 
 // Depth-only pass, used for both shadow maps. No colour attachment is bound, so the
-// fragment stage exists only to satisfy the linker.
+// fragment stage writes nothing — it exists only to apply the clip slab, which it must,
+// or geometry the beauty pass has cut away would go on casting shadows onto the interior
+// the cut just revealed. Both shadow passes render with model-space view matrices, so
+// aPos is already the coordinate the slab is expressed in.
 const VERT_DEPTH = `#version 300 es
 precision highp float;
 layout(location=0) in vec3 aPos;
 uniform mat4 uProj;
 uniform mat4 uView;
-void main() { gl_Position = uProj * uView * vec4(aPos, 1.0); }`;
-const FRAG_EMPTY = `#version 300 es
+out vec3 vModelPos;
+void main() {
+  vModelPos = aPos;
+  gl_Position = uProj * uView * vec4(aPos, 1.0);
+}`;
+const FRAG_DEPTH = `#version 300 es
 precision highp float;
-void main() {}`;
+in vec3 vModelPos;
+uniform int uClipOn;
+uniform vec3 uClipN;
+uniform vec2 uClipRange;
+void main() {
+  if (uClipOn == 1) {
+    float d = dot(vModelPos, uClipN);
+    if (d < uClipRange.x || d > uClipRange.y) discard;
+  }
+}`;
+
+// Unlit line overlay (PDB backbone traces). Depth-tested against the surfaces so a
+// trace threads through its map instead of floating in front of it.
+const VERT_LINE = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uProj;
+uniform mat4 uView;
+uniform mat4 uModel;
+void main() { gl_Position = uProj * uView * uModel * vec4(aPos, 1.0); }`;
+const FRAG_LINE = `#version 300 es
+precision highp float;
+uniform vec3 uColor;
+out vec4 outColor;
+void main() { outColor = vec4(uColor, 1.0); }`;
 
 // Camera-space position prepass, read back a few pixels at a time to find what is under
 // the centre of the window. That is the only thing the camera needs from the renderer
@@ -126,8 +162,19 @@ void main() {}`;
 const FRAG_GEOM = `#version 300 es
 precision highp float;
 in vec3 vViewPos;
+in vec3 vModelPos;
+uniform int uClipOn;
+uniform vec3 uClipN;
+uniform vec2 uClipRange;
 out vec4 outPos;
-void main() { outPos = vec4(vViewPos, 1.0); }`;
+void main() {
+  // Same clip as the beauty pass, so the pivot lands on a surface you can see.
+  if (uClipOn == 1) {
+    float d = dot(vModelPos, uClipN);
+    if (d < uClipRange.x || d > uClipRange.y) discard;
+  }
+  outPos = vec4(vViewPos, 1.0);
+}`;
 
 // The beauty pass: ChimeraX's fragmentShader.txt, USE_LIGHTING branch, with
 // USE_LIGHTING_NORMALS, USE_SHADOW, USE_MULTISHADOW and USE_DEPTH_CUE all enabled and
@@ -139,8 +186,10 @@ in vec3 vNormal;
 in vec3 vViewPos;
 in vec3 vModelPos;
 in vec3 vModelNormal;
+in vec3 vColor;
 
 uniform vec3 uColor;
+uniform int uUseVColor;   // 1 = per-vertex colours (painted surface), 0 = uColor
 
 // The lighting_block uniforms, already multiplied by the material reflectivities.
 uniform vec3 uKeyDir;             // camera space, direction the key light shines
@@ -169,10 +218,26 @@ layout(std140) uniform shadow_matrix_block { mat4 uMSXf[${MS_COUNT}]; };
 uniform vec3 uDepthCueColor;
 uniform vec2 uDepthCueRange;
 
+// Model-space clip slab: a pair of parallel planes with unit normal uClipN, keeping the
+// fragments whose signed distance along it lands inside uClipRange. Clipping to a
+// coordinate axis is the case where the normal is a coordinate axis, like ChimeraX's
+// per-axis clipping of a surface; an arbitrary normal is what the viewer's "view" cut
+// uses. The shadow passes apply the same slab, so a cutaway is lit like an exterior
+// rather than sitting in the shadow of the geometry it removed — but the 64-pass ambient
+// atlas only catches up on a debounce (see setClip), since rebuilding it on every slider
+// tick would make the slab unusable to drag. The one-pass key shadow keeps up live.
+uniform int uClipOn;
+uniform vec3 uClipN;
+uniform vec2 uClipRange;
+
 out vec4 frag_color;
 
 void main() {
-  vec4 fcolor = vec4(uColor, 1.0);
+  if (uClipOn == 1) {
+    float clipD = dot(vModelPos, uClipN);
+    if (clipD < uClipRange.x || clipD > uClipRange.y) discard;
+  }
+  vec4 fcolor = vec4(uUseVColor == 1 ? vColor : uColor, 1.0);
 
   // Unit normal, with two-sided lighting.
   float side = gl_FrontFacing ? 1.0 : -1.0;
@@ -241,8 +306,13 @@ export function createRenderer(canvas) {
   const floatTargets = !!gl.getExtension("EXT_color_buffer_float");
 
   const beauty = makeProg(gl, VERT, FRAG_BEAUTY);
-  const depthP = makeProg(gl, VERT_DEPTH, FRAG_EMPTY);
+  const depthP = makeProg(gl, VERT_DEPTH, FRAG_DEPTH);
   const geomP = floatTargets ? makeProg(gl, VERT, FRAG_GEOM) : null;
+  const lineP = makeProg(gl, VERT_LINE, FRAG_LINE);
+
+  // Line overlays (PDB traces): id -> { vao, buf, count, color }. Drawn unlit after
+  // the beauty pass, depth-tested against the surfaces. GL_LINES pairs, model space.
+  const lineModels = new Map();
 
   // Mesh geometry, one entry per model in the scene. A lone map is just the case where
   // there is one of them, so the single-map path is not a separate code path.
@@ -253,10 +323,13 @@ export function createRenderer(canvas) {
 
   function makeModel() {
     const m = { vao: gl.createVertexArray(), posBuf: gl.createBuffer(), normBuf: gl.createBuffer(),
-                idxBuf: gl.createBuffer(), count: 0, color: null, visible: true, bounds: null };
+                colBuf: gl.createBuffer(), idxBuf: gl.createBuffer(),
+                count: 0, color: null, visible: true, bounds: null, hasVColor: false };
     gl.bindVertexArray(m.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, m.normBuf); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    // Colour attribute stays disabled until a painted mesh arrives.
+    gl.bindBuffer(gl.ARRAY_BUFFER, m.colBuf); gl.vertexAttribPointer(2, 3, gl.UNSIGNED_BYTE, true, 0, 0);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.idxBuf);
     gl.bindVertexArray(null);
     return m;
@@ -283,6 +356,19 @@ export function createRenderer(canvas) {
   let color = [0.863, 0.863, 0.863];   // ChimeraX-style near-white neutral gray
   let bg = [0.016, 0.024, 0.06];
   let light = { ...LIGHTING.standard };
+  // Model-space clip slab: keep the fragments with clipRange[0] <= dot(p, clipN) <= clipRange[1].
+  // A null normal is no clipping at all.
+  let clipN = null, clipRange = [0, 0];
+  let clipSettle = 0;                  // the pending "rebuild the ambient atlas" timer
+
+  // Every program that honours the slab reads the same three uniforms, and all of them
+  // have to be written whenever the program is bound — the depth passes included.
+  function uploadClip(p) {
+    gl.uniform1i(p.u("uClipOn"), clipN ? 1 : 0);
+    if (!clipN) return;
+    gl.uniform3fv(p.u("uClipN"), clipN);
+    gl.uniform2fv(p.u("uClipRange"), clipRange);
+  }
 
   // ---------------------------------------------------------------------------
   // Shadow maps
@@ -400,6 +486,7 @@ export function createRenderer(canvas) {
     gl.useProgram(depthP.prog);
     gl.uniformMatrix4fv(depthP.u("uProj"), false, proj);
     gl.uniformMatrix4fv(depthP.u("uView"), false, view);
+    uploadClip(depthP);
     for (const m of drawable()) {
       gl.bindVertexArray(m.vao);
       gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
@@ -473,11 +560,14 @@ export function createRenderer(canvas) {
       mv[4] * KEY_DIR[0] + mv[5] * KEY_DIR[1] + mv[6] * KEY_DIR[2],
       mv[8] * KEY_DIR[0] + mv[9] * KEY_DIR[1] + mv[10] * KEY_DIR[2],
     ];
-    // Only the model-space light direction and the geometry can change what this map
-    // holds, so a redraw that changed neither (a recolour, a resize, a zoom, a pan — the
-    // last two move the camera without turning the model) reuses it. Rotation does change
-    // it, which is inherent: a camera-fixed light sweeps over the model as it turns.
-    const key = `${geomGen}|${ld[0].toFixed(6)},${ld[1].toFixed(6)},${ld[2].toFixed(6)}`;
+    // Only the model-space light direction, the geometry and the clip slab can change what
+    // this map holds, so a redraw that changed none of them (a recolour, a resize, a zoom,
+    // a pan — the last two move the camera without turning the model) reuses it. Rotation
+    // does change it, which is inherent: a camera-fixed light sweeps over the model as it
+    // turns. Dragging the slab changes it too, and unlike the 64-pass ambient atlas one
+    // extra depth pass per tick is cheap enough to just pay.
+    const clipKey = clipN ? `${clipN.join()}/${clipRange.join()}` : "-";
+    const key = `${geomGen}|${ld[0].toFixed(6)},${ld[1].toFixed(6)},${ld[2].toFixed(6)}|${clipKey}`;
     if (key === shadowKey && shadowXf) return;
 
     const t = shadowTransforms(ld, bs.center, bs.radius, SHADOW_DEPTH_BIAS);
@@ -540,6 +630,7 @@ export function createRenderer(canvas) {
     gl.uniformMatrix4fv(geomP.u("uProj"), false, proj);
     gl.uniformMatrix4fv(geomP.u("uView"), false, view);
     gl.uniformMatrix4fv(geomP.u("uModel"), false, model);
+    uploadClip(geomP);
     for (const m of drawable()) {
       gl.bindVertexArray(m.vao);
       gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
@@ -581,8 +672,9 @@ export function createRenderer(canvas) {
   const orbit = createOrbit(canvas, () => render(), null,
     { fitRadius: 1.33, probeDepth: centreDepth, modelBounds: sceneBounds });
 
+  let renderScale = null;   // pinned backing-store scale while a video is being recorded
   function resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = renderScale != null ? renderScale : Math.min(window.devicePixelRatio || 1, 2);
     const w = Math.max(1, Math.floor(canvas.clientWidth * dpr)), h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   }
@@ -627,7 +719,7 @@ export function createRenderer(canvas) {
     gl.depthMask(true);
     gl.clearColor(bg[0], bg[1], bg[2], alpha);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (!anyGeometry()) return;
+    if (!anyGeometry()) { drawLines(proj, view, model); return; }
 
     gl.useProgram(beauty.prog);
     gl.uniformMatrix4fv(beauty.u("uProj"), false, proj);
@@ -658,11 +750,30 @@ export function createRenderer(canvas) {
     gl.uniform3fv(beauty.u("uDepthCueColor"), bg);
     gl.uniform2fv(beauty.u("uDepthCueRange"), depthCueRange(view, model));
 
-    const cLoc = beauty.u("uColor");
+    uploadClip(beauty);
+
+    const cLoc = beauty.u("uColor"), vcLoc = beauty.u("uUseVColor");
     for (const m of drawable()) {
       gl.uniform3fv(cLoc, m.color || color);
+      gl.uniform1i(vcLoc, m.hasVColor ? 1 : 0);
       gl.bindVertexArray(m.vao);
       gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+    }
+    gl.bindVertexArray(null);
+    drawLines(proj, view, model);
+  }
+
+  function drawLines(proj, view, model) {
+    if (!lineModels.size) return;
+    gl.useProgram(lineP.prog);
+    gl.uniformMatrix4fv(lineP.u("uProj"), false, proj);
+    gl.uniformMatrix4fv(lineP.u("uView"), false, view);
+    gl.uniformMatrix4fv(lineP.u("uModel"), false, model);
+    for (const m of lineModels.values()) {
+      if (!m.count) continue;
+      gl.uniform3fv(lineP.u("uColor"), m.color);
+      gl.bindVertexArray(m.vao);
+      gl.drawArrays(gl.LINES, 0, m.count);
     }
     gl.bindVertexArray(null);
   }
@@ -701,12 +812,21 @@ export function createRenderer(canvas) {
     return lo ? { lo, hi } : null;
   }
 
-  function setModelMesh(id, positions, normals, indices) {
+  function setModelMesh(id, positions, normals, indices, colors) {
     let m = models.get(id);
     if (!m) models.set(id, (m = makeModel()));
     gl.bindBuffer(gl.ARRAY_BUFFER, m.posBuf); gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, m.normBuf); gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.idxBuf); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+    // Optional per-vertex uint8 RGB (painted surfaces). A mesh delivered without
+    // colours turns painting off again — re-contouring clears the paint by design.
+    m.hasVColor = !!(colors && colors.length === positions.length);
+    gl.bindVertexArray(m.vao);
+    if (m.hasVColor) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.colBuf); gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(2);
+    } else gl.disableVertexAttribArray(2);
+    gl.bindVertexArray(null);
     m.count = indices.length;
     m.bounds = indices.length ? aabb(positions) : null;
     orbit.invalidatePivot();   // a new contour is a new front surface
@@ -732,6 +852,32 @@ export function createRenderer(canvas) {
     // Single-map callers (the landscape viewer) address the one implicit model.
     setMesh: (positions, normals, indices) => setModelMesh(0, positions, normals, indices),
     setModelMesh, dropModel,
+    // Line overlay (GL_LINES vertex pairs in model space). Same id space as nothing
+    // else — line models live in their own map and never collide with mesh ids.
+    setLineModel(id, positions, rgb) {
+      let m = lineModels.get(id);
+      if (!m) {
+        m = { vao: gl.createVertexArray(), buf: gl.createBuffer(), count: 0, color: [1, 1, 1] };
+        gl.bindVertexArray(m.vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, m.buf);
+        gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+        gl.bindVertexArray(null);
+        lineModels.set(id, m);
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.buf);
+      gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+      m.count = positions.length / 3;
+      if (rgb) m.color = rgb;
+      render();
+    },
+    dropLineModel(id) {
+      const m = lineModels.get(id);
+      if (!m) return;
+      gl.deleteVertexArray(m.vao); gl.deleteBuffer(m.buf);
+      lineModels.delete(id);
+      render();
+    },
+    clearLineModels() { for (const id of [...lineModels.keys()]) this.dropLineModel(id); },
     setModelColor(id, rgb) { const m = models.get(id); if (m) { m.color = rgb; render(); } },
     setModelVisible(id, on) {
       const m = models.get(id);
@@ -747,10 +893,28 @@ export function createRenderer(canvas) {
     // shading of the far side of the map — as it does in ChimeraX.
     setBackground(rgb) { bg = rgb; render(); },
     setLighting(m) { light = { ...(LIGHTING[m] || LIGHTING.standard) }; render(); },
+    // Model-space clip slab: keep lo <= dot(p, n) <= hi, with `n` a unit normal in the
+    // [-1,1] cube coordinates. Pass a null normal to clear. The pivot probe honours it
+    // too, so rotation centres on what is actually visible.
+    //
+    // The ambient atlas is 64 depth passes, far too many to redo per slider tick, so it
+    // is left standing (a freshly revealed interior stays dark for a moment) and rebuilt
+    // once the slab has been still for a beat. Clearing the clip takes the same route:
+    // the standing atlas was built cut, and has to be rebuilt whole.
+    setClip(n, lo, hi) {
+      clipN = n ? [n[0], n[1], n[2]] : null;
+      clipRange = [lo, hi];
+      orbit.invalidatePivot();
+      clearTimeout(clipSettle);
+      clipSettle = setTimeout(() => { msReady = false; render(); }, 150);
+      render();
+    },
     resetView() { orbit.reset(); },
     getCamera() { return orbit.getState(); },   // handed to the other renderer on a render-mode switch
     setCamera(cam) { orbit.setState(cam); },
     captureStream(fps) { return canvas.captureStream(fps); },
+    canvas,
+    setRenderScale(s) { renderScale = s; render(); },
     async snapshot({ scale = 2, transparent = false } = {}) {
       const ow = canvas.width, oh = canvas.height;
       canvas.width = Math.floor(canvas.clientWidth * scale);

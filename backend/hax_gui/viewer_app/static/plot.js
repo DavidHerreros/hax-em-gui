@@ -79,8 +79,11 @@ export function createPlot(canvas) {
       }
     }
     if (!isFinite(x0)) { x0 = 0; x1 = 1; y0 = 0; y1 = 1; }
-    if (x0 === x1) { x0 -= 0.5; x1 += 0.5; }
-    if (y0 === y1) { y0 -= 0.5; y1 += 0.5; }
+    // "Flat" means flat to within rounding, not bit-identical: smoothing a constant curve
+    // leaves ~1e-17 of noise, and an axis that narrow cannot be ticked (see niceTicks).
+    const flat = (a, b) => b - a <= 1e-9 * Math.max(Math.abs(a), Math.abs(b), 1e-300);
+    if (flat(x0, x1)) { const m = (x0 + x1) / 2; x0 = m - 0.5; x1 = m + 0.5; }
+    if (flat(y0, y1)) { const m = (y0 + y1) / 2; y0 = m - 0.5; y1 = m + 0.5; }
     const px = (x1 - x0) * 0.03, py = (y1 - y0) * 0.05;
     return { x0: x0 - px, x1: x1 + px, y0: y0 - py, y1: y1 + py };
   }
@@ -93,8 +96,17 @@ export function createPlot(canvas) {
   function niceTicks(lo, hi, n) {
     const span = hi - lo, step0 = span / Math.max(1, n), mag = Math.pow(10, Math.floor(Math.log10(step0)));
     const norm = step0 / mag, step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+    // Counted, never accumulated: once `step` drops below the spacing of doubles around
+    // `lo` (a deep zoom, a near-constant curve), `v += step` stops moving and the old loop
+    // pushed ticks until the tab ran out of memory.
     const ticks = [];
-    for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) ticks.push(v);
+    if (!(step > 0) || !isFinite(step)) return { ticks, step: 1 };
+    const first = Math.ceil(lo / step);
+    const count = Math.min(200, Math.floor(hi / step) - first + 1);
+    for (let k = 0; k < count; k++) {
+      const v = (first + k) * step;
+      if (!ticks.length || v > ticks[ticks.length - 1]) ticks.push(v);
+    }
     return { ticks, step };
   }
 
@@ -411,7 +423,8 @@ export function createPlot(canvas) {
   // into it lands in a 1px bitmap and is effectively lost. That happens whenever a plot
   // is built on a tab that isn't on screen yet. Watch our own box instead of trusting
   // callers to redraw us at the right moment.
-  if (window.ResizeObserver) new ResizeObserver(() => draw()).observe(canvas);
+  let ro = null;
+  if (window.ResizeObserver) { ro = new ResizeObserver(() => draw()); ro.observe(canvas); }
 
   // Hover readout. Skipped while panning — you're moving the plot, not reading it.
   canvas.addEventListener("mousemove", (e) => {
@@ -437,6 +450,13 @@ export function createPlot(canvas) {
     setFocus(name) { if (focus !== name) { focus = name; draw(); } },
     resetZoom,
     redraw: draw,
+    // Release what outlives the canvas: the ResizeObserver and the global
+    // resize listener each kept the whole plot closure (canvas + series)
+    // alive after the renderer was swapped out or the panel closed.
+    destroy() {
+      if (ro) { ro.disconnect(); ro = null; }
+      window.removeEventListener("resize", draw);
+    },
     // `scale` is the DPI multiplier (2 == twice the on-screen pixel size). Transparent
     // exports drop the background so the chart drops onto a slide or a paper figure;
     // opaque ones get the panel colour, which is what you want for a screenshot.

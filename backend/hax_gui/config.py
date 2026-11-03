@@ -42,8 +42,20 @@ class Settings:
     file_roots: list[str] = field(default_factory=lambda: _env_list("HAX_GUI_FILE_ROOTS", []))
     # Where the file browser opens when no path is given. Not a restriction.
     browse_home: Path = field(default_factory=lambda: _env_path("HAX_GUI_BROWSE_HOME", Path.home()))
-    # Shared auth token. Empty disables auth (dev only).
+    # Shared auth token. Empty disables auth — allowed only on a loopback bind:
+    # a public bind with no HAX_GUI_TOKEN falls back to the persisted token in
+    # `token_path` (generated on first use). See `ensure_auth_for_bind`.
     auth_token: str = field(default_factory=lambda: os.environ.get("HAX_GUI_TOKEN", ""))
+    # The address the server was asked to bind (set by `hax-gui start`). Unset
+    # (e.g. a bare `uvicorn hax_gui.app:app`) is treated as loopback — the
+    # secure default for the Host allowlist below.
+    bind_host: str = field(default_factory=lambda: os.environ.get("HAX_GUI_BIND_HOST", ""))
+    # Extra Host-header values to accept (comma-separated), for reverse-proxy
+    # setups where the browser's Host is a public name the server can't infer.
+    # "*" disables the check entirely.
+    allowed_hosts: list[str] = field(
+        default_factory=lambda: [h.strip() for h in os.environ.get("HAX_GUI_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    )
     # Whether the GUI may start a local Ollama when one isn't already running, and
     # stop that (and only that) instance on shutdown. A user-run Ollama is never
     # touched. Off with HAX_GUI_MANAGE_OLLAMA=0.
@@ -56,6 +68,12 @@ class Settings:
     assistant_actions: bool = field(
         default_factory=lambda: os.environ.get("HAX_GUI_ASSISTANT_ACTIONS", "0") in ("1", "true", "yes")
     )
+    # Minutes a viewer session (landscape/map/metadata) may go without a single
+    # proxied request before it is stopped, releasing its port — and, for the
+    # landscape viewer, its GPU memory. 0 disables the timeout.
+    viewer_idle_minutes: float = field(
+        default_factory=lambda: float(os.environ.get("HAX_GUI_VIEWER_IDLE_MINUTES", "120") or 0)
+    )
     # CORS origins for the SPA during dev (Vite default is 5173).
     cors_origins: list[str] = field(
         default_factory=lambda: _env_list("HAX_GUI_CORS_ORIGINS", ["http://localhost:5173", "http://127.0.0.1:5173"])
@@ -64,6 +82,45 @@ class Settings:
     @property
     def db_path(self) -> Path:
         return self.data_dir / "hax_gui.db"
+
+    @property
+    def token_path(self) -> Path:
+        """Persisted auth token, generated on first public bind (0600)."""
+        return self.data_dir / "token"
+
+    @property
+    def is_public_bind(self) -> bool:
+        return bool(self.bind_host) and not is_loopback_host(self.bind_host)
+
+    def load_or_create_token(self) -> str:
+        """The persisted token, minted on first use. Never returns empty."""
+        import secrets
+
+        try:
+            tok = self.token_path.read_text().strip()
+            if tok:
+                return tok
+        except OSError:
+            pass
+        tok = secrets.token_urlsafe(32)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.token_path.write_text(tok + "\n")
+        self.token_path.chmod(0o600)
+        return tok
+
+    def ensure_auth_for_bind(self) -> str | None:
+        """Enforce 'no open server on a public interface'.
+
+        On a public bind with no HAX_GUI_TOKEN, adopt the persisted token
+        (creating it on first use) so the API is never exposed unauthenticated —
+        the job API is arbitrary command execution as the server user. Returns a
+        human-readable description of what happened, or None if nothing changed.
+        """
+        if self.auth_token or not self.is_public_bind:
+            return None
+        self.auth_token = self.load_or_create_token()
+        return (f"public bind ({self.bind_host}) with no HAX_GUI_TOKEN: "
+                f"using the persisted token from {self.token_path}")
 
     @property
     def runs_dir(self) -> Path:
@@ -104,6 +161,12 @@ class Settings:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.viewer_logs_dir.mkdir(parents=True, exist_ok=True)
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for addresses that only the local machine can reach."""
+    h = host.strip("[]").lower()
+    return h in ("localhost", "::1", "") or h.startswith("127.")
 
 
 settings = Settings()

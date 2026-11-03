@@ -1,11 +1,13 @@
 // Landscape explorer + volume viewer orchestration. Relative URLs (works behind
 // the /viewer/<id>/ proxy). Zero dependencies.
 import { createRenderer } from "./gl.js";
-import { createVolume } from "./volume.js";
+import { createVolume, smoothGrid } from "./volume.js";
 import { createScatter, clusterColor } from "./scatter.js";
 import { createCloud } from "./cloud.js";
 import { createHistogram } from "./histogram.js";
 import { createSlices } from "./slices.js";
+import { FMT, parseGrid, parseMesh, unwrap } from "./wire.js";
+import { makeLive, startCanvasRecording } from "./viewerbase.js";
 
 // Density colormaps (RGB 0–255 control stops, low→high). Default inferno, to
 // match the desktop annotate_space landscape (napari "inferno" over a dark
@@ -707,7 +709,7 @@ function updatePoints() {
 // `.slice()` all behave as before, but a row costs a small view object rather than a
 // fresh array of boxed doubles.
 async function fetchMatrix(url) {
-  const buf = await (await fetch(url)).arrayBuffer();
+  const buf = unwrap(await (await fetch(url)).arrayBuffer(), FMT.f32matrix);
   const [rows, cols] = new Int32Array(buf, 0, 2);
   const data = new Float32Array(buf, 8, rows * cols);
   const out = new Array(rows);
@@ -715,7 +717,7 @@ async function fetchMatrix(url) {
   return out;
 }
 async function fetchLabels(url) {
-  const buf = await (await fetch(url)).arrayBuffer();
+  const buf = unwrap(await (await fetch(url)).arrayBuffer(), FMT.i32vector);
   const n = new Int32Array(buf, 0, 1)[0];
   return new Int32Array(buf, 4, n);
 }
@@ -953,7 +955,7 @@ let zInflight = null;  // { k, p } — the request in flight, so concurrent call
 async function fetchVector(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error((await r.text()) || r.statusText);
-  const buf = await r.arrayBuffer();
+  const buf = unwrap(await r.arrayBuffer(), FMT.f32vector);
   const n = new Int32Array(buf, 0, 1)[0];
   return new Float32Array(buf, 4, n);
 }
@@ -1698,22 +1700,8 @@ async function recontourSeries(draft) {
 }
 const liveSeriesContour = makeLive((draft) => recontourSeries(draft));
 
-// Coalescing single-flight runner: fires immediately, and if more updates arrive while a
-// request is in flight, re-runs once with the latest values when it returns. Gives
-// continuous (server-bounded) updates without piling up requests.
-//
-// It must *wait* for the in-flight request, not abandon it. This used to abort the fetch
-// on supersede, to avoid downloading a mesh that was already stale — but `/api/decode` is
-// a sync route, so it runs in a threadpool task that cannot be cancelled: aborting freed
-// the browser to fire the next request while the server kept grinding on the abandoned
-// one. A drag therefore stacked up marching-cubes jobs that don't parallelise (8 at once
-// measured ~5x slower *each*), so the further you dragged the slower it got. Waiting keeps
-// the server at exactly one mesh at a time; the draft below is what makes that cheap.
-function makeLive(fn) {
-  let busy = false, pending = false, args = [];
-  async function run() { busy = true; do { pending = false; try { await fn(...args); } catch { /* ignore */ } } while (pending); busy = false; }
-  return (...a) => { args = a; if (busy) pending = true; else run(); };
-}
+// makeLive comes from viewerbase.js (single-flight, waits rather than aborts —
+// see the note there); the draft resolutions below are what make coalescing cheap.
 const liveDecode = makeLive((draft) => decode(draft));
 const liveFrame = makeLive((i, draft) => renderFrame(i, draft));
 
@@ -1784,7 +1772,9 @@ function setRenderMode(mode) {
   if (mode !== state.render) clearFrameCache();   // surface<->volume payloads differ
   const surf = mode === "surface";
   const isSlices = mode === "slices";
-  const isVol = mode === "mip" || mode === "emission";
+  // Three volume styles now share the ray-marcher canvas: MIP, glow and the shaded
+  // isosurface. Only the style passed to volRenderer.setMode tells them apart.
+  const isVol = mode === "mip" || mode === "emission" || mode === "iso";
   // Surface and the ray-marcher live on different canvases, each with its own camera;
   // the slice view has none. Hand the outgoing 3D camera over so the map does not jump
   // back to a default view when returning from slices to a 3D mode.
@@ -1811,7 +1801,7 @@ function setRenderMode(mode) {
       slices.setContrast(+$("slicelo").value, +$("slicehi").value); slices.setCrosshair($("slicecross").checked);
     } catch (err) { status("Slices unavailable: " + err.message, "err"); setRenderMode("surface"); return; }
   }
-  if (isVol) volRenderer.setMode(mode === "emission" ? "emission" : "mip");
+  if (isVol) volRenderer.setMode(mode);   // iso keeps volume.js's default "standard" lighting: this viewer has no lighting control for it
   const to = surf ? renderer : isVol ? volRenderer : null;
   if (to && to !== from && camera) to.setCamera(camera);
   if (isSlices) { refreshSlices(); return; }
@@ -1885,6 +1875,33 @@ function loadLandSlices() {
   status(`Landscape density slices ${g.nx}×${g.ny}×${g.nz} · ${axisLabel(state.x)} · ${axisLabel(state.y)} · ${axisLabel(state.z)}`);
 }
 
+// Grid resolution for the ray-marcher, per style: an isosurface shows every voxel of the
+// grid it was cut from, and 96³ — smooth enough for MIP and glow, which integrate along the
+// ray — comes out blobby. Volume payloads are cached by URL, so the size is part of the key.
+// The /api/grid query for the current render style. MIP, glow and the slice frames keep the
+// 96³ uint8 payload they always had. Iso shades the grid rather than integrating along it,
+// so it asks for float16 at the decoder's native box where the renderer can hold it (the
+// backend clamps `size` to the box, so 384 means "native, no downsampling"), and falls back
+// to 256³ uint8 + the de-banding blur where it cannot. The query string is part of the frame
+// cache key, so a style switch never reuses the wrong payload.
+const ISO_GRID_U8 = 256, ISO_MAX = 384;
+const isoF16 = () => !!(volRenderer && volRenderer.hasF16);
+function volQuery() {
+  if (state.render !== "iso") return "&size=96";
+  return isoF16() ? `&size=${ISO_MAX}&bits=16` : `&size=${ISO_GRID_U8}`;
+}
+
+// The blur exists only to hide 8-bit banding, so a float16 grid must never see it: it would
+// throw away exactly the fine features 16 bits were fetched for. Tagged so a cached frame
+// payload is smoothed once and only once.
+function isoSmooth(g) {
+  if (state.render === "iso" && !g.f16 && !g.smoothed) {
+    g.data = smoothGrid(g.data, g.nx, g.ny, g.nz);
+    g.smoothed = true;
+  }
+  return g;
+}
+
 function normThreshold() {
   if (!curVolMeta) return 0.45;
   const span = curVolMeta.vmax - curVolMeta.vmin || 1;
@@ -1896,26 +1913,16 @@ async function loadVolume(index) {
   const token = ++decodeToken;
   status("Loading volume…", "busy");
   try {
-    const res = await fetch(`./api/grid?index=${index}&size=96`);
+    const res = await fetch(`./api/grid?index=${index}${volQuery()}`);
     if (!res.ok) throw new Error(await res.text());
-    const g = parseGrid(await res.arrayBuffer());
+    const g = isoSmooth(parseGrid(await res.arrayBuffer()));
     if (token !== decodeToken) return;
     curVolMeta = g;
     volRenderer.setVolume(g.nx, g.ny, g.nz, g.data, g.boxLo, g.boxHi);
     volRenderer.setThreshold(normThreshold());
     volRenderer.setColor(colorForIndex(index));
-    status(`Volume ${g.nx}×${g.ny}×${g.nz} · ${state.render === "emission" ? "glow" : "MIP"}`);
+    status(`Volume ${g.nx}×${g.ny}×${g.nz} · ${state.render === "emission" ? "glow" : state.render === "iso" ? "shaded iso" : "MIP"}`);
   } catch (err) { if (token === decodeToken) status("Volume load failed: " + err.message, "err"); }
-}
-
-function parseGrid(buf) {
-  const dv = new DataView(buf);
-  const nx = dv.getInt32(0, true), ny = dv.getInt32(4, true), nz = dv.getInt32(8, true);
-  const vmin = dv.getFloat32(12, true), vmax = dv.getFloat32(16, true), mean = dv.getFloat32(20, true), std = dv.getFloat32(24, true);
-  const boxLo = [dv.getFloat32(28, true), dv.getFloat32(32, true), dv.getFloat32(36, true)];
-  const boxHi = [dv.getFloat32(40, true), dv.getFloat32(44, true), dv.getFloat32(48, true)];
-  const data = new Uint8Array(buf, 52, nx * ny * nz);
-  return { nx, ny, nz, vmin, vmax, mean, std, boxLo, boxHi, data };
 }
 
 // ---- morph / volume series as a scrubbable timeline ----
@@ -2189,7 +2196,7 @@ function frameRequest(i, draft) {
     const q = at + (draft ? `&smooth=${draftSmooth()}&size=${PLAY_GRID}` : `&smooth=${state.smooth}`) + level;
     return { surface: true, url: `./api/decode?${q}`, key: `s|${q}` };
   }
-  const q = `${at}&size=96`;
+  const q = `${at}${volQuery()}`;
   return { surface: false, url: `./api/grid?${q}`, key: `v|${q}` };
 }
 
@@ -2208,7 +2215,7 @@ function decodeFrame(i, draft) {
   if (flight) return flight;
   const p = (async () => {
     const buf = await (await fetch(req.url)).arrayBuffer();
-    const payload = req.surface ? parseMesh(buf) : parseGrid(buf);
+    const payload = req.surface ? parseMesh(buf) : isoSmooth(parseGrid(buf));
     const bytes = req.surface
       ? payload.positions.byteLength + payload.normals.byteLength + payload.indices.byteLength
       : payload.data.byteLength;
@@ -2423,13 +2430,9 @@ async function recordSeries() {
   if (!state.timeline.length && !(await buildTimeline())) { status("Build a path first (shift-click states).", "warn"); return; }
   const active = state.render === "surface" ? renderer : volRenderer;
   if (!active || !active.captureStream) { status("Recording unavailable for this view.", "err"); return; }
-  let rec = null; const chunks = [];
-  try {
-    const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm";
-    rec = new MediaRecorder(active.captureStream(30), { mimeType: mime });
-    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-    rec.start();
-  } catch (err) { status("Recording unavailable: " + err.message, "err"); return; }
+  let rec = null;
+  try { rec = startCanvasRecording(active, 30); }
+  catch (err) { status("Recording unavailable: " + err.message, "err"); return; }
   recording = true; setPlaying(true);
   // Recording stays on full-resolution frames — an exported movie is the one place the
   // draft would be a real loss — but it now prefetches ahead of itself instead of decoding
@@ -2440,7 +2443,7 @@ async function recordSeries() {
   for (let i = recStep; i < state.timeline.length && playing; i += recStep) { await renderFrame(i, false); status(`Recording… ${i + 1}/${state.timeline.length}`, "busy"); await sleep(recDelay); }
   fillToken++;
   setPlaying(false); recording = false;
-  rec.stop(); rec.onstop = () => downloadBlob(new Blob(chunks, { type: "video/webm" }), "morph.webm");
+  downloadBlob(await rec.stop(), "morph.webm");
   status("Recording saved (morph.webm).");
 }
 
@@ -3051,16 +3054,6 @@ function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
-function parseMesh(buf) {
-  const dv = new DataView(buf);
-  const nverts = dv.getInt32(0, true), nfaces = dv.getInt32(4, true);
-  const level = dv.getFloat32(8, true), mass = dv.getFloat32(12, true);
-  let off = 20;
-  const positions = new Float32Array(buf, off, nverts * 3); off += nverts * 12;
-  const normals = new Float32Array(buf, off, nverts * 3); off += nverts * 12;
-  const indices = new Uint32Array(buf, off, nfaces * 3);
-  return { positions, normals, indices, level, mass };
-}
 function hexToRgb(hex) { const n = parseInt(hex.slice(1), 16); return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]; }
 
 boot();

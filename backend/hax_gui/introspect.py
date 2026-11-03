@@ -136,6 +136,11 @@ def field_for_action(action: argparse.Action, group: str | None = None) -> dict[
     if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
         field["type"] = "boolean"
         field["default"] = bool(action.default)
+        # store_false flags SET the value to False: the form's checkbox holds the
+        # *destination* value, so command generation must emit the flag when the
+        # box is UNchecked — the opposite of store_true (see command.py).
+        if isinstance(action, argparse._StoreFalseAction):
+            field["invert"] = True
     elif action.choices:
         field["type"] = "enum"
         field["choices"] = [_json_safe(c) for c in action.choices]

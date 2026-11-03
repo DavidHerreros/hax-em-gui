@@ -18,6 +18,46 @@ export function renderMarkdown(src) {
   return frag;
 }
 
+// Untrusted *HTML* (e.g. TensorBoard add_text payloads, which hax logs as real
+// <h3>/<ul> markup) rebuilt as a safe DocumentFragment. DOMParser parses into an
+// inert document (no script execution, no resource loads); the walk then keeps
+// only structural tags and copies NO attributes — so event handlers, javascript:
+// hrefs, style exfiltration and <img onerror> all die here. Unknown tags are
+// unwrapped to their text; script/style-like elements are dropped wholesale.
+// Never feed server- or file-derived HTML to an `html:` prop — use this.
+const _HTML_KEEP = new Set([
+  "H1", "H2", "H3", "H4", "H5", "H6", "P", "BR", "HR", "B", "STRONG", "I", "EM",
+  "U", "S", "SUB", "SUP", "CODE", "PRE", "UL", "OL", "LI", "DL", "DT", "DD",
+  "TABLE", "THEAD", "TBODY", "TFOOT", "TR", "TH", "TD", "CAPTION",
+  "BLOCKQUOTE", "SPAN", "DIV",
+]);
+const _HTML_DROP = new Set([
+  "SCRIPT", "STYLE", "IFRAME", "OBJECT", "EMBED", "LINK", "META", "TITLE",
+  "TEMPLATE", "NOSCRIPT", "FORM", "INPUT", "BUTTON", "SELECT", "TEXTAREA",
+]);
+
+export function sanitizedHtml(src) {
+  const doc = new DOMParser().parseFromString(String(src == null ? "" : src), "text/html");
+  const walk = (node) => {
+    const out = document.createDocumentFragment();
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        out.appendChild(document.createTextNode(child.textContent));
+      } else if (child.nodeType === Node.ELEMENT_NODE && !_HTML_DROP.has(child.tagName)) {
+        if (_HTML_KEEP.has(child.tagName)) {
+          const el = document.createElement(child.tagName);
+          el.appendChild(walk(child));
+          out.appendChild(el);
+        } else {
+          out.appendChild(walk(child));   // unwrap: keep the content, lose the tag
+        }
+      }
+    }
+    return out;
+  };
+  return walk(doc.body);
+}
+
 // ---- block level ----
 function isBlockStart(line) {
   return (

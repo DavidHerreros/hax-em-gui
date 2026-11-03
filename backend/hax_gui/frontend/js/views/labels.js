@@ -4,6 +4,7 @@
 // Workflow views (refresh after any mutation, notify subscribers).
 import { h, clear } from "../h.js";
 import { icon } from "../icons.js";
+import { confirmModal } from "./confirmModal.js";
 import { api } from "../api.js";
 
 const PALETTE = ["#ef4444", "#f59e0b", "#eab308", "#22c55e", "#14b8a6", "#3b82f6", "#8b5cf6", "#ec4899", "#64748b", "#0ea5e9"];
@@ -171,7 +172,8 @@ function openPicker(anchorEl, adapter, onChange) {
   // Delete a label everywhere: the server drops it from all jobs (cascade), then
   // we sync the currently-open job/node so its chip disappears immediately.
   async function removeLabel(l) {
-    if (!confirm(`Delete label "${l.name}"? It will be removed from all jobs.`)) return;
+    if (!(await confirmModal({ title: "Delete label?", danger: true, okText: "Delete",
+        message: `“${l.name}” will be removed from all jobs.` }))) return;
     try {
       await api.deleteLabel(l.id);
       await _refresh();
@@ -229,7 +231,7 @@ function openLabelEditor(anchorEl, label, onDone) {
       onclick: async () => { await api.updateLabel(label.id, { color: c }); await onDone(); close(); } })),
     customSwatch(label.color, { onCommit: async (c) => { await api.updateLabel(label.id, { color: c }); await onDone(); close(); } }));
   const save = h("button", { class: "btn small", onclick: async () => { await api.updateLabel(label.id, { name: nameI.value }); await onDone(); close(); } }, icon("check", 13), "Save");
-  const del = h("button", { class: "btn small ghost", style: { color: "var(--err)" }, onclick: async () => { if (!confirm(`Delete label "${label.name}"? It will be removed from all jobs.`)) return; await api.deleteLabel(label.id); await onDone(); close(); } }, icon("trash", 13));
+  const del = h("button", { class: "btn small ghost", style: { color: "var(--err)" }, onclick: async () => { if (!(await confirmModal({ title: "Delete label?", danger: true, okText: "Delete", message: `“${label.name}” will be removed from all jobs.` }))) return; await api.deleteLabel(label.id); await onDone(); close(); } }, icon("trash", 13));
   const menu = h("div", { class: "lblpick lblpick-editor", onclick: (e) => e.stopPropagation() },
     h("div", { class: "lblpick-head" }, "Edit label"),
     nameI, swatches, h("div", { class: "lblpick-create" }, save, h("span", { style: { flex: "1" } }), del));

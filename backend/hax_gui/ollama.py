@@ -57,6 +57,18 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _looks_like_ollama(pid: int) -> bool:
+    """Is this pid actually running Ollama? A pid from the pidfile survived a GUI
+    restart, so the kernel may have recycled it onto an unrelated process — which
+    must not be SIGKILLed on the pidfile's say-so."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv0 = f.read().split(b"\0", 1)[0]
+    except OSError:
+        return False
+    return b"ollama" in os.path.basename(argv0).lower()
+
+
 class OllamaManager:
     """Tracks whether *this* GUI owns a local Ollama process."""
 
@@ -77,7 +89,7 @@ class OllamaManager:
         if is_running(base_url):
             # already up — reclaim ownership if a prior (restarted) GUI started it
             pid = _read_pid(pf)
-            if pid and _pid_alive(pid):
+            if pid and _pid_alive(pid) and _looks_like_ollama(pid):
                 self._owned = True
                 return {"managed": True, "started": False, "reclaimed": True, "pid": pid}
             _unlink(pf)  # stale or foreign
@@ -115,7 +127,11 @@ class OllamaManager:
         proc = self._proc
         pid = proc.pid if proc is not None else _read_pid(pf)
         stopped = False
-        if pid and _pid_alive(pid):
+        # Our own un-reaped child is trustworthy (its pid can't be recycled until we
+        # wait() on it); a pid reclaimed from the pidfile is not — re-verify it still
+        # names an Ollama before signalling its whole process group.
+        ours = proc is not None and proc.poll() is None
+        if pid and (ours or (proc is None and _pid_alive(pid) and _looks_like_ollama(pid))):
             _terminate(pid)
             stopped = True
         if proc is not None:  # reap our direct child so it doesn't linger as a zombie

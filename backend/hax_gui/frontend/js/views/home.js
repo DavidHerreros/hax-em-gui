@@ -41,7 +41,7 @@ function hero() {
       h(
         "div",
         { class: "hero-actions" },
-        h("a", { class: "btn", href: "#/projects" }, icon("box", 18), "Go to Projects"),
+        h("a", { class: "btn", href: "#/project" }, icon("box", 18), "Open a project"),
         h("a", { class: "btn secondary", href: DOCS, target: "_blank", rel: "noreferrer" }, icon("book", 18), "Open documentation")
       )
     )

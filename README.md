@@ -61,12 +61,19 @@ The server reads a few optional environment variables:
 | `HAX_GUI_DATA_DIR` | `~/.hax_gui` | Where job logs and the run database are stored |
 | `HAX_GUI_FILE_ROOTS` | _(unrestricted)_ | Colon-separated folders to **confine** the file browser to. Unset, it shows anything the server can read. Not a security boundary: job arguments accept any path either way |
 | `HAX_GUI_BROWSE_HOME` | `$HOME` | Folder the file browser opens at |
-| `HAX_GUI_TOKEN` | _(empty)_ | Shared access token; set one when exposing the server beyond your own machine |
+| `HAX_GUI_TOKEN` | _(empty)_ | Shared access token. On a non-loopback bind one is **always** enforced: if unset, a token is generated once and kept in `<data dir>/token` (`hax-gui start` prints its location) |
+| `HAX_GUI_ALLOWED_HOSTS` | _(empty)_ | Extra `Host` header values to accept (comma-separated), for reverse-proxy setups; `*` disables the check. Loopback binds accept only loopback hostnames (DNS-rebinding protection) |
 | `HAX_PROJECT_MANAGER` | `hax_project_manager` | The `hax-em` launcher command to use |
 
 ## Remote use & security
 
-When you expose the interface beyond `localhost`, protect it: set an access
-token with `HAX_GUI_TOKEN` and put a reverse proxy (such as Caddy or nginx) in
-front to terminate HTTPS. The backend stays on the GPU server; the browser can
-be anywhere.
+When you expose the interface beyond `localhost`, an access token is enforced
+automatically: `hax-gui start --host 0.0.0.0` generates one on first use (kept
+in `<data dir>/token`) unless `HAX_GUI_TOKEN` is set. Put a reverse proxy (such
+as Caddy or nginx) in front to terminate HTTPS, and set `HAX_GUI_ALLOWED_HOSTS`
+to the public name(s) the proxy serves. The backend stays on the GPU server;
+the browser can be anywhere.
+
+On the default loopback bind the server stays open (no token) but accepts only
+loopback `Host` headers, which blocks DNS-rebinding attacks from hostile web
+pages. Set `HAX_GUI_TOKEN` anyway if other people can log into the machine.

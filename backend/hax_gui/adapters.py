@@ -39,10 +39,11 @@ BINDABLE_FIELDS: dict[str, dict[str, str]] = {
     # FlexConsensus consensuates many input latent spaces, so `--input_space` is a
     # *multi-valued* input: wire one latents source per program you want included.
     "flexconsensus": {"reload": "flexconsensus_model", "input_space": "latents"},
-    "latent_space_deconvolution": {"reload": "deconvolver_model", "md": "particles"},
-    "image_gray_scale_adjustment": {"reload": "image_adjust_model", "md": "particles", "vol": "volume"},
-    "volume_gray_scale_adjustment": {"reload": "volume_adjust_model", "md": "particles", "vol": "volume"},
-    "estimate_latent_covariances": {"md": "particles"},
+    "latent_space_deconvolution": {"reload": "deconvolver_model", "md": "particles",
+                                   "nn_path": "latent_model", "covariances": "covariances"},
+    "image_gray_scale_adjustment": {"md": "particles", "vol": "volume"},
+    "volume_gray_scale_adjustment": {"md": "particles", "vol": "volume"},
+    "estimate_latent_covariances": {"md": "particles", "nn_path": "latent_model"},
     # `motion_correction` is a --reload in disguise: MoDART loads a trained motion
     # decoder (HetSIREN w/ transport of mass, or Zernike3Deep) to correct particles
     # while reconstructing, so it auto-wires from such a run just like a reload.
@@ -66,6 +67,20 @@ MULTI_BINDABLE: dict[str, set[str]] = {
 }
 
 
+# Fields a program takes over from the run wired into one of its inputs: MoDART
+# corrects the particles its motion model was trained on, with the same map and mask.
+INHERITED_FIELDS: dict[str, dict[str, list[str]]] = {
+    "modart": {"motion_correction": ["md", "vol", "mask", "sr", "ctf_type"]},
+    # The covariances are row-aligned with their run's particles, in its network's latent space.
+    "latent_space_deconvolution": {"covariances": ["md", "nn_path"]},
+}
+
+
+def inherited_fields(program: str) -> dict[str, list[str]]:
+    """{bindable field: [fields copied from the run wired into it]} for `program`."""
+    return INHERITED_FIELDS.get(program, {})
+
+
 def multi_bindable_fields(program: str) -> list[str]:
     """Bindable fields of `program` that accept multiple wired sources."""
     return sorted(MULTI_BINDABLE.get(program, set()))
@@ -84,8 +99,6 @@ _CHECKPOINT_DIR: dict[str, str] = {
     "reconsiren_het_only": "ReconSIREN",   # het-only variant saves under the same subfolder
     "flexconsensus": "FlexConsensus",
     "latent_space_deconvolution": "deconvolver",
-    "image_gray_scale_adjustment": "imageAdjustment",
-    "volume_gray_scale_adjustment": "volumeAdjustment",
 }
 
 # Each `*_model` kind -> the producer programs whose checkpoint a consumer can
@@ -104,8 +117,6 @@ _MODEL_KINDS: dict[str, dict[str, Any]] = {
     "reconsiren_het_only_model": {"programs": ["reconsiren_het_only"], "form": "parent"},
     "flexconsensus_model": {"programs": ["flexconsensus"], "form": "parent"},
     "deconvolver_model": {"programs": ["latent_space_deconvolution"], "form": "parent"},
-    "image_adjust_model": {"programs": ["image_gray_scale_adjustment"], "form": "parent"},
-    "volume_adjust_model": {"programs": ["volume_gray_scale_adjustment"], "form": "parent"},
     "decoder_model": {"programs": ["hetsiren", "zernike3deep", "reconsiren", "reconsiren_het_only"], "form": "dir"},
     # MoDART's motion_correction loads the checkpoint path directly and calls
     # decode_field on it, which only HetSIREN and Zernike3Deep implement -- so this
@@ -117,6 +128,8 @@ _MODEL_KINDS: dict[str, dict[str, Any]] = {
     # Hence a kind narrower than motion_model, further filtered on --transport_mass by
     # `job_produces` so only a run that actually trained one is offered.
     "transport_motion_model": {"programs": ["hetsiren"], "form": "dir"},
+    # `--nn_path` needs an encoder returning latents (ReconSIREN's returns poses).
+    "latent_model": {"programs": ["hetsiren", "zernike3deep"], "form": "dir"},
 }
 
 # Artifacts referenced *in place* (no copy): the consumer is handed the producer's
@@ -147,6 +160,12 @@ _ARTIFACT_PRODUCERS: dict[str, list[dict[str, Any]]] = {
             "globs": ["predicted_latents.xmd", "predicted_latents.star",
                       "predicted_pose_shifts.xmd", "predicted_pose_shifts.star"],
         },
+        {
+            # The rescaled particles of an image gray-scale adjustment (a new stack)
+            "style": "path",
+            "programs": {"image_gray_scale_adjustment"},
+            "globs": ["adjusted_images.xmd", "adjusted_images.star"],
+        },
     ],
     "volume": [
         {
@@ -163,6 +182,24 @@ _ARTIFACT_PRODUCERS: dict[str, list[dict[str, Any]]] = {
             "style": "unique_glob",
             "programs": {"reconstruct_volume"},
             "globs": ["consensus_reconstruction.mrc"],
+        },
+        {
+            "style": "unique_glob",
+            "programs": {"volume_gray_scale_adjustment"},
+            "globs": ["adjusted_volume.mrc"],
+        },
+        {
+            # MoDART's final FSC-weighted map (not its halves or the consensus it may write)
+            "style": "unique_glob",
+            "programs": {"modart"},
+            "globs": ["modart_map.mrc"],
+        },
+    ],
+    "covariances": [
+        {
+            "style": "path",
+            "programs": {"estimate_latent_covariances"},
+            "globs": ["covariance_matrices.npy"],
         },
     ],
 }

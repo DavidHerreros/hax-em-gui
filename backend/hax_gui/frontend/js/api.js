@@ -31,10 +31,10 @@ async function req(path, init = {}) {
   return res.json();
 }
 
-// Same as `req`, for endpoints that answer with binary (image/png).
-async function blob(path) {
+// Same as `req`, for endpoints that answer with binary (image/png, pdf).
+async function blob(path, init = {}) {
   const token = getToken();
-  const res = await fetch(path, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  const res = await fetch(path, { ...init, headers: token ? { Authorization: `Bearer ${token}` } : {} });
   if (!res.ok) {
     let detail;
     try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
@@ -43,11 +43,36 @@ async function blob(path) {
   return res.blob();
 }
 
+// Same as `req`, for endpoints that answer with plain text rather than JSON.
+async function text(path, init = {}) {
+  const token = getToken();
+  const res = await fetch(path, { ...init, headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  if (!res.ok) {
+    let detail;
+    try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
+    throw new ApiError(res.status, detail);
+  }
+  return res.text();
+}
+
 export const api = {
   health: () => req("/api/health"),
+  authCheck: () => req("/api/auth/check"),
+  // Probe /api/auth/check with a candidate token (not the stored one) so the
+  // prompt can reject a bad paste before committing it — returns the HTTP status,
+  // or 0 on network failure.
+  authCheckWith: async (t) => {
+    try {
+      const res = await fetch("/api/auth/check", { headers: t ? { Authorization: `Bearer ${t}` } : {} });
+      return res.status;
+    } catch { return 0; }
+  },
   programs: () => req("/api/programs"),
   program: (name) => req(`/api/programs/${name}`),
   gpus: () => req("/api/gpus"),
+  // Installed versions of the packages stamped into each job's provenance
+  // (hax-em / hax-em-gui / jax / flax) — for the reproduce-run mismatch warning.
+  systemVersions: () => req("/api/system/versions"),
   updates: () => req("/api/updates"),
   checkUpdates: () => req("/api/updates/check", { method: "POST" }),
   updateRunState: () => req("/api/updates/run"),
@@ -64,9 +89,12 @@ export const api = {
   files: (path, fallback) =>
     req(`/api/files${path ? `?path=${encodeURIComponent(path)}${fallback ? "&fallback=true" : ""}` : ""}`),
   mkdir: (path, name) => req("/api/files/mkdir", { method: "POST", body: JSON.stringify({ path: path || null, name }) }),
-  jobs: () => req("/api/jobs"),
+  jobs: (limit) => req("/api/jobs" + (limit ? `?limit=${limit}` : "")),
   job: (id) => req(`/api/jobs/${id}`),
   jobLog: (id) => req(`/api/jobs/${id}/log`),
+  // Whole persisted log for one stream, uncapped — for a file too big for the
+  // windowed read the WS snapshot ships by default.
+  jobLogFull: (id, stream = "out") => text(`/api/jobs/${id}/log/full?stream=${stream}`),
   renameJob: (id, name) => req(`/api/jobs/${id}`, { method: "PUT", body: JSON.stringify({ name }) }),
   startJob: (id) => req(`/api/jobs/${id}/start`, { method: "POST" }),
   cancelJob: (id) => req(`/api/jobs/${id}/cancel`, { method: "POST" }),
@@ -86,6 +114,12 @@ export const api = {
   projectUsage: (id, refresh) => req(`/api/projects/${id}/usage${refresh ? "?refresh=true" : ""}`),
   projectsUsage: (refresh) => req(`/api/projects/usage${refresh ? "?refresh=true" : ""}`),
   deleteJob: (id) => req(`/api/jobs/${id}`, { method: "DELETE" }),
+  // Raw log file as a blob (stream: "out" | "err").
+  downloadLog: (id, stream = "out") => blob(`/api/jobs/${id}/log/download?stream=${stream}`),
+  // Watch mode: divergence/rising/plateau alerts on a running run's loss curve.
+  watchJob: (id) => req(`/api/jobs/${id}/watch`, { method: "POST" }),
+  unwatchJob: (id) => req(`/api/jobs/${id}/watch`, { method: "DELETE" }),
+  watchList: () => req("/api/watch"),
   // labels (colored tags on jobs)
   labels: () => req("/api/labels"),
   createLabel: (name, color) => req("/api/labels", { method: "POST", body: JSON.stringify({ name, color: color || null }) }),
@@ -119,8 +153,8 @@ export const api = {
   metricsImage: (logdir, run, tag, frame) =>
     blob(`/api/metrics/image?logdir=${encodeURIComponent(logdir)}&run=${encodeURIComponent(run)}` +
       `&tag=${encodeURIComponent(tag)}${frame != null ? `&frame=${frame}` : ""}`),
-  metricsSprite: (logdir, step, tag) =>
-    blob(`/api/metrics/sprite?logdir=${encodeURIComponent(logdir)}&step=${step}` +
+  metricsSprite: (logdir, step, index, tag) =>
+    blob(`/api/metrics/sprite?logdir=${encodeURIComponent(logdir)}&step=${step}&index=${index}` +
       (tag ? `&tag=${encodeURIComponent(tag)}` : "")),
 
   // workflows (visual pipeline builder)
@@ -209,6 +243,11 @@ export const api = {
 // Optional AI assistant. status() is always safe to call (reports
 // {available:false} when the hax-em-assistant package isn't installed).
 api.assistantStatus = () => req("/api/assistant/status");
+api.diagnoseJob = (id) => req(`/api/jobs/${id}/diagnose`, { method: "POST" });
+// PDF run report (deterministic figures + measured values, AI discussion when the
+// model is up). Slow — the server builds it synchronously; returns the PDF blob.
+api.runReport = (id, narrate = true) =>
+  blob(`/api/assistant/run-report/${id}?narrate=${narrate ? "true" : "false"}`, { method: "POST" });
 // Rebuild the docs vector index from the current hax-em-docs checkout (live,
 // no GUI restart). Returns {ok, rebuilt, chunks, ...}.
 api.assistantReindexDocs = (force = true) =>
@@ -224,15 +263,18 @@ api.assistantPrepareMotion = ({ jobId, gpu, onStatus, onDone, onError }) => {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const q = token ? `?token=${encodeURIComponent(token)}` : "";
   const ws = new WebSocket(`${proto}://${location.host}/ws/assistant/prepare-motion${q}`);
+  let settled = false;   // done/error already delivered (or caller closed)
   ws.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch { return; }
     if (m.status != null) { if (onStatus) onStatus(m.status); }
-    else if (m.done) { if (onDone) onDone(m.deformation_dir); ws.close(); }
-    else if (m.error != null) { if (onError) onError(m.error); ws.close(); }
+    else if (m.done) { settled = true; if (onDone) onDone(m.deformation_dir); ws.close(); }
+    else if (m.error != null) { settled = true; if (onError) onError(m.error); ws.close(); }
   };
   ws.onopen = () => ws.send(JSON.stringify({ job_id: jobId, gpu }));
-  ws.onerror = () => { if (onError) onError("connection error"); };
-  return { close: () => ws.close() };
+  // One-shot pipeline: no auto-reconnect (the server-side run can't be
+  // rejoined), but a drop must not leave the dialog spinning forever.
+  ws.onclose = () => { if (!settled) { settled = true; if (onError) onError("connection lost"); } };
+  return { close: () => { settled = true; ws.close(); } };
 };
 // Expand an assistant job proposal (program + path) into a draft spec + path facts.
 api.assistantPreviewJob = (program, path) =>
@@ -276,53 +318,116 @@ api.deleteChat = (id) => req(`/api/chats/${id}`, { method: "DELETE" });
 // Open a chat socket. Send full-history requests via send({messages, grounded});
 // tokens arrive through onToken, then onDone; onError on failure. Returns
 // { send, close }.
-export function assistantChat({ onToken, onStatus, onAction, onDone, onError }) {
-  const token = getToken();
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const q = token ? `?token=${encodeURIComponent(token)}` : "";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/assistant/chat${q}`);
-  ws.onmessage = (e) => {
-    const m = JSON.parse(e.data);
-    if (m.token != null) onToken(m.token);
-    else if (m.status != null) { if (onStatus) onStatus(m.status); }
-    else if (m.action != null) { if (onAction) onAction(m.action); }
-    else if (m.error) { if (onError) onError(m.error); }
-    else if (m.done) onDone();
+export function assistantChat({ onToken, onStatus, onAction, onDone, onError, onClose }) {
+  // Reconnecting: the old socket was created once and cached for the app's
+  // lifetime with no onclose — after a server restart every Send silently
+  // dropped its payload and the composer locked on "Stop" forever. Now a drop
+  // notifies once via onClose (so the view can unlock a stuck turn) and the
+  // socket reopens with backoff; later sends queue until it is OPEN again.
+  let ws = null;
+  let closed = false;
+  let attempt = 0;
+  let timer = null;
+  let pending = [];
+
+  const open = () => {
+    if (closed) return;
+    ws = new WebSocket(wsUrl("/ws/assistant/chat"));
+    ws.onopen = () => {
+      attempt = 0;
+      const queued = pending; pending = [];
+      for (const d of queued) ws.send(d);
+    };
+    ws.onmessage = (e) => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (m.token != null) onToken(m.token);
+      else if (m.status != null) { if (onStatus) onStatus(m.status); }
+      else if (m.action != null) { if (onAction) onAction(m.action); }
+      else if (m.error) { if (onError) onError(m.error); }
+      else if (m.done) onDone(m.turn);
+    };
+    ws.onclose = () => {
+      if (closed) return;
+      // A mid-turn drop loses the turn server-side; tell the view once so it
+      // can unlock, then quietly reopen for the next question.
+      if (onClose) onClose();
+      attempt += 1;
+      timer = setTimeout(open, Math.min(15000, 500 * 2 ** Math.min(attempt, 5)));
+    };
   };
-  ws.onerror = () => { if (onError) onError("connection error"); };
+  open();
 
   // `new WebSocket()` returns in CONNECTING state; calling send() before the
-  // socket is OPEN throws InvalidStateError. Queue payloads until onopen flushes.
-  let pending = [];
+  // socket is OPEN throws InvalidStateError. Queue payloads until onopen
+  // flushes (also covers the reconnecting window).
   const raw = (payload) => {
     const data = JSON.stringify(payload);
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
-    else if (ws.readyState === WebSocket.CONNECTING) pending.push(data);
-    // CLOSING/CLOSED: drop silently
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(data);
+    else pending.push(data);
   };
-  ws.onopen = () => { const queued = pending; pending = []; for (const d of queued) ws.send(d); };
   return {
     send: (payload) => raw(payload),
     stop: () => raw({ stop: true }),
-    close: () => { pending = []; try { ws.close(); } catch { /* already closed */ } },
+    close: () => {
+      closed = true; pending = [];
+      if (timer) clearTimeout(timer);
+      try { ws.close(); } catch { /* already closed */ }
+    },
   };
 }
 
 // Subscribe to a job's live log. Returns a close() function.
-export function subscribeLog(jobId, onMessage) {
-  return subscribeWS(`/ws/jobs/${jobId}/log`, onMessage);
+// `shouldReconnect` (from the caller, which knows the job's status) gates the
+// reconnect: a finished job's socket is closed by the server on purpose after
+// the replay, and blindly reopening it would loop forever.
+export function subscribeLog(jobId, onMessage, opts) {
+  return subscribeWS(`/ws/jobs/${jobId}/log`, onMessage, opts);
 }
 
 // Subscribe to the live update-installer log. Returns a close() function.
+// Always reconnects: the update restarts the server, and reconnecting through
+// that restart is exactly how the modal shows the tail end of the install.
 export function subscribeUpdateLog(onMessage) {
   return subscribeWS(`/ws/updates/log`, onMessage);
 }
 
-function subscribeWS(path, onMessage) {
+function wsUrl(path) {
   const token = getToken();
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const q = token ? `?token=${encodeURIComponent(token)}` : "";
-  const ws = new WebSocket(`${proto}://${location.host}${path}${q}`);
-  ws.onmessage = (e) => onMessage(JSON.parse(e.data));
-  return () => { try { ws.close(); } catch { /* already closed */ } };
+  return `${proto}://${location.host}${path}${q}`;
+}
+
+// A WebSocket subscription that survives the other end going away. The old
+// version set only onmessage: a server restart (which the GUI itself triggers
+// on update) or a proxy idle-timeout silently froze the stream — the log
+// stopped mid-training with no indication and no recovery short of a reload.
+// Reconnects with exponential backoff (0.5 s → 15 s), resets on success, and
+// guards JSON.parse so one malformed frame can't kill the handler.
+export function subscribeWS(path, onMessage, { shouldReconnect } = {}) {
+  let ws = null;
+  let closed = false;
+  let attempt = 0;
+  let timer = null;
+  const open = () => {
+    if (closed) return;
+    ws = new WebSocket(wsUrl(path));
+    ws.onopen = () => { attempt = 0; };
+    ws.onmessage = (e) => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      onMessage(m);
+    };
+    ws.onclose = () => {
+      if (closed) return;
+      if (shouldReconnect && !shouldReconnect()) { closed = true; return; }
+      attempt += 1;
+      timer = setTimeout(open, Math.min(15000, 500 * 2 ** Math.min(attempt, 5)));
+    };
+  };
+  open();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    try { ws.close(); } catch { /* already closed */ }
+  };
 }

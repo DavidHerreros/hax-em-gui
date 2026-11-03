@@ -6,8 +6,12 @@
 // drag-and-drop add + drop-to-connect, per-node + selection runs with live
 // per-node status, predict<->train parameter inheritance on wiring, file-browser
 // pickers for path args, and "import a project as a workflow".
+import { announceJobRename } from "./jobs.js";
 import { h, clear, mount } from "../h.js";
+import { poller } from "../poller.js";
+import { setNavGuard } from "../router.js";
 import { icon } from "../icons.js";
+import { confirmModal } from "./confirmModal.js";
 import { api } from "../api.js";
 import { navigate } from "../router.js";
 import { store, getState } from "../store.js";
@@ -17,6 +21,7 @@ import { paramForm } from "./paramForm.js";
 import { nodeLabelChips, loadLabels, labelsByIds, labelChip } from "./labels.js";
 import { openContextMenu } from "./contextMenu.js";
 import { promptModal } from "./promptModal.js";
+import { fixParamsModal } from "./fixParams.js";
 import { confirmCascade, downstreamNodes, nodeAsDependent } from "./cascadeModal.js";
 import { pickProject } from "./pickProject.js";
 import { loadProgramGroups, isModed } from "../programGroups.js";
@@ -59,14 +64,15 @@ export function rememberWorkflowToOpen(id) {
 const NODE_W = 196;     // node width (px)
 const HEADER_H = 34;    // node header height
 const ROW_H = 26;       // per-input-port row height
-const CONTENT_W = 4000; // scrollable canvas content size (matches the wires SVG)
-const CONTENT_H = 3000;
+const MIN_CONTENT_W = 4000; // minimum canvas size; the content grows to keep margin beyond the graph
+const MIN_CONTENT_H = 3000;
+const GROW_PAD = 800;   // margin kept past the outermost node so there's always room to drag/wire
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 // Concrete status colors for the overview map. Canvas 2D takes only resolved colors,
 // and these are semantic (green succeeded / red failed) rather than themed, so unlike
 // the map's ink they are literals rather than read off the computed style.
-const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", running: "#38bdf8", succeeded: "#22c55e", failed: "#ef4444", blocked: "#f59e0b", cancelling: "#f59e0b", cancelled: "#94a3b8", interrupted: "#f59e0b", idle: "#94a3b8" };
+const MINI_STATUS = { saved: "#a78bfa", pending: "#94a3b8", queued: "#f59e0b", running: "#38bdf8", succeeded: "#22c55e", failed: "#ef4444", blocked: "#f59e0b", cancelling: "#f59e0b", cancelled: "#94a3b8", interrupted: "#f59e0b", idle: "#94a3b8" };
 
 // Programs that expose a train/predict mode (derived from the backend, see
 // programGroups.js) — wiring their model output into another node of the same
@@ -79,6 +85,7 @@ const STATUS_COLOR = {
   saved: "#a78bfa", pending: "var(--muted)", running: "var(--accent)",
   succeeded: "#22c55e", failed: "var(--err)", blocked: "var(--warn)",
   cancelling: "var(--warn)", cancelled: "var(--muted)", interrupted: "var(--warn)",
+  queued: "var(--warn)",
   idle: "var(--muted)", skipped: "var(--muted)",
 };
 // Any status not in the map must still get a concrete color, or SVG strokes /
@@ -108,16 +115,69 @@ export function WorkflowsView() {
   let catalog = [];
   let byName = {};
   let graph = { nodes: [], edges: [], orientation: rememberedOrientation() };
+
+  // ── undo/redo: debounced JSON snapshots of the graph ──────────────────────
+  // Every mutation site sets `dirty` and calls touchHistory(); 400 ms later the
+  // (deduped) state lands on the stack, so a drag collapses to one step.
+  let history = [], histIdx = -1, histTimer = null;
+  const snapshot = () => JSON.stringify({ nodes: graph.nodes, edges: graph.edges });
+  function seedHistory() { clearTimeout(histTimer); history = [snapshot()]; histIdx = 0; }
+  function touchHistory() {
+    clearTimeout(histTimer);
+    histTimer = setTimeout(() => {
+      const snap = snapshot();
+      if (history[histIdx] === snap) return;
+      history = history.slice(0, histIdx + 1);
+      history.push(snap);
+      if (history.length > 100) history.shift();
+      histIdx = history.length - 1;
+    }, 400);
+  }
+  // Moving a box, Tidy, restoring a pinned layout — cosmetic, not a decision the user
+  // needs to be asked about on their way out. These stay undoable (touchHistory still
+  // runs) but auto-save on their own debounce instead of setting `dirty`, so they never
+  // trip the unsaved-changes guard the way an actual graph edit does.
+  function touchLayout() {
+    layoutDirty = true;
+    touchHistory();
+    clearTimeout(layoutTimer);
+    layoutTimer = setTimeout(flushLayoutSave, 1000);
+  }
+  function flushLayoutSave() {
+    clearTimeout(layoutTimer);
+    // Checked here, not at schedule time: a semantic edit landing inside the debounce
+    // window must NOT get silently persisted — it rides along with the next explicit Save.
+    if (!(wf && layoutDirty && !dirty)) return;
+    const id = wf.id;   // captured now: `wf` may point at a different workflow by the time this resolves
+    api.updateWorkflow(id, { graph: graphSnapshot() })
+      .then((u) => { if (wf && wf.id === id) { wf = u; layoutDirty = false; } })
+      .catch(() => {});
+  }
+  function timeTravel(dir) {
+    clearTimeout(histTimer);                    // a pending push would clobber the jump
+    const to = histIdx + dir;
+    if (to < 0 || to >= history.length) { flash(dir < 0 ? "Nothing to undo." : "Nothing to redo.", "muted"); return; }
+    histIdx = to;
+    const g = JSON.parse(history[histIdx]);
+    graph.nodes = g.nodes; graph.edges = g.edges;
+    selected = null; selectedSet.clear();
+    dirty = true;
+    renderNodes(); renderInspector();
+  }
   let wf = null;            // saved workflow record
   let selected = null;      // primary selected node id (drives the inspector)
   const selectedSet = new Set();   // multi-selection (run / move together)
   let runState = null;      // {nodeId: {job_id, status, error}}
+  let flaggedFor = null;    // node whose parameter errors the inspector has already scrolled to
   let dirty = false;
+  let layoutDirty = false, layoutTimer = null;   // layout-only changes: auto-saved, never trip the unsaved-changes guard
   let poll = null;
   const schemaCache = {};
   let drag = null;          // active node drag / wiring / pan gesture
   let nodeSeq = 1, edgeSeq = 1;
   let focusMode = rememberedFocus();   // dim everything not wired to the selection?
+  let stepSearch = "";      // lowercased step-search query; dims non-matches + drives the dropdown
+  let searchState = { matches: [], hi: -1 };   // current dropdown matches + keyboard highlight
   let minimapOn = true;     // overview window visible?
   let mmCollapsed = false;  // overview shrunk to its title pill?
   let mmXform = null;       // last minimap transform (for click-to-navigate)
@@ -136,9 +196,34 @@ export function WorkflowsView() {
   // (steps appended to the live queue); otherwise a Run split button. Queued steps
   // start as soon as their device has a free slot, so several can be running at once.
   const nameInput = h("input", { class: "wf-name", placeholder: "Workflow name", value: "" });
-  nameInput.addEventListener("input", () => { dirty = true; });
-  const wfSelect = h("select", { class: "wf-select", title: "Open a saved workflow" });
-  wfSelect.addEventListener("change", () => openWorkflow(wfSelect.value || null));
+  nameInput.addEventListener("input", () => { dirty = true, touchHistory(); });
+  const wfSelect = h("select", { class: "wf-select", title: "Open a project or draft workflow" });
+  wfSelect.addEventListener("change", async () => {
+    const v = wfSelect.value;
+    if (v === "new-project") {
+      const name = await promptModal({ title: "New project", label: "Project name", placeholder: "my-project", okText: "Create" });
+      if (!name) { syncPickerValue(); return; }
+      if (!(await confirmDiscard())) { syncPickerValue(); return; }
+      try {
+        const created = await api.createProject(name);
+        store.openProject(created);
+        await openProjectById(created.id);
+      } catch (err) { flash("Couldn't create project: " + (err.detail || err.message), "err"); syncPickerValue(); }
+      return;
+    }
+    if (!(await confirmDiscard())) { syncPickerValue(); return; }
+    if (v.startsWith("p:")) {
+      const pid = v.slice(2);
+      const project = projList.find((p) => p.id === pid);
+      if (project) store.openProject(project);
+      try { await openProjectById(pid); }
+      catch (err) { flash("Open failed: " + (err.detail || err.message), "err"); syncPickerValue(); }
+    } else if (v.startsWith("w:")) {
+      openWorkflow(v.slice(2));
+    } else {
+      syncPickerValue();   // the disabled "— open —" placeholder — nothing to do
+    }
+  });
   const statusEl = h("span", { class: "wf-status muted" }, "");
   const zoomLabel = h("button", { class: "btn small wf-zoom", title: "Reset zoom to 100%", onclick: resetZoom }, "100%");
   const saveBtn = h("button", { class: "btn", onclick: save }, icon("save", 15), "Save");
@@ -147,6 +232,12 @@ export function WorkflowsView() {
     onclick: (e) => openContextMenu(e.currentTarget, wfMenuItems()) }, icon("more", 15));
   const viewMenuBtn = h("button", { class: "btn small", title: "View & layout",
     onclick: (e) => openContextMenu(e.currentTarget, viewMenuItems()) }, icon("sliders", 14), "View");
+
+  // Step search: the canvas dims to non-matches (same as focus mode's dim/near/focused
+  // classes below) while a dropdown lists the same matches for jumping straight to one.
+  const searchInput = h("input", { class: "wf-search", type: "search", placeholder: "Search steps…" });
+  const searchDd = h("div", { class: "wf-search-dd", hidden: true });
+  const searchWrap = h("div", { class: "wf-search-wrap" }, searchInput, searchDd);
 
   // Steps run concurrently, capped per device: a step's GPU (or the CPU) is the resource
   // it contends for, so branches on different GPUs already run side by side at 1. Raising
@@ -159,15 +250,14 @@ export function WorkflowsView() {
 
   const topbar = h("div", { class: "wf-topbar" },
     h("div", { class: "wf-zone" }, h("strong", null, "Workflow"), wfSelect, nameInput, parSel, wfMenuBtn),
-    h("div", { class: "wf-zone" }, viewMenuBtn, zoomLabel),
+    h("div", { class: "wf-zone" }, searchWrap, viewMenuBtn, zoomLabel),
     h("span", { class: "wf-spacer" }),
     statusEl, actionsEl);
 
   // Menus are built on open, so they always read the current workflow / layout state.
   function wfMenuItems() {
     const items = [
-      { label: "New workflow", icon: icon("plus", 15), onClick: () => openWorkflow(null) },
-      { label: "Open project as workflow", icon: icon("box", 15), onClick: openProject },
+      { label: "New draft workflow", icon: icon("plus", 15), onClick: async () => { if (await confirmDiscard()) openWorkflow(null); } },
     ];
     if (!(wf && wf.project_id)) items.push({ label: "Save as project", icon: icon("save", 15), onClick: saveAsProject });
     if (wf && wf.project_id) items.push({ label: "Reconnect step inputs", icon: icon("link", 15), onClick: relinkInputs });
@@ -210,7 +300,7 @@ export function WorkflowsView() {
   }
   function viewMenuItems() {
     const items = [
-      { label: "Tidy — arrange by dependency", icon: icon("sliders", 15), onClick: () => { autoLayout(); dirty = true; } },
+      { label: "Tidy — arrange by dependency", icon: icon("sliders", 15), onClick: () => { autoLayout(); touchLayout(); } },
       { label: horiz() ? "Switch to vertical" : "Switch to horizontal", icon: icon(horiz() ? "chevronRight" : "arrowRight", 15), onClick: toggleOrientation },
       { label: "Center in view", icon: icon("orbit", 15), onClick: centerView },
       { label: minimapOn ? "Hide overview map" : "Show overview map", icon: icon("grid", 15), onClick: toggleMinimap },
@@ -249,6 +339,9 @@ export function WorkflowsView() {
   }
 
   function syncActions() {
+    // Rebuilding this cluster mid-node-drag can wrap `.wf-topbar` onto a second row and
+    // shift the canvas out from under the pointer — deferred to onUp instead.
+    if (drag && drag.kind === "node") return;
     parSel.value = String((wf && wf.max_per_device) || 1);
     parSel.disabled = !wf;
     clear(actionsEl);
@@ -261,6 +354,16 @@ export function WorkflowsView() {
         h("button", { class: "btn secondary small", title: "Remove the selected step(s) (Delete / Backspace). Save to persist.", onclick: () => removeNodes([...selectedSet]) }, icon("x", 14)));
     }
     actionsEl.appendChild(saveBtn);
+    // Every parameter that would sink a run, repairable in one pass. Only offered when
+    // there is something to repair — otherwise it is a button that always says "no".
+    const bad = issueCount();
+    if (bad) {
+      actionsEl.appendChild(h("button", {
+        class: "btn secondary", style: { color: "var(--warn)", borderColor: "var(--warn)" },
+        title: `${bad} parameter${bad === 1 ? "" : "s"} would stop a run before any job is created. Fix them here.`,
+        onclick: () => openFixParams(null),
+      }, icon("sliders", 15), `Fix parameters (${bad})`));
+    }
     if (running) {
       if (n) actionsEl.appendChild(h("button", { class: "btn secondary", title: "Queue the selected step(s) onto the running workflow — each starts as soon as its dependencies are met and its device is free",
         onclick: () => runNodes([...selectedSet]) }, icon("plus", 15), "Queue selected"));
@@ -284,14 +387,18 @@ export function WorkflowsView() {
       h("button", { class: "wf-pane-collapse", title: "Hide programs", onclick: () => setPalette(false) }, icon("chevronLeft", 16))),
     paletteInner);
 
-  // The content (wires + nodes) lives in a fixed CONTENT_W×CONTENT_H layer that is
+  // The content (wires + nodes) lives in a contentW×contentH layer that is
   // CSS-scaled by `zoom`; a sizer of the scaled size gives the scroll container its
-  // extent. Node coords stay in content units — only the view scales.
+  // extent. Node coords stay in content units — only the view scales. contentW/H
+  // start at the minimums and grow (see fitContent below) as nodes are dragged or
+  // placed near the edge, so the usable area is effectively unlimited rightward/
+  // downward while the origin stays anchored at 0 (existing clamps already enforce that).
   let zoom = 1;
+  let contentW = MIN_CONTENT_W, contentH = MIN_CONTENT_H;
   const ZOOM_MIN = 0.2, ZOOM_MAX = 2.5;
-  const svg = svgEl("svg", { class: "wf-wires", width: String(CONTENT_W), height: String(CONTENT_H) });
+  const svg = svgEl("svg", { class: "wf-wires", width: String(contentW), height: String(contentH) });
   const nodesLayer = h("div", { class: "wf-nodes" });
-  const contentLayer = h("div", { class: "wf-content", style: { width: CONTENT_W + "px", height: CONTENT_H + "px" } }, svg, nodesLayer);
+  const contentLayer = h("div", { class: "wf-content", style: { width: contentW + "px", height: contentH + "px" } }, svg, nodesLayer);
   const sizer = h("div", { class: "wf-sizer" }, contentLayer);
   const canvas = h("div", { class: "wf-canvas" }, sizer);
   // ── overview panel ──
@@ -316,10 +423,25 @@ export function WorkflowsView() {
   contentLayer.appendChild(marqueeEl);
 
   function applyZoom() {
-    sizer.style.width = CONTENT_W * zoom + "px";
-    sizer.style.height = CONTENT_H * zoom + "px";
+    sizer.style.width = contentW * zoom + "px";
+    sizer.style.height = contentH * zoom + "px";
     contentLayer.style.transform = `scale(${zoom})`;
     updateZoomLabel();
+  }
+  // Grow the canvas to keep GROW_PAD of margin past the outermost node — only ever
+  // grows (never shrinks) so a drag/wire gesture in flight never has the floor pulled
+  // out from under it; a page reload is what resets an over-grown canvas back down.
+  function fitContent() {
+    const b = graphBBox();
+    const needW = Math.max(contentW, MIN_CONTENT_W, (b ? b.x1 : 0) + GROW_PAD);
+    const needH = Math.max(contentH, MIN_CONTENT_H, (b ? b.y1 : 0) + GROW_PAD);
+    if (needW === contentW && needH === contentH) return;
+    contentW = needW; contentH = needH;
+    svg.setAttribute("width", String(contentW));
+    svg.setAttribute("height", String(contentH));
+    contentLayer.style.width = contentW + "px";
+    contentLayer.style.height = contentH + "px";
+    applyZoom();
   }
   function updateZoomLabel() { zoomLabel.textContent = Math.round(zoom * 100) + "%"; }
   // Zoom to `next`, keeping the content point under (mx,my) (canvas-local px) fixed.
@@ -482,21 +604,54 @@ export function WorkflowsView() {
     loadLabels().catch(() => {});
     loadProgramGroups().catch(() => {});
     await refreshList();
-    // Reopen the workflow left open last time (if it still exists), so entering the
-    // page resumes where you were instead of a blank canvas. Falls back to empty.
+    // Project-first: entering the builder shows whatever project is already active,
+    // full stop — that beats reopening some other draft/project left open last time.
+    // Only when there's no active project do we fall back to the old "resume where
+    // you were" behavior, and then to a blank canvas.
+    const activePid = getState().activeProjectId;
+    if (activePid) {
+      try { await openProjectById(activePid); return; }
+      catch { /* stale/removed project — fall through to the paths below */ }
+    }
     const last = localStorage.getItem(LAST_WF_KEY);
     if (last && wfList.some((w) => w.id === last)) openWorkflow(last);
     else openWorkflow(null);
   }
 
-  let wfList = [];   // last-fetched saved-workflow list (drives the reopen check)
+  let wfList = [];    // last-fetched workflow list, ALL projects (drives the reopen check + picker groups)
+  let projList = [];  // last-fetched project list (drives the picker's "Projects" group)
   async function refreshList() {
-    const pid = getState().activeProjectId;
-    try { wfList = await api.workflows(pid); } catch { wfList = []; }
+    const [projects, workflows] = await Promise.all([api.projects().catch(() => []), api.workflows().catch(() => [])]);
+    projList = projects; wfList = workflows;
     clear(wfSelect);
-    wfSelect.appendChild(h("option", { value: "" }, "— saved workflows —"));
-    for (const w of wfList) wfSelect.appendChild(h("option", { value: w.id }, w.name || "Untitled"));
-    if (wf) wfSelect.value = wf.id;
+    wfSelect.appendChild(h("option", { value: "", disabled: true }, "— open —"));
+    wfSelect.appendChild(h("option", { value: "new-project" }, "＋ New project…"));
+    const projGroup = h("optgroup", { label: "Projects" });
+    for (const p of projList) projGroup.appendChild(h("option", { value: "p:" + p.id }, p.name));
+    wfSelect.appendChild(projGroup);
+    // Standalone workflows saved while this project was active — shown only once its
+    // live canvas is actually open, so switching projects doesn't leak the last one's drafts.
+    if (wf && wf.kind === "project") {
+      const inProject = wfList.filter((w) => w.project_id === wf.project_id && w.kind !== "project");
+      if (inProject.length) {
+        const grp = h("optgroup", { label: "In this project" });
+        for (const w of inProject) grp.appendChild(h("option", { value: "w:" + w.id }, w.name || "Untitled"));
+        wfSelect.appendChild(grp);
+      }
+    }
+    const drafts = wfList.filter((w) => !w.project_id);
+    if (drafts.length) {
+      const grp = h("optgroup", { label: "Drafts" });
+      for (const w of drafts) grp.appendChild(h("option", { value: "w:" + w.id }, w.name || "Untitled"));
+      wfSelect.appendChild(grp);
+    }
+    syncPickerValue();
+  }
+
+  // What the picker should show for the currently open workflow: the project it lives
+  // in (if it IS that project's live canvas), the draft itself, or nothing.
+  function syncPickerValue() {
+    wfSelect.value = wf ? (wf.kind === "project" ? "p:" + wf.project_id : "w:" + wf.id) : "";
   }
 
   function renderPalette() {
@@ -529,8 +684,9 @@ export function WorkflowsView() {
     const id = "n" + (nodeSeq++);
     const node = { id, program, args: {}, gpu: "0", name: "", labels: [], x, y };
     graph.nodes.push(node);
-    selectOnly(id); dirty = true;
+    selectOnly(id); dirty = true, touchHistory();
     renderNodes(); renderInspector();
+    prefetchSchemas();   // a program new to this graph: its chip appears when the schema lands
     return node;
   }
   // The job backing a node, if any: project-canvas nodes carry `job_id`; a
@@ -564,7 +720,8 @@ export function WorkflowsView() {
     const n = set.size;
     let msg = n > 1 ? `Remove ${n} selected steps from the canvas?` : "Remove this step from the canvas?";
     if (jobIds.length) msg += `\n\nThis also permanently deletes ${jobIds.length} associated job${jobIds.length > 1 ? "s" : ""} — their output folders and logs — and cannot be undone.`;
-    if ((n > 1 || jobIds.length) && !confirm(msg)) return;
+    if ((n > 1 || jobIds.length) && !(await confirmModal({ title: "Remove step(s)?", danger: !!jobIds.length,
+        okText: "Remove", message: msg }))) return;
 
     // keep what we drop, so a step whose job survives can be restored below
     const cutNodes = graph.nodes.filter((nd) => set.has(nd.id));
@@ -577,7 +734,7 @@ export function WorkflowsView() {
     graph.edges = graph.edges.filter((e) => !set.has(e.from) && !set.has(e.to));
     for (const id of set) { selectedSet.delete(id); if (runState) delete runState[id]; }
     if (set.has(selected)) selected = selectedSet.size ? [...selectedSet][0] : null;
-    dirty = true; renderNodes(); renderInspector();
+    dirty = true, touchHistory(); renderNodes(); renderInspector();
 
     // delete the backing jobs (best-effort: an active job can't be deleted, so it
     // is reported rather than silently skipped)
@@ -652,7 +809,7 @@ export function WorkflowsView() {
     }
     selectedSet.clear(); for (const id of made) selectedSet.add(id);
     selected = made[made.length - 1];
-    dirty = true; renderNodes(); renderInspector();
+    dirty = true, touchHistory(); renderNodes(); renderInspector();
     flash(made.length === 1 ? "Step duplicated — Save to keep it." : `${made.length} steps duplicated — Save to keep them.`, "muted");
   }
   const isMultiField = (program, field) => (byName[program]?.bindable_multi || []).includes(field);
@@ -669,9 +826,10 @@ export function WorkflowsView() {
     }
     graph.edges.push({ id: "e" + (edgeSeq++), from: fromId, to: toId, field, kind });
     inheritParams(fromId, toId, kind);
-    dirty = true; renderNodes(); renderInspector();
+    inheritInputs(fromId, toId, field);
+    dirty = true, touchHistory(); renderNodes(); renderInspector();
   }
-  function removeEdge(id) { graph.edges = graph.edges.filter((e) => e.id !== id); dirty = true; renderNodes(); renderInspector(); }
+  function removeEdge(id) { graph.edges = graph.edges.filter((e) => e.id !== id); dirty = true, touchHistory(); renderNodes(); renderInspector(); }
 
   // When a node's model output feeds another node of the same moded program
   // (train -> predict), copy the source's parameters into the target (mode aside),
@@ -687,6 +845,21 @@ export function WorkflowsView() {
     }
     if (!("mode" in dst.args)) dst.args.mode = "predict";
     if (!("mode" in src.args)) src.args.mode = "train";
+  }
+
+  // Fill the target's empty `inherits` fields from the source: its wiring where the
+  // source is wired, its literal value otherwise (e.g. MoDART <- HetSIREN md/vol/mask/sr).
+  function inheritInputs(fromId, toId, field) {
+    const src = nodeById(fromId), dst = nodeById(toId);
+    const names = src && dst && byName[dst.program]?.inherits?.[field];
+    if (!names) return;
+    const bindable = byName[dst.program].bindable || {};
+    for (const name of names) {
+      if (name in dst.args || wiredInto(dst, name)) continue;
+      const wired = graph.edges.filter((e) => e.to === fromId && e.field === name && e.kind === bindable[name]);
+      for (const e of wired) graph.edges.push({ id: "e" + (edgeSeq++), from: e.from, to: toId, field: name, kind: e.kind });
+      if (!wired.length && name in src.args) dst.args[name] = src.args[name];
+    }
   }
 
   // A node's output kinds, narrowed by its mode: a moded network yields its trained
@@ -720,6 +893,10 @@ export function WorkflowsView() {
   }
 
   const nodeById = (id) => graph.nodes.find((n) => n.id === id);
+  // A step "matches" the search box on its custom name or its program, same rule the
+  // jobs-list name filter uses. False whenever the box is empty, so callers can gate
+  // dim/dropdown logic on stepSearch alone without a separate truthiness check.
+  const searchMatch = (n) => !!stepSearch && ((n.name || "").toLowerCase().includes(stepSearch) || n.program.toLowerCase().includes(stepSearch));
   const inputsOf = (program) => Object.entries((byName[program] || {}).bindable || {});
   const LABEL_ROW_H = 22;   // height of one wrapped row of label chips
   const nodeLabels = (n) => labelsByIds(n.labels);
@@ -781,6 +958,111 @@ export function WorkflowsView() {
       : "Focus mode off.", "muted");
   }
 
+  // ── parameter issues ──
+  // What build_command (backend/hax_gui/command.py) would reject, worked out here so a
+  // step can say so *before* it is run: a launch that fails validation produces no job,
+  // so there is no log to read the reason from and the step just turns red. The checks
+  // below mirror that function; whatever it rejected for reasons the client cannot see
+  // (a binding whose source job is gone) comes back as `error_fields` on the run state
+  // and is merged in.
+  const emptyArg = (v) => v === undefined || v === null || (typeof v === "string" && v.trim() === "");
+  // Python's int()/float(), not JS's: int("3.5") and float("x") both raise, so a plain
+  // Number() cast would pass values the backend is about to refuse.
+  const intLike = (v) => (typeof v === "number" ? Number.isFinite(v) : /^[+-]?\d+$/.test(String(v).trim()));
+  const numLike = (v) => {
+    if (typeof v === "number") return Number.isFinite(v);
+    const s = String(v).trim();
+    return s !== "" && (!Number.isNaN(Number(s)) || /^[+-]?(inf(inity)?|nan)$/i.test(s));   // float() takes inf/nan
+  };
+  const wiredInto = (n, field) => graph.edges.some((e) => e.to === n.id && e.field === field);
+
+  // [{ field, message, source }] — "params" for what the schema check found, "launch"
+  // for what the last failed launch reported.
+  function stepIssues(n) {
+    const schema = schemaCache[n.program];
+    if (!schema) return [];        // not fetched yet — prefetchSchemas() re-renders when it lands
+    const args = n.args || {};
+    const out = [];
+    for (const f of visibleFields(schema)) {
+      // A wired input is filled from the graph at launch, and a boolean is always
+      // sendable. Neither can be "missing". visibleFields() also keeps the auto-managed
+      // output/scratch args out of this — _run_node strips them before building.
+      if (f.type === "boolean" || wiredInto(n, f.name)) continue;
+      const v = args[f.name];
+      if (emptyArg(v)) {
+        if (f.required) out.push({ field: f.name, message: "required", source: "params" });
+        continue;
+      }
+      if (f.type === "enum" && f.choices && !f.choices.includes(v)) out.push({ field: f.name, message: `must be one of ${JSON.stringify(f.choices)}`, source: "params" });
+      else if (f.type === "integer" && !intLike(v)) out.push({ field: f.name, message: "must be an integer", source: "params" });
+      else if (f.type === "number" && !numLike(v)) out.push({ field: f.name, message: "must be a number", source: "params" });
+    }
+    const failed = runState && runState[n.id] && runState[n.id].error_fields;
+    if (failed && typeof failed === "object" && !Array.isArray(failed)) {
+      const seen = new Set(out.map((i) => i.field));
+      for (const [field, message] of Object.entries(failed)) {
+        if (!seen.has(field)) out.push({ field, message: String(message), source: "launch" });
+      }
+    }
+    return out;
+  }
+
+  // Recomputed on demand rather than cached: a graph is a few dozen nodes, and nothing
+  // then has to remember to invalidate it when an argument or a wire changes.
+  function issueCount() {
+    let n = 0;
+    for (const node of graph.nodes) n += stepIssues(node).length;
+    return n;
+  }
+
+  // The catalog is deliberately fieldless (registry.py), so every chip depends on a
+  // schema that only arrives per program. Pull the ones this graph needs in one go
+  // instead of waiting for the user to click each step.
+  function prefetchSchemas() {
+    const missing = [...new Set(graph.nodes.map((n) => n.program))].filter((p) => p && !schemaCache[p]);
+    if (!missing.length) return;
+    // renderNodes() + syncActions(), but never renderInspector(): the inspector would
+    // rebuild the form under a user already typing in it, and it reloads its own schema
+    // anyway. syncActions() has to be spelled out — renderNodes() calls it, but only
+    // when a node drag isn't in flight, and the toolbar's count is as new as the chips.
+    Promise.all(missing.map(loadSchema)).then(() => { if (root.isConnected) { renderNodes(); syncActions(); } });
+  }
+
+  // One pass over every broken parameter in the graph (or just `ids`) — the alternative
+  // is selecting each step in turn, and the inspector only shows one at a time.
+  async function openFixParams(ids) {
+    const scope = ids ? graph.nodes.filter((n) => ids.includes(n.id)) : graph.nodes;
+    const steps = [];
+    for (const n of scope) {
+      const schema = schemaCache[n.program];
+      if (!schema) continue;
+      const issues = stepIssues(n);
+      if (!issues.length) continue;
+      // Fixable = a field this form can render that isn't fed by a wire. The rest (a
+      // wired input, an argument the program no longer has) is listed but not editable.
+      const known = new Set(visibleFields(schema).map((f) => f.name));
+      const fixable = (node, list) => list.filter((i) => known.has(i.field) && !wiredInto(node, i.field));
+      steps.push({
+        node: n, schema,
+        issues: fixable(n, issues),
+        wiredIssues: issues.filter((i) => !known.has(i.field) || wiredInto(n, i.field)),
+        recheck: (node) => fixable(node, stepIssues(node)),
+      });
+    }
+    if (!steps.length) { flash("Nothing to fix — every step's parameters are complete.", "muted"); return; }
+    // The forms write into the live node objects, and a poll that adopts the server
+    // graph would swap those objects out from under them — the same reason the inspector
+    // is protected (see startPolling). So the first keystroke marks the canvas dirty,
+    // and a dismissed window puts the flag back where it found it.
+    const wasDirty = dirty;
+    const res = await fixParamsModal({ steps, onGoToStep: (id) => jumpTo(id), onEdit: () => { dirty = true; } });
+    if (!res) { dirty = wasDirty; renderNodes(); renderInspector(); return; }   // edits rolled back — redraw the chips
+    dirty = true, touchHistory();
+    await save();
+    renderNodes(); renderInspector();
+    if (res.action === "save-run" && res.nodes.length) runNodes(res.nodes);
+  }
+
   // ── rendering ──
   function renderNodes() {
     clear(nodesLayer);
@@ -790,9 +1072,14 @@ export function WorkflowsView() {
       // three tiers: the selection (already ringed by .sel/.primary), the steps it is
       // wired to, and everything else.
       if (focus) el.classList.add(!focus.nodes.has(n.id) ? "dim" : (selectedSet.has(n.id) ? "focused" : "near"));
+      // renderNodes() rebuilds every node from scratch, so the search dim/ring has to be
+      // reapplied here too — otherwise a selection change or a poll refresh would silently
+      // drop it until the next keystroke.
+      if (stepSearch) el.classList.add(searchMatch(n) ? "search-match" : "search-dim");
       nodesLayer.appendChild(el);
     }
     redrawWires(null, focus);
+    fitContent();     // size the canvas to whatever was just loaded/laid out
     drawMinimap();
     syncActions();   // the action cluster follows the selection and the run state
   }
@@ -807,6 +1094,7 @@ export function WorkflowsView() {
     const st = runState && runState[n.id] ? runState[n.id].status : null;
     // Its inputs were re-made after it ran, so what it holds no longer matches them.
     const stale = !!(runState && runState[n.id] && runState[n.id].stale);
+    const issues = stepIssues(n);   // parameters a run would reject (empty until the schema is in)
     const running = wf && wf.status === "running";
     const el = h("div", {
       class: "wf-node" + (selectedSet.has(n.id) ? " sel" : "") + (selected === n.id ? " primary" : "") + (stale ? " stale" : ""),
@@ -820,6 +1108,12 @@ export function WorkflowsView() {
     const head = h("div", { class: "wf-node-head" },
       h("span", { class: "wf-node-title mono", title: n.program }, n.name || n.program),
       stale ? h("span", { class: "wf-node-stale", title: "A step this one depends on has been re-run since — these outputs are out of date. Run it again to refresh them." }, icon("refresh", 11)) : null,
+      issues.length ? h("button", {
+        class: "wf-node-issues",
+        title: `${issues.length} parameter${issues.length === 1 ? "" : "s"} would stop this step from running:\n`
+          + issues.map((i) => `  ${i.field} — ${i.message}`).join("\n") + "\nClick to fix.",
+        onclick: (e) => { e.stopPropagation(); openFixParams([n.id]); },
+      }, "!" + issues.length) : null,
       st ? h("span", { class: "wf-node-st", style: { color: statusColor(st) } }, st) : null,
       h("button", { class: "wf-node-run", title: running ? "Queue this step onto the running workflow — it starts when its device is free" : "Run this step", onclick: (e) => { e.stopPropagation(); runNodes([n.id]); } }, icon(running ? "plus" : "play", 12)),
       h("button", { class: "wf-node-run", title: "Duplicate this step (un-run copy)", onclick: (e) => { e.stopPropagation(); duplicateNodes([n.id]); } }, icon("copy", 12)),
@@ -881,7 +1175,7 @@ export function WorkflowsView() {
     }
     if (edge && !temp) {
       path.style.cursor = "pointer"; path.style.pointerEvents = "stroke";
-      path.addEventListener("click", () => { if (confirm("Remove this connection?")) removeEdge(edge.id); });
+      path.addEventListener("click", async () => { if (await confirmModal({ title: "Remove this connection?", okText: "Remove" })) removeEdge(edge.id); });
     }
     return path;
   }
@@ -898,11 +1192,85 @@ export function WorkflowsView() {
       if (!s || !d) continue;
       const ins = inputsOf(d.program);
       const idx = Math.max(0, ins.findIndex(([f]) => f === e.field));
-      svg.appendChild(wirePath(outPort(s), inPort(d, idx, ins.length), e, false,
-        focus ? (focus.edges.has(e.id) ? "hot" : "dim") : null));
+      // Focus mode (if on) owns the dim/hot call; otherwise a live search dims any wire
+      // whose endpoints are both non-matches.
+      const fs = focus
+        ? (focus.edges.has(e.id) ? "hot" : "dim")
+        : (stepSearch && !(searchMatch(s) || searchMatch(d)) ? "dim" : null);
+      svg.appendChild(wirePath(outPort(s), inPort(d, idx, ins.length), e, false, fs));
     }
     if (drag && drag.kind === "wire" && tempTo) svg.appendChild(wirePath(outPort(nodeById(drag.from)), tempTo, null, true));
   }
+
+  // ── step search: canvas dim + jump-list dropdown driven by the same query ──
+  function closeSearchDd() { searchDd.hidden = true; }
+
+  // Cheap live pass over the already-rendered nodes (same trick the marquee uses):
+  // toggling classes beats a full renderNodes() on every keystroke.
+  function applySearch() {
+    const active = !!stepSearch;
+    for (const el of nodesLayer.querySelectorAll(".wf-node")) {
+      const n = nodeById(el.dataset.node);
+      const m = n && searchMatch(n);
+      el.classList.toggle("search-dim", active && !m);
+      el.classList.toggle("search-match", active && !!m);
+    }
+    redrawWires();
+    renderSearchDropdown();
+  }
+
+  function renderSearchDropdown() {
+    clear(searchDd);
+    if (!stepSearch) { searchDd.hidden = true; searchState = { matches: [], hi: -1 }; return; }
+    const matches = graph.nodes.filter(searchMatch);
+    if (searchState.hi < 0 || searchState.hi >= matches.length) searchState.hi = matches.length ? 0 : -1;
+    searchState.matches = matches;
+    matches.forEach((n, i) => {
+      const st = runState && runState[n.id] ? runState[n.id].status : null;
+      const row = h("div", {
+        class: "wf-search-row" + (i === searchState.hi ? " hi" : ""),
+        onmousedown: (e) => { e.preventDefault(); jumpTo(n.id); },   // preventDefault: don't blur the input before the click lands
+      },
+        h("span", { class: "wf-search-name" }, n.name || n.program),
+        n.name ? h("span", { class: "wf-search-prog mono" }, n.program) : null,
+        st ? h("span", { class: "wf-search-st", style: { color: statusColor(st) } }, st) : null);
+      searchDd.appendChild(row);
+    });
+    searchDd.appendChild(h("div", { class: "wf-search-count" }, `${matches.length} of ${graph.nodes.length} steps match`));
+    searchDd.hidden = false;
+  }
+
+  // Navigate to a step from the dropdown (click or Enter). No hover preview — this is
+  // the only thing that moves the selection/viewport; the query and the canvas dim
+  // both stay exactly as they were.
+  function jumpTo(id) {
+    selectOnly(id);
+    renderNodes(); renderInspector();
+    const n = nodeById(id);
+    if (n) scrollToContent(n.x + NODE_W / 2, n.y + nodeHeight(n) / 2);
+    closeSearchDd();
+  }
+
+  searchInput.addEventListener("input", (e) => {
+    stepSearch = e.target.value.trim().toLowerCase();
+    applySearch();
+  });
+  searchInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      stepSearch = ""; searchInput.value = "";
+      applySearch();
+      return;
+    }
+    if (!searchState.matches.length) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); searchState.hi = (searchState.hi + 1) % searchState.matches.length; renderSearchDropdown(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); searchState.hi = (searchState.hi - 1 + searchState.matches.length) % searchState.matches.length; renderSearchDropdown(); }
+    else if (e.key === "Enter") { e.preventDefault(); jumpTo(searchState.matches[searchState.hi].id); }
+  });
+  searchInput.addEventListener("blur", () => {
+    // Let a row's mousedown-select land before the dropdown disappears under it.
+    setTimeout(closeSearchDd, 120);
+  });
 
   // ── gestures (node drag + wiring) ──
   function canvasPoint(e) {
@@ -920,11 +1288,15 @@ export function WorkflowsView() {
     if (e.shiftKey || e.ctrlKey || e.metaKey) toggleSel(n.id);
     else if (!selectedSet.has(n.id)) selectOnly(n.id);
     else selected = n.id;
-    renderNodes(); renderInspector();
+    // canvasPoint() reads the canvas's live bounding rect, so it has to run — and `drag`
+    // has to be set — before renderNodes() below gets any chance to reflow the topbar
+    // (see syncActions()'s node-drag guard): once that shifts the canvas under the
+    // pointer, every subsequent onMove delta is offset by however far it moved.
     const p = canvasPoint(e);
     // move every selected node together
     const group = (selectedSet.has(n.id) ? [...selectedSet] : [n.id]).map((id) => nodeById(id)).filter(Boolean);
     drag = { kind: "node", id: n.id, ox: p.x, oy: p.y, start: group.map((g) => ({ id: g.id, x: g.x, y: g.y })) };
+    renderNodes(); renderInspector();
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -975,17 +1347,35 @@ export function WorkflowsView() {
     const p = canvasPoint(e);
     if (drag.kind === "node") {
       const ddx = p.x - drag.ox, ddy = p.y - drag.oy;
+      // Same 3px threshold as the pan gesture: a plain click on a node (to select
+      // or inspect it) must not count as a move — it used to mark the workflow
+      // dirty, which is what made leaving ask about changes that were never made.
+      if (!drag.moved && Math.abs(ddx) + Math.abs(ddy) <= 3) return;
+      drag.moved = true;
       for (const s of drag.start) {
         const node = nodeById(s.id); if (!node) continue;
         node.x = Math.max(0, s.x + ddx); node.y = Math.max(0, s.y + ddy);
         const el = nodesLayer.querySelector(`.wf-node[data-node="${node.id}"]`);
         if (el) { el.style.left = node.x + "px"; el.style.top = node.y + "px"; }
       }
-      // ports move with the node; cheapest correct redraw is a full re-render
-      renderNodes();
+      // Grow the canvas as the drag approaches the edge, so a node dragged toward
+      // the right/bottom never runs out of content to be dropped onto or wired
+      // past — cheap (one bbox walk of the node array) with an early-out in
+      // fitContent() itself when nothing actually changed.
+      fitContent();
+      // Ports are computed from node data (outPort/inPort), so only the wires
+      // and the minimap need repainting — the old full renderNodes() rebuilt
+      // every node element at pointer-event rate, which made dragging a
+      // 15-node graph visibly lag. Throttled to one repaint per frame.
+      scheduleDragRedraw();
     } else {
       redrawWires(p);
     }
+  }
+  let dragRaf = 0;
+  function scheduleDragRedraw() {
+    if (dragRaf) return;
+    dragRaf = requestAnimationFrame(() => { dragRaf = 0; redrawWires(); drawMinimap(); });
   }
   function onUp(e) {
     window.removeEventListener("pointermove", onMove);
@@ -1022,10 +1412,11 @@ export function WorkflowsView() {
         }
       }
       redrawWires();
-    } else if (drag && drag.kind === "node") {
-      dirty = true;
+    } else if (drag && drag.kind === "node" && drag.moved) {
+      touchLayout();
     }
     drag = null;
+    syncActions();   // deferred by the node-drag guard above — show the cluster now that it's safe to reflow
   }
 
   // Persist a step rename: save the graph, and let the server carry the new name onto
@@ -1038,7 +1429,7 @@ export function WorkflowsView() {
     await save();
     const saved = ((wf.graph && wf.graph.nodes) || []).find((x) => x.id === n.id);
     const jid = (saved && saved.job_id) || (runState && runState[n.id] && runState[n.id].job_id);
-    if (jid) store.renameViewerForJob(jid, value.trim());
+    if (jid) announceJobRename(jid, value.trim());
   }
 
   // ── inspector (per-node args) ──
@@ -1048,18 +1439,19 @@ export function WorkflowsView() {
     if (!n) {
       inspBody.appendChild(h("div", { class: "wf-insp-empty muted" },
         "Select a step to edit its parameters. Wire a step's output port into another step's input port to pass data. Shift-click to multi-select. Double-click a step that has run to open its job log."));
+      flaggedFor = null;   // nothing shown: the next step selected gets its scroll
       return;
     }
     inspBody.appendChild(h("div", { class: "wf-insp-head" }, h("strong", null, n.program)));
     const nameI = h("input", { class: "wf-field", placeholder: "step name (optional)", value: n.name || "" });
-    nameI.addEventListener("input", () => { n.name = nameI.value; dirty = true; const t = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"] .wf-node-title`); if (t) t.textContent = n.name || n.program; });
+    nameI.addEventListener("input", () => { n.name = nameI.value; dirty = true, touchHistory(); const t = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"] .wf-node-title`); if (t) t.textContent = n.name || n.program; });
     // A step that has already run owns a job, and that job holds the name the Jobs
     // view shows — and the one a project canvas reads back on every load. Renaming
     // only the node would be undone by that re-sync unless the step were run again,
     // so commit the new name to the job as well (same as the label chips below).
     nameI.addEventListener("change", () => commitNodeName(n, nameI.value));
     const gpuI = h("input", { class: "wf-field", placeholder: "GPU (e.g. 0, empty = CPU)", value: n.gpu ?? "0" });
-    gpuI.addEventListener("input", () => { n.gpu = gpuI.value; dirty = true; });
+    gpuI.addEventListener("input", () => { n.gpu = gpuI.value; dirty = true, touchHistory(); });
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "Name", nameI));
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "GPU", gpuI));
     inspBody.appendChild(h("label", { class: "wf-lbl" }, "Labels",
@@ -1067,7 +1459,7 @@ export function WorkflowsView() {
         // Persist to the linked job whether the link is on the node (project
         // canvas) or only in the run mapping (a standalone workflow that has run).
         jobId: n.job_id || (runState && runState[n.id] && runState[n.id].job_id),
-        onChange: () => { dirty = true; const el = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"]`); if (el) renderNodes(); },
+        onChange: () => { dirty = true, touchHistory(); const el = nodesLayer.querySelector(`.wf-node[data-node="${n.id}"]`); if (el) renderNodes(); },
       })));
 
     const schema = schemaCache[n.program];
@@ -1077,14 +1469,14 @@ export function WorkflowsView() {
     // stores only the arguments that differ from the program's defaults, so a
     // default changed in hax-em is picked up on the next run — hence the sparse
     // `set` that deletes rather than storing an empty value.
-    inspBody.appendChild(paramForm(schema, visibleFields(schema), {
+    const form = paramForm(schema, visibleFields(schema), {
       density: "compact",
       get: (name) => n.args[name],
       set: (name, v, f) => {
         const numeric = f.type === "integer" || f.type === "number";
         if (v === "" || v == null) delete n.args[name];
         else n.args[name] = numeric && v !== "" ? Number(v) : v;
-        dirty = true;
+        dirty = true, touchHistory();
       },
       // A wired input is fed by the graph, so it shows its source(s) instead of
       // an editable control.
@@ -1104,7 +1496,19 @@ export function WorkflowsView() {
         if (!(f.name in bindable)) return null;
         return isMultiField(n.program, f.name) ? "wirable, multi" : "wirable";
       },
-    }).el);
+    });
+    inspBody.appendChild(form.el);
+    // Say which parameters are wrong on the parameters themselves. A failed launch only
+    // ever produced one flattened sentence, and it had nowhere to appear: the step has no
+    // job, so there is no log page to send the user to.
+    const errs = {};
+    for (const i of stepIssues(n)) errs[i.field] = i.message;
+    // Marked on every render (a mark that came and went with a re-wire or a drag would be
+    // no mark at all), but *scrolled to* only when this step has just become the selected
+    // one: renderInspector() also runs on every drag start and every edge change, and a
+    // panel that jumps each time you pick a step up is unusable.
+    if (Object.keys(errs).length) form.setErrors(errs, { scroll: flaggedFor !== n.id });
+    flaggedFor = n.id;
   }
 
   function loadSchema(program) {
@@ -1123,7 +1527,7 @@ export function WorkflowsView() {
   async function toggleOrientation() {
     graph.orientation = horiz() ? "vertical" : "horizontal";
     rememberOrientation(graph.orientation);
-    autoLayout(); dirty = true;
+    autoLayout(); dirty = true, touchHistory();
     if (wf) await save();
   }
 
@@ -1151,9 +1555,11 @@ export function WorkflowsView() {
     // room to pan on every side, then center the viewport on it
     const b = graphBBox();
     if (b) {
-      const offx = Math.round(CONTENT_W / 2 - b.cx), offy = Math.round(CONTENT_H / 2 - b.cy);
+      const offx = Math.round(contentW / 2 - b.cx), offy = Math.round(contentH / 2 - b.cy);
       for (const n of graph.nodes) { n.x = Math.max(0, n.x + offx); n.y = Math.max(0, n.y + offy); }
     }
+    // renderNodes() calls fitContent() at its end, resizing the canvas to the
+    // positions just assigned — before centerView(), so its clamps see the new extent.
     renderNodes();
     centerView();
   }
@@ -1190,8 +1596,8 @@ export function WorkflowsView() {
   // content is scaled by `zoom`, so content coords map to scroll via *zoom).
   function centerView() {
     const b = graphBBox(); if (!b) return;
-    canvas.scrollLeft = Math.max(0, Math.min(CONTENT_W * zoom - canvas.clientWidth, b.cx * zoom - canvas.clientWidth / 2));
-    canvas.scrollTop = Math.max(0, Math.min(CONTENT_H * zoom - canvas.clientHeight, b.cy * zoom - canvas.clientHeight / 2));
+    canvas.scrollLeft = Math.max(0, Math.min(contentW * zoom - canvas.clientWidth, b.cx * zoom - canvas.clientWidth / 2));
+    canvas.scrollTop = Math.max(0, Math.min(contentH * zoom - canvas.clientHeight, b.cy * zoom - canvas.clientHeight / 2));
     drawMinimap();
   }
   function toggleMinimap() { minimapOn = !minimapOn; minimap.classList.toggle("hidden", !minimapOn); drawMinimap(); }
@@ -1203,8 +1609,8 @@ export function WorkflowsView() {
   }
   // Centre the viewport on a content-space point, clamped to the scrollable extent.
   function scrollToContent(cx, cy) {
-    canvas.scrollLeft = Math.max(0, Math.min(CONTENT_W * zoom - canvas.clientWidth, cx * zoom - canvas.clientWidth / 2));
-    canvas.scrollTop = Math.max(0, Math.min(CONTENT_H * zoom - canvas.clientHeight, cy * zoom - canvas.clientHeight / 2));
+    canvas.scrollLeft = Math.max(0, Math.min(contentW * zoom - canvas.clientWidth, cx * zoom - canvas.clientWidth / 2));
+    canvas.scrollTop = Math.max(0, Math.min(contentH * zoom - canvas.clientHeight, cy * zoom - canvas.clientHeight / 2));
     drawMinimap();
   }
 
@@ -1365,7 +1771,14 @@ export function WorkflowsView() {
     const live = minimapOn && !mmCollapsed && runState && root.isConnected
       && graph.nodes.some((n) => runState[n.id] && runState[n.id].status === "running");
     if (live && mmPulse === null) {
-      const tick = () => { mmPulse = requestAnimationFrame(tick); drawMinimap(); };
+      // The pulse is a slow 1.6 s glow: ~10 repaints/s renders it just as
+      // smoothly as the old every-frame loop, at a sixth of the work — this
+      // used to repaint the full minimap at 60 fps for a multi-hour run.
+      let last = 0;
+      const tick = (t) => {
+        mmPulse = requestAnimationFrame(tick);
+        if (t - last >= 100) { last = t; drawMinimap(); }
+      };
       mmPulse = requestAnimationFrame(tick);
     } else if (!live && mmPulse !== null) {
       cancelAnimationFrame(mmPulse); mmPulse = null;
@@ -1373,16 +1786,20 @@ export function WorkflowsView() {
   }
 
   // ── open a project as a live workflow ──
-  async function openProject() {
-    const pid = getState().activeProjectId;
-    if (!pid) { flash("Open a project first (Projects) to open it as a workflow.", "err"); return; }
+  // Get-or-create + reconcile `pid`'s per-project workflow and switch the canvas to it.
+  // Shared by the picker (picking a project, or "New project…") and boot()'s auto-open
+  // of whatever project is already active — each of those decides for itself what a
+  // failure means (flash an error vs. quietly fall back to something else), so this
+  // throws rather than swallowing.
+  async function openProjectById(pid) {
     flash("Opening project…", "busy");
-    try {
-      const opened = await api.workflowFromProject(pid);
-      await refreshList();
-      await openWorkflow(opened.id);
-      flash(`Opened "${wf ? wf.name : "project"}" as a live workflow — edits & runs change the project.`, "muted");
-    } catch (err) { flash("Open failed: " + (err.detail || err.message), "err"); }
+    const opened = await api.workflowFromProject(pid);
+    await refreshList();
+    await openWorkflow(opened.id);
+    // refreshList()'s "In this project" group reads the CURRENT wf, which was still the
+    // outgoing one on the call above — rebuild the picker now that wf is the opened project.
+    await refreshList();
+    flash(`Opened "${wf ? wf.name : "project"}" as a live workflow — edits & runs change the project.`, "muted");
   }
 
   // Create a new project backed by this workflow (so edits/runs populate it).
@@ -1428,7 +1845,7 @@ export function WorkflowsView() {
       let y = refs.length ? Math.min(...refs.map((n) => n.y)) : 40;
       for (const n of unknown) { n.x = x1 + 80; n.y = y; y += nodeHeight(n) + 26; }
     }
-    dirty = true; renderNodes(); centerView();
+    touchLayout(); renderNodes(); centerView();
     flash(unknown.length ? `Restored the pinned layout; placed ${unknown.length} new node(s) alongside it.` : "Restored the pinned layout.", "muted");
   }
 
@@ -1442,14 +1859,14 @@ export function WorkflowsView() {
     try {
       if (wf) wf = await api.updateWorkflow(wf.id, { name, graph: graphSnapshot() });
       else wf = await api.createWorkflow({ project_id: pid, name, graph: graphSnapshot() });
-      dirty = false; rememberWorkflow(wf.id); flash("Saved.", "muted"); await refreshList(); wfSelect.value = wf.id; syncActions();
+      dirty = false; layoutDirty = false; rememberWorkflow(wf.id); flash("Saved.", "muted"); await refreshList(); syncPickerValue(); syncActions();
     } catch (err) { flash("Save failed: " + (err.detail || err.message), "err"); }
     return wf;
   }
 
   // ids === null -> run the whole workflow; an array -> run that subset only.
   async function runNodes(ids) {
-    if (!(wf && wf.project_id) && !getState().activeProjectId) { flash("Open a project first (Projects), or use “Save as project” — steps run into a project.", "err"); return; }
+    if (!(wf && wf.project_id) && !getState().activeProjectId) { flash("Open a project from the picker above, or use “Save as project” — steps run into a project.", "err"); return; }
     if (!graph.nodes.length) { flash("Add at least one step.", "warn"); return; }
     if (ids && !ids.length) { flash("Select one or more steps first.", "warn"); return; }
     // Running a subset re-makes those steps under everything they feed, so ask what
@@ -1487,7 +1904,7 @@ export function WorkflowsView() {
       runState = wf.run_state || null;
       // The queued count is read back from the server: with cascade "queue" it also took
       // on the steps downstream, which is more than were asked for here.
-      const queued = runState ? Object.values(runState).filter((s) => s.status === "pending" || s.status === "running").length : (ids || graph.nodes).length;
+      const queued = runState ? Object.values(runState).filter((s) => s.status === "pending" || s.status === "queued" || s.status === "running").length : (ids || graph.nodes).length;
       flash(wasRunning
         ? `Queued onto the running workflow — ${queued} step(s) pending or running.`
         : (ids ? `Running ${queued} step(s)…` : "Running…"), "busy");
@@ -1514,28 +1931,38 @@ export function WorkflowsView() {
   // Adopt a server graph into local state (keeping the id counters ahead).
   function adoptGraph(g) {
     graph = { nodes: g.nodes || [], edges: g.edges || [], orientation: g.orientation || graph.orientation || rememberedOrientation(), savedLayout: g.savedLayout || null };
+    seedHistory();
     nodeSeq = Math.max(1, ...graph.nodes.map((n) => +(n.id.replace(/\D/g, "")) || 0)) + 1;
     edgeSeq = Math.max(1, ...graph.edges.map((e) => +((e.id || "").replace(/\D/g, "")) || 0)) + 1;
+    prefetchSchemas();   // the issue chips need every program's fields, not just the selected step's
   }
 
   function startPolling() {
     stopPolling();
-    poll = setInterval(async () => {
+    poll = poller(async () => {
       if (!wf) return stopPolling();
       try {
         const w = await api.workflow(wf.id);
         wf = w; runState = w.run_state || null;
         // when a run settles, adopt the server graph so live node<->job links and
-        // statuses (project workflows write job ids back) are reflected
-        if (w.status !== "running" && w.graph) { adoptGraph(w.graph); if (!dirty) renderInspector(); }
+        // statuses (project workflows write job ids back) are reflected.
+        // NOT while `dirty`: adoptGraph replaces the node objects the open
+        // inspector is writing into, so a run finishing mid-edit silently
+        // discarded the user's keystrokes on the next Save. The user's graph
+        // wins until they save or reopen.
+        if (w.status !== "running" && w.graph && !dirty) { adoptGraph(w.graph); renderInspector(); }
         renderNodes();
         const counts = countStatuses();
         flash(`${w.status} — ${counts}`, w.status === "running" ? "busy" : (w.status === "succeeded" ? "muted" : "err"));
         if (w.status !== "running") stopPolling();
-      } catch { stopPolling(); }
-    }, 2000);
+      } catch {
+        // Transient fetch failure (server restart, blip): keep polling — the
+        // old stopPolling() here froze node statuses on the first hiccup with
+        // no retry and no indication.
+      }
+    }, 2000, { immediate: false });
   }
-  function stopPolling() { if (poll) { clearInterval(poll); poll = null; } }
+  function stopPolling() { if (poll) { poll.stop(); poll = null; } }
   function countStatuses() {
     if (!runState) return "";
     const c = {};
@@ -1545,20 +1972,33 @@ export function WorkflowsView() {
 
   async function openWorkflow(id) {
     stopPolling();
+    // Flush any pending layout autosave for the OUTGOING workflow before anything below
+    // reassigns `wf`/`graph` — this is what makes a just-moved box survive a switch.
+    flushLayoutSave();
     // Park the outgoing workflow's view before `wf` changes. Skipped for an empty
     // canvas, so the first open of a freshly built view doesn't record its 0,0 start.
     if (graph.nodes.length) rememberViewport();
     selectedSet.clear();
+    // A query from the outgoing workflow must not dim/ring steps in the one being opened —
+    // and its match list holds that workflow's node ids, which Enter would otherwise
+    // still "select" here.
+    stepSearch = ""; searchInput.value = ""; searchState = { matches: [], hi: -1 }; closeSearchDd();
     if (!id) {
-      wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; nameInput.value = "";
-      wfSelect.value = ""; rememberWorkflow(null);
+      wf = null; graph = { nodes: [], edges: [], orientation: rememberedOrientation() }; runState = null; selected = null; flaggedFor = null; nameInput.value = ""; seedHistory();
+      dirty = false;          // a fresh canvas has nothing to lose yet
+      layoutDirty = false;    // ...and nothing pending to autosave either
+      syncPickerValue(); rememberWorkflow(null);
       renderNodes(); restoreViewport("");
       renderInspector(); syncActions(); flash("New workflow.", "muted"); return;
     }
     try {
       wf = await api.workflow(id);
       adoptGraph(wf.graph || {});
-      runState = wf.run_state || null; selected = null; nameInput.value = wf.name || ""; wfSelect.value = wf.id;
+      runState = wf.run_state || null; selected = null; flaggedFor = null; nameInput.value = wf.name || ""; syncPickerValue();
+      // What was just loaded IS the saved state — without this reset, a dirty flag
+      // from the previous canvas followed you into a workflow you never touched.
+      dirty = false;
+      layoutDirty = false;
       rememberWorkflow(wf.id);
       // freshly imported / never-laid-out graphs have all-zero coords — tidy once
       if (graph.nodes.length && graph.nodes.every((n) => !n.x && !n.y)) autoLayout();
@@ -1580,7 +2020,8 @@ export function WorkflowsView() {
 
   async function removeWorkflow() {
     if (!wf) return openWorkflow(null);
-    if (!confirm(`Delete workflow "${wf.name}"?`)) return;
+    if (!(await confirmModal({ title: "Delete workflow?", danger: true, okText: "Delete",
+        message: `“${wf.name}” will be removed. The runs it created are kept.` }))) return;
     try { const id = wf.id; await api.deleteWorkflow(id); VIEWPORTS.delete(id); await refreshList(); openWorkflow(null); }
     catch (err) { flash("Delete failed: " + (err.detail || err.message), "err"); }
   }
@@ -1590,7 +2031,13 @@ export function WorkflowsView() {
   function onKey(e) {
     const t = e.target;
     if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+      e.preventDefault();
+      timeTravel(e.shiftKey ? 1 : -1);
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
+      e.preventDefault();
+      timeTravel(1);
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
       e.preventDefault();
       duplicateNodes([...selectedSet]);
     } else if ((e.key === "Delete" || e.key === "Backspace") && selectedSet.size) {
@@ -1603,5 +2050,18 @@ export function WorkflowsView() {
   boot();
   // cleanup runs before the view is detached, so the canvas is still laid out here and
   // its final scroll/zoom can be recorded.
-  return { el: root, cleanup: () => { rememberViewport(); stopPolling(); document.removeEventListener("keydown", onKey); } };
+  // Unsaved-changes guards: SPA navigation asks via the router; closing or
+  // reloading the tab asks via beforeunload. Both key off the same dirty flag.
+  const unsavedMsg = () => (dirty && wf ? "This workflow has unsaved changes — leave and discard them?" : null);
+  setNavGuard(unsavedMsg);
+  // Same guard, for discarding in place (dropdown switch / New workflow) rather than
+  // navigating away — router.js's guard only fires on a route change, not on these.
+  async function confirmDiscard() {
+    if (!(dirty && wf)) return true;
+    return confirmModal({ title: "Unsaved changes", message: "This workflow has unsaved changes — discard them?",
+                          okText: "Discard", cancelText: "Keep editing", danger: true });
+  }
+  const onBeforeUnload = (e) => { if (unsavedMsg()) { e.preventDefault(); e.returnValue = ""; } };
+  window.addEventListener("beforeunload", onBeforeUnload);
+  return { el: root, cleanup: () => { flushLayoutSave(); rememberViewport(); stopPolling(); document.removeEventListener("keydown", onKey); window.removeEventListener("beforeunload", onBeforeUnload); } };
 }

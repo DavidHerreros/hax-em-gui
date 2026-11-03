@@ -11,7 +11,10 @@ import { h, clear } from "../h.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { store, getState, subscribe } from "../store.js";
+import { announceJobRename } from "./jobs.js";
 import { promptModal } from "./promptModal.js";
+import { openFilePicker } from "./filePicker.js";
+import { toast } from "../toast.js";
 
 const GEO_KEY = "hax_gui_viewer_window";
 const MIN_W = 380, MIN_H = 260;
@@ -32,6 +35,7 @@ export function mountViewerWindow() {
   let maximized = false, minimized = false;
   let knownIds = new Set();
   const frames = new Map();
+  const popped = new Map();
 
   const tabs = h("div", { class: "vwin-tabs" });
   const body = h("div", { class: "vwin-body" });
@@ -52,6 +56,19 @@ export function mountViewerWindow() {
   window.addEventListener("hax-theme", (e) => {
     const theme = e.detail === "light" ? "light" : "dark";
     for (const f of frames.values()) { try { f.contentWindow.postMessage({ type: "hax-theme", theme }, "*"); } catch { /* cross-origin/none */ } }
+    for (const w of popped.values()) { try { w.postMessage({ type: "hax-theme", theme }, "*"); } catch { /* window gone */ } }
+  });
+
+  // ── file picking on behalf of a viewer iframe (e.g. the PDB overlay) ──
+  // The viewer apps are separate pages with no access to the GUI's file browser,
+  // so they ask over postMessage and get the chosen server path back. Only our
+  // own iframes are answered; the reply goes to whichever frame asked.
+  window.addEventListener("message", (e) => {
+    const d = e.data;
+    if (!d || d.type !== "hax-pick-file" || !e.source) return;
+    if (![...frames.values()].some((f) => f.contentWindow === e.source) && ![...popped.values()].includes(e.source)) return;
+    const reply = (path) => { try { e.source.postMessage({ type: "hax-picked-file", token: d.token, path }, "*"); } catch { /* frame gone */ } };
+    openFilePicker("file", reply, d.startPath || undefined);
   });
 
   function applyGeom() {
@@ -113,10 +130,55 @@ export function mountViewerWindow() {
   });
   window.addEventListener("resize", () => { if (win.style.display !== "none") applyGeom(); });
 
+  // ── pop-out: each viewer is already a standalone same-origin page (that's
+  // what makes it embeddable as an iframe), so the same URL opened with
+  // window.open is simply the same page living in a real OS window instead
+  // of our tab strip — useful for dragging a viewer to another monitor.
+  // There's no reliable cross-window "closed" event, so a single poll (only
+  // running while something is popped) notices when the user hits the OS
+  // close button and re-docks it. Re-docking recreates the iframe from
+  // scratch, so its client-side state resets, but the viewer session itself
+  // lives on the server and the fresh iframe just reconnects to it.
+  let popPoll = null;
+  function startPopPoll() {
+    if (popPoll) return;
+    popPoll = setInterval(() => {
+      let changed = false;
+      for (const [id, w] of popped) if (w.closed) { popped.delete(id); changed = true; }
+      if (!popped.size) { clearInterval(popPoll); popPoll = null; }
+      if (changed) render();
+    }, 1000);
+  }
+  function popOut(v) {
+    const w = window.open(withTheme(v.url), "hax-viewer-" + v.id,
+      `popup=yes,width=${geom.width},height=${geom.height},left=${geom.left + 40},top=${geom.top + 40}`);
+    if (!w) { toast("Pop-out blocked by the browser — allow popups for this site.", { kind: "error" }); return; }
+    popped.set(v.id, w);
+    const f = frames.get(v.id);
+    if (f) { f.remove(); frames.delete(v.id); }
+    startPopPoll();
+    if (getState().activeViewerId === v.id) {
+      const next = getState().openViewers.find((x) => x.id !== v.id && !popped.has(x.id));
+      if (next) { store.setActiveViewer(next.id); return; } // setActiveViewer emits → render()
+    }
+    render();
+  }
+  function reDock(id) {
+    const w = popped.get(id);
+    popped.delete(id);
+    if (w && !w.closed) { try { w.close(); } catch { /* already gone */ } }
+    render();
+  }
+  // If the GUI tab itself goes away, popped-out windows would otherwise be
+  // left running with no way to manage or close them — take them down too.
+  window.addEventListener("pagehide", () => { for (const w of popped.values()) { try { w.close(); } catch { /* already gone */ } } });
+
   function closeOne(id) {
     const v = getState().openViewers.find((x) => x.id === id);
     const stop = v && v.kind === "mrc" ? api.stopMrcViewer : v && v.kind === "md" ? api.stopMdViewer : api.stopViewer;
     stop(id).catch(() => {});
+    const w = popped.get(id);
+    if (w) { popped.delete(id); try { w.close(); } catch { /* already gone */ } }
     store.closeViewer(id);
   }
   function closeAll() { for (const v of [...getState().openViewers]) closeOne(v.id); }
@@ -141,7 +203,7 @@ export function mountViewerWindow() {
     const current = sep >= 0 ? v.title.slice(0, sep) : (v.title || "");
     const name = await promptModal({ title: "Rename run", label: "Run name", value: current, okText: "Rename" });
     if (name === null || !name) return;
-    try { const u = await api.renameJob(v.jobId, name); store.renameViewerForJob(v.jobId, u.name); }
+    try { const u = await api.renameJob(v.jobId, name); announceJobRename(v.jobId, u.name); }
     catch { /* ignore */ }
   }
 
@@ -164,6 +226,7 @@ export function mountViewerWindow() {
 
     clear(tabs);
     for (const v of openViewers) {
+      const isPopped = popped.has(v.id);
       const { main, sub } = tabLines(v);
       const label = h("span", {
         class: "tab-lines",
@@ -172,12 +235,16 @@ export function mountViewerWindow() {
       },
         h("span", { class: "tab-main" }, main),
         sub ? h("span", { class: "tab-sub mono" }, sub) : null);
-      tabs.appendChild(h("div", { class: "tab two-line" + (v.id === activeViewerId ? " active" : ""), onclick: () => store.setActiveViewer(v.id) },
+      tabs.appendChild(h("div", {
+        class: "tab two-line" + (isPopped ? " popped" : v.id === activeViewerId ? " active" : ""),
+        onclick: () => isPopped ? popped.get(v.id)?.focus() : store.setActiveViewer(v.id),
+      },
         label,
+        h("button", { class: "tab-pop", title: isPopped ? "Bring back into the GUI" : "Open in a separate window", onclick: (e) => { e.stopPropagation(); isPopped ? reDock(v.id) : popOut(v); } }, icon("external", 14)),
         h("button", { class: "tab-close", title: "Close", onclick: (e) => { e.stopPropagation(); closeOne(v.id); } }, icon("x", 14))));
     }
     for (const v of openViewers) {
-      if (!frames.has(v.id)) {
+      if (!frames.has(v.id) && !popped.has(v.id)) {
         const f = h("iframe", { class: "vwin-frame", src: withTheme(v.url), title: "Viewer " + v.id });
         frames.set(v.id, f); body.appendChild(f);
       }

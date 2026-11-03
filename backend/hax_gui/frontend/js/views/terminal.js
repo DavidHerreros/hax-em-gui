@@ -79,14 +79,22 @@ export function createTerminal(container) {
     else if (mode === 2) { cur.cells = []; cur.col = 0; }
   }
 
-  function write(text) {
+  // Parse up to `limit` characters of `text`; returns how many were consumed.
+  // Stops cleanly at an escape sequence split across the boundary (it stays
+  // unconsumed until the rest arrives). Plain printable runs are appended in
+  // bulk with ONE shared style snapshot — the old per-character
+  // { ch, style: {...} } allocation was millions of objects for a large
+  // replay, all on the main thread in one synchronous burst.
+  function parse(text, limit) {
     let i = 0;
-    while (i < text.length) {
+    while (i < text.length && i < limit) {
       const ch = text[i];
       if (ch === "\x1b") {
+        if (i + 1 >= text.length) break;      // lone ESC at the end: wait for more
         if (text[i + 1] === "[") {
           let j = i + 2, params = "";
           while (j < text.length && !(text.charCodeAt(j) >= 0x40 && text.charCodeAt(j) <= 0x7e)) { params += text[j]; j += 1; }
+          if (j >= text.length) break;        // CSI split across chunks: keep it whole
           const final = text[j];
           if (final === "m") applySGR(params);
           else if (final === "K") eraseLine(params);
@@ -100,10 +108,40 @@ export function createTerminal(container) {
       else if (ch === "\b") { cur.col = Math.max(0, cur.col - 1); i += 1; }
       else if (ch === "\t") { const next = (Math.floor(cur.col / 8) + 1) * 8; while (cur.col < next) putChar(" "); i += 1; }
       else if (ch < " ") { i += 1; } // other control char: skip
-      else { putChar(ch); i += 1; }
+      else {
+        let e = i + 1;
+        while (e < text.length && text[e] >= " " && text[e] !== "\x1b") e += 1;
+        const st = { ...style };
+        for (let k = i; k < e; k++) { cur.cells[cur.col] = { ch: text[k], style: st }; cur.col += 1; }
+        i = e;
+      }
     }
+    return i;
+  }
+
+  // Writes append to a queue drained in bounded slices, yielding to the event
+  // loop between them: opening a job with megabytes of accumulated log used to
+  // parse it all in one synchronous pass — a multi-second tab freeze.
+  const SLICE = 200_000;
+  let queue = "";
+  let draining = false;
+
+  function write(text) {
+    queue += text;
+    if (!draining) drain();
+  }
+
+  function drain() {
+    const consumed = parse(queue, SLICE);
+    queue = queue.slice(consumed);
     renderLine(node, cur.cells);
     if (stick) container.scrollTop = container.scrollHeight;
+    if (queue.length && consumed > 0) {
+      draining = true;
+      setTimeout(drain, 0);
+    } else {
+      draining = false;   // drained, or holding a partial escape for more input
+    }
   }
 
   function reset() {
@@ -112,6 +150,8 @@ export function createTerminal(container) {
     node = lineNode();
     container.replaceChildren(node);
     stick = true;
+    queue = "";
+    draining = false;
   }
 
   return { write, reset };

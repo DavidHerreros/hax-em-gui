@@ -31,6 +31,23 @@ def _get() -> "AssistantSession":
     return _session
 
 
+def base_url() -> str:
+    """The configured Ollama endpoint, read from config alone.
+
+    Deliberately does NOT construct the session: construction builds the docs
+    vector index, whose embeddings need Ollama up — the caller uses this to
+    start Ollama *first* (see the warmup task in app.py). ``status()`` here
+    would re-create the old ordering bug it exists to fix.
+    """
+    if not _INSTALLED:
+        return ""
+    try:
+        from hax_assistant.config import Settings
+        return Settings.from_env().base_url
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def status() -> dict:
     """Availability + (when installed) model/grounding info for the SPA."""
     if not _INSTALLED:
@@ -50,6 +67,29 @@ def reindex_docs(*, force: bool = True) -> dict:
         return _get().reindex_docs(force=force)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": str(e), "chunks": 0}
+
+
+def diagnose_job_log(log_text: str, run_config: str | None = None) -> dict:
+    """Diagnose a failed run's log: deterministic classifier findings always,
+    an LLM root-cause/fix narrative when the model is reachable.
+
+    The classifier (hax_assistant.context.logs) is a rule table — GPU OOM, shape
+    mismatch, NaN divergence, missing metadata labels, checkpoint errors — so
+    the findings arrive even with Ollama down; the narrative is best-effort.
+    """
+    if not _INSTALLED:
+        return {"available": False}
+    from hax_assistant.context.logs import classify_log
+    findings = [{"kind": f.kind, "title": f.title, "hint": f.hint, "evidence": f.evidence}
+                for f in classify_log(log_text)]
+    analysis, error = None, None
+    try:
+        from hax_assistant.skills.diagnose_logs import diagnose_logs
+        analysis = diagnose_logs(_get().backend, log_text, run_config)
+    except Exception as e:  # noqa: BLE001 - the findings alone are still useful
+        error = str(e)
+    return {"available": True, "findings": findings, "analysis": analysis,
+            "analysis_error": error}
 
 
 def list_gpus() -> list[dict]:
