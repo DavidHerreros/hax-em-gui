@@ -16,13 +16,14 @@ function ensureStack() {
 
 const ICONS = { error: "ban", success: "check", info: "chat" };
 
+// `message` may be a DOM node (e.g. with buttons); `timeout: 0` keeps it until clicked.
 export function toast(message, { kind = "info", timeout } = {}) {
   const ms = timeout ?? (kind === "error" ? 8000 : 4000);
   const el = h("div", { class: `toast ${kind}`, onclick: () => dismiss() },
     icon(ICONS[kind] || "chat", 15),
-    h("span", { class: "toast-msg" }, String(message)));
+    h("span", { class: "toast-msg" }, message instanceof Node ? message : String(message)));
   ensureStack().appendChild(el);
-  let timer = setTimeout(dismiss, ms);
+  let timer = ms > 0 ? setTimeout(dismiss, ms) : 0;
   function dismiss() {
     if (!el.isConnected) return;
     clearTimeout(timer);

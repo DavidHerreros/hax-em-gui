@@ -9,10 +9,10 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from .. import assistant as assistant_bridge
-from .. import assistant_actions
+from .. import assistant_actions, assistant_workflows
 from .. import gpus as gpus_mod
 from .. import chats as chat_store
 from .. import ollama as ollama_manager_mod
@@ -44,6 +44,45 @@ def assistant_reindex_docs(force: bool = True) -> dict[str, Any]:
     return assistant_bridge.reindex_docs(force=force)
 
 
+class AutonomyBody(BaseModel):
+    level: str
+
+
+@router.get("/api/assistant/autonomy", dependencies=[Depends(auth)])
+def assistant_get_autonomy() -> dict[str, Any]:
+    """May the assistant launch, stop or relaunch jobs: advisory | ask | auto."""
+    if not assistant_bridge.available():
+        raise HTTPException(status_code=400, detail="assistant not installed")
+    return assistant_bridge.get_autonomy()
+
+
+@router.put("/api/assistant/autonomy", dependencies=[Depends(auth)])
+def assistant_set_autonomy(body: AutonomyBody) -> dict[str, Any]:
+    if not assistant_bridge.available():
+        raise HTTPException(status_code=400, detail="assistant not installed")
+    try:
+        return assistant_bridge.set_autonomy(body.level)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+class WatchApply(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # the client never sends the changes
+    kind: str
+
+
+@router.post("/api/assistant/watch/{job_id}/apply", dependencies=[Depends(auth)])
+async def assistant_watch_apply(job_id: str, body: WatchApply) -> dict[str, Any]:
+    """Accept the restart the assistant proposed for a watch alert of kind ``kind``.
+    The remedy is re-derived server-side; a restart from scratch is a new job in a new
+    folder (the old run is kept), a resume continues the run in place."""
+    from .. import watch
+    try:
+        return await watch.apply_proposal(job_id, body.kind)
+    except watch.ApplyError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+
+
 class JobProposal(BaseModel):
     program: str
     path: str | None = None
@@ -62,6 +101,51 @@ def assistant_preview_job(body: JobProposal) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail=spec["error"])
     inspect = assistant_actions.inspect_path(body.path) if body.path else None
     return {"spec": spec, "inspect": inspect}
+
+
+class WorkflowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # the client never sends args or a graph
+    request: str = Field(min_length=1, max_length=4000)
+    project_id: str | None = None
+    name: str | None = Field(default=None, max_length=120)
+    gpu: str | None = Field(default=None, pattern=r"^\d+(,\d+)*$")
+
+
+class WorkflowCreate(WorkflowRequest):
+    run: bool = False
+    auto: bool = False      # the card acting on its own: refused unless autonomy is still auto
+    fingerprint: str | None = Field(default=None, max_length=64)   # the previewed graph
+
+
+def _workflow_actions_allowed() -> None:
+    if not assistant_bridge.available():
+        raise HTTPException(status_code=400, detail="assistant not installed")
+    if not assistant_actions.actions_enabled():
+        raise HTTPException(status_code=403, detail="assistant actions are disabled")
+
+
+@router.post("/api/assistant/actions/preview-workflow", dependencies=[Depends(auth)])
+async def assistant_preview_workflow(body: WorkflowRequest) -> dict[str, Any]:
+    """Re-plan a workflow request server-side and build the graph the workflow builder would
+    run, with the pre-flight checks and the autonomy decision. Creates nothing."""
+    _workflow_actions_allowed()
+    try:
+        return await asyncio.to_thread(assistant_workflows.preview, body.request, body.project_id,
+                                       body.name, body.gpu)
+    except assistant_workflows.CreateError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+
+
+@router.post("/api/assistant/actions/create-workflow", dependencies=[Depends(auth)])
+async def assistant_create_workflow(body: WorkflowCreate) -> dict[str, Any]:
+    """Re-plan, then save the workflow in the project (a new project when none is given) and,
+    with ``run``, start it unless autonomy is advisory. Refused on any failed check."""
+    _workflow_actions_allowed()
+    try:
+        return await assistant_workflows.create(body.request, body.project_id, body.name, body.gpu,
+                                                run=body.run, auto=body.auto, fingerprint=body.fingerprint)
+    except assistant_workflows.CreateError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
 
 
 @router.get("/api/assistant/actions/prepare-motion/{job_id}", dependencies=[Depends(auth)])
@@ -268,9 +352,15 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             # worker closes the generator, which tears down the model request).
             out: asyncio.Queue = asyncio.Queue()
             cancel = threading.Event()
+            # Lets the session ask the user mid-turn; the worker blocks until the
+            # answer frame arrives or the turn is cancelled.
+            interaction = assistant_bridge.ChatInteraction(
+                lambda kind, val, out=out: loop.call_soon_threadsafe(out.put_nowait, (kind, val)),
+                cancel)
 
             def _worker(messages=messages, grounded=grounded, run=run, job=job if run_job_id else None,
-                        extra_jobs=extra_jobs, allow_actions=allow_actions, cancel=cancel, out=out) -> None:
+                        extra_jobs=extra_jobs, allow_actions=allow_actions, cancel=cancel, out=out,
+                        interaction=interaction) -> None:
                 # EVERYTHING inside the try, including building the generator:
                 # session construction (docs index load, embedder init) can
                 # raise, and with it outside the try neither ("error") nor the
@@ -294,7 +384,8 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                             except Exception:  # noqa: BLE001
                                 pass
                     gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run,
-                                                         allow_actions=allow_actions)
+                                                         allow_actions=allow_actions,
+                                                         interaction=interaction)
                     for ev in gen:
                         if cancel.is_set():
                             break
@@ -325,6 +416,8 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             # stop and threw its payload away, so a question sent right after
             # Stop vanished permanently with no error. Keep draining after a
             # cancel until the worker reports done, but stop forwarding tokens.
+            # The one exception is an {"answer":…} frame: it answers a question the
+            # worker is blocked on and must NOT cancel the turn.
             get_task = asyncio.ensure_future(out.get())
             inbox_task = asyncio.ensure_future(inbox.get())
             stopped = False
@@ -334,7 +427,11 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                 while True:
                     waiters = {get_task} | ({inbox_task} if inbox_task else set())
                     done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-                    if inbox_task and inbox_task in done:
+                    if inbox_task and inbox_task in done and isinstance(inbox_task.result(), dict) \
+                            and "answer" in inbox_task.result():
+                        interaction.answer(inbox_task.result()["answer"])
+                        inbox_task = asyncio.ensure_future(inbox.get())
+                    elif inbox_task and inbox_task in done:
                         msg = inbox_task.result()
                         cancel.set()
                         stopped = True
@@ -435,9 +532,21 @@ def _run_facts(job: dict[str, Any], include_gpus: bool = True) -> str:
         if not facts.get("exists"):
             lines.append(f"--{field}: {val} (MISSING on disk)")
             continue
+        # The assistant's inspector counts particles (a full streaming read).
+        extra = assistant_bridge.data_facts(val)
+        for src, dst in (("n_particles", "particles"), ("image_box", "box"),
+                         ("sampling_rate", "pixel_size"), ("voxel_size", "voxel_size"),
+                         ("has_ctf", "has_ctf"), ("has_poses", "has_poses"),
+                         ("has_shifts", "has_shifts"), ("has_latents", "has_latents")):
+            if extra.get(src) is None:
+                continue
+            if isinstance(extra[src], bool):
+                facts[dst] = bool(facts.get(dst)) or extra[src]   # either inspector seeing it counts
+            else:
+                facts.setdefault(dst, extra[src])
         bits = [f"--{field}: {val}"]
-        for key in ("kind", "particles", "box", "voxel_size", "columns_count",
-                    "has_ctf", "has_latents", "volumes", "size"):
+        for key in ("kind", "particles", "box", "pixel_size", "voxel_size", "columns_count",
+                    "has_ctf", "has_poses", "has_shifts", "has_latents", "volumes", "size"):
             if key in facts:
                 bits.append(f"{key}={facts[key]}")
         if "columns" in facts:

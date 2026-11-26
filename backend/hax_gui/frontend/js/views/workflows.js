@@ -57,8 +57,17 @@ const VIEWPORTS = new Map();
 // Point the *next* visit to this page at `id`. Used by callers that create a
 // workflow elsewhere (the getting-started recipe) and then navigate here: the view
 // already reopens whatever was left open, so this is all the handoff that's needed.
-export function rememberWorkflowToOpen(id) {
-  try { localStorage.setItem(LAST_WF_KEY, id); } catch { /* storage unavailable */ }
+// `first`: open it even over the active project's canvas (once, on the next visit).
+const OPEN_NEXT_KEY = "hax_gui_wf_open_next";
+export function rememberWorkflowToOpen(id, { first = false } = {}) {
+  try {
+    localStorage.setItem(LAST_WF_KEY, id);
+    if (first) sessionStorage.setItem(OPEN_NEXT_KEY, id);
+  } catch { /* storage unavailable */ }
+}
+function takeWorkflowToOpen() {
+  try { const id = sessionStorage.getItem(OPEN_NEXT_KEY); sessionStorage.removeItem(OPEN_NEXT_KEY); return id; }
+  catch { return null; }
 }
 
 const NODE_W = 196;     // node width (px)
@@ -604,6 +613,8 @@ export function WorkflowsView() {
     loadLabels().catch(() => {});
     loadProgramGroups().catch(() => {});
     await refreshList();
+    const handed = takeWorkflowToOpen();
+    if (handed && wfList.some((w) => w.id === handed)) { await openWorkflow(handed); await refreshList(); return; }
     // Project-first: entering the builder shows whatever project is already active,
     // full stop — that beats reopening some other draft/project left open last time.
     // Only when there's no active project do we fall back to the old "resume where
@@ -630,8 +641,8 @@ export function WorkflowsView() {
     for (const p of projList) projGroup.appendChild(h("option", { value: "p:" + p.id }, p.name));
     wfSelect.appendChild(projGroup);
     // Standalone workflows saved while this project was active — shown only once its
-    // live canvas is actually open, so switching projects doesn't leak the last one's drafts.
-    if (wf && wf.kind === "project") {
+    // live canvas (or one of them) is actually open, so switching projects doesn't leak the last one's drafts.
+    if (wf && wf.project_id) {
       const inProject = wfList.filter((w) => w.project_id === wf.project_id && w.kind !== "project");
       if (inProject.length) {
         const grp = h("optgroup", { label: "In this project" });

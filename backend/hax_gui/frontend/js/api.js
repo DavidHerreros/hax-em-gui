@@ -243,6 +243,13 @@ export const api = {
 // Optional AI assistant. status() is always safe to call (reports
 // {available:false} when the hax-em-assistant package isn't installed).
 api.assistantStatus = () => req("/api/assistant/status");
+// Autonomy: may the assistant launch/stop/relaunch jobs (advisory | ask | auto).
+api.assistantAutonomy = () => req("/api/assistant/autonomy");
+api.setAssistantAutonomy = (level) =>
+  req("/api/assistant/autonomy", { method: "PUT", body: JSON.stringify({ level }) });
+// Accept the restart a watch alert proposed; the server re-derives the changes.
+api.assistantWatchApply = (jobId, kind) =>
+  req(`/api/assistant/watch/${jobId}/apply`, { method: "POST", body: JSON.stringify({ kind }) });
 api.diagnoseJob = (id) => req(`/api/jobs/${id}/diagnose`, { method: "POST" });
 // PDF run report (deterministic figures + measured values, AI discussion when the
 // model is up). Slow — the server builds it synchronously; returns the PDF blob.
@@ -279,6 +286,16 @@ api.assistantPrepareMotion = ({ jobId, gpu, onStatus, onDone, onError }) => {
 // Expand an assistant job proposal (program + path) into a draft spec + path facts.
 api.assistantPreviewJob = (program, path) =>
   req("/api/assistant/actions/preview-job", { method: "POST", body: JSON.stringify({ program, path: path || null }) });
+// A workflow request, re-planned on the server: plan, graph, checks and the autonomy decision.
+api.assistantPreviewWorkflow = ({ request, projectId }) =>
+  req("/api/assistant/actions/preview-workflow", { method: "POST",
+    body: JSON.stringify({ request, project_id: projectId || null }) });
+// Save it (run=false: a draft), or save and start it; auto=true when the card acts on its own.
+// `fingerprint` is the previewed graph's: a plan that changed since is refused.
+api.assistantCreateWorkflow = ({ request, projectId, run, auto, fingerprint }) =>
+  req("/api/assistant/actions/create-workflow", { method: "POST",
+    body: JSON.stringify({ request, project_id: projectId || null, run: !!run, auto: !!auto,
+                           fingerprint: fingerprint || null }) });
 
 // Generate a PDF run report and trigger a browser download. Returns nothing;
 // throws ApiError on failure. Blocking on the server (figures + narration).
@@ -318,7 +335,7 @@ api.deleteChat = (id) => req(`/api/chats/${id}`, { method: "DELETE" });
 // Open a chat socket. Send full-history requests via send({messages, grounded});
 // tokens arrive through onToken, then onDone; onError on failure. Returns
 // { send, close }.
-export function assistantChat({ onToken, onStatus, onAction, onDone, onError, onClose }) {
+export function assistantChat({ onToken, onStatus, onAction, onQuestion, onDone, onError, onClose }) {
   // Reconnecting: the old socket was created once and cached for the app's
   // lifetime with no onclose — after a server restart every Send silently
   // dropped its payload and the composer locked on "Stop" forever. Now a drop
@@ -343,6 +360,7 @@ export function assistantChat({ onToken, onStatus, onAction, onDone, onError, on
       if (m.token != null) onToken(m.token);
       else if (m.status != null) { if (onStatus) onStatus(m.status); }
       else if (m.action != null) { if (onAction) onAction(m.action); }
+      else if (m.question != null) { if (onQuestion) onQuestion(m.question); }
       else if (m.error) { if (onError) onError(m.error); }
       else if (m.done) onDone(m.turn);
     };
@@ -368,6 +386,8 @@ export function assistantChat({ onToken, onStatus, onAction, onDone, onError, on
   return {
     send: (payload) => raw(payload),
     stop: () => raw({ stop: true }),
+    // Answers the pending question ({id, value} or {id, cancel: true}); does not stop the turn.
+    answer: (answer) => raw({ answer }),
     close: () => {
       closed = true; pending = [];
       if (timer) clearTimeout(timer);

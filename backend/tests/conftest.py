@@ -23,6 +23,10 @@ os.environ["HAX_GUI_DATA_DIR"] = str(TMP / "data")
 os.environ["HAX_GUI_MANAGE_OLLAMA"] = "0"
 os.environ["HAX_GUI_ASSISTANT_WARMUP"] = "0"
 os.environ["HAXSTUB_GATE"] = str(GATE)
+# The assistant bridge registers workspaces / reads autonomy: never the user's real config.
+os.environ["HAX_ASSISTANT_CONFIG"] = str(TMP / "assistant" / "settings.json")
+os.environ.pop("HAX_ASSISTANT_WORKSPACE", None)
+os.environ.pop("HAX_ASSISTANT_AUTONOMY", None)
 
 _stub = TMP / "hax_stub.sh"
 _stub.write_text(

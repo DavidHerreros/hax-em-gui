@@ -9,15 +9,17 @@
 // and you see the ongoing answering process — or the finished answer.
 import { h } from "../h.js";
 import { icon } from "../icons.js";
-import { toastError } from "../toast.js";
+import { errText, toastError } from "../toast.js";
 import { confirmModal } from "./confirmModal.js";
 import { assistantChat, api } from "../api.js";
 import { renderMarkdown } from "../markdown.js";
+import { navigate } from "../router.js";
 import { store } from "../store.js";
 import { createTerminal } from "./terminal.js";
 import { runBrowser, folderName } from "./runBrowser.js";
 import { jobLabelChips } from "./labels.js";
 import { jobTimeEl } from "./jobs.js";
+import { rememberWorkflowToOpen } from "./workflows.js";
 
 const GREETING =
   "Hi! I can help you pick programs and parameters, explain options from the docs, "
@@ -38,11 +40,15 @@ const ctrl = {
   liveRaw: "",             // partial assistant answer accumulated so far
   liveSteps: [],           // activity-trace step texts for the current turn
   liveActions: [],         // proposed-action records for this turn
+  liveQuestion: null,      // a question the assistant is waiting on (ask-and-wait)
   stopped: false,
   liveError: null,         // transient transport/model error — shown, never persisted
   socket: null,            // one WebSocket for the app's lifetime (reused per turn)
   hooks: null,             // set by the mounted view; null while unmounted
 };
+// Workflow-card state (preview, creation) keyed by its action object, which ctrl.liveActions
+// keeps across re-renders: a re-rendered card shows the same state and never creates twice.
+const wfCards = new WeakMap();
 
 function ensureSocket() {
   if (ctrl.socket) return ctrl.socket;
@@ -57,6 +63,11 @@ function ensureSocket() {
       const rec = { action };
       ctrl.liveActions.push(rec);
       if (ctrl.hooks) ctrl.hooks.onAction(rec);
+    },
+    onQuestion: (q) => {
+      if (!ctrl.streaming) return;   // a late question from a stopped turn
+      ctrl.liveQuestion = q;
+      if (ctrl.hooks) ctrl.hooks.onQuestion(q);
     },
     onToken: (t) => {
       if (!ctrl.streaming) return;
@@ -111,6 +122,7 @@ function completeTurn() {
            ctrl.history[ctrl.history.length - 1].role === "user") ctrl.history.pop();
   ctrl.streaming = false;
   ctrl.liveRaw = "";
+  ctrl.liveQuestion = null;
   // `pushed` tells the view whether the live bubble has an answer to show:
   // rendering "the last assistant message" unconditionally used to duplicate
   // the PREVIOUS answer into the new bubble on an empty turn.
@@ -185,6 +197,15 @@ export function AssistantView() {
   }, "docs grounding");
   groundBtn.classList.toggle("active", ctrl.grounded);
 
+  // Autonomy (also `/autonomy [level]` in the composer): may the assistant act on jobs?
+  const autonomySelect = h("select", {
+    class: "chat-action-gpu", style: { display: "none" },
+    title: "Autonomy: may the assistant launch, stop or relaunch jobs? (also /autonomy in the chat)",
+  }, ...["advisory", "ask", "auto"].map((l) => h("option", { value: l }, l)));
+  autonomySelect.addEventListener("change", () => autonomyCommand(autonomySelect.value));
+  let workspaceError = null;
+  const wsWarn = h("span", { class: "chat-action-warn" });
+
   const statusText = h("span", null, "");
   // Rebuild the docs index in place so edits to hax-em-docs are picked up
   // without restarting the GUI. The index also auto-rebuilds on process start
@@ -210,12 +231,17 @@ export function AssistantView() {
       }
     },
   }, icon("refresh", 13));
-  const statusLine = h("div", { class: "chat-status" }, statusText, reindexBtn);
+  const statusLine = h("div", { class: "chat-status" }, statusText, reindexBtn, wsWarn);
   function showStatus(s) {
     statusText.textContent = s.available
       ? `model: ${s.model}  ·  docs: ${s.docs_grounding ? "on" : "off"}  ·  ${s.programs} programs, ${s.doc_chunks} doc chunks`
       : "assistant unavailable";
     reindexBtn.style.display = s.available ? "" : "none";
+    autonomySelect.style.display = s.available && s.autonomy ? "" : "none";
+    if (s.autonomy) autonomySelect.value = s.autonomy;
+    workspaceError = (s.available && s.workspace_error) || null;
+    wsWarn.textContent = workspaceError ? "⚠ assistant actions off" : "";
+    wsWarn.title = workspaceError || "";
   }
   api.assistantStatus().then(showStatus).catch(() => { statusText.textContent = ""; });
 
@@ -354,7 +380,7 @@ export function AssistantView() {
   // and any proposed-action cards. Called on mount and on chat switch.
   function renderConversation() {
     log.replaceChildren();
-    current = currentActivity = null;
+    current = currentActivity = questionCard = null;
     if (!ctrl.history.length && !ctrl.streaming) { bubble("assistant", GREETING); }
     else for (const m of ctrl.history) bubble(m.role, m.content);
     if (ctrl.streaming) {
@@ -363,6 +389,7 @@ export function AssistantView() {
       if (ctrl.liveRaw) current.replaceChildren(renderMarkdown(ctrl.liveRaw));
     }
     for (const rec of ctrl.liveActions) renderActionCard(rec.action);
+    if (ctrl.streaming && ctrl.liveQuestion) renderQuestionCard(ctrl.liveQuestion);
     log.scrollTop = log.scrollHeight;
     setComposerMode();
   }
@@ -435,14 +462,84 @@ export function AssistantView() {
       current.classList.remove("streaming");
     }
     if (currentActivity && currentActivity.lastElementChild) currentActivity.lastElementChild.classList.remove("live");
+    dismissQuestion();   // the turn ended (or was stopped): nothing waits on it any more
     log.scrollTop = log.scrollHeight;
     setComposerMode();
+  }
+
+  // ── a question the assistant is waiting on (ask-and-wait) ─────────────
+  // The answer goes back as an {answer:{id, value}} frame, which does not stop
+  // the turn; Skip sends {id, cancel:true}; Stop in the composer ends the turn.
+  let questionCard = null;
+  function dismissQuestion() {
+    if (questionCard) { questionCard.remove(); questionCard = null; }
+  }
+  function renderQuestionCard(q) {
+    dismissQuestion();
+    const controls = h("div", { class: "chat-action-actions" });
+    const reply = (payload, shown) => {
+      ctrl.liveQuestion = null;
+      ensureSocket().answer({ id: q.id, ...payload });
+      controls.replaceChildren(h("span", { class: "muted chat-action-note" }, shown));
+    };
+    const choices = q.kind === "confirm" ? ["yes", "no"] : (q.kind === "choice" ? (q.choices || []) : []);
+    if (choices.length) {
+      for (const c of choices) {
+        controls.appendChild(h("button", {
+          class: "btn small" + (c === q.default ? "" : " secondary"),
+          onclick: () => reply({ value: c }, `Answered: ${c}`),
+        }, c));
+      }
+    } else {
+      const field = h("input", {
+        class: "chat-action-gpu", style: { minWidth: "260px" }, value: q.default ?? "",
+        placeholder: q.kind === "path" ? "a path on the server" : "your answer",
+      });
+      const submit = () => reply({ value: field.value }, `Answered: ${field.value || q.default || ""}`);
+      field.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
+      controls.appendChild(field);
+      controls.appendChild(h("button", { class: "btn small", onclick: submit }, "Answer"));
+      setTimeout(() => field.focus(), 0);
+    }
+    controls.appendChild(h("button", { class: "btn small ghost",
+      onclick: () => reply({ cancel: true }, "Skipped.") }, "Skip"));
+    const card = h("div", { class: "chat-action" },
+      h("div", { class: "chat-action-head" }, icon("chat", 15), h("span", null, "The assistant asks")),
+      h("div", { class: "chat-action-body" },
+        h("div", { style: { whiteSpace: "pre-wrap" } }, q.text),
+        q.error ? h("div", { class: "chat-action-warn" }, q.error) : null,
+        controls));
+    questionCard = h("div", { class: "chat-msg assistant" }, h("div", { class: "chat-role" }, "Question"), card);
+    log.appendChild(questionCard);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  // ── client-side commands (never sent to the model) ────────────────────
+  function notice(text) {
+    log.appendChild(h("div", { class: "chat-msg assistant" },
+      h("div", { class: "chat-step" }, h("span", { class: "chat-step-dot" }), h("span", null, text))));
+    log.scrollTop = log.scrollHeight;
+  }
+  async function autonomyCommand(level) {
+    try {
+      const a = level ? await api.setAssistantAutonomy(level) : await api.assistantAutonomy();
+      autonomySelect.value = a.level;
+      const others = Object.keys(a.levels || {}).filter((l) => l !== a.level);
+      notice(`autonomy: ${a.level} — ${a.description}`
+        + (level ? "" : `  (change with /autonomy ${others.join(" | ")})`)
+        + (a.env_override ? "  [HAX_ASSISTANT_AUTONOMY overrides the saved setting]" : "")
+        + (workspaceError && a.level !== "advisory" ? `  ⚠ actions are refused: ${workspaceError}` : ""));
+    } catch (e) {
+      notice(`autonomy: ${errText(e)}`);
+      api.assistantAutonomy().then((a) => { autonomySelect.value = a.level; }).catch(() => {});
+    }
   }
 
   // ── proposed-action card (create a draft job from a data path) ────────
   function renderActionCard(action) {
     if (!action) return;
     if (action.kind === "prepare_motion") { renderPrepareMotionCard(action); return; }
+    if (action.kind === "workflow") { renderWorkflowCard(action); return; }
     if (action.kind !== "create_job") return;
     const card = h("div", { class: "chat-action" });
     const body = h("div", { class: "chat-action-body" }, h("span", { class: "muted" }, "Preparing proposal…"));
@@ -503,6 +600,126 @@ export function AssistantView() {
     });
     body.appendChild(h("div", { class: "chat-action-actions" }, open,
       h("span", { class: "muted chat-action-note" }, "Draft only — nothing runs until you launch it.")));
+  }
+
+  // ── proposed workflow: re-planned on the server, run by the workflow engine ──
+  // What the card may do follows the autonomy decision in the preview: propose -> draft
+  // only; confirm -> draft or "Create and run"; proceed -> created and started at once.
+  const WF_MARK = { pass: "✓", warn: "⚠", fail: "✗" };
+  const argText = (v) => (v === true ? "on" : v === false ? "off" : String(v));
+  function wfErrText(e) {
+    const d = e && e.detail;
+    if (d && typeof d === "object" && d.error) {
+      return [d.error, ...(d.failed_checks || []).map((c) => `${c.name}: ${c.message}`), ...(d.errors || [])].join(" · ");
+    }
+    return errText(e);
+  }
+  function openInBuilder(id) { rememberWorkflowToOpen(id, { first: true }); navigate("/workflows"); }
+
+  function renderWorkflowCard(action) {
+    let st = wfCards.get(action);
+    if (!st) {
+      st = { request: (action.form && action.form.raw) || "", projectId: ctrl.currentChatProject || null,
+             created: null, creating: null, error: null, autoTried: false };
+      st.preview = api.assistantPreviewWorkflow({ request: st.request, projectId: st.projectId });
+      wfCards.set(action, st);
+    }
+    const label = String(action.template || "workflow").replace(/_run$/, " (existing run)").replace(/_/g, " ");
+    const body = h("div", { class: "chat-action-body" }, h("span", { class: "muted" }, "Checking the plan…"));
+    log.appendChild(h("div", { class: "chat-msg assistant" }, h("div", { class: "chat-role" }, "Action"),
+      h("div", { class: "chat-action" },
+        h("div", { class: "chat-action-head" }, icon("workflow", 15),
+          h("span", null, "Proposed workflow: ", h("strong", null, label))),
+        body)));
+    log.scrollTop = log.scrollHeight;
+    st.preview.then((p) => { fillWorkflowCard(body, st, p); log.scrollTop = log.scrollHeight; })
+      .catch((e) => body.replaceChildren(h("span", { class: "chat-action-warn" },
+        "Could not prepare the workflow: " + wfErrText(e))));
+  }
+
+  function fillWorkflowCard(body, st, p) {
+    body.replaceChildren(h("div", { class: "muted" }, p.plan.description));
+    const inheritedNote = (s) => {
+      const names = Object.keys(s.inherited);
+      return names.length ? h("div", { class: "chat-wf-why" }, `${names.map((n) => "--" + n).join(", ")}: taken from `
+        + `${Object.values(s.inherited)[0]}, as the workflow builder does when wiring its network`) : null;
+    };
+    body.appendChild(h("ol", { class: "chat-action-steps" }, ...p.steps.map((s) => h("li", null,
+      h("strong", null, s.title), s.note ? h("span", { class: "muted" }, ` — ${s.note}`) : null,
+      ...Object.entries(s.args).map(([flag, v]) => h("div", { class: "chat-wf-arg" },
+        h("code", { class: "md-code" }, `--${flag} ${argText(v)}`),
+        s.reasons[flag] ? h("div", { class: "chat-wf-why" }, s.reasons[flag]) : null)),
+      ...Object.entries(s.wired).map(([flag, src]) => h("div", { class: "chat-wf-arg" },
+        h("code", { class: "md-code" }, `--${flag}`), h("div", { class: "chat-wf-why" }, `← the output of ${src}`))),
+      inheritedNote(s)))));
+    for (const o of p.omitted) {
+      body.appendChild(h("div", { class: "chat-wf-arg muted" }, `${o.index}. ${o.title} — ${o.reason}`));
+    }
+    const shown = p.plan.checks.filter((c) => c.status !== "pass");
+    const passed = p.plan.checks.filter((c) => c.status === "pass");
+    const checkRow = (c) => h("div", { class: `chat-wf-check ${c.status}` },
+      h("span", { class: "chat-wf-mark" }, WF_MARK[c.status] || "·"), h("span", null, `${c.name}: ${c.message}`));
+    body.appendChild(h("div", { class: "chat-wf-checks" }, ...shown.map(checkRow),
+      passed.length ? h("details", null, h("summary", { class: "muted" }, `${passed.length} pre-flight checks passed`),
+        ...passed.map(checkRow)) : null));
+    for (const e of p.errors) body.appendChild(h("div", { class: "chat-action-warn" }, e));
+    body.appendChild(h("div", { class: "chat-action-row" }, h("span", { class: "muted" }, "Project"),
+      h("span", null, p.project.new ? `a new project “${p.project.name}”` : p.project.name || p.project.id)));
+    const actions = h("div", { class: "chat-action-actions" });
+    body.appendChild(actions);
+    renderWorkflowActions(actions, st, p);
+  }
+
+  function renderWorkflowActions(el, st, p) {
+    const decision = p.autonomy.decision;
+    if (st.created) {
+      const c = st.created;
+      const text = !c.started
+        ? (c.run_error ? `Saved “${c.name}” as a draft, but it could not start: ${c.run_error}`
+                       : `Saved “${c.name}” as a draft. Nothing runs until you run it.`)
+        : c.auto ? `Autonomy is auto, so the assistant created and started “${c.name}” on its own. `
+                   + "Its steps run one after another in the project; the training is monitored."
+                 : `Created and started “${c.name}”. Its steps run one after another in the project; `
+                   + "the training is monitored.";
+      el.replaceChildren(h("div", { class: c.started ? "chat-action-done" : "muted" }, icon(c.started ? "play" : "check", 14), text),
+        h("button", { class: "btn small chat-action-open", onclick: () => openInBuilder(c.workflow_id) },
+          icon("workflow", 14), "Open in the workflow builder"));
+      return;
+    }
+    if (st.creating) {
+      el.replaceChildren(h("span", { class: "muted" }, st.creatingText));
+      st.creating.then(() => renderWorkflowActions(el, st, p));
+      return;
+    }
+    const blocked = !p.ok;
+    const draft = h("button", { class: "btn chat-action-open", disabled: blocked ? "true" : undefined,
+      onclick: () => createWorkflow(el, st, p, false, false) }, icon("workflow", 15), "Open as draft in the workflow builder");
+    const go = decision === "confirm" ? h("button", { class: "btn chat-action-open", disabled: blocked ? "true" : undefined,
+      onclick: () => createWorkflow(el, st, p, true, false) }, icon("play", 15), "Create and run") : null;
+    const note = blocked ? "Failed checks: nothing can be created until they pass."
+      : decision === "propose" ? "Draft only — nothing runs until you run it."
+      : decision === "confirm" ? "“Create and run” starts the steps now, one after another; a draft runs nothing."
+      : "";
+    el.replaceChildren(draft, go || "", note ? h("span", { class: "muted chat-action-note" }, note) : "",
+      st.error ? h("div", { class: "chat-action-warn" }, st.error) : "");
+    // auto: act once, and say so on the card; a failure falls back to the buttons above
+    if (decision === "proceed" && !blocked && !st.autoTried) { st.autoTried = true; createWorkflow(el, st, p, true, true); }
+  }
+
+  function createWorkflow(el, st, p, run, auto) {
+    if (st.creating || st.created) return;          // one workflow per card
+    st.error = null;
+    st.creatingText = !run ? "Saving the draft…"
+      : auto ? "Autonomy is auto: creating and starting the workflow…" : "Creating and starting the workflow…";
+    st.creating = api.assistantCreateWorkflow({ request: st.request, projectId: st.projectId, run, auto,
+                                                fingerprint: p.fingerprint })
+      .then((res) => {
+        st.created = { ...res, auto };
+        if (!run && ctrl.hooks === hooks) openInBuilder(res.workflow_id);   // only while this view is up
+      })
+      .catch((e) => { st.error = wfErrText(e); })
+      .finally(() => { st.creating = null; });
+    renderWorkflowActions(el, st, p);
   }
 
   // Confirm card for preparing a run's deformation field (per-domain motion). This
@@ -582,6 +799,13 @@ export function AssistantView() {
   // ── send / hooks ──────────────────────────────────────────────────────
   function send() {
     const text = input.value.trim();
+    const cmd = /^\/autonomy\b\s*(.*)$/i.exec(text);
+    if (cmd) {                 // handled here: the model never sees it
+      input.value = "";
+      autosize();
+      autonomyCommand(cmd[1].trim());
+      return;
+    }
     if (!text || ctrl.streaming) return;
     input.value = "";
     autosize();
@@ -599,6 +823,7 @@ export function AssistantView() {
     onStep(text) { appendStep(text); },
     onToken() { scheduleRender(); },
     onAction(rec) { renderActionCard(rec.action); },
+    onQuestion(q) { renderQuestionCard(q); },
     onDone(pushed) { finishRender(pushed); },
     onChatsChanged() { refreshChats(); },
   };
@@ -743,7 +968,8 @@ export function AssistantView() {
     h("label", { class: "chat-project-row" }, h("span", { class: "muted" }, "New chat in"), projectSelect),
     chatList);
   const header = h("div", { class: "chat-header" },
-    h("div", { class: "chat-title" }, icon("chat", 18), h("span", null, "Assistant")), groundBtn);
+    h("div", { class: "chat-title" }, icon("chat", 18), h("span", null, "Assistant")),
+    h("div", { style: { display: "flex", alignItems: "center", gap: "8px" } }, autonomySelect, groundBtn));
   const composer = h("div", { class: "chat-composer" }, input, sendBtn);
   const main = h("div", { class: "chat-main" }, header, statusLine, log, attachRow, composer);
   const el = h("div", { class: "view chat-view" }, sidebar, main);
