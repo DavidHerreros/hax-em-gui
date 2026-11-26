@@ -324,6 +324,13 @@ api.assistantRunReport = async (jobId, narrate = true) => {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 };
 
+// The user's own "/" chat commands (one text file each on the server).
+api.assistantCommands = () => req("/api/assistant/commands");
+api.saveAssistantCommand = (name, body) =>
+  req(`/api/assistant/commands/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify(body) });
+api.deleteAssistantCommand = (name) =>
+  req(`/api/assistant/commands/${encodeURIComponent(name)}`, { method: "DELETE" });
+
 // Persisted assistant chats (optionally grouped by project).
 api.chats = () => req("/api/chats");
 api.chat = (id) => req(`/api/chats/${id}`);

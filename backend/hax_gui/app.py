@@ -36,6 +36,7 @@ from .md_viewer import md_viewer_manager
 from .mrc_viewer import mrc_viewer_manager
 from .routes import (
     assistant as assistant_routes,
+    assistant_commands as assistant_command_routes,
     jobs as job_routes,
     metrics as metrics_routes,
     projects as project_routes,
@@ -278,6 +279,7 @@ async def _poll_updates() -> None:
 # -- routers ---------------------------------------------------------------
 app.include_router(system_routes.router)
 app.include_router(assistant_routes.router)
+app.include_router(assistant_command_routes.router)
 app.include_router(project_routes.router)
 app.include_router(job_routes.router)
 app.include_router(metrics_routes.router)

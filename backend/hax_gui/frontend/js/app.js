@@ -20,7 +20,8 @@ import { ViewerView } from "./views/viewer.js";
 import { JobsView } from "./views/jobs.js";
 import { CompareView } from "./views/compare.js";
 import { WorkflowsView } from "./views/workflows.js";
-import { AssistantView } from "./views/assistant.js";
+import { AssistantView, assistantActivity, onAssistantActivity } from "./views/assistant.js";
+import { mountAssistantFloat } from "./views/assistantFloat.js";
 
 const DOCS_URL = "https://davidherreros.github.io/hax-em-docs/";
 const THEME_KEY = "hax_gui_theme";
@@ -46,6 +47,7 @@ function probeAssistant() {
     if (nav) nav.appendChild(h("a", { href: "#/assistant", "data-path": "/assistant", class: "side-item" },
                               icon("chat"), labelSpan("Assistant")));
     if (currentPath().startsWith("/assistant")) reload();   // deep link opened early
+    mountAssistantFloat({ View: AssistantView, activity: assistantActivity, subscribe: onAssistantActivity });
   }).catch(() => { /* offline or endpoint missing: stay hidden */ });
 }
 
