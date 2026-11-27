@@ -281,7 +281,7 @@ async def _relaunch(job: dict[str, Any], proposal: dict[str, Any], by: str, orig
     new = await _scratch(job, proposal["changes"])
     _audit(job, proposal, "relaunched", by, origin, new)
     _origins[new["id"]] = origin
-    _register(new, workdir)
+    register(new, workdir)
     _watched[new["id"]] = {"fired": set()}     # keep watching the relaunched run, afresh
     _ensure_task()
     where = (f"relaunched from scratch as {new.get('name') or new['id']} in a new folder "
@@ -333,7 +333,8 @@ def _audit(job: dict[str, Any], proposal: dict[str, Any], decision: str, by: str
         pass
 
 
-def _register(new: dict[str, Any], origin: str) -> None:
+def register(new: dict[str, Any], origin: str) -> None:
+    """Record a job as launched by the assistant, so that under auto it may stop or relaunch it."""
     # A job still queued for its GPU has no pid yet: it stays unowned, so the assistant asks first.
     job = manager.get(new["id"]) or new
     if not job.get("pid") or not job.get("workdir"):

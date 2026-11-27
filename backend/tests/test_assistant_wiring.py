@@ -522,7 +522,7 @@ _WF_ALLOWED = {"assistant_workflows.py": re.compile(r"wf_manager\.(save|validate
 
 def test_assistant_paths_never_delete():
     hits = []
-    for rel in ("assistant.py", "watch.py", "assistant_actions.py", "assistant_workflows.py"):
+    for rel in ("assistant.py", "watch.py", "assistant_actions.py", "assistant_workflows.py", "assistant_tools.py"):
         allowed = _WF_ALLOWED.get(rel)
         for n, line in enumerate((BACKEND / rel).read_text().splitlines(), 1):
             if _DESTRUCTIVE.search(allowed.sub("", line) if allowed else line):

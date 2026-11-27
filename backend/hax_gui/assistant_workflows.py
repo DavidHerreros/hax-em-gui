@@ -28,9 +28,9 @@ INTERNAL_NOTES = {
 UNBOUND_NOTE = ("not added: it needs the few representative states the assistant selects, and the "
                 "builder's latents input would hand it every particle's latent (one volume each). "
                 "Decode states after the run, e.g. with the assistant's per-domain motion action.")
-WATCH_FOR_S = 600.0            # how long to wait for a training step's job to appear
 _creating: set[tuple] = set()
 _tasks: set[asyncio.Task] = set()
+launched: dict[str, dict[str, str]] = {}    # job id -> its workflow and step, for the runs started here
 
 
 class CreateError(Exception):
@@ -197,32 +197,51 @@ async def _create(request, project_id, name, gpu, run, auto, fingerprint) -> dic
         except WorkflowError as exc:
             return {**result, "run_error": "; ".join(exc.errors)}
         result["started"] = True
-        _follow_training(wf["id"], [s["node"] for s in out["steps"] if s["watch"]])
+        origin = str(projects.dir_for(project_id))
+        task = asyncio.get_running_loop().create_task(_follow(wf["id"], out["steps"], origin))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
     return result
 
 
-def _follow_training(wid: str, node_ids: list[str]) -> None:
-    if node_ids:
-        task = asyncio.get_running_loop().create_task(_watch_when_launched(wid, set(node_ids)))
-        _tasks.add(task)
-        task.add_done_callback(_tasks.discard)
-
-
-async def _watch_when_launched(wid: str, todo: set[str], every: float = 2.0) -> None:
-    """Turn on health monitoring for the training steps as their jobs appear (bounded wait)."""
-    loop = asyncio.get_running_loop()
-    end = loop.time() + WATCH_FOR_S
-    while todo and loop.time() < end:
+async def _follow(wid: str, steps: list[dict[str, Any]], origin: str, every: float = 2.0) -> None:
+    """Follow a workflow started here to its end: as each step's job starts it is registered as launched
+    by the assistant (under auto it may then stop or relaunch it) and a training step is watched."""
+    todo = {s["node"]: s for s in steps}
+    while todo:
         wf = wf_manager.get(wid)
         if wf is None:
             return
         state = wf.get("run_state") or {}
-        for nid in list(todo):
-            s = state.get(nid) or {}
-            if s.get("job_id"):
-                watch.watch(s["job_id"])
-                todo.discard(nid)
-            elif s.get("status") not in ("pending", "queued", "running"):
-                todo.discard(nid)              # never launched (failed, blocked, cancelled)
-        if todo:
-            await asyncio.sleep(every)
+        for nid, step in list(todo.items()):
+            job = jobs.get((state.get(nid) or {}).get("job_id") or "")
+            if job is not None:
+                launched[job["id"]] = {"workflow_id": wid, "workflow": wf["name"], "step": step["title"]}
+            if job is not None and job.get("pid"):
+                watch.register(job, origin)
+                if step["watch"]:
+                    watch.watch(job["id"])
+                del todo[nid]
+        if wf["status"] != "running":
+            return                             # finished, failed or stopped: no step starts any more
+        await asyncio.sleep(every)
+
+
+async def step_jobs(wid: str, wait: float = 3.0) -> list[dict[str, Any]]:
+    """Each step of a workflow with its job as far as it exists, after waiting up to ``wait`` seconds for
+    the first one (the engine creates it on its next tick); a step not started yet has no job or folder."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + wait
+    while True:
+        wf = wf_manager.get(wid) or {}
+        state = wf.get("run_state") or {}
+        if any(s.get("job_id") for s in state.values()) or loop.time() >= end:
+            break
+        await asyncio.sleep(0.2)
+    out = []
+    for node in (wf.get("graph") or {}).get("nodes", []):
+        s = state.get(node["id"]) or {}
+        job = jobs.get(s.get("job_id") or "")
+        out.append({"step": node.get("name"), "status": job["status"] if job else s.get("status", "pending"),
+                    "job_id": job["id"] if job else None, "run_dir": job.get("workdir") if job else None})
+    return out

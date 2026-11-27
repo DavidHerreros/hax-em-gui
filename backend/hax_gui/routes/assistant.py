@@ -148,6 +148,23 @@ async def assistant_create_workflow(body: WorkflowCreate) -> dict[str, Any]:
         raise HTTPException(status_code=exc.status, detail=exc.detail)
 
 
+class StopJob(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    job_id: str = Field(min_length=1, max_length=64)
+    auto: bool = False      # the card acting on its own: refused unless the decision is still proceed
+
+
+@router.post("/api/assistant/actions/stop-job", dependencies=[Depends(auth)])
+async def assistant_stop_job(body: StopJob) -> dict[str, Any]:
+    """Stop a job from the chat's stop card, through the job manager (its run folder and checkpoint
+    are kept). Everything is checked again here."""
+    _workflow_actions_allowed()
+    try:
+        return await assistant_tools.stop_job(body.job_id, auto=body.auto)
+    except assistant_tools.StopError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+
+
 @router.get("/api/assistant/actions/prepare-motion/{job_id}", dependencies=[Depends(auth)])
 def assistant_prepare_motion_plan(job_id: str) -> dict[str, Any]:
     """Read-only plan for preparing a run's deformation field (per-domain motion),
@@ -349,6 +366,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                           if j is not None and j["id"] != run_job_id]
             allow_actions = assistant_actions.actions_enabled()
             project_id = req.get("project_id") or None      # the chat's project
+            route_job_id = req.get("route_job_id") or None  # the job of the page the chat is on
             last_user = next((m.get("content") or "" for m in reversed(messages)
                               if isinstance(m, dict) and m.get("role") == "user"), "")
 
@@ -369,7 +387,8 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
 
             def _worker(messages=messages, grounded=grounded, run=run, job=job if run_job_id else None,
                         extra_jobs=extra_jobs, allow_actions=allow_actions, cancel=cancel, post=post,
-                        interaction=interaction, project_id=project_id, last_user=last_user) -> None:
+                        interaction=interaction, project_id=project_id, last_user=last_user,
+                        route_job_id=route_job_id) -> None:
                 # EVERYTHING inside the try, including building the generator:
                 # session construction (docs index load, embedder init) can
                 # raise, and with it outside the try neither ("error") nor the
@@ -404,7 +423,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                             payload = ("status", ev.get("text"))
                         elif etype == "action":
                             payload = ("action", assistant_tools.place(ev.get("action"), last_user,
-                                                                       interaction, project_id))
+                                                                       interaction, project_id, route_job_id))
                         else:
                             payload = ("token", ev.get("delta"))
                         post(payload)

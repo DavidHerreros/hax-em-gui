@@ -296,6 +296,9 @@ api.assistantCreateWorkflow = ({ request, projectId, run, auto, fingerprint }) =
   req("/api/assistant/actions/create-workflow", { method: "POST",
     body: JSON.stringify({ request, project_id: projectId || null, run: !!run, auto: !!auto,
                            fingerprint: fingerprint || null }) });
+// Stop a job from the chat's stop card (checked again on the server); auto=true when the card acts on its own.
+api.assistantStopJob = (jobId, auto) =>
+  req("/api/assistant/actions/stop-job", { method: "POST", body: JSON.stringify({ job_id: jobId, auto: !!auto }) });
 
 // Generate a PDF run report and trigger a browser download. Returns nothing;
 // throws ApiError on failure. Blocking on the server (figures + narration).

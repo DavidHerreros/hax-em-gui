@@ -141,7 +141,7 @@ def test_free_tier_launch_in_a_named_project(client, run, project, data, stub, s
     be = Backend(("launch_workflow", {"request": ask(data), "project": project["name"]}), "Started.")
     _, inter = _turn(run, _session(be, schema), "run the continuous motion workflow in testproj")
     res = be.tool_result()
-    assert res["status"] == "started" and "testproj" in res["project"], res
+    assert res["status"] == "started" and res["project"]["id"] == project["id"], res
     assert [n for n, _ in inter.notifications if "Done automatically" in n]
     assert _new_folders(ready, before) == []                      # no plain folder next to the projects
     seen = []
@@ -164,12 +164,12 @@ def test_free_tier_launch_without_a_project_makes_a_gui_project(client, run, dat
     be = Backend(("launch_workflow", {"request": ask(data)}), "Started.")
     _, inter = _turn(run, _session(be, schema), "launch it", {"confirm_launch_workflow": "yes"})
     res = be.tool_result()
-    assert res["status"] == "started" and "a new project" in res["project"], res
+    assert res["status"] == "started", res
     assert "a new project" in inter.asked[-1].text and "Proceed?" in inter.asked[-1].text
     new = _new_folders(ready, before)
     assert len(new) == 1 and (ready / new[0] / projects.META).is_file()
     assert not (ready / new[0] / "assistant_workflow.json").exists()
-    assert new[0] in {p["id"] for p in projects.list_projects()}
+    assert new[0] in {p["id"] for p in projects.list_projects()} and res["project"]["id"] == new[0]
     jobs = run(client.get(f"/api/projects/{new[0]}/jobs")).json()
     assert jobs and all(j["project_id"] == new[0] for j in jobs)
 
@@ -276,7 +276,7 @@ def test_socket_passes_gui_tools_and_places_proposals(project, monkeypatch, read
                       "project_id": "the-chats"})
         assert ws.receive_json()["action"]["project_id"] == "the-chats"
         assert ws.receive_json() == {"done": True, "turn": 2}
-    assert seen["tools"] == ["plan_workflow", "launch_workflow", "stop_run", "relaunch_run"]
+    assert seen["tools"] == ["list_jobs", "plan_workflow", "launch_workflow", "stop_run", "relaunch_run"]
 
 
 

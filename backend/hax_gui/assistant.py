@@ -187,6 +187,14 @@ def decide_relaunch(run_dir: str) -> str:
     return safety.decide("relaunch", run_dir)
 
 
+def decide_stop(run_dir: str, level: Optional[str] = None) -> str:
+    """``propose`` | ``confirm`` | ``proceed`` for stopping the job in ``run_dir`` at ``level`` (default:
+    the current autonomy)."""
+    from hax_assistant import safety
+    ensure_workspace()
+    return safety.decide("stop", run_dir, level)
+
+
 def guard_relaunch(program: str, run_dir: str, changes: dict) -> None:
     """Raise :class:`Refused` unless the assistant may relaunch this run with ``changes``."""
     from hax_assistant import safety
@@ -239,14 +247,23 @@ def decide_launch() -> str:
 def plan_workflow(request: str, project_dir: str, name: Optional[str] = None,
                   gpu: Optional[str] = None) -> dict:
     """Re-plan a workflow request for a GUI project folder, as plain data. Deterministic and
-    creates nothing; raises :class:`Refused` when the request is not a workflow it can plan."""
-    from hax_assistant.workflows import WorkflowError, plan_request
+    creates nothing; raises :class:`Refused` when the request is not a workflow it can plan.
+    With an SSD scratch root in Settings the steps read their images from the project's scratch
+    folder (the job manager fills --ssd_scratch_folder), not from RAM."""
+    from hax_assistant.workflows import Check, WorkflowError, plan_request
     ensure_workspace()
+    root = settings_store.ssd_scratch_root()
     try:
         plan = plan_request(request, _schema(), project_dir=project_dir, name=name, gpu=gpu,
-                            cli=shlex.split(settings.hax_cli))
+                            cli=shlex.split(settings.hax_cli),
+                            scratch=str(root / Path(project_dir).name) if root else None,
+                            scratch_name="the GUI's SSD scratch folder, set in Settings")
     except WorkflowError as e:
         raise Refused(str(e)) from None
+    if root is None:
+        plan.checks.append(Check("SSD scratch", "warn", "no SSD scratch folder is set in Settings: set one and "
+                                                        "the jobs read their images from that fast disk instead "
+                                                        "of loading them into RAM or copying them into each run"))
     steps = [{"index": s.index, "key": s.key, "program": s.program, "mode": s.mode, "title": s.title,
               "internal": s.internal, "args": dict(s.args), "params": dict(s.params),
               "reasons": dict(s.reasons), "links": dict(s.links), "watch": s.watch, "note": s.note}
@@ -351,7 +368,19 @@ def stream_events(messages: list[dict], grounded: bool = True,
     ``tools`` replace the free-tier tools of the same name (see assistant_tools).
     """
     return _get().stream_events(messages, grounded=grounded, run=run, allow_actions=allow_actions,
-                                interaction=interaction, tools=tools)
+                                interaction=interaction, tools=tools, host_notes=scratch_note())
+
+
+def scratch_note() -> str:
+    """What the model must know about the GUI's SSD scratch folder when it suggests flags."""
+    if settings_store.ssd_scratch_root() is not None:
+        return ("This GUI has an SSD scratch folder (set in its Settings): every job it launches gets "
+                "--ssd_scratch_folder automatically, one folder per project. Never ask the user for a scratch "
+                "path and never set --ssd_scratch_folder yourself; leave --load_images_to_ram off, so the "
+                "images are read from that folder.")
+    return ("No SSD scratch folder is set in this GUI's Settings, so images are loaded into RAM "
+            "(--load_images_to_ram) or copied into each run folder. Suggest setting an SSD scratch folder in "
+            "Settings rather than asking the user for a path.")
 
 
 class ChatInteraction:

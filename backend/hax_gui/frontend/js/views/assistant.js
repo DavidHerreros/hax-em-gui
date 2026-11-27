@@ -91,6 +91,7 @@ function describeRoute() {
 // Workflow-card state (preview, creation) keyed by its action object, which a chat's liveActions
 // keeps across re-renders: a re-rendered card shows the same state and never creates twice.
 const wfCards = new WeakMap();
+const stopCards = new WeakMap();   // the same for a stop card: a re-render never stops twice
 
 function ensureSocket(c) {
   if (c.socket) return c.socket;
@@ -166,6 +167,8 @@ function sendMessage(c, text, { shown, noAct } = {}) {
   c.liveError = null;
   const payload = { messages: c.history.map(({ role, content }) => ({ role, content })),
                     grounded: ctrl.grounded, turn: c.turn, project_id: c.project || null };
+  const here = describeRoute();
+  if (here.jobId) payload.route_job_id = here.jobId;   // "stop the run" on a job's page means that job
   if (c.attachedRun) payload.run_job_id = c.attachedRun.job_id;
   if (c.extraRuns.length) payload.extra_run_job_ids = c.extraRuns.map((r) => r.job_id);
   ensureSocket(c).send(payload);
@@ -654,6 +657,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     if (!action) return;
     if (action.kind === "prepare_motion") { renderPrepareMotionCard(action, rec); return; }
     if (action.kind === "workflow") { renderWorkflowCard(action, rec); return; }
+    if (action.kind === "stop_job") { renderStopCard(action, rec); return; }
     if (action.kind !== "create_job") return;
     const card = h("div", { class: "chat-action" });
     const body = h("div", { class: "chat-action-body" }, h("span", { class: "muted" }, "Preparing proposal…"));
@@ -850,6 +854,87 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       .catch((e) => { st.error = wfErrText(e); })
       .finally(() => { st.creating = null; });
     renderWorkflowActions(el, st, p);
+  }
+
+  // ── stop a job ("stop the run"): the server named the job(s) and what autonomy allows ──
+  // Advisory points to the job's own Stop; ask stops on the click; auto stops alone only the
+  // assistant's own job. Stopping keeps the run folder and its checkpoint.
+  const KEPT = "Its run folder and checkpoint are kept; nothing is deleted.";
+  function renderStopCard(action, rec) {
+    let st = stopCards.get(action);
+    if (!st) {
+      st = { pick: action.jobs.length === 1 ? action.jobs[0] : null, stopping: null, done: null, error: null,
+             autoTried: false };
+      stopCards.set(action, st);
+    }
+    const body = h("div", { class: "chat-action-body" });
+    const card = h("div", { class: "chat-action" }, cardHead("stop", "muted", "", "Stop a run"), body);
+    log.appendChild(h("div", { class: "chat-msg assistant" }, card));
+    fillStopCard(card, body, action, st, rec);
+    log.scrollTop = log.scrollHeight;
+  }
+  function fillStopCard(card, body, action, st, rec) {
+    const j = st.pick;
+    const redraw = () => fillStopCard(card, body, action, st, rec);
+    const title = card.querySelector(".chat-action-title");
+    clear(title);
+    append(title, ["Stop ", h("strong", null, j ? j.name : "a run")]);
+    clear(body);
+    const line = (...kids) => body.appendChild(h("div", null, ...kids));
+    const actions = (...kids) => body.appendChild(h("div", { class: "chat-action-actions" }, ...kids));
+    const state = () => {
+      if (!j && action.unknown) {
+        line(h("code", { class: "md-code" }, action.unknown), " is not the folder of a job of the GUI, so nothing is stopped from here.");
+        return ["muted", "Nothing to stop"];
+      }
+      if (!j && !action.jobs.length) {
+        const where = action.named || (active.project && projectName(active.project));
+        line("Nothing is waiting or running", where ? ` in “${where}”` : "", ", so there is nothing to stop.");
+        return ["muted", "Nothing to stop"];
+      }
+      if (!j) {
+        line("Several jobs are waiting or running. Which one should stop?");
+        actions(...action.jobs.map((x) => h("button", { class: "btn small secondary",
+          onclick: () => { st.pick = x; redraw(); } }, `${x.name} (${x.status})`)));
+        return ["ask", "Pick one"];
+      }
+      const openJob = h("button", { class: "chat-link", onclick: () => navigate(`/jobs/${encodeURIComponent(j.id)}`) }, "Open the job");
+      if (st.done) {
+        body.appendChild(h("div", { class: "chat-action-done" }, icon("check", 14),
+          `${st.done.auto ? "Autonomy is auto and the assistant launched this job, so it stopped it" : "Stopped"}: `
+          + `“${j.name}” is now ${st.done.status}. ${KEPT}`));
+        return st.done.auto ? ["done", "Stopped by the assistant"] : ["done", "Stopped"];
+      }
+      if (!j.decision) {
+        line(`“${j.name}” already ended (${j.status}): there is nothing to stop.`);
+        return ["muted", "Ended"];
+      }
+      if (j.decision === "propose") {
+        line(`The assistant does not stop it: ${j.reason}. Use the Stop button on the job's page. ${KEPT}`);
+        actions(openJob);
+        return ["proposal", "Proposal"];
+      }
+      if (st.stopping) {
+        line(h("span", { class: "muted" }, "Stopping…"));
+        st.stopping.then(redraw);
+        return ["ask", "Stopping"];
+      }
+      line(h("span", { class: "muted" }, `${j.program} · ${j.status}. ${KEPT}`));
+      actions(h("button", { class: "btn danger chat-action-open", onclick: () => stop(false) }, icon("stop", 14), `Stop “${j.name}”`),
+        openJob, st.error ? h("div", { class: "chat-action-warn" }, st.error) : null);
+      return ["ask", "Needs your OK"];
+    };
+    // The click is the confirmation; at auto the card acts once, on the assistant's own job only.
+    const stop = (auto) => {
+      st.error = null;
+      st.stopping = api.assistantStopJob(j.id, auto).then((r) => { st.done = r; }, (e) => { st.error = errText(e); })
+        .finally(() => { st.stopping = null; });
+      redraw();
+    };
+    if (j && j.decision === "proceed" && !st.done && !st.autoTried) { st.autoTried = true; stop(true); return; }
+    const [kind, text] = state();
+    card.querySelector(".chat-badge").replaceWith(badge(kind, text));
+    if (kind !== "ask") resolved(rec);
   }
 
   // Confirm card for preparing a run's deformation field (per-domain motion). This
@@ -1066,13 +1151,14 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       await refreshChats();
     } catch { /* ignore */ }
   }
-  // Another chat on screen; the one left keeps answering in the background, or is dropped when idle.
+  // Another chat on screen; the one left keeps answering in the background, or is dropped when idle
+  // (a card still waiting for you keeps it, so its button is there when you come back).
   function show(c) {
     const left = active;
     active = c;
     kept.add(c);
     c.unread = false;
-    if (left !== c && !left.streaming && !left.unread) drop(left);
+    if (left !== c && !left.streaming && !left.unread && left.liveActions.every((r) => r.resolved)) drop(left);
     changed();
     renderConversation();
     renderChatList();
