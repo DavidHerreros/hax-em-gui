@@ -30,6 +30,10 @@ UNBOUND_NOTE = ("not added: it needs the few representative states the assistant
                 "builder's latents input would hand it every particle's latent (one volume each). "
                 "Decode states after the run: the assistant's select_states tool, then launch_job with the "
                 "decode arguments it returns (or the per-domain motion action).")
+NO_STATES_WIRE = ("decode_states_from_latents needs a few representative states, but a wired latents input "
+                  "hands it every particle's latent (one volume each): end the workflow at the predict step, "
+                  "then use select_states and launch_job")
+WATCHED = ("hetsiren", "zernike3deep")      # their training steps are watched
 REBIND_WAIT_S = 30.0          # how long a relaunch waits for the old step's workflow run to settle
 _creating: set[tuple] = set()
 _tasks: set[asyncio.Task] = set()
@@ -96,6 +100,57 @@ def build_graph(plan: dict[str, Any]) -> dict[str, Any]:
                       "wired": wired, "inherited": inherited})
     graph = {"nodes": nodes, "edges": edges, "orientation": "horizontal"}   # zero coords: tidied on open
     return {"graph": graph, "steps": steps, "omitted": omitted, "errors": errors}
+
+
+def custom_graph(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], gpu: str | None = None) -> dict[str, Any]:
+    """A graph from steps the model wrote (``nodes`` [{id, program, args, name}], ``edges`` [{from, to,
+    field}]), wired as a planned workflow is (inherited fields included). Saves nothing."""
+    errors: list[str] = []
+    by_id: dict[str, dict] = {}
+    for n in nodes:
+        nid = str(n.get("id") or "").strip()
+        if not nid or nid in by_id or not n.get("program"):
+            errors.append(f"every step needs its own id and a program ({nid or n})")
+            continue
+        by_id[nid] = n
+    links: dict[str, dict[str, str]] = {nid: {} for nid in by_id}
+    for e in edges:
+        src, dst, field = (str(e.get(k) or "") for k in ("from", "to", "field"))
+        if src not in by_id or dst not in by_id:
+            errors.append(f"the edge {src} -> {dst} names a step that is not in the workflow")
+            continue
+        sp, dp = by_id[src]["program"], by_id[dst]["program"]
+        inputs = adapters.bindable_fields(dp)
+        made = adapters.job_produces(sp, by_id[src].get("args") or {})
+        if field not in inputs:
+            errors.append(f"{dst}: --{field} cannot take another step's output; {dp} can be wired on "
+                          f"{', '.join('--' + f for f in inputs) or 'nothing'}")
+        elif dp == "decode_states_from_latents" and field == "latents_file":
+            errors.append(f"{dst}: {NO_STATES_WIRE}")
+        elif inputs[field] not in made:
+            errors.append(f"{dst}: --{field} takes {inputs[field]}, which {src} ({sp}) does not produce "
+                          f"(it produces {', '.join(sorted(made)) or 'nothing another step can take'})")
+        elif field in links[dst]:
+            errors.append(f"{dst}: --{field} is wired twice (several sources: build it in the workflow editor)")
+        else:
+            links[dst][field] = src
+    order, todo = [], dict(links)
+    while todo:
+        ready = [nid for nid, ins in todo.items() if all(s in order for s in ins.values())]
+        if not ready:
+            return {"graph": None, "steps": [], "errors": errors + [f"the steps {', '.join(todo)} wait on each other"]}
+        order += ready
+        for nid in ready:
+            del todo[nid]
+    steps = []
+    for i, nid in enumerate(order, 1):
+        n, args = by_id[nid], dict(by_id[nid].get("args") or {})
+        title = n.get("name") or (f"{n['program']} {args['mode']}" if args.get("mode") else n["program"])
+        steps.append({"index": i, "key": nid, "title": title, "program": n["program"], "args": args,
+                      "links": {f: f"step:{s}" for f, s in links[nid].items()}, "internal": False, "note": "",
+                      "watch": n["program"] in WATCHED and args.get("mode") == "train", "reasons": {}})
+    built = build_graph({"steps": steps, "gpu": gpu})
+    return {"graph": built["graph"], "steps": built["steps"], "errors": errors + built["errors"]}
 
 
 def check_graph(graph: dict[str, Any]) -> list[str]:
@@ -188,10 +243,32 @@ async def _create(request, project_id, name, gpu, run, auto, fingerprint, chat_i
             project_id = projects.create(plan["name"])["id"]     # always a new folder
         except (projects.ProjectsRootUnset, OSError) as exc:
             raise CreateError(409, f"could not create the project: {exc}")
-    wf = wf_manager.save(project_id, plan["name"], out["graph"])
+    return await _save_and_run(project_id, plan["name"], out["graph"], out["steps"], out["project"]["new"],
+                               decision, run, chat_id)
+
+
+async def create_custom(graph: dict[str, Any], steps: list[dict[str, Any]], project_id: str | None, name: str,
+                        *, auto: bool, chat_id: str | None) -> dict[str, Any]:
+    """Save and start a workflow the model designed (custom_graph), with the guards create() applies."""
+    decision = await asyncio.to_thread(assistant_bridge.decide_launch)
+    if decision == "propose":
+        raise CreateError(403, "autonomy is advisory, so the assistant runs nothing (switch with /autonomy ask)")
+    if auto and decision != "proceed":
+        raise CreateError(403, "autonomy is no longer auto, so the assistant does not act on its own")
+    new = not project_id
+    if new:
+        try:
+            project_id = projects.create(name)["id"]
+        except (projects.ProjectsRootUnset, OSError) as exc:
+            raise CreateError(409, f"could not create the project: {exc}")
+    return await _save_and_run(project_id, name, graph, steps, new, decision, True, chat_id)
+
+
+async def _save_and_run(project_id, name, graph, steps, new_project, decision, run, chat_id) -> dict[str, Any]:
+    wf = wf_manager.save(project_id, name, graph)
     # Open views refresh their project and workflow lists (the jobs announce themselves).
     events.publish({"kind": "workflow", "workflow_id": wf["id"], "project_id": project_id,
-                    "new_project": out["project"]["new"]})
+                    "new_project": new_project})
     result = {"workflow_id": wf["id"], "project_id": project_id, "name": wf["name"],
               "decision": decision, "started": False}
     if run:
@@ -201,8 +278,8 @@ async def _create(request, project_id, name, gpu, run, auto, fingerprint, chat_i
             return {**result, "run_error": "; ".join(exc.errors)}
         result["started"] = True
         origin = str(projects.dir_for(project_id))
-        assistant_monitor.remember_workflow(wf["id"], chat_id, origin, out["steps"])   # followed again after a restart
-        follow(wf["id"], out["steps"], origin, chat_id)
+        assistant_monitor.remember_workflow(wf["id"], chat_id, origin, steps)   # followed again after a restart
+        follow(wf["id"], steps, origin, chat_id)
     return result
 
 
