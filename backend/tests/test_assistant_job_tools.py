@@ -106,3 +106,32 @@ def test_select_states_refusals(client, run, project, md_file, ready, schema, tm
     be = Backend(("select_states", {"latents": str(outside)}), "ok")
     _turn(run, _session(be, schema), "pick states")
     assert be.tool_result()["status"] == "refused" and "workspace" in be.tool_result()["reason"]
+
+
+def test_write_report_builds_the_pdf_and_the_page_fetches_it(client, run, project, md_file, ready, monkeypatch):
+    from fastapi.testclient import TestClient
+    from hax_gui.app import app
+    pred, _ = _predict_run(client, run, project, md_file)
+    monkeypatch.setattr(assistant_bridge, "generate_report", lambda out, **kw: Path(out).write_bytes(b"%PDF-1.4 stub"))
+    assert run(client.get(f"/api/assistant/run-report/{pred['id']}")).status_code == 404     # none built yet
+    results = []
+
+    def stream(messages, grounded=True, run=None, allow_actions=False, interaction=None, tools=None):
+        tool = next(t for t in tools if t.spec.name == "write_report")
+        results.append(tool.fn(None))                           # the attached run
+        results.append(tool.fn(None, job=pred["id"]))
+        with pytest.raises(ValueError, match="not one job of the GUI"):
+            tool.fn(None, job="no-such-job")
+        yield {"type": "content", "delta": "Done."}
+    monkeypatch.setattr(assistant_bridge, "stream_events", stream)
+    with TestClient(app).websocket_connect("ws://127.0.0.1/ws/assistant/chat") as ws:
+        ws.send_json({"messages": [{"role": "user", "content": "write the report"}], "turn": 1,
+                      "run_job_id": pred["id"]})
+        assert ws.receive_json() == {"report": {"job_id": pred["id"]}}
+        assert ws.receive_json() == {"report": {"job_id": pred["id"]}}
+        assert ws.receive_json() == {"token": "Done."}
+        assert ws.receive_json() == {"done": True, "turn": 1}
+    assert all(r["status"] == "written" and "_report.pdf" in r["delivery"] for r in results)
+    got = run(client.get(f"/api/assistant/run-report/{pred['id']}"))
+    assert got.status_code == 200 and got.content == b"%PDF-1.4 stub"
+    assert f"{pred['id']}_report.pdf" in got.headers["content-disposition"]

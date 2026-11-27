@@ -276,7 +276,7 @@ def test_socket_passes_gui_tools_and_places_proposals(project, monkeypatch, read
                       "project_id": "the-chats"})
         assert ws.receive_json()["action"]["project_id"] == "the-chats"
         assert ws.receive_json() == {"done": True, "turn": 2}
-    assert seen["tools"] == ["list_jobs", "watch_run", "plan_workflow", "launch_workflow", "check_custom_workflow",
+    assert seen["tools"] == ["write_report", "list_jobs", "watch_run", "plan_workflow", "launch_workflow", "check_custom_workflow",
                              "launch_custom_workflow", "select_states",
                              "launch_job", "stop_run", "relaunch_run"]
 

@@ -158,6 +158,9 @@ function ensureSocket(c) {
       const v = view(c);
       if (v) v.onAction(rec);
     },
+    onReport: (r) => {
+      if (live()) api.assistantRunReport(r.job_id, true, "GET").catch((e) => toastError(e, "Report download failed."));
+    },
     onQuestion: (q) => {
       if (!live()) return;
       c.liveQuestion = q;

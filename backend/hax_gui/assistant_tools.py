@@ -251,13 +251,15 @@ async def _adopt(job_id: str, origin: str, watch_it: bool, every: float = 2.0) -
 
 
 def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id: str | None = None,
-               chat_id: str | None = None, review: dict[str, Any] | None = None, depth: int = 0) -> list:
+               chat_id: str | None = None, review: dict[str, Any] | None = None, depth: int = 0,
+               report=None) -> list:
     """list_jobs, watch_run, plan_workflow, launch_workflow, check/launch_custom_workflow, select_states,
     launch_job, stop_run and relaunch_run for one chat turn;
     ``project_id`` is the chat's project, ``chat_id`` the chat (what it launches or watches is linked to
     it). ``review``: the assistant reviewing a monitor finding (assistant_monitor): it acts only on that
     job, an OK it needs becomes an Apply in the chat, and it launches nothing. ``depth``: how many
-    automatic next steps led to this turn (assistant_continue)."""
+    automatic next steps led to this turn (assistant_continue). ``report`` (a turn on the chat socket)
+    builds a job's PDF report and has the page download it; ``None`` names the attached run's job."""
     from hax_assistant import safety
     from hax_assistant.agent import Tool
     from hax_assistant.interaction import Cancelled, Question
@@ -437,6 +439,17 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         return {"status": "saved", **out, "decode_with": {"program": "decode_states_from_latents", "args": decode},
                 "note": "the states are ordered along the landscape's path; particles_per_state counts the particles "
                         "nearest each one"}
+
+    def write_report(ctx, job=None):
+        if cancel.is_set():
+            return STOPPED
+        target = None
+        if job:
+            found, how = find_jobs(job, project_id)
+            if how not in ("job", "name") or len(found) != 1:
+                raise ValueError(f"{job} is not one job of the GUI: list_jobs shows the jobs")
+            target = found[0]
+        return report(target)
 
     built: dict[str, tuple[dict, list[str]]] = {}
 
@@ -644,7 +657,13 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         "project": {"type": "string", "description": "one of the user's GUI projects (name or id); omit for the "
                                                      "chat's project, or a new one"},
         "gpu": {"type": "string", "description": "GPU index for every step"}}
-    return [
+    report_tool = [Tool(spec(
+        "write_report", "Write the PDF report of a job's run (figures, measured analysis, AI discussion) and have "
+                        "the user's browser download it: the same report as the report button of an attached run. "
+                        "Takes a minute or two. job: the training, predict or decode job; omit for the attached run.",
+        {"job": {"type": "string", "description": "the job: job id, job name or run folder"}}, []),
+        write_report)] if report else []
+    return report_tool + [
         Tool(spec("list_jobs", "The jobs of a GUI project (default: the chat's project; all projects when it has "
                                "none), newest first: id, name, program, status, run folder, workflow step, and "
                                "whether the assistant launched it. Read-only.",

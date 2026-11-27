@@ -412,6 +412,29 @@ def assistant_run_preview(job_id: str) -> dict[str, Any]:
     }
 
 
+def _report_name(job: dict[str, Any]) -> str:
+    return f"{job.get('program') or 'run'}_{job['id']}_report.pdf"
+
+
+def _write_report(job: dict[str, Any], narrate: bool = True):
+    """Build a job's PDF run report in the GUI's data folder (rewritten each time) and return its path."""
+    art = _resolve_run_artifacts(job)
+    if not (art["run_dir"] or art["latents"] or art["volumes"]):
+        raise HTTPException(status_code=422, detail="run has no readable artifacts to report on")
+    reports_dir = settings.data_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    out = reports_dir / f"{job['id']}.pdf"
+    program = job.get("program") or "run"
+    subtitle = " · ".join(x for x in (job.get("project_id"), program, job.get("name")) if x)
+    try:
+        assistant_bridge.generate_report(
+            str(out), run_dir=art["run_dir"], latents=art["latents"], volumes=art["volumes"],
+            title=f"{program} run report", subtitle=subtitle, narrate=narrate)
+    except Exception as exc:  # noqa: BLE001 - surface a clean error to the client
+        raise HTTPException(status_code=500, detail=f"report generation failed: {exc}")
+    return out
+
+
 @router.post("/api/assistant/run-report/{job_id}", dependencies=[Depends(auth)])
 def assistant_run_report(job_id: str, narrate: bool = True) -> FileResponse:
     """Generate a PDF run report (deterministic figures + measured values, plus an
@@ -422,22 +445,17 @@ def assistant_run_report(job_id: str, narrate: bool = True) -> FileResponse:
     job = manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
-    art = _resolve_run_artifacts(job)
-    if not (art["run_dir"] or art["latents"] or art["volumes"]):
-        raise HTTPException(status_code=422, detail="run has no readable artifacts to report on")
-    reports_dir = settings.data_dir / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    out = reports_dir / f"{job_id}.pdf"
-    program = job.get("program") or "run"
-    subtitle = " · ".join(x for x in (job.get("project_id"), program, job.get("name")) if x)
-    try:
-        assistant_bridge.generate_report(
-            str(out), run_dir=art["run_dir"], latents=art["latents"], volumes=art["volumes"],
-            title=f"{program} run report", subtitle=subtitle, narrate=narrate)
-    except Exception as exc:  # noqa: BLE001 - surface a clean error to the client
-        raise HTTPException(status_code=500, detail=f"report generation failed: {exc}")
-    return FileResponse(str(out), media_type="application/pdf",
-                        filename=f"{program}_{job_id}_report.pdf")
+    return FileResponse(str(_write_report(job, narrate)), media_type="application/pdf", filename=_report_name(job))
+
+
+@router.get("/api/assistant/run-report/{job_id}", dependencies=[Depends(auth)])
+def assistant_get_run_report(job_id: str) -> FileResponse:
+    """The report last generated for a job (the chat's write_report tool builds it, then the page fetches it)."""
+    job = manager.get(job_id)
+    out = settings.data_dir / "reports" / f"{job_id}.pdf"
+    if job is None or not out.is_file():
+        raise HTTPException(status_code=404, detail="no report has been generated for this job")
+    return FileResponse(str(out), media_type="application/pdf", filename=_report_name(job))
 
 
 @router.get("/api/ollama/status", dependencies=[Depends(auth)])
@@ -562,7 +580,20 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                                 run["facts"] = (run.get("facts") or "") + "\n\n" + _extra_run_facts(job, ej)
                             except Exception:  # noqa: BLE001
                                 pass
-                    tools = assistant_tools.chat_tools(loop, interaction, cancel, project_id, chat_id)
+                    def report(target):
+                        target = target or job or (manager.get(route_job_id) if route_job_id else None)
+                        if target is None:
+                            return {"status": "not_written", "reason": "say which job (list_jobs shows them)"}
+                        try:
+                            _write_report(target)
+                        except HTTPException as exc:
+                            return {"status": "not_written", "reason": exc.detail}
+                        post(("report", {"job_id": target["id"]}))
+                        return {"status": "written", "job": target.get("name") or target["program"],
+                                "delivery": f"downloaded by the user's browser as {_report_name(target)}; "
+                                            "it is not in the run folder, so give no path for it"}
+
+                    tools = assistant_tools.chat_tools(loop, interaction, cancel, project_id, chat_id, report=report)
                     gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run,
                                                          allow_actions=allow_actions,
                                                          interaction=interaction, tools=tools)

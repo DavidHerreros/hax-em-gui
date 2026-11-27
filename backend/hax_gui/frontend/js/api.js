@@ -315,10 +315,11 @@ api.assistantStopJob = (jobId, auto) =>
 
 // Generate a PDF run report and trigger a browser download. Returns nothing;
 // throws ApiError on failure. Blocking on the server (figures + narration).
-api.assistantRunReport = async (jobId, narrate = true) => {
+// method "GET" downloads the report the chat's write_report tool just built.
+api.assistantRunReport = async (jobId, narrate = true, method = "POST") => {
   const token = getToken();
   const res = await fetch(`/api/assistant/run-report/${jobId}?narrate=${narrate ? "true" : "false"}`, {
-    method: "POST",
+    method,
     headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
   });
   if (!res.ok) {
@@ -358,7 +359,7 @@ api.deleteChat = (id) => req(`/api/chats/${id}`, { method: "DELETE" });
 // Open a chat socket. Send full-history requests via send({messages, grounded});
 // tokens arrive through onToken, then onDone; onError on failure. Returns
 // { send, close }.
-export function assistantChat({ onToken, onStatus, onAction, onQuestion, onDone, onError, onClose }) {
+export function assistantChat({ onToken, onStatus, onAction, onQuestion, onReport, onDone, onError, onClose }) {
   // Reconnecting: the old socket was created once and cached for the app's
   // lifetime with no onclose — after a server restart every Send silently
   // dropped its payload and the composer locked on "Stop" forever. Now a drop
@@ -384,6 +385,7 @@ export function assistantChat({ onToken, onStatus, onAction, onQuestion, onDone,
       else if (m.status != null) { if (onStatus) onStatus(m.status); }
       else if (m.action != null) { if (onAction) onAction(m.action); }
       else if (m.question != null) { if (onQuestion) onQuestion(m.question); }
+      else if (m.report != null) { if (onReport) onReport(m.report); }
       else if (m.error) { if (onError) onError(m.error); }
       else if (m.done) onDone(m.turn);
     };
