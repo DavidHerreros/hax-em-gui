@@ -308,20 +308,26 @@ async def _relaunch(job: dict[str, Any], proposal: dict[str, Any], by: str, orig
         assistant_monitor.link(new["id"], assistant_monitor.chat_of(job["id"]))   # its findings go to the same chat
     where = (f"relaunched from scratch as {new.get('name') or new['id']} in a new folder "
              "(the old run is kept)")
+    note = await _in_workflow(job, new, proposal, origin)
     return {"applied": True, "restart": proposal["restart"], "job": new,
-            "text": proposal["text"], "message": f"— the assistant {where}.{_blocked_steps(job, proposal)}"}
+            "text": proposal["text"], "message": f"— the assistant {where}.{note}"}
 
 
-def _blocked_steps(job: dict[str, Any], proposal: dict[str, Any]) -> str:
-    """A relaunched workflow step runs outside its workflow: say what that leaves blocked and how to go on."""
-    from . import assistant_monitor
-    step = assistant_monitor.step_of(job["id"])
-    if not step:
+async def _in_workflow(job: dict[str, Any], new: dict[str, Any], proposal: dict[str, Any], origin: str) -> str:
+    """A relaunched workflow step takes its place in the workflow, whose later steps then run on it; when
+    that is refused, it runs outside it: say what that leaves blocked and how to go on by hand."""
+    from . import assistant_workflows
+    done = await assistant_workflows.rebind_step(job, new, origin)
+    if not done["workflow"]:
         return ""
+    if done["ok"]:
+        return (f" It was the “{done['step']}” step of the workflow “{done['workflow']}”: the workflow continues "
+                f"with the new run, and its later steps ({', '.join(done['later'])}) run on it.")
     changes = ", ".join(f"--{k} {v}" for k, v in proposal["changes"].items()) or "no flag changes"
-    return (f" It was the “{step['step']}” step of the workflow “{step['workflow']}”: the new run is outside "
-            "that workflow, so the steps after it stay blocked. To continue them, open the workflow, make the "
-            f"same change ({changes}) on its “{step['step']}” step and run that step with the steps after it.")
+    return (f" It was the “{done['step']}” step of the workflow “{done['workflow']}”: the new run is outside "
+            f"that workflow ({done['reason']}), so the steps after it stay blocked. To continue them, open the "
+            f"workflow, make the same change ({changes}) on its “{done['step']}” step and run that step with the "
+            "steps after it.")
 
 
 async def _scratch(job: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:

@@ -516,8 +516,9 @@ _DESTRUCTIVE = re.compile(
     r"rmtree|os\.remove\b|os\.unlink|\.unlink\(|rmdir|os\.rename|shutil\.move|send2trash|"
     r"(?<![\w.])manager\.(rerun|delete\w*|start)\b|projects\.delete|wf_manager\.|workflows\.\w*delete|"
     r"replace_job_id|restart_running|\.rerun\(|_clear_run_folder|_purge_dataset_cache|recreate_ssd")
-# The assistant's workflow module saves, validates, reads and starts workflows; nothing else.
-_WF_ALLOWED = {"assistant_workflows.py": re.compile(r"wf_manager\.(save|validate|run|get)\(")}
+# The assistant's workflow module saves, validates, reads and starts workflows, and seeds the run_state
+# of one (where a relaunched step takes its place: see the test below); nothing else.
+_WF_ALLOWED = {"assistant_workflows.py": re.compile(r"wf_manager\.(save|validate|run|get|seed_state)\(")}
 
 
 def test_assistant_paths_never_delete():
@@ -534,3 +535,16 @@ def test_assistant_paths_never_delete():
     assert not re.search(r"rmtree|os\.remove\b|\.unlink\(|rmdir", routes)
     assert _DESTRUCTIVE.search("wf_manager.delete(wid)") and _DESTRUCTIVE.search("wf_manager.stop(wid)")
     assert not _DESTRUCTIVE.search(_WF_ALLOWED["assistant_workflows.py"].sub("", "wf_manager.run(wid)"))
+
+
+def test_seed_state_only_where_a_relaunched_step_takes_its_place():
+    import ast
+    files = ("assistant.py", "watch.py", "assistant_actions.py", "assistant_workflows.py", "assistant_tools.py",
+             "assistant_monitor.py", "routes/assistant.py")
+    hits = [(rel, n) for rel in files for n, line in enumerate((BACKEND / rel).read_text().splitlines(), 1)
+            if "seed_state(" in line]
+    assert [rel for rel, _ in hits] == ["assistant_workflows.py"], hits
+    tree = ast.parse((BACKEND / "assistant_workflows.py").read_text())
+    fn = next(f for f in ast.walk(tree) if isinstance(f, ast.AsyncFunctionDef) and f.name == "rebind_step")
+    assert fn.lineno <= hits[0][1] <= fn.end_lineno
+    assert _DESTRUCTIVE.search("wf_manager.seed_state(wid, state)")       # forbidden everywhere else

@@ -17,7 +17,7 @@ from typing import Any
 from . import adapters, assistant_monitor, events, projects, registry, settings_store, watch
 from . import assistant as assistant_bridge
 from .command import ValidationError
-from .jobs import manager as jobs
+from .jobs import ACTIVE, manager as jobs
 from .workflows import WorkflowError, manager as wf_manager
 
 INTERNAL_NOTES = {
@@ -28,6 +28,7 @@ INTERNAL_NOTES = {
 UNBOUND_NOTE = ("not added: it needs the few representative states the assistant selects, and the "
                 "builder's latents input would hand it every particle's latent (one volume each). "
                 "Decode states after the run, e.g. with the assistant's per-domain motion action.")
+REBIND_WAIT_S = 30.0          # how long a relaunch waits for the old step's workflow run to settle
 _creating: set[tuple] = set()
 _tasks: set[asyncio.Task] = set()
 
@@ -237,6 +238,100 @@ async def _follow(wid: str, steps: list[dict[str, Any]], origin: str, chat_id: s
             break                              # finished, failed or stopped: no step starts any more
         await asyncio.sleep(every)
     assistant_monitor.forget_workflow(wid)
+
+
+class _NoRebind(Exception):
+    """Why a relaunched step cannot take its place in the workflow (the workflow is left as it was)."""
+
+
+async def rebind_step(old: dict[str, Any], new: dict[str, Any], origin: str) -> dict[str, Any]:
+    """Put the job a relaunch from scratch just created in the place of the step it replaces, in the
+    workflow the assistant launched, and run the steps after it on it. The only caller of seed_state,
+    and guarded: it changes that one step's entry and nothing else, only to this new job (same program
+    and project, a step of no workflow yet), only once the old job has ended and the workflow's run has
+    settled, and only while the entry still points at the old job. Anything else is refused and leaves
+    the workflow as it was; every attempt is audited. Returns {ok, reason, workflow, step, later}."""
+    step = assistant_monitor.step_of(old["id"])
+    out = {"ok": False, "reason": None, "workflow": step.get("workflow"), "step": step.get("step"), "later": []}
+    wid = step.get("workflow_id")
+    if not wid:
+        return out                                          # not a step of a workflow launched here
+    try:
+        # The old job has ended and the run has settled: the scheduler's last act writes a status other
+        # than "running" (its _finish, or its stop/failure handler), so nothing writes run_state after.
+        # Steps of other branches still running keep it "running": then this waits and is refused.
+        loop = asyncio.get_running_loop()
+        end = loop.time() + REBIND_WAIT_S
+        while True:
+            wf, ended = wf_manager.get(wid), (jobs.get(old["id"]) or {}).get("status") not in ACTIVE
+            if wf is None:
+                raise _NoRebind("the workflow no longer exists")
+            if ended and wf["status"] != "running":
+                break
+            if loop.time() >= end:
+                raise _NoRebind("the old run has not ended" if not ended else
+                                "the workflow is still running other steps, so its record cannot be changed safely")
+            await asyncio.sleep(0.25)
+        # From here on nothing awaits until the write: no other coroutine can change the workflow meanwhile.
+        before = dict(wf.get("run_state") or {})
+        nodes = {n["id"]: n for n in wf["graph"]["nodes"]}
+        nid = next((k for k, s in before.items() if (s or {}).get("job_id") == old["id"]), None)
+        if nid is None:
+            raise _NoRebind("the step no longer points at the old run (it was re-run or edited meanwhile)")
+        fresh = jobs.get(new["id"])
+        if fresh is None:
+            raise _NoRebind("the new run does not exist")
+        if fresh["program"] != nodes[nid]["program"]:
+            raise _NoRebind("the new run is not the step's program")
+        if fresh.get("project_id") != wf.get("project_id"):
+            raise _NoRebind("the new run is in another project")
+        if any((s or {}).get("job_id") == new["id"] for s in before.values()) or assistant_monitor.step_of(new["id"]):
+            raise _NoRebind("the new run is already a step of a workflow")
+        edges, seen, queue = wf["graph"]["edges"], {nid}, [nid]
+        while queue:
+            cur = queue.pop(0)
+            for e in edges:
+                if e["from"] == cur and e["to"] not in seen:
+                    seen.add(e["to"])
+                    queue.append(e["to"])
+        later = [n for n in nodes if n in seen - {nid} and (before.get(n) or {}).get("status") != "succeeded"]
+        if not later:
+            raise _NoRebind("no later step is left to run")
+        after = {**before, nid: {"job_id": new["id"], "status": "running", "error": None}}
+        if set(after) != set(before) or any(after[k] != before[k] for k in before if k != nid):
+            raise _NoRebind("only the relaunched step may change")
+
+        def put(state: dict[str, Any]) -> None:
+            wf_manager.seed_state(wid, state)
+        put(after)
+        try:
+            await wf_manager.run(wid, only=later)          # the scheduler adopts the new job, then runs these
+        except Exception:
+            put(before)                                    # as it was: the new run goes on by itself
+            raise
+        out.update(ok=True, later=[nodes[n].get("name") or nodes[n]["program"] for n in later])
+    except _NoRebind as exc:
+        out["reason"] = str(exc)
+    except Exception as exc:  # noqa: BLE001 - a relaunch never fails because of its workflow
+        out["reason"] = f"the workflow could not be restarted ({exc})"
+    _audit_rebind(origin, wid, old, new, out)
+    if out["ok"]:
+        chat_id, folder = assistant_monitor.chat_of(old["id"]), str(projects.dir_for(wf["project_id"]))
+        assistant_monitor.link(new["id"], chat_id, workflow_id=wid, workflow=wf["name"], step=step["step"])
+        steps = [{"node": n, "title": nodes[n].get("name") or nodes[n]["program"], "watch": False} for n in later]
+        assistant_monitor.remember_workflow(wid, chat_id, folder, steps)
+        follow(wid, steps, folder, chat_id)                # its later steps are the assistant's too
+    return out
+
+
+def _audit_rebind(origin: str, wid: str, old: dict[str, Any], new: dict[str, Any], out: dict[str, Any]) -> None:
+    try:
+        assistant_bridge.audit(origin, {
+            "run_dir": old.get("workdir"), "job_id": old["id"], "decision": "rebound" if out["ok"] else "rebind_refused",
+            "reason": out["reason"], "workflow_id": wid, "step": out["step"], "new_job_id": new["id"],
+            "later_steps": out["later"], "via": "hax-gui"})
+    except Exception:  # noqa: BLE001 - the audit trail is best-effort
+        pass
 
 
 async def step_jobs(wid: str, wait: float = 3.0) -> list[dict[str, Any]]:
