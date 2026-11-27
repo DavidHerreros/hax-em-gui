@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import assistant as assistant_bridge
-from .. import assistant_actions, assistant_workflows
+from .. import assistant_actions, assistant_tools, assistant_workflows
 from .. import gpus as gpus_mod
 from .. import chats as chat_store
 from .. import ollama as ollama_manager_mod
@@ -318,9 +318,11 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             inbox.put_nowait(None)
 
     recv = asyncio.ensure_future(receiver())
+    carry: dict | None = None
     try:
         while True:
-            req = await inbox.get()
+            req = carry if carry is not None else await inbox.get()   # a turn sent mid-turn runs next
+            carry = None
             if req is None:  # client disconnected
                 break
             if not isinstance(req, dict) or "messages" not in req:
@@ -346,21 +348,28 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             extra_jobs = [j for j in (manager.get(i) for i in (req.get("extra_run_job_ids") or [])[:2])
                           if j is not None and j["id"] != run_job_id]
             allow_actions = assistant_actions.actions_enabled()
+            project_id = req.get("project_id") or None      # the chat's project
+            last_user = next((m.get("content") or "" for m in reversed(messages)
+                              if isinstance(m, dict) and m.get("role") == "user"), "")
 
             # Run the blocking LLM stream off the event loop, funnel events back.
             # A cancel Event lets a client "stop" actually halt generation (the
             # worker closes the generator, which tears down the model request).
             out: asyncio.Queue = asyncio.Queue()
             cancel = threading.Event()
+
+            def post(item, out=out) -> None:
+                try:
+                    loop.call_soon_threadsafe(out.put_nowait, item)
+                except RuntimeError:  # the loop is gone (shutdown): nobody listens
+                    pass
             # Lets the session ask the user mid-turn; the worker blocks until the
             # answer frame arrives or the turn is cancelled.
-            interaction = assistant_bridge.ChatInteraction(
-                lambda kind, val, out=out: loop.call_soon_threadsafe(out.put_nowait, (kind, val)),
-                cancel)
+            interaction = assistant_bridge.ChatInteraction(lambda kind, val, post=post: post((kind, val)), cancel)
 
             def _worker(messages=messages, grounded=grounded, run=run, job=job if run_job_id else None,
-                        extra_jobs=extra_jobs, allow_actions=allow_actions, cancel=cancel, out=out,
-                        interaction=interaction) -> None:
+                        extra_jobs=extra_jobs, allow_actions=allow_actions, cancel=cancel, post=post,
+                        interaction=interaction, project_id=project_id, last_user=last_user) -> None:
                 # EVERYTHING inside the try, including building the generator:
                 # session construction (docs index load, embedder init) can
                 # raise, and with it outside the try neither ("error") nor the
@@ -383,9 +392,10 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                                 run["facts"] = (run.get("facts") or "") + "\n\n" + _extra_run_facts(job, ej)
                             except Exception:  # noqa: BLE001
                                 pass
+                    tools = assistant_tools.chat_tools(loop, interaction, cancel, project_id)
                     gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run,
                                                          allow_actions=allow_actions,
-                                                         interaction=interaction)
+                                                         interaction=interaction, tools=tools)
                     for ev in gen:
                         if cancel.is_set():
                             break
@@ -393,71 +403,59 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                         if etype == "status":
                             payload = ("status", ev.get("text"))
                         elif etype == "action":
-                            payload = ("action", ev.get("action"))
+                            payload = ("action", assistant_tools.place(ev.get("action"), last_user,
+                                                                       interaction, project_id))
                         else:
                             payload = ("token", ev.get("delta"))
-                        loop.call_soon_threadsafe(out.put_nowait, payload)
+                        post(payload)
                 except Exception as exc:  # noqa: BLE001 - report, keep socket alive
-                    loop.call_soon_threadsafe(out.put_nowait, ("error", str(exc)))
+                    post(("error", str(exc)))
                 finally:
                     if gen is not None:
                         try:
                             gen.close()  # stop the model stream promptly on cancel
                         except Exception:  # noqa: BLE001 - the sentinel must go out
                             pass
-                    loop.call_soon_threadsafe(out.put_nowait, ("done", None))
+                    post(("done", None))
 
-            loop.run_in_executor(None, _worker)
+            # Its own thread, not the shared executor: abandoned workers must not hold up new turns.
+            threading.Thread(target=_worker, daemon=True).start()
 
-            # Forward events while watching the inbox. An explicit {"stop":…}
-            # cancels this turn; a NEW turn ({"messages":…} — the user stopped
-            # and immediately asked again) cancels this one and is carried over
-            # to run next. The old behaviour treated *any* inbound frame as a
-            # stop and threw its payload away, so a question sent right after
-            # Stop vanished permanently with no error. Keep draining after a
-            # cancel until the worker reports done, but stop forwarding tokens.
-            # The one exception is an {"answer":…} frame: it answers a question the
-            # worker is blocked on and must NOT cancel the turn.
+            # Forward events while watching the inbox. An {"answer":…} frame answers the
+            # question the worker waits on; any other frame ({"stop":…}, or a new turn,
+            # which runs next) or a disconnect ends the turn at once. Its worker is not
+            # waited for (it may be deep in a run's inspection): once cancelled it acts on
+            # nothing, and what it still emits stays in its own queue.
             get_task = asyncio.ensure_future(out.get())
             inbox_task = asyncio.ensure_future(inbox.get())
-            stopped = False
             disconnected = False
-            carry: dict | None = None
             try:
                 while True:
-                    waiters = {get_task} | ({inbox_task} if inbox_task else set())
-                    done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-                    if inbox_task and inbox_task in done and isinstance(inbox_task.result(), dict) \
-                            and "answer" in inbox_task.result():
-                        interaction.answer(inbox_task.result()["answer"])
-                        inbox_task = asyncio.ensure_future(inbox.get())
-                    elif inbox_task and inbox_task in done:
+                    done, _ = await asyncio.wait({get_task, inbox_task}, return_when=asyncio.FIRST_COMPLETED)
+                    if inbox_task in done:
                         msg = inbox_task.result()
-                        cancel.set()
-                        stopped = True
-                        if msg is None:            # disconnect mid-turn
-                            disconnected = True
-                            inbox_task = None      # stop re-arming; drain to done then exit
-                        else:
-                            if isinstance(msg, dict) and "messages" in msg:
-                                carry = msg        # latest next-turn request wins
+                        if isinstance(msg, dict) and "answer" in msg:
+                            interaction.answer(msg["answer"])
                             inbox_task = asyncio.ensure_future(inbox.get())
+                        else:
+                            disconnected = msg is None
+                            if isinstance(msg, dict) and "messages" in msg:
+                                carry = msg
+                            break
                     if get_task in done:
                         kind, value = get_task.result()
                         if kind == "done":
                             break
-                        if not stopped:
-                            await websocket.send_json({kind: value})
+                        await websocket.send_json({kind: value})
                         get_task = asyncio.ensure_future(out.get())
             finally:
+                cancel.set()          # an ended turn ignores it; an interrupted one stops acting
+                interaction.release()
                 get_task.cancel()
-                if inbox_task:
-                    inbox_task.cancel()
+                inbox_task.cancel()
             if disconnected:
                 break
             await websocket.send_json({"done": True, "turn": turn_id})
-            if carry is not None:
-                inbox.put_nowait(carry)   # run the question that arrived mid-stop
     except WebSocketDisconnect:
         pass
     finally:

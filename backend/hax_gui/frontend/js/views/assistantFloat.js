@@ -37,7 +37,7 @@ function renderPill() {
   clear(pill);
   append(pill, [icon("chat", 18), "Assistant",
     a.pending ? h("span", { class: "chat-badge ask" }, `${a.pending} to review`)
-      : a.streaming ? h("span", { class: "chat-pill-note" }, "answering…")
+      : a.streaming ? h("span", { class: "chat-pill-note" }, a.streaming > 1 ? `${a.streaming} answering…` : "answering…")
       : a.unread ? h("span", { class: "chat-pill-note" }, "new reply") : null]);
 }
 

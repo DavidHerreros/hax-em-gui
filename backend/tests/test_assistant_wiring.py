@@ -163,7 +163,7 @@ def test_chat_question_answer_round_trip(monkeypatch):
     from hax_gui.app import app
     log: list = []
 
-    def fake_stream(messages, grounded=True, run=None, allow_actions=False, interaction=None):
+    def fake_stream(messages, grounded=True, run=None, allow_actions=False, interaction=None, tools=None):
         yield {"type": "status", "text": "thinking"}
         try:
             ans = interaction.ask(Question("colour", "Which colour?", kind="choice",

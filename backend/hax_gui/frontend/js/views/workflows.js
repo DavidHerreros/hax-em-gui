@@ -9,6 +9,7 @@
 import { announceJobRename } from "./jobs.js";
 import { h, clear, mount } from "../h.js";
 import { poller } from "../poller.js";
+import { onJobEvent } from "../events.js";
 import { setNavGuard } from "../router.js";
 import { icon } from "../icons.js";
 import { confirmModal } from "./confirmModal.js";
@@ -2074,5 +2075,7 @@ export function WorkflowsView() {
   }
   const onBeforeUnload = (e) => { if (unsavedMsg()) { e.preventDefault(); e.returnValue = ""; } };
   window.addEventListener("beforeunload", onBeforeUnload);
-  return { el: root, cleanup: () => { flushLayoutSave(); rememberViewport(); stopPolling(); document.removeEventListener("keydown", onKey); window.removeEventListener("beforeunload", onBeforeUnload); } };
+  // A workflow (and maybe a project) the assistant created elsewhere shows in the picker.
+  const offEvents = onJobEvent((m) => { if (m.kind === "workflow") refreshList(); });
+  return { el: root, cleanup: () => { flushLayoutSave(); rememberViewport(); stopPolling(); offEvents(); document.removeEventListener("keydown", onKey); window.removeEventListener("beforeunload", onBeforeUnload); } };
 }

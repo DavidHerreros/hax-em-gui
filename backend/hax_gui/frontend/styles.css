@@ -1235,6 +1235,7 @@ body.vwin-dragging iframe { pointer-events: none; }
 .chat-item-btn { padding: 2px; background: none; border: none; color: var(--muted); cursor: pointer;
   display: inline-flex; }
 .chat-item-btn:hover { color: var(--text); }
+.chat-item > .chat-step-dot { background: var(--accent); }   /* a reply finished while not on screen */
 .chat-empty { padding: 8px; font-size: 12px; color: var(--muted); }
 /* drag-and-drop: move a chat onto a project group */
 .chat-group { display: flex; flex-direction: column; gap: 1px; border-radius: 8px; }

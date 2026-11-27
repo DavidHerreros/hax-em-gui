@@ -28,6 +28,7 @@ except Exception:  # noqa: BLE001 - ImportError, or a broken/incompatible instal
     _INSTALLED = False
 
 _session: Optional["AssistantSession"] = None
+_session_lock = threading.Lock()
 _schema_index: Any = None          # False once loading it failed
 _facts_cache: dict[tuple, dict] = {}
 
@@ -42,8 +43,12 @@ def available() -> bool:
 
 def _get() -> "AssistantSession":
     global _session
-    if _session is None:
-        _session = AssistantSession()  # type: ignore[operator]
+    # Chats stream in parallel: build the one session (and its lazily cached tier) once.
+    with _session_lock:
+        if _session is None:
+            session = AssistantSession()  # type: ignore[operator]
+            session.tier
+            _session = session
     return _session
 
 
@@ -114,12 +119,13 @@ def data_facts(path: str) -> dict:
     try:
         st = Path(path).expanduser().stat()
         key = (str(path), st.st_mtime_ns, st.st_size)
-        if key not in _facts_cache:
+        facts = _facts_cache.get(key)        # a local: another turn may clear the cache meanwhile
+        if facts is None:
             from hax_assistant.context.data import inspect_data
             if len(_facts_cache) > 64:
                 _facts_cache.clear()
-            _facts_cache[key] = inspect_data(str(path)).as_dict()
-        return _facts_cache[key]
+            facts = _facts_cache[key] = inspect_data(str(path)).as_dict()
+        return facts
     except Exception:  # noqa: BLE001 - facts are optional
         return {}
 
@@ -333,7 +339,7 @@ def stream_reply(messages: list[dict], grounded: bool = True,
 
 def stream_events(messages: list[dict], grounded: bool = True,
                   run: Optional[dict] = None, allow_actions: bool = False,
-                  interaction=None) -> Iterator[dict]:
+                  interaction=None, tools=None) -> Iterator[dict]:
     """Yield typed events (status activity + content tokens + action proposals).
 
     ``run`` (optional) is a dict of resolved artifact paths for an attached run:
@@ -342,9 +348,10 @@ def stream_events(messages: list[dict], grounded: bool = True,
     ``allow_actions`` lets the session emit deterministic action proposals (create
     a draft job from a data path); the GUI confirms before anything happens.
     ``interaction`` (a :class:`ChatInteraction`) lets the session ask the user.
+    ``tools`` replace the free-tier tools of the same name (see assistant_tools).
     """
     return _get().stream_events(messages, grounded=grounded, run=run, allow_actions=allow_actions,
-                                interaction=interaction)
+                                interaction=interaction, tools=tools)
 
 
 class ChatInteraction:
@@ -397,6 +404,13 @@ class ChatInteraction:
             box.update(value=data.get("value"), cancel=bool(data.get("cancel")))
         got.set()
         return True
+
+    def release(self) -> None:
+        """Wake a pending :meth:`ask` at once after the turn's cancel is set (it raises Cancelled)."""
+        with self._lock:
+            pending = self._pending
+        if pending is not None:
+            pending[1].set()
 
     def notify(self, text: str, level: str = "info") -> None:
         self._send("status", text)

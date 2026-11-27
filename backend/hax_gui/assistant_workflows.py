@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import adapters, projects, registry, settings_store, watch
+from . import adapters, events, projects, registry, settings_store, watch
 from . import assistant as assistant_bridge
 from .command import ValidationError
 from .jobs import manager as jobs
@@ -186,6 +186,9 @@ async def _create(request, project_id, name, gpu, run, auto, fingerprint) -> dic
         except (projects.ProjectsRootUnset, OSError) as exc:
             raise CreateError(409, f"could not create the project: {exc}")
     wf = wf_manager.save(project_id, plan["name"], out["graph"])
+    # Open views refresh their project and workflow lists (the jobs announce themselves).
+    events.publish({"kind": "workflow", "workflow_id": wf["id"], "project_id": project_id,
+                    "new_project": out["project"]["new"]})
     result = {"workflow_id": wf["id"], "project_id": project_id, "name": wf["name"],
               "decision": decision, "started": False}
     if run:

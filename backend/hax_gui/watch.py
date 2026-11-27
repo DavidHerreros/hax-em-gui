@@ -241,6 +241,36 @@ async def _apply(job_id: str, kind: str, by: str) -> dict[str, Any]:
         raise ApplyError(403, str(exc))
     if proposal["restart"] == "scratch" and assistant_bridge.applied_before(origin, job_id, kind):
         raise ApplyError(409, "this proposal was already applied: the relaunched job exists")
+    return await _relaunch(job, proposal, by, origin)
+
+
+async def relaunch(job: dict[str, Any], restart: str, changes: dict[str, Any]) -> dict[str, Any]:
+    """The chat's relaunch of a job, once its tool loop has applied the autonomy level; the same
+    guards, budget and rules as an accepted proposal."""
+    if job["id"] in _applying:
+        raise ApplyError(409, "a restart of this job is already in progress")
+    workdir = job.get("workdir")
+    if not workdir or not job.get("project_id"):
+        raise ApplyError(422, "this job has no run folder in a project")
+    if restart not in ("scratch", "resume"):
+        raise ApplyError(422, "restart must be 'scratch' or 'resume'")
+    proposal = {"finding": None, "restart": restart, "changes": dict(changes or {}), "text": ""}
+    origin = _origins.get(job["id"], workdir)
+    _applying.add(job["id"])
+    try:
+        try:
+            await asyncio.to_thread(assistant_bridge.guard_relaunch, job["program"], workdir,
+                                    proposal["changes"])
+        except assistant_bridge.Refused as exc:
+            _audit(job, proposal, "blocked", "chat", origin)
+            raise ApplyError(403, str(exc))
+        return await _relaunch(job, proposal, "chat", origin)
+    finally:
+        _applying.discard(job["id"])
+
+
+async def _relaunch(job: dict[str, Any], proposal: dict[str, Any], by: str, origin: str) -> dict[str, Any]:
+    workdir = job["workdir"]
     used, allowed = assistant_bridge.relaunch_budget(origin)
     if used >= allowed:
         raise ApplyError(409, f"relaunch budget used up ({used} of {allowed}); not relaunching")

@@ -351,7 +351,7 @@ export function jobTree(opts = {}) {
   loadProjects();
   loadLabels().catch(() => {});
   const p = poller(() => refresh(false), 3000);
-  const offEvents = onJobEvent(() => p.kick());
+  const offEvents = onJobEvent((m) => { if (m.kind === "workflow") loadProjects(); p.kick(); });   // the assistant may add a project
   // A rename from anywhere: patch the cached job and its row in place (no rebuild, so
   // nothing moves), and realign the signature so the next poll does not rebuild either.
   const offRename = onJobRenamed((jid, name) => {

@@ -3,10 +3,11 @@
 // rendering, and a Stop button. Only routed when /api/assistant/status reports the
 // optional hax-em-assistant package is installed (see app.js).
 //
-// The conversation + WebSocket + streaming buffers live in a module-level
-// controller (`ctrl`) that OUTLIVES the route view, so a question keeps running in
-// the background when you leave the page: on return the view rebuilds from `ctrl`
-// and you see the ongoing answering process — or the finished answer.
+// Each chat's conversation + WebSocket + streaming buffers live in a module-level
+// record that OUTLIVES the route view, so a question keeps running in the
+// background when you leave the page or open another chat: on return the view
+// rebuilds from the record and you see the ongoing answering process — or the
+// finished answer.
 import { h, clear, append } from "../h.js";
 import { icon } from "../icons.js";
 import { errText, toastError } from "../toast.js";
@@ -30,34 +31,51 @@ const GREETING =
 
 // ── persistent controller (survives view unmount) ───────────────────────────
 const ctrl = {
-  history: [],             // {role, content} — the active conversation
-  currentChatId: null,     // persisted chat id (null = unsaved new chat)
-  currentChatProject: "",  // project_id of the active chat (scopes the run picker)
   newChatProject: "",      // project_id for the next new chat
-  attachedRun: null,       // {job_id,label,has_*} attached-run context (primary: full artifacts)
-  extraRuns: [],           // up to 2 more runs: measured facts + parameter diff only
   grounded: true,
-  // live turn state (an in-flight answer)
-  streaming: false,
-  turn: 0,                 // client turn id (echoed on the server's done)
-  liveRaw: "",             // partial assistant answer accumulated so far
-  liveSteps: [],           // activity-trace step texts for the current turn
-  liveActions: [],         // proposed-action records for this turn
-  liveQuestion: null,      // a question the assistant is waiting on (ask-and-wait)
-  stopped: false,
-  liveError: null,         // transient transport/model error — shown, never persisted
-  socket: null,            // one WebSocket for the app's lifetime (reused per turn)
   hooks: null,             // set by the mounted view; null while unmounted
-  turnNoAct: false,        // this turn came from a command that may not act: its proposals stay drafts
-  unread: false,           // an answer finished while no view was mounted
 };
-// What the floating chat's pill shows while the chat is minimised.
+// One record per chat with live state in this tab; chats answer side by side, each on its own socket.
+function blankChat(project) {
+  return {
+    id: null,                // persisted chat id (null = unsaved new chat)
+    project: project || "",  // project_id of the chat (scopes the run picker, and where its workflows go)
+    history: [],             // {role, content}
+    attachedRun: null,       // {job_id,label,has_*} attached-run context (primary: full artifacts)
+    extraRuns: [],           // up to 2 more runs: measured facts + parameter diff only
+    // live turn state (an in-flight answer)
+    streaming: false,
+    turn: 0,                 // client turn id (echoed on the server's done)
+    draining: null,          // a stopped turn whose late frames (up to its done) are dropped
+    liveRaw: "",             // partial assistant answer accumulated so far
+    liveSteps: [],           // activity-trace step texts for the current turn
+    liveActions: [],         // proposed-action records for this turn
+    liveQuestion: null,      // a question the assistant is waiting on (ask-and-wait)
+    stopped: false,
+    liveError: null,         // transient transport/model error — shown, never persisted
+    turnNoAct: false,        // this turn came from a command that may not act: its proposals stay drafts
+    unread: false,           // an answer finished while the chat was not on screen
+    socket: null,            // opened on the first send, closed when the record is dropped
+    saving: Promise.resolve(),   // this chat's persist chain
+    deleted: false,
+  };
+}
+let active = blankChat("");      // the chat on screen
+const kept = new Set([active]);  // active, plus the chats answering or unread in the background
+const recordOf = (id) => [...kept].find((c) => c.id === id) || null;
+const view = (c) => (c === active ? ctrl.hooks : null);   // the mounted view, while it shows `c`
+function drop(c) {
+  kept.delete(c);
+  if (c.socket) { c.socket.close(); c.socket = null; }
+}
+// What the floating chat's pill and the chat list show.
 const watchers = new Set();
 function changed() { for (const fn of watchers) fn(); }
 export function onAssistantActivity(fn) { watchers.add(fn); return () => watchers.delete(fn); }
 export function assistantActivity() {
-  return { streaming: ctrl.streaming, unread: ctrl.unread,
-           pending: (ctrl.liveQuestion ? 1 : 0) + ctrl.liveActions.filter((r) => !r.resolved).length };
+  const all = [...kept];
+  return { streaming: all.filter((c) => c.streaming).length, unread: all.some((c) => c.unread),
+           pending: all.reduce((n, c) => n + (c.liveQuestion ? 1 : 0) + c.liveActions.filter((r) => !r.resolved).length, 0) };
 }
 function resolved(rec) { if (rec && !rec.resolved) { rec.resolved = true; changed(); } }
 
@@ -70,134 +88,140 @@ function describeRoute() {
   const m = /^\/jobs\/([^/]+)/.exec(path);
   return { tab: hit ? hit[1] : "Home", jobId: m ? decodeURIComponent(m[1]) : null };
 }
-// Workflow-card state (preview, creation) keyed by its action object, which ctrl.liveActions
+// Workflow-card state (preview, creation) keyed by its action object, which a chat's liveActions
 // keeps across re-renders: a re-rendered card shows the same state and never creates twice.
 const wfCards = new WeakMap();
 
-function ensureSocket() {
-  if (ctrl.socket) return ctrl.socket;
-  ctrl.socket = assistantChat({
+function ensureSocket(c) {
+  if (c.socket) return c.socket;
+  // Frames of a stopped turn still on the wire (up to its done) must not land in the next one.
+  const live = () => c.streaming && c.draining == null;
+  c.socket = assistantChat({
     onStatus: (text) => {
-      if (!ctrl.streaming) return;
-      ctrl.liveSteps.push(text);
-      if (ctrl.hooks) ctrl.hooks.onStep(text);
+      if (!live()) return;
+      c.liveSteps.push(text);
+      const v = view(c);
+      if (v) v.onStep(text);
     },
     onAction: (action) => {
-      if (!ctrl.streaming) return;   // a late action from a stopped turn
-      const rec = { action, noAct: ctrl.turnNoAct };
-      ctrl.liveActions.push(rec);
+      if (!live()) return;
+      const rec = { action, noAct: c.turnNoAct };
+      c.liveActions.push(rec);
       changed();
-      if (ctrl.hooks) ctrl.hooks.onAction(rec);
+      const v = view(c);
+      if (v) v.onAction(rec);
     },
     onQuestion: (q) => {
-      if (!ctrl.streaming) return;   // a late question from a stopped turn
-      ctrl.liveQuestion = q;
+      if (!live()) return;
+      c.liveQuestion = q;
       changed();
-      if (ctrl.hooks) ctrl.hooks.onQuestion(q);
+      const v = view(c);
+      if (v) v.onQuestion(q);
     },
     onToken: (t) => {
-      if (!ctrl.streaming) return;
-      ctrl.liveRaw += t;
-      if (ctrl.hooks) ctrl.hooks.onToken();
+      if (!live()) return;
+      c.liveRaw += t;
+      const v = view(c);
+      if (v) v.onToken();
     },
     // Ignore a done that belongs to an earlier (stopped) turn: after
     // stop-then-ask, the cancelled turn's done can land while the new
     // question is already streaming and must not complete it.
     onDone: (turn) => {
-      if (ctrl.streaming && (turn == null || turn === ctrl.turn)) completeTurn();
+      if (c.draining != null && turn === c.draining) c.draining = null;
+      else if (c.streaming && (turn == null || turn === c.turn)) completeTurn(c);
     },
     onError: (err) => {
-      if (!ctrl.streaming) return;
+      if (!live()) return;
       // Shown in the transcript but NEVER pushed into history: a transport
       // error used to become a permanent assistant turn, re-sent to the model
       // as context on every later message in the chat.
-      ctrl.liveError = String(err);
-      completeTurn();
+      c.liveError = String(err);
+      completeTurn(c);
     },
     onClose: () => {
       // The socket dropped (server restart, network). The turn is lost
       // server-side; unlock the composer instead of staying on "Stop" forever.
-      if (!ctrl.streaming) return;
-      ctrl.liveError = "connection lost — the server went away mid-answer";
-      completeTurn();
+      c.draining = null;
+      if (!c.streaming) return;
+      c.liveError = "connection lost — the server went away mid-answer";
+      completeTurn(c);
     },
   });
-  return ctrl.socket;
+  return c.socket;
 }
 
 // `shown` is what the bubble displays when the text is a command's expanded prompt.
-function sendMessage(text, { shown, noAct } = {}) {
-  ctrl.history.push(shown ? { role: "user", content: text, shown } : { role: "user", content: text });
-  ctrl.turnNoAct = Boolean(noAct);
-  ctrl.streaming = true;
-  ctrl.turn = (ctrl.turn || 0) + 1;
-  ctrl.liveRaw = "";
-  ctrl.liveSteps = [];
-  ctrl.liveActions = [];
-  ctrl.stopped = false;
-  ctrl.liveError = null;
-  const payload = { messages: ctrl.history.map(({ role, content }) => ({ role, content })),
-                    grounded: ctrl.grounded, turn: ctrl.turn };
-  if (ctrl.attachedRun) payload.run_job_id = ctrl.attachedRun.job_id;
-  if (ctrl.extraRuns.length) payload.extra_run_job_ids = ctrl.extraRuns.map((r) => r.job_id);
-  ensureSocket().send(payload);
-  if (ctrl.hooks) ctrl.hooks.onSend();
+// Sent mid-turn, it interrupts that turn (kept, marked stopped) and the server starts this one at once.
+function sendMessage(c, text, { shown, noAct } = {}) {
+  stopTurn(c);
+  c.history.push(shown ? { role: "user", content: text, shown } : { role: "user", content: text });
+  c.turnNoAct = Boolean(noAct);
+  c.streaming = true;
+  c.turn = (c.turn || 0) + 1;
+  c.liveRaw = "";
+  c.liveSteps = [];
+  c.liveActions = [];
+  c.stopped = false;
+  c.liveError = null;
+  const payload = { messages: c.history.map(({ role, content }) => ({ role, content })),
+                    grounded: ctrl.grounded, turn: c.turn, project_id: c.project || null };
+  if (c.attachedRun) payload.run_job_id = c.attachedRun.job_id;
+  if (c.extraRuns.length) payload.extra_run_job_ids = c.extraRuns.map((r) => r.job_id);
+  ensureSocket(c).send(payload);
+  const v = view(c);
+  if (v) v.onSend();
   changed();
+  persist(c);   // saved at once, so a chat answering in the background is in the list
 }
 
-function completeTurn() {
-  const pushed = Boolean(ctrl.liveRaw);
-  if (pushed) ctrl.history.push({ role: "assistant", content: ctrl.liveRaw });
-  else if (!ctrl.stopped && ctrl.history.length &&
-           ctrl.history[ctrl.history.length - 1].role === "user") ctrl.history.pop();
-  ctrl.streaming = false;
-  ctrl.liveRaw = "";
-  ctrl.liveQuestion = null;
-  if (pushed && !ctrl.hooks) ctrl.unread = true;
+function completeTurn(c) {
+  const pushed = Boolean(c.liveRaw);
+  if (pushed) c.history.push({ role: "assistant", content: c.liveRaw });
+  else if (!c.stopped && c.history.length &&
+           c.history[c.history.length - 1].role === "user") c.history.pop();
+  c.streaming = false;
+  c.liveRaw = "";
+  c.liveQuestion = null;
+  const v = view(c);
+  if ((pushed || c.liveError) && !v) c.unread = true;
   changed();
   // `pushed` tells the view whether the live bubble has an answer to show:
   // rendering "the last assistant message" unconditionally used to duplicate
   // the PREVIOUS answer into the new bubble on an empty turn.
-  if (ctrl.hooks) ctrl.hooks.onDone(pushed);
-  persistCurrent();
+  if (v) v.onDone(pushed);
+  persist(c);
 }
 
-function stopTurn() {
-  if (!ctrl.streaming) return;
-  ctrl.stopped = true;
-  if (ctrl.socket) ctrl.socket.stop();
-  ctrl.liveSteps.push("⏹ stopped");
-  if (ctrl.hooks) ctrl.hooks.onStep("⏹ stopped");
-  completeTurn();
+function stopTurn(c) {
+  if (!c.streaming) return;
+  c.stopped = true;
+  c.draining = c.turn;
+  if (c.socket) c.socket.stop();
+  c.liveSteps.push("⏹ stopped");
+  const v = view(c);
+  if (v) v.onStep("⏹ stopped");
+  completeTurn(c);
 }
 
-function deriveTitle() {
-  const u = ctrl.history.find((m) => m.role === "user");
+function deriveTitle(c) {
+  const u = c.history.find((m) => m.role === "user");
   return u ? (u.shown || u.content).slice(0, 60) : "New chat";
 }
-// Serialised: two overlapping persists used to both see currentChatId === null
-// and both POST a new chat (one duplicate, one empty); and re-reading the
-// globals after an await could write chat A's messages into chat B after a
-// switch. Each persist snapshots the conversation (array identity marks a
-// switch — selectChat/newChat replace ctrl.history wholesale) and runs after
-// the previous one has settled.
-let persistChain = Promise.resolve();
-function persistCurrent() {
-  const hist = ctrl.history;
-  persistChain = persistChain.then(async () => {
-    if (!hist.length || ctrl.history !== hist) return;   // empty, or switched away
-    if (!ctrl.currentChatId) {
-      const c = await api.createChat(ctrl.newChatProject || null, deriveTitle());
-      if (ctrl.history !== hist) return;   // switched while creating — don't adopt/write
-      ctrl.currentChatId = c.id;
-    }
-    await api.updateChat(ctrl.currentChatId, { messages: hist });
+// Serialised per chat: two overlapping persists used to both see no id and
+// both POST a new chat (one duplicate, one empty). Each chat writes its own
+// history, whichever chat is on screen.
+function persist(c) {
+  c.saving = c.saving.then(async () => {
+    if (!c.history.length || c.deleted) return;
+    if (!c.id) c.id = (await api.createChat(c.project || null, deriveTitle(c))).id;
+    await api.updateChat(c.id, { messages: c.history });
     if (ctrl.hooks && ctrl.hooks.onChatsChanged) ctrl.hooks.onChatsChanged();
   }).catch(() => { /* persistence is best-effort */ });
-  return persistChain;
+  return c.saving;
 }
 
-// ── the route view (rebuilds from ctrl on mount; detaches on unmount) ────────
+// ── the route view (rebuilds from the chat on screen; detaches on unmount) ───
 // `compact` is the floating window: no chat list, a line saying what the user is looking
 // at, and `headerExtra` (the window buttons) in the header, which doubles as drag handle.
 export function AssistantView(_params, { compact = false, headerExtra = [] } = {}) {
@@ -217,14 +241,12 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     rows: "1",
     placeholder: "Ask anything, or type / for commands", "aria-label": "Message",
   });
-  const sendBtn = h("button", { class: "chat-send" });
-  sendBtn.addEventListener("click", () => { if (ctrl.streaming) stopTurn(); else send(); });
-  function setComposerMode() {
-    sendBtn.replaceChildren(icon(ctrl.streaming ? "stop" : "arrowUp", ctrl.streaming ? 14 : 17));
-    sendBtn.title = ctrl.streaming ? "Stop" : "Send";
-    sendBtn.setAttribute("aria-label", sendBtn.title);
-    sendBtn.classList.toggle("danger", ctrl.streaming);
-  }
+  // Send works during a turn too (it interrupts the turn); Stop ends the turn without sending.
+  const sendBtn = h("button", { class: "chat-send", title: "Send", "aria-label": "Send", onclick: () => send() },
+    icon("arrowUp", 17));
+  const stopBtn = h("button", { class: "chat-send danger", title: "Stop", "aria-label": "Stop",
+    onclick: () => stopTurn(active) }, icon("stop", 14));
+  function setComposerMode() { stopBtn.style.display = active.streaming ? "" : "none"; }
 
   const groundBtn = h("button", {
     class: "chip",
@@ -333,8 +355,8 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   function renderAttachRow() {
     attachRow.replaceChildren();
     renderContext();
-    if (ctrl.attachedRun) {
-      const ar = ctrl.attachedRun;
+    if (active.attachedRun) {
+      const ar = active.attachedRun;
       const tags = ["metrics", "latents", "volumes"].filter((k) => ar["has_" + k])
         .map((k) => (k === "latents" && ar.latents_from) ? `latents ← ${ar.latents_from}` : k);
       const hasArtifacts = ["metrics", "latents", "volumes"].some((k) => ar["has_" + k]);
@@ -354,13 +376,13 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
         h("button", { class: "chat-item-btn", title: "Detach run", onclick: detachRun }, icon("x", 14)));
       attachRow.appendChild(chip);
       // Extra runs (cross-run reasoning): facts + parameter diff, no artifacts.
-      ctrl.extraRuns.forEach((er, i) => {
+      active.extraRuns.forEach((er, i) => {
         attachRow.appendChild(h("div", { class: "chat-attach-chip extra", title: "Compared against the primary run: the model sees its measured facts and the flags that differ" },
           icon("grid", 13),
           h("span", { class: "chat-attach-name" }, er.label),
-          h("button", { class: "chat-item-btn", title: "Detach", onclick: () => { ctrl.extraRuns.splice(i, 1); renderAttachRow(); } }, icon("x", 13))));
+          h("button", { class: "chat-item-btn", title: "Detach", onclick: () => { active.extraRuns.splice(i, 1); renderAttachRow(); } }, icon("x", 13))));
       });
-      if (ctrl.extraRuns.length < 2) {
+      if (active.extraRuns.length < 2) {
         attachRow.appendChild(h("button", { class: "chat-attach-btn",
           title: "Attach another run to compare against — the model gets its measured facts and the parameter differences",
           onclick: openRunPicker }, icon("plus", 13), "Compare with…"));
@@ -375,32 +397,32 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     const here = describeRoute();
     const job = here.jobId && jobsCache.find((j) => j.id === here.jobId);
     if (here.jobId && !job && askedJobs !== here.jobId) { askedJobs = here.jobId; loadJobs().then(renderContext); }
-    const attached = [ctrl.attachedRun, ...ctrl.extraRuns].some((r) => r && r.job_id === here.jobId);
+    const attached = [active.attachedRun, ...active.extraRuns].some((r) => r && r.job_id === here.jobId);
     clear(contextRow);
     append(contextRow, [icon("eye", 13),
       h("span", null, "Looking at ", h("strong", null, here.tab + (job ? ` · ${job.name || job.program}` : ""))),
       here.jobId && !attached ? h("button", { class: "chat-link", onclick: () => attachJob(here.jobId) }, "Attach this run") : null]);
   }
   async function attachJob(id) {
-    if (!id) { ctrl.attachedRun = null; ctrl.extraRuns = []; renderAttachRow(); return; }
+    if (!id) { active.attachedRun = null; active.extraRuns = []; renderAttachRow(); return; }
     let preview;
     try { preview = await api.assistantRunPreview(id); }
     catch { preview = { job_id: id, label: "run", has_metrics: false, has_latents: false, has_volumes: false }; }
-    if (ctrl.attachedRun && ctrl.attachedRun.job_id !== id) {
+    if (active.attachedRun && active.attachedRun.job_id !== id) {
       // A second/third pick becomes a comparison run rather than replacing the primary.
-      if (!ctrl.extraRuns.some((r) => r.job_id === id) && ctrl.extraRuns.length < 2) ctrl.extraRuns.push(preview);
+      if (!active.extraRuns.some((r) => r.job_id === id) && active.extraRuns.length < 2) active.extraRuns.push(preview);
     } else {
-      ctrl.attachedRun = preview;
+      active.attachedRun = preview;
     }
     renderAttachRow();
   }
   // Detaching the primary promotes the first comparison run (its artifacts load next turn).
-  function detachRun() { ctrl.attachedRun = ctrl.extraRuns.shift() || null; renderAttachRow(); }
+  function detachRun() { active.attachedRun = active.extraRuns.shift() || null; renderAttachRow(); }
   async function downloadReport() {
-    if (!ctrl.attachedRun || reportBusy) return;
+    if (!active.attachedRun || reportBusy) return;
     reportBusy = true; renderAttachRow();
     try {
-      await api.assistantRunReport(ctrl.attachedRun.job_id, true);
+      await api.assistantRunReport(active.attachedRun.job_id, true);
     } catch (e) {
       toastError(e, "Report generation failed.");
     } finally {
@@ -415,7 +437,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     onchange: (e) => {
       ctrl.newChatProject = e.target.value;
       // an unsaved chat follows the picker's project scope immediately
-      if (!ctrl.currentChatId) { ctrl.currentChatProject = ctrl.newChatProject; renderAttachRow(); }
+      if (!active.id) { active.project = ctrl.newChatProject; renderAttachRow(); }
     },
   });
 
@@ -430,20 +452,24 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     log.scrollTop = log.scrollHeight;
     return body;
   }
-  // Rebuild the whole log from ctrl: history, the in-flight turn (if streaming),
-  // and any proposed-action cards. Called on mount and on chat switch.
+  // Rebuild the whole log from the chat on screen: history, the in-flight turn (if
+  // streaming), and any proposed-action cards. Called on mount and on chat switch.
   function renderConversation() {
     log.replaceChildren();
     current = currentActivity = questionCard = null;
-    if (!ctrl.history.length && !ctrl.streaming) { bubble("assistant", GREETING); }
-    else for (const m of ctrl.history) bubble(m.role, m.content, m.shown);
-    if (ctrl.streaming) {
-      startLiveTurn();
-      for (const s of ctrl.liveSteps) appendStep(s);
-      if (ctrl.liveRaw) current.replaceChildren(renderMarkdown(ctrl.liveRaw));
+    if (!active.history.length && !active.streaming) { bubble("assistant", GREETING); }
+    else for (const m of active.history) bubble(m.role, m.content, m.shown);
+    if (active.liveError && !active.streaming) {   // a turn that failed while the chat was not on screen
+      log.appendChild(h("div", { class: "chat-msg assistant" }, h("div", { class: "chat-error muted" }, `⚠ ${active.liveError}`)));
+      active.liveError = null;
     }
-    for (const rec of ctrl.liveActions) renderActionCard(rec.action, rec);
-    if (ctrl.streaming && ctrl.liveQuestion) renderQuestionCard(ctrl.liveQuestion);
+    if (active.streaming) {
+      startLiveTurn();
+      for (const s of active.liveSteps) appendStep(s);
+      if (active.liveRaw) current.replaceChildren(renderMarkdown(active.liveRaw));
+    }
+    for (const rec of active.liveActions) renderActionCard(rec.action, rec);
+    if (active.streaming && active.liveQuestion) renderQuestionCard(active.liveQuestion);
     log.scrollTop = log.scrollHeight;
     setComposerMode();
   }
@@ -454,7 +480,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   }
   // "/" menu: Enter runs the command, Tab (or a command that takes a value) fills it in.
   const editCommands = (select) => openCommandEditor({
-    select, lastMessage: (ctrl.history.filter((m) => m.role === "user" && !m.shown).pop() || {}).content || "",
+    select, lastMessage: (active.history.filter((m) => m.role === "user" && !m.shown).pop() || {}).content || "",
     onTry: (draft) => runCustom(draft, ""),
   });
   const menu = slashMenu({
@@ -504,7 +530,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       const now = performance.now();
       if (now - lastRender < RENDER_MS) { scheduleLate(); return; }
       lastRender = now;
-      if (current) current.replaceChildren(renderMarkdown(ctrl.liveRaw));
+      if (current) current.replaceChildren(renderMarkdown(active.liveRaw));
       log.scrollTop = log.scrollHeight;
     });
   }
@@ -522,13 +548,13 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       // Only show an answer this turn actually produced. Reading "the last
       // assistant message" unconditionally re-rendered the PREVIOUS answer
       // into the new bubble whenever a turn ended empty.
-      const content = pushed && ctrl.history.length &&
-        ctrl.history[ctrl.history.length - 1].role === "assistant"
-        ? ctrl.history[ctrl.history.length - 1].content : "";
+      const content = pushed && active.history.length &&
+        active.history[active.history.length - 1].role === "assistant"
+        ? active.history[active.history.length - 1].content : "";
       current.replaceChildren(renderMarkdown(content));
-      if (ctrl.liveError) {
-        current.appendChild(h("div", { class: "chat-error muted" }, `⚠ ${ctrl.liveError}`));
-        ctrl.liveError = null;
+      if (active.liveError) {
+        current.appendChild(h("div", { class: "chat-error muted" }, `⚠ ${active.liveError}`));
+        active.liveError = null;
       }
       current.classList.remove("streaming");
     }
@@ -560,11 +586,12 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   }
   function renderQuestionCard(q) {
     dismissQuestion();
+    const chat = active;
     const controls = h("div", { class: "chat-action-actions" });
     const reply = (payload, shown) => {
-      ctrl.liveQuestion = null;
+      chat.liveQuestion = null;
       changed();
-      ensureSocket().answer({ id: q.id, ...payload });
+      ensureSocket(chat).answer({ id: q.id, ...payload });
       controls.replaceChildren(h("span", { class: "muted chat-action-note" }, shown));
     };
     const choices = q.kind === "confirm" ? ["yes", "no"] : (q.kind === "choice" ? (q.choices || []) : []);
@@ -621,6 +648,8 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   }
 
   // ── proposed-action card (create a draft job from a data path) ────────
+  // The project the server placed a proposal in: one the request names, else the chat's.
+  const placedIn = (action) => ("project_id" in action ? action.project_id : active.project) || "";
   function renderActionCard(action, rec) {
     if (!action) return;
     if (action.kind === "prepare_motion") { renderPrepareMotionCard(action, rec); return; }
@@ -666,15 +695,16 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
         h("span", { class: "chat-action-missing" },
           spec.missing_required.map((m) => "--" + m).join(", "))));
     }
-    const projName = projectName(ctrl.currentChatProject);
+    const pid = placedIn(action);
+    const projName = projectName(pid);
     body.appendChild(h("div", { class: "chat-action-row" },
       h("span", { class: "muted" }, "Project"),
-      h("span", null, ctrl.currentChatProject ? projName : "none — pick one in the form")));
+      h("span", null, pid ? projName : "none — pick one in the form")));
     const open = h("button", { class: "btn chat-action-open" }, icon("arrowRight", 15), "Open in job builder");
     open.addEventListener("click", () => {
       store.prefillProgram({
         program: action.program, values: spec.args || {},
-        projectId: ctrl.currentChatProject || null, projectName: projName,
+        projectId: pid || null, projectName: projName,
       });
       body.appendChild(h("div", { class: "chat-action-done muted" },
         "Opened in the job builder (right panel). Complete any required fields and launch it there."));
@@ -702,7 +732,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   function renderWorkflowCard(action, rec) {
     let st = wfCards.get(action);
     if (!st) {
-      st = { request: (action.form && action.form.raw) || "", projectId: ctrl.currentChatProject || null,
+      st = { request: (action.form && action.form.raw) || "", projectId: placedIn(action) || null,
              created: null, creating: null, error: null, autoTried: false, dismissed: false, rec };
       st.preview = api.assistantPreviewWorkflow({ request: st.request, projectId: st.projectId });
       wfCards.set(action, st);
@@ -898,25 +928,24 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   // ── send / hooks ──────────────────────────────────────────────────────
   async function runCustom(cmd, arg) {
     const here = describeRoute();
-    if (cmd.attach_run && !ctrl.attachedRun && here.jobId) await attachJob(here.jobId);
+    if (cmd.attach_run && !active.attachedRun && here.jobId) await attachJob(here.jobId);
     const text = expandCommand(cmd, {
-      run: ctrl.attachedRun && ctrl.attachedRun.label, tab: here.tab, text: arg,
-      project: ctrl.currentChatProject ? projectName(ctrl.currentChatProject) : "",
+      run: active.attachedRun && active.attachedRun.label, tab: here.tab, text: arg,
+      project: active.project ? projectName(active.project) : "",
     });
-    if (ctrl.streaming) return;
-    sendMessage(text, { shown: `/${cmd.name}${arg ? " " + arg : ""}`, noAct: !cmd.may_act });
+    sendMessage(active, text, { shown: `/${cmd.name}${arg ? " " + arg : ""}`, noAct: !cmd.may_act });
   }
   // True when `name` was a command and has been handled: the model never sees the line.
   function runCommand(name, arg) {
     if (name === "autonomy") autonomyCommand(arg);
     else if (name === "attach") openRunPicker();
-    else if (name === "report") { if (ctrl.attachedRun) downloadReport(); else notice("report: attach a run first (/attach)"); }
+    else if (name === "report") { if (active.attachedRun) downloadReport(); else notice("report: attach a run first (/attach)"); }
     else if (name === "float") { setFloating(!compact); if (compact) navigate("/assistant"); }
     else if (name === "new") newChat();
     else if (name === "commands") editCommands();
     else {
       const cmd = findCommand(name);
-      if (!cmd || ctrl.streaming) return false;
+      if (!cmd) return false;
       runCustom(cmd, arg);
     }
     return true;
@@ -930,16 +959,16 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       menu.close();
       return;
     }
-    if (!text || ctrl.streaming) return;
+    if (!text) return;
     input.value = "";
     autosize();
-    sendMessage(text);   // ctrl updates history + starts the socket turn; onSend renders
+    sendMessage(active, text);   // the chat's history + socket turn; onSend renders
   }
 
   // Hooks the controller calls to drive this view's DOM while it is mounted.
   const hooks = {
     onSend() {
-      const last = ctrl.history[ctrl.history.length - 1];
+      const last = active.history[active.history.length - 1];
       if (last && last.role === "user") bubble("user", last.content, last.shown);
       startLiveTurn();
       setComposerMode();
@@ -963,7 +992,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     renderChatList();
   }
   function renderChatList() {
-    titleEl.textContent = (chats.find((c) => c.id === ctrl.currentChatId) || {}).title || "New chat";
+    titleEl.textContent = (chats.find((c) => c.id === active.id) || {}).title || "New chat";
     chatList.replaceChildren();
     const groups = new Map();
     for (const c of chats) {
@@ -997,12 +1026,18 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     }
   }
   function chatItem(c) {
+    // Answering (pulsing, as a running job), waiting on your answer, or finished while not on screen (dot).
+    const rec = recordOf(c.id);
+    const state = !rec ? null
+      : rec.liveQuestion ? h("span", { class: "chat-badge ask" }, "needs answer")
+      : rec.streaming ? h("i", { class: "jt-dot running", title: "Answering…" })
+      : rec.unread ? h("span", { class: "chat-step-dot", title: "New reply" }) : null;
     const renameBtn = h("button", { class: "chat-item-btn", title: "Rename",
       onclick: (e) => { e.stopPropagation(); renameChat(c); } }, icon("pencil", 14));
     const delBtn = h("button", { class: "chat-item-btn", title: "Delete",
       onclick: (e) => { e.stopPropagation(); removeChat(c); } }, icon("trash", 14));
     return h("div", {
-      class: "chat-item" + (c.id === ctrl.currentChatId ? " active" : ""),
+      class: "chat-item" + (c.id === active.id ? " active" : ""),
       draggable: "true",
       title: "Drag onto a project to move this chat",
       ondragstart: (e) => {
@@ -1017,7 +1052,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       },
       onclick: () => selectChat(c.id),
     },
-      h("span", { class: "chat-item-title", title: c.title }, c.title),
+      h("span", { class: "chat-item-title", title: c.title }, c.title), state,
       h("span", { class: "chat-item-actions" }, renameBtn, delBtn));
   }
   async function moveChatToProject(chatId, projectId) {
@@ -1025,36 +1060,38 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     if (c && (c.project_id || "") === (projectId || "")) return;  // already there
     try {
       await api.updateChat(chatId, { project_id: projectId || null });
-      if (chatId === ctrl.currentChatId) { ctrl.currentChatProject = projectId || ""; renderAttachRow(); }
+      const rec = recordOf(chatId);
+      if (rec) rec.project = projectId || "";
+      if (rec === active) renderAttachRow();
       await refreshChats();
     } catch { /* ignore */ }
   }
-  async function selectChat(id) {
-    if (ctrl.streaming) return;
-    try {
-      const c = await api.chat(id);
-      ctrl.currentChatId = c.id;
-      ctrl.currentChatProject = c.project_id || "";
-      ctrl.attachedRun = null;
-      ctrl.extraRuns = [];
-      ctrl.liveActions = [];
-      ctrl.history = Array.isArray(c.messages) ? c.messages.slice() : [];
-      renderConversation();
-      renderChatList();
-      renderAttachRow();
-    } catch { /* ignore */ }
-  }
-  function newChat() {
-    if (ctrl.streaming) return;
-    ctrl.currentChatId = null;
-    ctrl.currentChatProject = ctrl.newChatProject || "";
-    ctrl.attachedRun = null;
-    ctrl.extraRuns = [];
-    ctrl.liveActions = [];
-    ctrl.history = [];
+  // Another chat on screen; the one left keeps answering in the background, or is dropped when idle.
+  function show(c) {
+    const left = active;
+    active = c;
+    kept.add(c);
+    c.unread = false;
+    if (left !== c && !left.streaming && !left.unread) drop(left);
+    changed();
     renderConversation();
     renderChatList();
     renderAttachRow();
+  }
+  async function selectChat(id) {
+    if (id === active.id) return;
+    let c = recordOf(id);
+    if (!c) {
+      try {
+        const got = await api.chat(id);
+        c = Object.assign(blankChat(got.project_id), { id: got.id,
+          history: Array.isArray(got.messages) ? got.messages.slice() : [] });
+      } catch { return; }
+    }
+    show(c);
+  }
+  function newChat() {
+    show(blankChat(ctrl.newChatProject));
     input.focus();
   }
   async function renameChat(c) {
@@ -1065,11 +1102,14 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   async function removeChat(c) {
     if (!(await confirmModal({ title: "Delete chat?", danger: true, okText: "Delete",
         message: `“${c.title}” will be removed.` }))) return;
+    const rec = recordOf(c.id);
+    if (rec) { rec.deleted = true; stopTurn(rec); }   // a running chat stops first; nothing is saved again
     try {
       await api.deleteChat(c.id);
-      if (c.id === ctrl.currentChatId) { ctrl.currentChatId = null; ctrl.history = []; ctrl.liveActions = []; renderConversation(); }
+      if (rec === active) show(blankChat(ctrl.newChatProject));
+      else if (rec) { drop(rec); changed(); }
       await refreshChats();
-    } catch { /* ignore */ }
+    } catch { if (rec) rec.deleted = false; }
   }
 
   function buildProjectSelect() {
@@ -1078,19 +1118,20 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       ...projects.map((p) => h("option", { value: p.id, selected: p.id === ctrl.newChatProject }, p.name)));
   }
 
-  // ── init (mount): rebuild from ctrl, then attach hooks ────────────────
+  // ── init (mount): rebuild from the chat on screen, then attach hooks ──
   api.projects().then((p) => { projects = p || []; buildProjectSelect(); renderChatList(); }).catch(() => {});
   loadJobs().then(renderAttachRow);
   refreshChats();
   renderConversation();
   renderAttachRow();
   ctrl.hooks = hooks;   // start receiving live updates for this mount
-  ctrl.unread = false;
+  active.unread = false;
   changed();
   const quickRow = h("div", { class: "chat-quick" });
   const renderQuick = () => quickRow.replaceChildren(...customCommands().filter((c) => c.pinned).map((c) =>
-    h("button", { class: "chat-quick-btn", title: c.description, onclick: () => { if (!ctrl.streaming) runCustom(c, ""); } }, "/" + c.name)));
+    h("button", { class: "chat-quick-btn", title: c.description, onclick: () => runCustom(c, "") }, "/" + c.name)));
   const offCommands = onCommandsChange(renderQuick);
+  const offActivity = onAssistantActivity(() => { if (!compact && !dragChatId) renderChatList(); });
   loadCommands().then(renderQuick);
   if (compact) window.addEventListener("hashchange", renderContext);
 
@@ -1115,7 +1156,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     h("div", { class: "chat-tools" },
       tool("paperclip", "Attach a run so the assistant can summarize its metrics, landscape and volume motions", openRunPicker),
       tool("slash", "Commands", () => { input.value = "/"; input.focus(); menu.update("/"); }, "Commands"),
-      groundBtn, h("span", { class: "vwin-spacer" }), sendBtn));
+      groundBtn, h("span", { class: "vwin-spacer" }), stopBtn, sendBtn));
   const main = h("div", { class: "chat-main" }, header, compact ? contextRow : statusLine, log, quickRow, composer);
   const el = h("div", { class: "view chat-view" + (compact ? " compact" : "") }, compact ? null : sidebar, main);
 
@@ -1124,6 +1165,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   return { el, header, cleanup: () => {
     if (ctrl.hooks === hooks) ctrl.hooks = null;
     offCommands();
+    offActivity();
     window.removeEventListener("hashchange", renderContext);
   } };
 }
