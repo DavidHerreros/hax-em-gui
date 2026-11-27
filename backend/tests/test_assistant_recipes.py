@@ -22,7 +22,7 @@ def test_workflow_card_starts_from_the_recipe(project, data):
     assert out["ok"], (out["errors"], [c for c in out["plan"]["checks"] if c["status"] == "fail"])
     train, predict = out["steps"][0], out["steps"][1]
     assert train["args"]["encoder_arch"] == "mlpnn" and train["args"]["batch_size"] == 32
-    assert train["reasons"]["encoder_arch"] == "from your recipe hetsiren motions (hax default: convnn)"
+    assert train["reasons"]["encoder_arch"] == "from the built-in recipe hetsiren motions (hax default: convnn)"
     assert "encoder_arch" not in predict["args"] and "film_heads" not in predict["args"]
     assert any(c["status"] == "info" and "hetsiren motions" in c["message"] for c in out["plan"]["checks"])
     assert "Recipe: hetsiren motions" in out["plan"]["describe"]
@@ -30,7 +30,7 @@ def test_workflow_card_starts_from_the_recipe(project, data):
 
 def test_draft_job_starts_from_the_recipe(data):
     spec = assistant_actions.build_draft_spec("hetsiren", str(data["md"]))
-    assert spec["recipe"] == "hetsiren motions"
+    assert spec["recipe"] == "the built-in recipe hetsiren motions"
     assert spec["args"]["encoder_arch"] == "mlpnn" and spec["args"]["batch_size"] == 32 and spec["args"]["epochs"] == 150
     assert spec["args"]["md"] == str(data["md"]) and "motion_only" not in spec["args"]
     from hax_assistant import recipes
