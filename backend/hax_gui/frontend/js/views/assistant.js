@@ -771,6 +771,10 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     body.appendChild(h("div", { class: "chat-action-row" },
       h("span", { class: "muted" }, "Maps to"),
       h("code", { class: "md-code" }, "--" + (spec.input_arg || "?"))));
+    if (spec.recipe) {
+      body.appendChild(h("div", { class: "chat-action-row" }, h("span", { class: "muted" }, "Settings"),
+        h("span", null, `from your recipe “${spec.recipe}”`)));
+    }
     if (spec.missing_required && spec.missing_required.length) {
       body.appendChild(h("div", { class: "chat-action-row" },
         h("span", { class: "muted" }, "You'll set"),

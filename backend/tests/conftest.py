@@ -29,6 +29,8 @@ os.environ.pop("HAX_ASSISTANT_WORKSPACE", None)
 os.environ.pop("HAX_ASSISTANT_AUTONOMY", None)
 # No docs download: tests that need docs set their own.
 os.environ["HAX_ASSISTANT_DOCS"] = "off"
+# No test reaches a real model (Ollama on this machine): the endpoint is a closed port.
+os.environ["HAX_ASSISTANT_BASE_URL"] = "http://127.0.0.1:9/v1"
 
 _stub = TMP / "hax_stub.sh"
 _stub.write_text(

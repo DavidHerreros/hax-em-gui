@@ -250,20 +250,23 @@ def _proposal(finding, remedy) -> dict:
 
 def watch_report(run_dir: str, pid_alive: Optional[bool] = True) -> dict:
     """Health findings for a run and the restart the assistant would propose, if any."""
+    from hax_assistant.context.logs import crash_on_resume_in
     from hax_assistant.monitor import check_health, pick, read_signals
     signals = read_signals(run_dir)
     findings = check_health(signals, pid_alive=pid_alive)
-    choice = pick(findings, signals, _schema())
+    choice = pick(findings, signals, _schema(), crash_on_resume_in(run_dir))
     return {"findings": [_finding(f) for f in findings],
             "proposal": _proposal(*choice) if choice and choice[1].restart != "none" else None}
 
 
 def remedy_for(run_dir: str, kind: str, pid_alive: Optional[bool] = None) -> Optional[dict]:
     """Re-derive, from the run's own signals, the restart for finding ``kind`` (None if none)."""
+    from hax_assistant.context.logs import crash_on_resume_in
     from hax_assistant.monitor import check_health, propose_remedy, read_signals
     signals = read_signals(run_dir)
     finding = next((f for f in check_health(signals, pid_alive=pid_alive) if f.kind == kind), None)
-    remedy = propose_remedy(finding, signals, _schema()) if finding is not None else None
+    remedy = (propose_remedy(finding, signals, _schema(), crash_on_resume_in(run_dir))
+              if finding is not None else None)
     if remedy is None or remedy.restart == "none":
         return None
     return _proposal(finding, remedy)

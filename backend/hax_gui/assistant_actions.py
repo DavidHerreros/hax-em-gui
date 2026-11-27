@@ -114,6 +114,9 @@ def build_draft_spec(program: str, data_path: Optional[str]) -> dict[str, Any]:
     in_arg = input_arg(program)
     if data_path and in_arg:
         args[in_arg] = data_path
+    recipe = _recipe_draft(program, data_path)          # the user's own settings, as the planner uses them
+    if recipe:
+        args.update({k: v for k, v in recipe["args"].items() if k in fields})
 
     auto = {registry.output_arg(program), registry.ssd_arg(program)}
     missing = [
@@ -126,7 +129,17 @@ def build_draft_spec(program: str, data_path: Optional[str]) -> dict[str, Any]:
         "args": args,
         "missing_required": missing,
         "auto_filled": [a for a in auto if a],
+        "recipe": recipe["recipe"] if recipe else None,
     }
+
+
+def _recipe_draft(program: str, data_path: Optional[str]) -> Optional[dict]:
+    try:
+        from hax_assistant import recipes
+        from .assistant import _schema
+        return recipes.draft(program, _schema(), data_path)
+    except Exception:  # noqa: BLE001 - no recipe: registry defaults only
+        return None
 
 
 def actions_enabled() -> bool:
