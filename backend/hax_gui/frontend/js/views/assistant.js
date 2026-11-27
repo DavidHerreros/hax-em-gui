@@ -512,7 +512,11 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     log.replaceChildren();
     current = currentActivity = questionCard = null;
     if (!active.history.length && !active.streaming) { bubble("assistant", GREETING); }
-    else for (const m of active.history) { bubble(m.role, m.content, m.shown); if (m.watch) findingCard(m); }
+    else for (const m of active.history) {
+      bubble(m.role, m.content, m.shown);
+      if (m.watch) findingCard(m);
+      if (m.next && !m.next.used) nextStepCard(m);
+    }
     if (active.liveError && !active.streaming) {   // a turn that failed while the chat was not on screen
       log.appendChild(h("div", { class: "chat-msg assistant" }, h("div", { class: "chat-error muted" }, `⚠ ${active.liveError}`)));
       active.liveError = null;
@@ -705,6 +709,18 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     log.appendChild(h("div", { class: "chat-msg assistant" }, h("div", { class: "chat-action-actions" },
       w.resolved ? h("div", { class: "chat-action-done" }, icon("check", 14), ` Decided: ${w.resolved.message || "applied"}`)
                  : buttons)));
+  }
+
+  // ── the next step of a run the assistant launched: Continue sends its note as the user's message ──
+  function nextStepCard(m) {
+    const chat = active;
+    log.appendChild(h("div", { class: "chat-msg assistant" }, h("div", { class: "chat-action-actions" },
+      h("button", { class: "btn small", onclick: async (e) => {
+        e.currentTarget.disabled = true;
+        try { await api.assistantContinueUsed(chat.id, m.id); } catch (err) { toastError(err, "Could not continue."); return; }
+        m.next.used = true;
+        sendMessage(chat, m.next.prompt, { shown: m.next.shown });
+      } }, icon("play", 14), " Continue"))));
   }
 
   // ── client-side commands (never sent to the model) ────────────────────

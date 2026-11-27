@@ -218,13 +218,17 @@ def _spawn(coro) -> None:
     task.add_done_callback(_tasks.discard)
 
 
-def _schedule(chat_id: str, job: dict[str, Any], finding: dict[str, Any], event: dict[str, Any]) -> None:
-    _update_finding(job["id"], finding["kind"], reviewed=True)       # counts against the cap from now on
-    start = lambda: _spawn(_review(chat_id, job, finding, event))   # noqa: E731
+def when_free(chat_id: str, start) -> None:
+    """Call ``start`` now, or once the turns running in ``chat_id`` have ended."""
     if _busy.get(chat_id):
         _waiting.setdefault(chat_id, []).append(start)              # never while the user has a turn there
     else:
         start()
+
+
+def _schedule(chat_id: str, job: dict[str, Any], finding: dict[str, Any], event: dict[str, Any]) -> None:
+    _update_finding(job["id"], finding["kind"], reviewed=True)       # counts against the cap from now on
+    when_free(chat_id, lambda: _spawn(_review(chat_id, job, finding, event)))
 
 
 class ReviewInteraction:

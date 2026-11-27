@@ -305,6 +305,8 @@ api.assistantCreateWorkflow = ({ request, projectId, run, auto, fingerprint, cha
     body: JSON.stringify({ request, project_id: projectId || null, run: !!run, auto: !!auto,
                            fingerprint: fingerprint || null, chat_id: chatId || null }) });
 // The change the assistant's review of a monitor finding proposed (read and checked on the server).
+api.assistantContinueUsed = (chatId, mid) =>
+  req(`/api/assistant/continue/${encodeURIComponent(chatId)}/${encodeURIComponent(mid)}`, { method: "POST" });
 api.assistantApplyReview = (jobId, kind) =>
   req(`/api/assistant/watch/${jobId}/apply-review`, { method: "POST", body: JSON.stringify({ kind }) });
 // Stop a job from the chat's stop card (checked again on the server); auto=true when the card acts on its own.

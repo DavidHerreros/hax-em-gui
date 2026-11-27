@@ -7,7 +7,8 @@ of a GUI project; stop and relaunch go through the job manager, a relaunch being
 (watch.relaunch), and take a job id, job name, run folder or project (find_jobs); list_jobs shows
 the jobs. launch_job starts one program as a new job of a project, select_states writes the
 representative states a decode reads (CPU, no job), and check/launch_custom_workflow build a workflow
-graph the model designed and run it in the same engine. The tool loop applies the autonomy level before
+graph the model designed and run it in the same engine. A launch may carry the model's note for what
+comes next (``then``): the chat goes on with it once the run has succeeded (assistant_continue). The tool loop applies the autonomy level before
 any of them acts. They run in the chat
 turn's worker thread, act on the event loop, and do nothing once the turn is cancelled. Also here:
 which GUI project a request means, and which job a "stop the run" means and the checked stop of the
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from . import assistant as assistant_bridge
-from . import adapters, assistant_monitor, assistant_workflows, projects, settings_store, watch
+from . import adapters, assistant_continue, assistant_monitor, assistant_workflows, projects, settings_store, watch
 from .assistant_workflows import WATCHED
 from .command import ValidationError
 from .jobs import ACTIVE, ProjectNotFound, manager
@@ -250,12 +251,13 @@ async def _adopt(job_id: str, origin: str, watch_it: bool, every: float = 2.0) -
 
 
 def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id: str | None = None,
-               chat_id: str | None = None, review: dict[str, Any] | None = None) -> list:
+               chat_id: str | None = None, review: dict[str, Any] | None = None, depth: int = 0) -> list:
     """list_jobs, watch_run, plan_workflow, launch_workflow, check/launch_custom_workflow, select_states,
     launch_job, stop_run and relaunch_run for one chat turn;
     ``project_id`` is the chat's project, ``chat_id`` the chat (what it launches or watches is linked to
     it). ``review``: the assistant reviewing a monitor finding (assistant_monitor): it acts only on that
-    job, an OK it needs becomes an Apply in the chat, and it launches nothing."""
+    job, an OK it needs becomes an Apply in the chat, and it launches nothing. ``depth``: how many
+    automatic next steps led to this turn (assistant_continue)."""
     from hax_assistant import safety
     from hax_assistant.agent import Tool
     from hax_assistant.interaction import Cancelled, Question
@@ -283,6 +285,18 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         if key not in shown:
             shown[key] = assistant_workflows.preview(a["request"], targets[where], a.get("name"), a.get("gpu"))
         return targets[where], shown[key]
+
+    def follow_up(kind: str, target_id: str, then: str | None, pid: str | None) -> dict:
+        """The chat's next step after the run, when the model left a note for it."""
+        if not (then or "").strip():
+            return {}
+        if not chat_id:
+            return {"then": "not set: this chat is not saved"}
+        on_loop(assistant_continue.arm(kind, target_id, chat_id, then, depth, pid))
+        return {"then": "set: this chat goes on with your note once the run has succeeded"}
+
+    def then_line(a: dict) -> str:
+        return f"\nWhen it has succeeded: {a['then']}" if (a.get("then") or "").strip() else ""
 
     def where_text(out: dict) -> str:
         p = out["project"]
@@ -320,9 +334,9 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         except Exception as e:  # noqa: BLE001
             return f"launch a workflow for: {a.get('request')} (it could not be planned: {e})"
         return (f"create and start this workflow in {where_text(out)} (its steps run as new jobs there; "
-                f"nothing that exists is changed):\n{out['plan']['describe']}")
+                f"nothing that exists is changed):\n{out['plan']['describe']}") + then_line(a)
 
-    def launch_workflow(ctx, request, project=None, name=None, gpu=None):
+    def launch_workflow(ctx, request, project=None, name=None, gpu=None, then=None):
         if cancel.is_set():
             return STOPPED
         if review:
@@ -339,7 +353,8 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
                 "workflow": {"id": made["workflow_id"], "name": made["name"]},
                 "steps": on_loop(assistant_workflows.step_jobs(made["workflow_id"])),
                 "note": "a step gets its job and run folder when it starts; list_jobs shows them, and stop_run or "
-                        "relaunch_run take a job id, run folder, job name or the project"}
+                        "relaunch_run take a job id, run folder, job name or the project",
+                **(follow_up("workflow", made["workflow_id"], then, made["project_id"]) if made["started"] else {})}
 
     def job_project(a: dict) -> str:
         """The project a new job goes into: the one named, else the chat's, else the one its paths are in."""
@@ -364,9 +379,10 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         except ValueError as e:
             return f"launch {a.get('program')} {flags} ({e})"
         return (f"launch {a.get('program')} as a new job of your project “{where}” (its own new run folder; nothing "
-                f"that exists is changed): {flags}" + (f" on GPU {a['gpu']}" if a.get("gpu") not in (None, "") else ""))
+                f"that exists is changed): {flags}" + (f" on GPU {a['gpu']}" if a.get("gpu") not in (None, "") else "")
+                + then_line(a))
 
-    def launch_job(ctx, program, args, project=None, name=None, gpu=None):
+    def launch_job(ctx, program, args, project=None, name=None, gpu=None, then=None):
         if cancel.is_set():
             return STOPPED
         if review:
@@ -401,7 +417,8 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
             pass
         return {"status": job["status"], "job": {"id": job["id"], "name": _name(job), "run_dir": job.get("workdir")},
                 "project": (projects.get(pid) or {}).get("name"),
-                "note": "list_jobs shows when it has succeeded; launch the step that reads its outputs only then"}
+                "note": "list_jobs shows when it has succeeded; launch the step that reads its outputs only then",
+                **follow_up("job", job["id"], then, pid)}
 
     def select_states(ctx, job=None, latents=None, n_states=10):
         run = None
@@ -470,9 +487,9 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
                  for s in out["steps"]]
         return (f"create and start the workflow “{a.get('name')}” in {where} (its steps run as new jobs there; "
                 "nothing that exists is changed):\n" + "\n".join(lines)
-                + (f"\nIt has errors, so it would not be created: {'; '.join(errors)}" if errors else ""))
+                + (f"\nIt has errors, so it would not be created: {'; '.join(errors)}" if errors else "") + then_line(a))
 
-    def launch_custom_workflow(ctx, name, steps, edges=None, project=None, gpu=None):
+    def launch_custom_workflow(ctx, name, steps, edges=None, project=None, gpu=None, then=None):
         if cancel.is_set():
             return STOPPED
         if review:
@@ -489,7 +506,8 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         return {"status": "started" if made["started"] else "saved_not_started", "run_error": made.get("run_error"),
                 "project": {"id": made["project_id"], "name": (projects.get(made["project_id"]) or {}).get("name")},
                 "workflow": {"id": made["workflow_id"], "name": made["name"]},
-                "steps": on_loop(assistant_workflows.step_jobs(made["workflow_id"]))}
+                "steps": on_loop(assistant_workflows.step_jobs(made["workflow_id"])),
+                **(follow_up("workflow", made["workflow_id"], then, made["project_id"]) if made["started"] else {})}
 
     def chosen(a: dict, verb: str) -> tuple[list[dict], str | None]:
         """The job(s) a stop or relaunch is about, resolved once per turn (asking when several match),
@@ -607,6 +625,9 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
                                                             "add it to; omit for the chat's project, or a new one"},
                "name": {"type": "string", "description": "workflow name"},
                "gpu": {"type": "string", "description": "GPU index"}}
+    then_arg = {"type": "string", "description": "your note for what to do once this run has succeeded (e.g. "
+                                              "select the states on the predict job and decode them): this chat "
+                                              "goes on with it then, by itself under autonomy auto"}
     graph_args = {
         "steps": {"type": "array", "description": "the steps, each a hax program", "items": {
             "type": "object", "required": ["id", "program"], "properties": {
@@ -642,7 +663,7 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         Tool(spec("launch_workflow", "Create a workflow in one of the user's GUI projects (or a new one) and "
                                      "start it in the GUI's workflow engine; its steps run as new jobs of "
                                      "that project. Returns the project, the workflow and each step's job.",
-                  wf_args, ["request"]),
+                  {**wf_args, "then": then_arg}, ["request"]),
              launch_workflow, side_effect="launch", describe=describe_launch, owned=lambda a: True),
         Tool(spec("check_custom_workflow", "Check a workflow you design (see launch_custom_workflow) without "
                                            "creating anything: the errors, and each step's arguments and wiring.",
@@ -654,7 +675,8 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
                                             "hetsiren train -> hetsiren predict on reload; train -> modart on "
                                             "motion_correction). The GUI sets every output folder. State selection "
                                             "is not a step: after the predict job, use select_states and launch_job.",
-                  {"name": {"type": "string", "description": "workflow name"}, **graph_args}, ["name", "steps"]),
+                  {"name": {"type": "string", "description": "workflow name"}, **graph_args, "then": then_arg},
+                  ["name", "steps"]),
              launch_custom_workflow, side_effect="launch", describe=describe_custom, owned=lambda a: True),
         Tool(spec("select_states", "Pick representative states of a run's latent space (KMeans on the predicted "
                                    "latents, ordered along the landscape's path) and save them as an .npy beside "
@@ -676,7 +698,7 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
                    "project": {"type": "string", "description": "the GUI project (name or id); omit for the "
                                                                 "chat's project, or the project its paths are in"},
                    "name": {"type": "string", "description": "job name"},
-                   "gpu": {"type": "string", "description": "GPU index"}}, ["program", "args"]),
+                   "gpu": {"type": "string", "description": "GPU index"}, "then": then_arg}, ["program", "args"]),
              launch_job, side_effect="launch", describe=describe_job, owned=lambda a: True),
         Tool(spec("stop_run", "Stop a job of the GUI (its run folder and checkpoint are kept). A project or "
                               "workflow means its running job; several are asked about.",

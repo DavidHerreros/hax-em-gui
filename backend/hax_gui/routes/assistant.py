@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import assistant as assistant_bridge
-from .. import assistant_actions, assistant_monitor, assistant_tools, assistant_workflows
+from .. import assistant_actions, assistant_continue, assistant_monitor, assistant_tools, assistant_workflows
 from .. import gpus as gpus_mod
 from .. import chats as chat_store
 from .. import ollama as ollama_manager_mod
@@ -185,6 +185,15 @@ def assistant_models(body: ModelsBody) -> dict[str, Any]:
         if origin(url) is None:
             raise HTTPException(status_code=422, detail=f"{url!r} is not an http(s) URL")
     return assistant_bridge.list_models(body.backend, body.base_url, body.embed_base_url)
+
+
+@router.post("/api/assistant/continue/{chat_id}/{mid}", dependencies=[Depends(auth)])
+def assistant_continue_used(chat_id: str, mid: str) -> dict[str, Any]:
+    """A posted next step's Continue was clicked (the chat sends its note): it is not offered again."""
+    done = assistant_continue.mark_used(chat_id, mid)
+    if done is None:
+        raise HTTPException(status_code=404, detail="no next step to continue with")
+    return {"ok": True}
 
 
 @router.post("/api/assistant/docs/check", dependencies=[Depends(auth)])
