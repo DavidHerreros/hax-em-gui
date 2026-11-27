@@ -80,7 +80,7 @@ export function AssistantSettings() {
           onclick: () => {
             if (v.backend === k) return;
             v.backend = k;
-            if (!locked("base_url")) v.base_url = cfg.defaults.base_url[k];
+            if (!locked("base_url")) v.base_url = k === "ollama" ? cfg.defaults.base_url.ollama : "";   // a hosted endpoint is always typed, never assumed
             if (!locked("model")) v.model = "";
             if (!locked("embed_model") && !v.embed_base_url) v.embed_model = "";
             lists = null; other = { model: false, embed_model: false }; keyEdit = false; confirmRemove = false;
@@ -101,6 +101,7 @@ export function AssistantSettings() {
     if (locked("base_url")) return h("div", null, label("endpoint", "base_url"), lockBox("base_url", v.base_url), reach);
     return h("div", null, label("endpoint", "base_url"),
       h("input", { id: "asst-url", class: "input", value: v.base_url, spellcheck: "false", autocomplete: "off",
+        placeholder: `e.g. ${cfg.defaults.base_url[v.backend] || "https://…/v1"}`,
         style: { fontFamily: "JetBrains Mono, monospace", fontSize: "13px" },
         oninput: (e) => { v.base_url = e.target.value; keyEdit = false; confirmRemove = false; drawKey(); },
         onchange: () => refresh() }),
@@ -318,6 +319,7 @@ export function AssistantSettings() {
     const body = {};
     for (const k of FIELDS) if (!locked(k)) body[k] = (v[k] || "").trim();
     if (docsMode() === "local" && !body.docs) { message = status("err", "Choose the docs folder first."); render(); return; }
+    if (!locked("base_url") && !originOf(body.base_url)) { message = status("err", "Enter the endpoint URL first."); render(); return; }
     if (!locked("model") && !body.model) { message = status("err", "Choose a chat model first."); render(); return; }
     try {
       take(await api.putAssistantConfig(body));
