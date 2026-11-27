@@ -5,7 +5,9 @@ folders the GUI does not know. In the GUI the tool loop gets these instead: a wo
 and built as the workflow card does it (assistant_workflows) and run by the workflow engine as jobs
 of a GUI project; stop and relaunch go through the job manager, a relaunch being a NEW job
 (watch.relaunch), and take a job id, job name, run folder or project (find_jobs); list_jobs shows
-the jobs. The tool loop applies the autonomy level before any of them acts. They run in the chat
+the jobs. launch_job starts one program as a new job of a project, and select_states writes the
+representative states a decode reads (CPU, no job). The tool loop applies the autonomy level before
+any of them acts. They run in the chat
 turn's worker thread, act on the event loop, and do nothing once the turn is cancelled. Also here:
 which GUI project a request means, and which job a "stop the run" means and the checked stop of the
 chat's stop card (the same resolution in both tiers).
@@ -19,14 +21,16 @@ from pathlib import Path
 from typing import Any
 
 from . import assistant as assistant_bridge
-from . import assistant_monitor, assistant_workflows, projects, watch
-from .jobs import ACTIVE, manager
+from . import adapters, assistant_monitor, assistant_workflows, projects, watch
+from .command import ValidationError
+from .jobs import ACTIVE, ProjectNotFound, manager
 
 NEW_PROJECT = "a new project"
 STOPPED = {"status": "not_executed", "reason": "the chat turn was stopped"}
 STOPPABLE = ACTIVE - {"cancelling"}
 ALL = "all of them"
 LIST_MAX = 25
+WATCHED = ("hetsiren", "zernike3deep")      # their training runs are watched, as a workflow's train step
 _stopping: set[str] = set()
 _MINE_RE = re.compile(r"\b(?:my|our|existing)\s+(?:[\w.-]+\s+){0,2}project\b|\bproject\s+(?:called|named)\b", re.I)
 
@@ -228,9 +232,25 @@ def watch_reply(action: dict[str, Any], text: str, route_job_id: str | None, pro
     return asyncio.run_coroutine_threadsafe(_watch_line(jobs[0], chat_id, not action.get("on", True)), loop).result()
 
 
+async def _adopt(job_id: str, origin: str, watch_it: bool, every: float = 2.0) -> None:
+    """Once a job the chat launched runs, record it as the assistant's (under auto it may then stop or
+    relaunch it) and watch it when it is a training."""
+    while True:
+        job = manager.get(job_id)
+        if job is None or job["status"] not in ACTIVE:
+            return
+        if job.get("pid"):
+            watch.register(job, origin)
+            if watch_it:
+                watch.watch(job_id)
+            return
+        await asyncio.sleep(every)
+
+
 def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id: str | None = None,
                chat_id: str | None = None, review: dict[str, Any] | None = None) -> list:
-    """list_jobs, watch_run, plan_workflow, launch_workflow, stop_run and relaunch_run for one chat turn;
+    """list_jobs, watch_run, plan_workflow, launch_workflow, select_states, launch_job, stop_run and
+    relaunch_run for one chat turn;
     ``project_id`` is the chat's project, ``chat_id`` the chat (what it launches or watches is linked to
     it). ``review``: the assistant reviewing a monitor finding (assistant_monitor): it acts only on that
     job, an OK it needs becomes an Apply in the chat, and it launches nothing."""
@@ -318,6 +338,86 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
                 "steps": on_loop(assistant_workflows.step_jobs(made["workflow_id"])),
                 "note": "a step gets its job and run folder when it starts; list_jobs shows them, and stop_run or "
                         "relaunch_run take a job id, run folder, job name or the project"}
+
+    def job_project(a: dict) -> str:
+        """The project a new job goes into: the one named, else the chat's, else the one its paths are in."""
+        if a.get("project"):
+            p = next((p for p in _listed() if a["project"].strip().lower() in (p["id"].lower(), p["name"].lower())), None)
+            if p is None:
+                raise ValueError(f"there is no project “{a['project']}”")
+            return p["id"]
+        if project_id:
+            return project_id
+        values = [v for v in (a.get("args") or {}).values() for v in (v if isinstance(v, list) else [v])]
+        for p in _listed():
+            folder = projects.dir_for(p["id"])
+            if folder and any(isinstance(v, str) and Path(v).expanduser().is_relative_to(folder) for v in values):
+                return p["id"]
+        raise ValueError("say which of the user's GUI projects the job goes into (project)")
+
+    def describe_job(a: dict) -> str:
+        flags = " ".join(f"--{k} {v}" for k, v in (a.get("args") or {}).items())
+        try:
+            where = (projects.get(job_project(a)) or {}).get("name")
+        except ValueError as e:
+            return f"launch {a.get('program')} {flags} ({e})"
+        return (f"launch {a.get('program')} as a new job of your project “{where}” (its own new run folder; nothing "
+                f"that exists is changed): {flags}" + (f" on GPU {a['gpu']}" if a.get("gpu") not in (None, "") else ""))
+
+    def launch_job(ctx, program, args, project=None, name=None, gpu=None):
+        if cancel.is_set():
+            return STOPPED
+        if review:
+            return {"status": "not_executed", "reason": "a review of a finding launches nothing"}
+        args, gpu = dict(args or {}), (None if gpu in (None, "") else str(gpu))
+        pid = job_project({"project": project, "args": args})
+        origin = str(projects.dir_for(pid))
+        try:
+            assistant_bridge.guard_new_job(program, args, origin, gpu)
+        except assistant_bridge.Refused as exc:
+            return {"status": "refused", "reason": str(exc)}
+        decision = assistant_bridge.decide_launch()
+        if decision == "propose":
+            return {"status": "not_executed", "reason": "autonomy is advisory, so the assistant runs nothing: "
+                                                        "launch it yourself (or switch with /autonomy ask)"}
+        try:
+            manager.precheck(program, args, gpu)
+            job = on_loop(manager.create(program, args, gpu, pid, name=name or program, launch=True))
+        except ValidationError as exc:
+            return {"status": "invalid", "errors": exc.errors}
+        except (ProjectNotFound, adapters.AdapterError) as exc:
+            return {"status": "not_created", "reason": str(exc)}
+        assistant_monitor.link(job["id"], chat_id)
+        asyncio.run_coroutine_threadsafe(_adopt(job["id"], origin, program in WATCHED and args.get("mode") == "train"), loop)
+        try:
+            assistant_bridge.audit(origin, {"run_dir": job.get("workdir"), "job_id": job["id"], "action": "launch",
+                                            "program": program, "args": args, "decided_by":
+                                            "auto" if decision == "proceed" else "user",
+                                            "autonomy": ctx.autonomy_level or assistant_bridge.autonomy_level(),
+                                            "via": "hax-gui"})
+        except Exception:  # noqa: BLE001 - the audit trail is best-effort
+            pass
+        return {"status": job["status"], "job": {"id": job["id"], "name": _name(job), "run_dir": job.get("workdir")},
+                "project": (projects.get(pid) or {}).get("name"),
+                "note": "list_jobs shows when it has succeeded; launch the step that reads its outputs only then"}
+
+    def select_states(ctx, job=None, latents=None, n_states=10):
+        run = None
+        if job:
+            found, how = find_jobs(job, project_id)
+            if how not in ("job", "name") or len(found) != 1 or not found[0].get("workdir"):
+                raise ValueError(f"{job} is not one job of the GUI with a run folder: list_jobs shows the jobs")
+            run = found[0]["workdir"]
+        elif not latents:
+            raise ValueError("say which job's latents to use (job), or give a latents file (latents)")
+        try:
+            out = assistant_bridge.select_states(run, latents, int(n_states or 10))
+        except assistant_bridge.Refused as exc:
+            return {"status": "refused", "reason": str(exc)}
+        decode = {"latents_file": out["file"], **({"reload": out["network"]} if out["network"] else {})}
+        return {"status": "saved", **out, "decode_with": {"program": "decode_states_from_latents", "args": decode},
+                "note": "the states are ordered along the landscape's path; particles_per_state counts the particles "
+                        "nearest each one"}
 
     def chosen(a: dict, verb: str) -> tuple[list[dict], str | None]:
         """The job(s) a stop or relaunch is about, resolved once per turn (asking when several match),
@@ -456,6 +556,28 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
                                      "that project. Returns the project, the workflow and each step's job.",
                   wf_args, ["request"]),
              launch_workflow, side_effect="launch", describe=describe_launch, owned=lambda a: True),
+        Tool(spec("select_states", "Pick representative states of a run's latent space (KMeans on the predicted "
+                                   "latents, ordered along the landscape's path) and save them as an .npy beside "
+                                   "the latents, for decode_states_from_latents --latents_file. job: the predict "
+                                   "job, or the training job whose network a predict job reloaded. CPU only, "
+                                   "seconds; creates no job. Returns the file and the args to decode it with.",
+                  {"job": job, "latents": {"type": "string", "description": "a latents file instead of a job "
+                                                                           "(.star, .xmd, .npy or .txt)"},
+                   "n_states": {"type": "integer", "description": "how many states (default 10, 2 to 50)"}}, []),
+             select_states),
+        Tool(spec("launch_job", "Launch one hax program as a new job of one of the user's GUI projects, in its own "
+                                "new run folder: the GUI sets --output_path and the SSD scratch folder, so never pass "
+                                "them, nor --config. The arguments are validated as a job submitted in the GUI; "
+                                "check the program's flags with program_reference first. For a chain of steps, "
+                                "launch the next one once the previous job has succeeded (list_jobs).",
+                  {"program": {"type": "string", "description": "the hax program, e.g. decode_states_from_latents"},
+                   "args": {"type": "object", "description": "flag name (no dashes) -> value; a list for a "
+                                                             "multi-valued flag"},
+                   "project": {"type": "string", "description": "the GUI project (name or id); omit for the "
+                                                                "chat's project, or the project its paths are in"},
+                   "name": {"type": "string", "description": "job name"},
+                   "gpu": {"type": "string", "description": "GPU index"}}, ["program", "args"]),
+             launch_job, side_effect="launch", describe=describe_job, owned=lambda a: True),
         Tool(spec("stop_run", "Stop a job of the GUI (its run folder and checkpoint are kept). A project or "
                               "workflow means its running job; several are asked about.",
                   {"job": job, "run_dir": run_dir}, []),

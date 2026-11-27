@@ -21,13 +21,15 @@ from .jobs import ACTIVE, manager as jobs
 from .workflows import WorkflowError, manager as wf_manager
 
 INTERNAL_NOTES = {
-    "select_states": "not added: the state selection runs inside the assistant, not as a hax program",
+    "select_states": "not added: the state selection runs inside the assistant, not as a hax program; after "
+                     "the predict step, the assistant's select_states tool does it",
     "analysis": "not added: the analysis (report, 3D views, per-particle table) runs inside the assistant; "
                 "write it after the run with the report button or `hax-assistant report`",
 }
 UNBOUND_NOTE = ("not added: it needs the few representative states the assistant selects, and the "
                 "builder's latents input would hand it every particle's latent (one volume each). "
-                "Decode states after the run, e.g. with the assistant's per-domain motion action.")
+                "Decode states after the run: the assistant's select_states tool, then launch_job with the "
+                "decode arguments it returns (or the per-domain motion action).")
 REBIND_WAIT_S = 30.0          # how long a relaunch waits for the old step's workflow run to settle
 _creating: set[tuple] = set()
 _tasks: set[asyncio.Task] = set()

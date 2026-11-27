@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import threading
 import uuid
@@ -297,6 +298,52 @@ def guard_relaunch(program: str, run_dir: str, changes: dict) -> None:
         safety.require_free_changes(program, changes, _schema())
     except safety.SafetyError as e:
         raise Refused(str(e)) from None
+
+
+def guard_new_job(program: str, args: dict, project_dir: str, gpu: Optional[str] = None) -> None:
+    """Raise :class:`Refused` unless the assistant may launch ``program`` with ``args`` as a new job of
+    the project in ``project_dir``."""
+    from hax_assistant import safety
+    ensure_workspace()
+    try:
+        safety.require_new_job(program, args, _schema())
+        safety.require_inside(project_dir, "project folder")
+        if gpu not in (None, "") and not re.fullmatch(r"\d+(,\d+)*", str(gpu)):
+            raise safety.SafetyError(f"{gpu!r} is not a GPU index such as 0 or 0,1.")
+    except safety.SafetyError as e:
+        raise Refused(str(e)) from None
+
+
+def select_states(run_dir: Optional[str], latents: Optional[str], n_states: int) -> dict:
+    """Pick ``n_states`` representative states from a run's predicted latents (or a latents file) and
+    save them as a new .npy beside them; returns that file, the network to decode them with and the
+    particles of each state. CPU only."""
+    from hax_assistant import safety
+    from hax_assistant.actions.prepare_motion import _find_checkpoint, _find_latents_source, _read_config
+    from hax_assistant.actions.prepare_motion import select_states as pick
+    ensure_workspace()
+    run = Path(run_dir) if run_dir else None
+    if not latents:
+        latents, _ = _find_latents_source(run, _read_config(run))
+        if latents is None:
+            raise Refused(f"{run_dir} has no predicted latents, nor a predict run of its network: predict them first")
+    src = Path(latents).expanduser()
+    if not src.is_file():
+        raise Refused(f"no latents file at {src}")
+    try:
+        safety.require_inside(src.parent, "latents folder")
+    except safety.SafetyError as e:
+        raise Refused(str(e)) from None
+    k = max(2, min(int(n_states), 50))
+    out_dir = src.parent / "assistant_states"
+    out_dir.mkdir(exist_ok=True)
+    out, i = out_dir / f"states_k{k}.npy", 2
+    while out.exists():                     # never overwrite an earlier selection
+        out, i = out_dir / f"states_k{k}_{i}.npy", i + 1
+    info = pick(str(src), str(out), k)
+    home = run or src.parent
+    network = _find_checkpoint(home, _read_config(home))
+    return {"file": str(out), "latents": str(src), "network": network, **info}
 
 
 def relaunch_budget(origin_dir: str) -> tuple[int, int]:
