@@ -89,7 +89,9 @@ async def _run(argv: list[str], stdin: str | None = None) -> tuple[int, str, str
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            # sbatch exports its environment to the job (and maybe the accounting database)
+            env={k: v for k, v in os.environ.items() if k != "HAX_ASSISTANT_API_KEY"})
     except OSError as exc:  # binary missing: the one error every call site must surface well
         raise SlurmError(f"{argv[0]}: {exc}") from exc
     out, err = await proc.communicate(stdin.encode() if stdin is not None else None)

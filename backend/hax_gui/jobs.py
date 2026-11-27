@@ -1116,7 +1116,7 @@ class JobManager:
                 cwd=cwd,
                 # hax colorizes output only on a TTY (honoring NO_COLOR/FORCE_COLOR). The
                 # log viewer renders ANSI, so ask for colors explicitly.
-                env={**os.environ, "FORCE_COLOR": "1"},
+                env={**{k: v for k, v in os.environ.items() if k != "HAX_ASSISTANT_API_KEY"}, "FORCE_COLOR": "1"},
                 # Own session/process group: a hax program spawns its real workers via
                 # `forkserver` (JAX/CUDA). Signalling must reach the whole group, or the
                 # workers survive the leader and keep holding the GPU.
