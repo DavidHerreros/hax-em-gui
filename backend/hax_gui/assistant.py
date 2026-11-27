@@ -52,8 +52,8 @@ def _get() -> "AssistantSession":
     return _session
 
 
-def base_url() -> str:
-    """The configured Ollama endpoint, read from config alone.
+def ollama_urls() -> list[str]:
+    """The endpoints a local Ollama should serve (chat on Ollama, separate embeddings), from config alone.
 
     Deliberately does NOT construct the session: construction builds the docs
     vector index, whose embeddings need Ollama up — the caller uses this to
@@ -61,12 +61,16 @@ def base_url() -> str:
     would re-create the old ordering bug it exists to fix.
     """
     if not _INSTALLED:
-        return ""
+        return []
     try:
         from hax_assistant.config import Settings
-        return Settings.from_env().base_url
+        s = Settings.from_env()
     except Exception:  # noqa: BLE001
-        return ""
+        return []
+    urls = [s.base_url] if s.is_ollama else []
+    if s.embed_base_url and s.embed_base_url not in urls:
+        urls.append(s.embed_base_url)
+    return urls
 
 
 def status() -> dict:
@@ -110,6 +114,91 @@ def set_autonomy(level: str) -> dict:
     from hax_assistant import autonomy
     autonomy.set_autonomy(level)
     return get_autonomy()
+
+
+# -- provider settings (Settings page) --------------------------------------
+_ENV_VARS = {"backend": "HAX_ASSISTANT_BACKEND", "base_url": "HAX_ASSISTANT_BASE_URL",
+             "model": "HAX_ASSISTANT_MODEL", "embed_model": "HAX_ASSISTANT_EMBED_MODEL",
+             "embed_base_url": "HAX_ASSISTANT_EMBED_BASE_URL", "docs": "HAX_ASSISTANT_DOCS"}
+
+
+def reset_session() -> None:
+    """The next turn builds a session from the saved settings; a turn in flight keeps its own."""
+    global _session
+    with _session_lock:
+        _session = None
+
+
+def get_config() -> dict:
+    """Provider, models and docs as configured, and where each came from. Never holds a key."""
+    from hax_assistant import config, credentials
+    from hax_assistant.knowledge.online_docs import download_info
+    s = config.Settings.from_env()
+    docs = s.resolve_docs()
+    online = download_info(s.resolve_index_dir() / "online") if isinstance(docs, str) else {}
+    local = config.local_docs_checkout()
+    index = _session.index if _session is not None else None
+    return {
+        "values": {"backend": s.backend, "base_url": s.base_url, "model": s.model, "embed_model": s.embed_model,
+                   "embed_base_url": s.embed_base_url or "", "docs": s.docs_path or "auto"},
+        "sources": {k: s.sources.get(k, "default") for k in _ENV_VARS},
+        "env_vars": _ENV_VARS,
+        "defaults": {"base_url": config.DEFAULT_URLS, "model": config.Settings.model,
+                     "embed_model": config.Settings.embed_model},
+        "key": {"origins": credentials.saved_origins(), "env": bool(os.environ.get("HAX_ASSISTANT_API_KEY")),
+                "openai_env": bool(os.environ.get("OPENAI_API_KEY"))},
+        "docs": {"kind": "online" if isinstance(docs, str) else "local" if docs else None,
+                 "where": str(docs) if docs else None, "local_checkout": str(local) if local else None,
+                 "online_url": config.ONLINE_DOCS_URL, "last_modified": online.get("last_modified"),
+                 "chunks": len(index) if index is not None else None},
+    }
+
+
+def save_config(values: dict) -> dict:
+    """Raises ValueError (ConfigError) on a bad value."""
+    from hax_assistant.config import save_settings
+    save_settings(values)
+    reset_session()
+    return get_config()
+
+
+def set_key(base_url: str, key: str) -> str:
+    """Save the key for ``base_url``'s origin; raises ValueError (CredentialError) when refused."""
+    from hax_assistant import credentials
+    origin = credentials.set_key(base_url, key)
+    reset_session()
+    return origin
+
+
+def delete_key(base_url: str) -> bool:
+    from hax_assistant import credentials
+    removed = credentials.delete_key(base_url)
+    reset_session()
+    return removed
+
+
+def list_models(backend: str, base_url: str, embed_base_url: str = "") -> dict:
+    """Chat models from ``base_url`` and embedding models from ``embed_base_url`` (an Ollama) or the same."""
+    from hax_assistant.config import Settings
+    from hax_assistant.llm.providers import ProviderError, list_models as _list
+    s = Settings.from_env()
+    s.backend, s.base_url, s.embed_base_url = backend, base_url, embed_base_url or None
+
+    def one(kind: str, url: str) -> dict:
+        try:
+            return {"ok": True, **_list(kind, url, s.api_key_for(url))}
+        except ProviderError as e:
+            return {"ok": False, "error": str(e)}
+
+    chat = one(backend, base_url)
+    return {"chat": chat, "embed": one("ollama", embed_base_url) if embed_base_url else chat}
+
+
+def check_docs() -> dict:
+    """Download the online docs now (or re-read the folder) and re-embed only what changed."""
+    out = _get().reindex_docs(force=False)
+    out["last_modified"] = get_config()["docs"]["last_modified"]
+    return out
 
 
 def data_facts(path: str) -> dict:

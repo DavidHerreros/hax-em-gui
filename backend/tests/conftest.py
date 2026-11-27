@@ -27,6 +27,8 @@ os.environ["HAXSTUB_GATE"] = str(GATE)
 os.environ["HAX_ASSISTANT_CONFIG"] = str(TMP / "assistant" / "settings.json")
 os.environ.pop("HAX_ASSISTANT_WORKSPACE", None)
 os.environ.pop("HAX_ASSISTANT_AUTONOMY", None)
+# No docs download: tests that need docs set their own.
+os.environ["HAX_ASSISTANT_DOCS"] = "off"
 
 _stub = TMP / "hax_stub.sh"
 _stub.write_text(

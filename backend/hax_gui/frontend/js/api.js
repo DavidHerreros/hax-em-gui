@@ -245,6 +245,14 @@ export const api = {
 api.assistantStatus = () => req("/api/assistant/status");
 // Autonomy: may the assistant launch/stop/relaunch jobs (advisory | ask | auto).
 api.assistantAutonomy = () => req("/api/assistant/autonomy");
+api.assistantConfig = () => req("/api/assistant/config");
+api.putAssistantConfig = (data) => req("/api/assistant/config", { method: "PUT", body: JSON.stringify(data) });
+api.putAssistantKey = (base_url, key) =>
+  req("/api/assistant/config/key", { method: "PUT", body: JSON.stringify({ base_url, key }) });
+api.deleteAssistantKey = (base_url) =>
+  req(`/api/assistant/config/key?base_url=${encodeURIComponent(base_url)}`, { method: "DELETE" });
+api.assistantModels = (data) => req("/api/assistant/models", { method: "POST", body: JSON.stringify(data) });
+api.assistantCheckDocs = () => req("/api/assistant/docs/check", { method: "POST" });
 api.setAssistantAutonomy = (level) =>
   req("/api/assistant/autonomy", { method: "PUT", body: JSON.stringify({ level }) });
 // Accept the restart a watch alert proposed; the server re-derives the changes.

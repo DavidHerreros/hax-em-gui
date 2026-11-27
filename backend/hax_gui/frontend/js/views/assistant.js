@@ -349,7 +349,9 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       }
     },
   }, icon("refresh", 13));
-  const statusLine = h("div", { class: "chat-status" }, statusText, reindexBtn, wsWarn);
+  const settingsLink = h("a", { href: "#/settings", class: "chat-reindex", title: "Assistant settings: provider, models, docs",
+    style: { display: "inline-flex", alignItems: "center", justifyContent: "center" } }, icon("gear", 13));
+  const statusLine = h("div", { class: "chat-status" }, statusText, reindexBtn, settingsLink, wsWarn);
   function showStatus(s) {
     statusText.textContent = s.available
       ? `model: ${s.model}  ·  docs: ${s.docs_grounding ? "on" : "off"}  ·  ${s.programs} programs, ${s.doc_chunks} doc chunks`

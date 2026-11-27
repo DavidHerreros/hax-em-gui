@@ -5,6 +5,7 @@ import { api } from "../api.js";
 import { errorBox, skeleton } from "./ui.js";
 import { openFilePicker } from "./filePicker.js";
 import { BranchPanel } from "./branchPanel.js";
+import { AssistantSettings } from "./assistantSettings.js";
 
 // Settings keys the setup notice can ask us to draw attention to on arrival.
 let pendingHighlight = [];
@@ -22,7 +23,7 @@ export function SettingsView() {
   mount(body, skeleton("160px"));
 
   Promise.all([api.getSettings(), api.gpus().catch(() => [])])
-    .then(([s, gpus]) => { mount(body, h("div", null, form(s, gpus), BranchPanel())); applyHighlight(); })
+    .then(([s, gpus]) => { mount(body, h("div", null, form(s, gpus), AssistantSettings(), BranchPanel())); applyHighlight(); })
     .catch((err) => mount(body, errorBox(err)));
 
   // Pulse (and focus) the fields the user was sent here to fill in.

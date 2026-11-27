@@ -210,8 +210,7 @@ async def _warm_assistant(app: FastAPI) -> None:
         return
     if settings.manage_ollama:
         try:
-            url = assistant_bridge.base_url()   # config only; must not build the index
-            if url:
+            for url in assistant_bridge.ollama_urls():   # config only; must not build the index
                 app.state.ollama = await asyncio.to_thread(
                     ollama_manager_mod.manager.ensure_started, url)
         except Exception:  # noqa: BLE001 - never fail startup on Ollama

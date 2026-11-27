@@ -4,8 +4,9 @@ run reports, the chat WebSocket, and chat history CRUD."""
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -16,7 +17,7 @@ from .. import assistant_actions, assistant_monitor, assistant_tools, assistant_
 from .. import gpus as gpus_mod
 from .. import chats as chat_store
 from .. import ollama as ollama_manager_mod
-from ..config import settings
+from ..config import is_loopback_host, settings
 from ..jobs import manager
 from .artifacts import _resolve_run_artifacts
 from .shared import auth, ws_authorized as _ws_authorized
@@ -64,6 +65,133 @@ def assistant_set_autonomy(body: AutonomyBody) -> dict[str, Any]:
         return assistant_bridge.set_autonomy(body.level)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+class ConfigBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # a key never travels with the settings
+    backend: Optional[str] = None
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    embed_model: Optional[str] = None
+    embed_base_url: Optional[str] = None
+    docs: Optional[str] = None
+
+
+class KeyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_url: str
+    key: str = Field(max_length=4096)
+
+
+class ModelsBody(BaseModel):
+    backend: str
+    base_url: str
+    embed_base_url: str = ""
+
+
+def _need_assistant() -> None:
+    if not assistant_bridge.available():
+        raise HTTPException(status_code=400, detail="assistant not installed")
+
+
+def _secure_channel(request: Request) -> bool:
+    """A key may arrive over https, or from this machine with no proxy in between (an SSH tunnel counts)."""
+    if request.url.scheme == "https":
+        return True
+    proxied = any(h in request.headers for h in ("x-forwarded-for", "x-forwarded-proto", "forwarded"))
+    host = request.client.host if request.client else ""
+    return bool(host) and is_loopback_host(host) and not proxied
+
+
+def _rewarm() -> None:
+    """Start a local Ollama if the new settings need one, then build the session in the background."""
+    if os.environ.get("HAX_GUI_ASSISTANT_WARMUP", "1") in ("0", "false", "no"):
+        return
+
+    def run() -> None:
+        if settings.manage_ollama:
+            for url in assistant_bridge.ollama_urls():
+                try:
+                    ollama_manager_mod.manager.ensure_started(url)
+                except Exception:  # noqa: BLE001 - the chat reports an unreachable model itself
+                    pass
+        try:
+            assistant_bridge.status()
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=run, daemon=True, name="hax-gui-assistant-rewarm").start()
+
+
+def _config(request: Request) -> dict[str, Any]:
+    try:
+        out = assistant_bridge.get_config()
+    except ValueError as exc:   # a bad HAX_ASSISTANT_* value in the server environment
+        raise HTTPException(status_code=422, detail=str(exc))
+    out["key"]["can_send"] = _secure_channel(request)
+    return out
+
+
+@router.get("/api/assistant/config", dependencies=[Depends(auth)])
+def assistant_get_config(request: Request) -> dict[str, Any]:
+    """Provider, endpoint, models and docs, and where each comes from (env / saved / default)."""
+    _need_assistant()
+    return _config(request)
+
+
+@router.put("/api/assistant/config", dependencies=[Depends(auth)])
+def assistant_put_config(body: ConfigBody, request: Request) -> dict[str, Any]:
+    _need_assistant()
+    try:
+        assistant_bridge.save_config(body.model_dump(exclude_unset=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    _rewarm()
+    return _config(request)
+
+
+@router.put("/api/assistant/config/key", dependencies=[Depends(auth)])
+def assistant_put_key(body: KeyBody, request: Request) -> dict[str, Any]:
+    """Save an API key for one endpoint. Write-only: no response ever contains it."""
+    _need_assistant()
+    if not _secure_channel(request):
+        raise HTTPException(status_code=403, detail=(
+            "This page reached the GUI over plain http from another computer, so the key would travel "
+            "unencrypted. Open the GUI on this machine, through an SSH tunnel or over https, or run "
+            "`hax-assistant key set` on the server."))
+    try:
+        origin = assistant_bridge.set_key(body.base_url, body.key)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    _rewarm()
+    return {"origin": origin, **_config(request)}
+
+
+@router.delete("/api/assistant/config/key", dependencies=[Depends(auth)])
+def assistant_delete_key(base_url: str, request: Request) -> dict[str, Any]:
+    _need_assistant()
+    removed = assistant_bridge.delete_key(base_url)
+    _rewarm()
+    return {"removed": removed, **_config(request)}
+
+
+@router.post("/api/assistant/models", dependencies=[Depends(auth)])
+def assistant_models(body: ModelsBody) -> dict[str, Any]:
+    """The chat and embedding models the endpoints offer, listed by this server (keys stay here)."""
+    _need_assistant()
+    from hax_assistant.credentials import origin
+    if body.backend not in ("ollama", "openai"):
+        raise HTTPException(status_code=422, detail=f"unknown provider {body.backend!r}")
+    for url in filter(None, (body.base_url, body.embed_base_url)):
+        if origin(url) is None:
+            raise HTTPException(status_code=422, detail=f"{url!r} is not an http(s) URL")
+    return assistant_bridge.list_models(body.backend, body.base_url, body.embed_base_url)
+
+
+@router.post("/api/assistant/docs/check", dependencies=[Depends(auth)])
+def assistant_check_docs() -> dict[str, Any]:
+    """Download the online docs now (or re-read the docs folder); re-embeds only on a change."""
+    _need_assistant()
+    return assistant_bridge.check_docs()
 
 
 class WatchApply(BaseModel):

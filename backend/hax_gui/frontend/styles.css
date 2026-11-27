@@ -1789,3 +1789,27 @@ body.chat-docked .app { margin-right: min(420px, calc(100vw - 24px)); }
 .chat-pill:hover { background: var(--brand); }
 .chat-pill .chat-badge { background: var(--warn); color: #1c1917; font-weight: 600; }
 .chat-pill-note { font-size: 12px; font-weight: 400; opacity: .9; }
+
+/* Settings → Assistant */
+.asst-fields { display: grid; gap: 18px; }
+.asst-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.asst-row > .input, .asst-row > select.input { flex: 1 1 260px; min-width: 0; }
+.asst-status { font-size: 12px; margin-top: 6px; color: var(--muted); }
+.asst-status.ok { color: var(--ok); }
+.asst-status.err { color: var(--err); }
+.asst-status.warn { color: var(--warn); }
+.asst-key { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: var(--surface); font-size: 13px; }
+.asst-key.blocked { border-color: var(--warn); }
+.asst-key-saved { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; justify-content: space-between; }
+.asst-lock { border: 1px dashed var(--border-2); border-radius: 9px; padding: 9px 12px; }
+.asst-lock .val { font-family: "JetBrains Mono", monospace; font-size: 13px; overflow-wrap: anywhere; }
+.asst-lock .why { font-size: 12px; color: var(--warn); margin-top: 3px; }
+.asst-caps { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.asst-caps span { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border-2); color: var(--muted); font-family: "JetBrains Mono", monospace; }
+.asst-caps span.cap { border-color: var(--accent); color: var(--accent); }
+.asst-radios { display: grid; gap: 8px; }
+.asst-radios label { display: flex; gap: 9px; align-items: flex-start; cursor: pointer; font-size: 14px; }
+.asst-radios input { margin-top: 3px; accent-color: var(--brand); }
+.asst-radios small { display: block; color: var(--faint); font-size: 12px; }
+.asst-sub { margin: 8px 0 0 25px; }
+.asst-link { background: none; border: none; padding: 0; margin-top: 6px; color: var(--brand-300); font-size: 12px; text-decoration: underline; }
