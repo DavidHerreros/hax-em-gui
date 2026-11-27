@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from . import assistant as assistant_bridge
+from . import assistant_monitor
 from . import chats as chat_store
 from . import children
 from . import ollama as ollama_manager_mod
@@ -146,6 +147,8 @@ async def _on_startup(app: FastAPI) -> None:
     # the rest are parked for the user to confirm, since resuming them would launch work).
     app.state.job_reattach = asyncio.create_task(manager.reattach())
     app.state.wf_resume = asyncio.create_task(wf_manager.resume_all())
+    # Watching lives in memory: watch the jobs linked to a chat again, follow the assistant's workflows.
+    app.state.monitor_restore = asyncio.create_task(assistant_monitor.restore())
     # TensorBoard/viewer children a crashed server left behind keep holding their
     # ports (and, for landscape viewers, GPU memory) — kill them now, off the loop.
     app.state.child_reap = asyncio.create_task(asyncio.to_thread(children.reap_orphans))

@@ -24,6 +24,7 @@ import { rememberWorkflowToOpen } from "./workflows.js";
 import { loadCommands, customCommands, findCommand, expandCommand, onCommandsChange,
          slashMenu, openCommandEditor } from "./assistantCommands.js";
 import { setFloating } from "./assistantFloat.js";
+import { onJobEvent } from "../events.js";
 
 const GREETING =
   "Hi! I can help you pick programs and parameters, explain options from the docs, "
@@ -71,13 +72,58 @@ function drop(c) {
 // What the floating chat's pill and the chat list show.
 const watchers = new Set();
 function changed() { for (const fn of watchers) fn(); }
-export function onAssistantActivity(fn) { watchers.add(fn); return () => watchers.delete(fn); }
+export function onAssistantActivity(fn) { listen(); watchers.add(fn); return () => watchers.delete(fn); }
 export function assistantActivity() {
   const all = [...kept];
-  return { streaming: all.filter((c) => c.streaming).length, unread: all.some((c) => c.unread),
+  return { streaming: all.filter((c) => c.streaming).length, unread: all.some((c) => c.unread) || serverUnread.size > 0,
            pending: all.reduce((n, c) => n + (c.liveQuestion ? 1 : 0) + c.liveActions.filter((r) => !r.resolved).length, 0) };
 }
 function resolved(rec) { if (rec && !rec.resolved) { rec.resolved = true; changed(); } }
+
+// Messages the server posts into a chat (the run monitor's findings, the assistant's reviews of them),
+// also while no browser shows it: merged into its record at their place; unread unless on screen.
+const serverUnread = new Set();   // chats with unseen posted messages and no record here
+let listening = false;
+function listen() {
+  if (listening) return;
+  listening = true;
+  onJobEvent((m) => { if (m.kind === "chat" && m.chat_id) refreshPosted(m.chat_id); });
+  api.chats().then((list) => {
+    for (const c of list) if (c.unread && !recordOf(c.id)) serverUnread.add(c.id);
+    changed();
+  }).catch(() => {});
+}
+async function refreshPosted(cid) {
+  const c = recordOf(cid);
+  if (!c) { serverUnread.add(cid); changed(); return; }
+  let got;
+  try { got = await api.chat(cid); } catch { return; }
+  mergePosted(c.history, got.messages || []);
+  const v = view(c);
+  if (v) { markSeen(c); v.onPosted(); } else c.unread = true;
+  changed();
+}
+// As the server's chats.py merge: a posted message replaces its copy, or goes after its `after`-th own one.
+function mergePosted(history, server) {
+  for (const m of server) {
+    if (!m.posted) continue;
+    const i = history.findIndex((x) => x.posted && x.id === m.id);
+    if (i >= 0) { history[i] = { ...m, seen: Boolean(history[i].seen || m.seen) }; continue; }
+    let own = 0, at = history.length;
+    for (let k = 0; k < history.length; k++) {
+      if (own === m.after) { at = k; break; }
+      if (!history[k].posted) own++;
+    }
+    while (at < history.length && history[at].posted) at++;
+    history.splice(at, 0, { ...m });
+  }
+}
+function markSeen(c) {
+  let any = false;
+  for (const m of c.history) if (m.posted && !m.seen) { m.seen = true; any = true; }
+  serverUnread.delete(c.id);
+  if (any) persist(c);
+}
 
 const TABS = [["/jobs", "Project"], ["/project", "Project"], ["/metrics", "Metrics"], ["/viewer", "3D viewer"],
               ["/workflows", "Workflows"], ["/compare", "Compare"], ["/settings", "Settings"], ["/assistant", ""]];
@@ -171,11 +217,14 @@ function sendMessage(c, text, { shown, noAct } = {}) {
   if (here.jobId) payload.route_job_id = here.jobId;   // "stop the run" on a job's page means that job
   if (c.attachedRun) payload.run_job_id = c.attachedRun.job_id;
   if (c.extraRuns.length) payload.extra_run_job_ids = c.extraRuns.map((r) => r.job_id);
-  ensureSocket(c).send(payload);
   const v = view(c);
   if (v) v.onSend();
   changed();
-  persist(c);   // saved at once, so a chat answering in the background is in the list
+  // Saved at once, so a chat answering in the background is in the list; a new chat is sent once it has
+  // its id, to which the server links what the turn launches or watches.
+  const saved = persist(c);
+  const send = () => ensureSocket(c).send({ ...payload, chat_id: c.id });
+  if (c.id) send(); else saved.then(send);
 }
 
 function completeTurn(c) {
@@ -461,7 +510,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     log.replaceChildren();
     current = currentActivity = questionCard = null;
     if (!active.history.length && !active.streaming) { bubble("assistant", GREETING); }
-    else for (const m of active.history) bubble(m.role, m.content, m.shown);
+    else for (const m of active.history) { bubble(m.role, m.content, m.shown); if (m.watch) findingCard(m); }
     if (active.liveError && !active.streaming) {   // a turn that failed while the chat was not on screen
       log.appendChild(h("div", { class: "chat-msg assistant" }, h("div", { class: "chat-error muted" }, `⚠ ${active.liveError}`)));
       active.liveError = null;
@@ -583,9 +632,10 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   // ── a question the assistant is waiting on (ask-and-wait) ─────────────
   // The answer goes back as an {answer:{id, value}} frame, which does not stop
   // the turn; Skip sends {id, cancel:true}; Stop in the composer ends the turn.
-  let questionCard = null;
+  let questionCard = null, answerPending = null;   // the composer answers a pending question too
   function dismissQuestion() {
     if (questionCard) { questionCard.remove(); questionCard = null; }
+    answerPending = null;
   }
   function renderQuestionCard(q) {
     dismissQuestion();
@@ -596,7 +646,9 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       changed();
       ensureSocket(chat).answer({ id: q.id, ...payload });
       controls.replaceChildren(h("span", { class: "muted chat-action-note" }, shown));
+      answerPending = null;
     };
+    answerPending = (text) => reply({ value: text }, `Answered: ${text}`);
     const choices = q.kind === "confirm" ? ["yes", "no"] : (q.kind === "choice" ? (q.choices || []) : []);
     if (choices.length) {
       for (const c of choices) {
@@ -627,6 +679,30 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     questionCard = h("div", { class: "chat-msg assistant" }, card);
     log.appendChild(questionCard);
     log.scrollTop = log.scrollHeight;
+  }
+
+  // ── a run-monitor finding, or the assistant's review of it, posted by the server ──
+  // One decision, wherever Apply is clicked (here or in the notification): the server checks it again.
+  function findingCard(m) {
+    const w = m.watch, chat = active;
+    const act = (label, primary, call) => h("button", { class: "btn small" + (primary ? "" : " secondary"),
+      onclick: async (e) => {
+        e.currentTarget.disabled = true;
+        try { await call(); } catch (err) { toastError(err, "Could not apply it."); }
+        refreshPosted(chat.id);
+      } }, label);
+    const same = w.rule && w.proposed && w.proposed.restart === w.rule.restart
+      && JSON.stringify(w.proposed.changes) === JSON.stringify(w.rule.changes);
+    const buttons = w.resolved ? [] : [
+      m.posted === "review" && w.proposed
+        ? act(same ? "Apply" : "Apply the assistant's change", true, () => api.assistantApplyReview(w.job_id, w.kind)) : null,
+      (m.posted === "watch" && w.needs_confirmation) || (m.posted === "review" && w.proposed && w.rule && !same)
+        ? act(m.posted === "review" ? "Apply the rule's change" : "Apply", m.posted === "watch",
+              () => api.assistantWatchApply(w.job_id, w.kind)) : null].filter(Boolean);
+    if (!w.resolved && !buttons.length) return;
+    log.appendChild(h("div", { class: "chat-msg assistant" }, h("div", { class: "chat-action-actions" },
+      w.resolved ? h("div", { class: "chat-action-done" }, icon("check", 14), ` Decided: ${w.resolved.message || "applied"}`)
+                 : buttons)));
   }
 
   // ── client-side commands (never sent to the model) ────────────────────
@@ -736,7 +812,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   function renderWorkflowCard(action, rec) {
     let st = wfCards.get(action);
     if (!st) {
-      st = { request: (action.form && action.form.raw) || "", projectId: placedIn(action) || null,
+      st = { request: (action.form && action.form.raw) || "", projectId: placedIn(action) || null, chatId: active.id,
              created: null, creating: null, error: null, autoTried: false, dismissed: false, rec };
       st.preview = api.assistantPreviewWorkflow({ request: st.request, projectId: st.projectId });
       wfCards.set(action, st);
@@ -846,7 +922,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     st.creatingText = !run ? "Saving the draft…"
       : auto ? "Autonomy is auto: creating and starting the workflow…" : "Creating and starting the workflow…";
     st.creating = api.assistantCreateWorkflow({ request: st.request, projectId: st.projectId, run, auto,
-                                                fingerprint: p.fingerprint })
+                                                fingerprint: p.fingerprint, chatId: st.chatId })
       .then((res) => {
         st.created = { ...res, auto };
         if (!run && ctrl.hooks === hooks) openInBuilder(res.workflow_id);   // only while this view is up
@@ -1047,6 +1123,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     if (!text) return;
     input.value = "";
     autosize();
+    if (answerPending && active.liveQuestion) { answerPending(text); return; }   // an answer, not a new request
     sendMessage(active, text);   // the chat's history + socket turn; onSend renders
   }
 
@@ -1064,6 +1141,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     onQuestion(q) { renderQuestionCard(q); },
     onDone(pushed) { finishRender(pushed); },
     onChatsChanged() { refreshChats(); },
+    onPosted() { renderConversation(); },
   };
 
   // ── persistence sidebar ───────────────────────────────────────────────
@@ -1074,6 +1152,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   }
   async function refreshChats() {
     try { chats = await api.chats(); } catch { chats = []; }
+    for (const c of chats) if (c.unread && c.id !== active.id && !recordOf(c.id)) serverUnread.add(c.id);
     renderChatList();
   }
   function renderChatList() {
@@ -1117,6 +1196,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       : rec.liveQuestion ? h("span", { class: "chat-badge ask" }, "needs answer")
       : rec.streaming ? h("i", { class: "jt-dot running", title: "Answering…" })
       : rec.unread ? h("span", { class: "chat-step-dot", title: "New reply" }) : null;
+    const posted = !rec && serverUnread.has(c.id) ? h("span", { class: "chat-step-dot", title: "New finding" }) : null;
     const renameBtn = h("button", { class: "chat-item-btn", title: "Rename",
       onclick: (e) => { e.stopPropagation(); renameChat(c); } }, icon("pencil", 14));
     const delBtn = h("button", { class: "chat-item-btn", title: "Delete",
@@ -1137,7 +1217,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
       },
       onclick: () => selectChat(c.id),
     },
-      h("span", { class: "chat-item-title", title: c.title }, c.title), state,
+      h("span", { class: "chat-item-title", title: c.title }, c.title), state || posted,
       h("span", { class: "chat-item-actions" }, renameBtn, delBtn));
   }
   async function moveChatToProject(chatId, projectId) {
@@ -1158,6 +1238,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
     active = c;
     kept.add(c);
     c.unread = false;
+    markSeen(c);
     if (left !== c && !left.streaming && !left.unread && left.liveActions.every((r) => r.resolved)) drop(left);
     changed();
     renderConversation();
@@ -1211,6 +1292,7 @@ export function AssistantView(_params, { compact = false, headerExtra = [] } = {
   renderConversation();
   renderAttachRow();
   ctrl.hooks = hooks;   // start receiving live updates for this mount
+  listen();
   active.unread = false;
   changed();
   const quickRow = h("div", { class: "chat-quick" });

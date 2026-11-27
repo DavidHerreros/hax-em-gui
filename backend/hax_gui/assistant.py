@@ -233,6 +233,17 @@ def applied_before(origin_dir: str, job_id: str, kind: str) -> bool:
     return False
 
 
+def owned(run_dir: str) -> bool:
+    """Whether the job in ``run_dir`` was launched by the assistant (its registry and marker agree)."""
+    from hax_assistant import safety
+    return safety.is_owned(run_dir)
+
+
+def tier() -> str:
+    """``guided`` or ``free`` (the model drives a tool-calling loop)."""
+    return _get().tier
+
+
 def autonomy_level() -> str:
     from hax_assistant import autonomy
     return autonomy.get_autonomy()

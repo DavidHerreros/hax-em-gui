@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from . import assistant as assistant_bridge
-from . import assistant_workflows, projects, watch
+from . import assistant_monitor, assistant_workflows, projects, watch
 from .jobs import ACTIVE, manager
 
 NEW_PROJECT = "a new project"
@@ -127,8 +127,7 @@ def find_jobs(ref: str, project_id: str | None = None,
     if proj is not None:
         group = [j for j in every if j.get("project_id") == proj["id"]]
     else:
-        ids = {jid for jid, w in assistant_workflows.launched.items()
-               if ref.lower() in (w["workflow_id"], w["workflow"].lower())}
+        ids = assistant_monitor.jobs_of_workflow(ref)
         group = [j for j in every if j["id"] in ids]
         if not group:
             return [], ""
@@ -205,9 +204,36 @@ async def stop_job(job_id: str, *, auto: bool = False, by: str = "user", level: 
     return {"job_id": job_id, "name": _name(job), "status": manager.get(job_id)["status"], "auto": auto}
 
 
-def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id: str | None = None) -> list:
-    """list_jobs, plan_workflow, launch_workflow, stop_run and relaunch_run for one chat turn;
-    ``project_id`` is the chat's project."""
+async def _watch_line(job: dict[str, Any], chat_id: str, stop: bool) -> str:
+    if stop:
+        return assistant_monitor.unwatch_from_chat(job)
+    if job["status"] not in STOPPABLE:
+        return f"“{_name(job)}” already ended ({job['status']}): there is nothing to watch."
+    return assistant_monitor.watch_from_chat(job, chat_id)
+
+
+def watch_reply(action: dict[str, Any], text: str, route_job_id: str | None, project_id: str | None,
+                chat_id: str | None, loop: asyncio.AbstractEventLoop) -> str:
+    """The one line a guided "watch this run" (or "stop watching") gets: the run the request names, else
+    the attached one, else the page's, linked to this chat and watched (or unlinked)."""
+    every = manager.list(limit=1_000_000)
+    named = next((found for found, _ in (find_jobs(w.strip(".,;:!?¿¡'\"()"), project_id, every)
+                                         for w in text.split()) if found), [])
+    jid = action.get("job_id") or route_job_id
+    jobs = named or [j for j in [manager.get(jid) if jid else None] if j]
+    if len(jobs) != 1:
+        return "Which run? Attach it (the paperclip) or open its page, then ask again."
+    if not chat_id:
+        return "This chat could not be saved, so its findings could not be posted here."
+    return asyncio.run_coroutine_threadsafe(_watch_line(jobs[0], chat_id, not action.get("on", True)), loop).result()
+
+
+def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id: str | None = None,
+               chat_id: str | None = None, review: dict[str, Any] | None = None) -> list:
+    """list_jobs, watch_run, plan_workflow, launch_workflow, stop_run and relaunch_run for one chat turn;
+    ``project_id`` is the chat's project, ``chat_id`` the chat (what it launches or watches is linked to
+    it). ``review``: the assistant reviewing a monitor finding (assistant_monitor): it acts only on that
+    job, an OK it needs becomes an Apply in the chat, and it launches nothing."""
     from hax_assistant import safety
     from hax_assistant.agent import Tool
     from hax_assistant.interaction import Cancelled, Question
@@ -254,7 +280,7 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
             {"id": j["id"], "name": _name(j), "program": j["program"], "status": j["status"],
              "started": j.get("started_at"), "run_dir": j.get("workdir"),
              "launched_by_assistant": bool(j.get("workdir")) and safety.is_owned(j["workdir"]),
-             **assistant_workflows.launched.get(j["id"], {})} for j in rows[:LIST_MAX]]}
+             **assistant_monitor.step_of(j["id"])} for j in rows[:LIST_MAX]]}
         if len(rows) > LIST_MAX:
             out["truncated"] = f"only the newest {LIST_MAX} of {len(rows)}; narrow it with status"
         return out
@@ -277,11 +303,13 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
     def launch_workflow(ctx, request, project=None, name=None, gpu=None):
         if cancel.is_set():
             return STOPPED
+        if review:
+            return {"status": "not_executed", "reason": "a review of a finding launches no workflow"}
         target, out = preview({"request": request, "project": project, "name": name, "gpu": gpu})
         auto = assistant_bridge.decide_launch() == "proceed"
         try:
             made = on_loop(assistant_workflows.create(request, target, name, gpu, run=True, auto=auto,
-                                                      fingerprint=out["fingerprint"]))
+                                                      fingerprint=out["fingerprint"], chat_id=chat_id))
         except assistant_workflows.CreateError as exc:
             return {"status": "not_created", "reason": exc.detail}
         return {"status": "started" if made["started"] else "saved_not_started", "run_error": made.get("run_error"),
@@ -316,6 +344,8 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
                     picks[ref, verb] = (list(labels.values()) if answer == ALL else [labels[answer]]), None
                 except Cancelled:
                     picks[ref, verb] = [], "no job was chosen"
+            if review and any(j["id"] != review["job_id"] for j in picks[ref, verb][0]):
+                raise ValueError("a review acts only on the job of the finding it reviews")
         return picks[ref, verb]
 
     def describe_jobs(verb: str, a: dict) -> str:
@@ -329,8 +359,26 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         return f"{verb} " + "; ".join(f"the job “{_name(j)}” ({j['status']}) in {j['workdir']}" for j in found)
 
     def owned(verb: str):
-        # under auto the assistant acts alone only on jobs it launched; "all of them" only when it launched all
-        return lambda a: bool(chosen(a, verb)[0]) and all(safety.is_owned(j["workdir"]) for j in chosen(a, verb)[0])
+        # under auto the assistant acts alone only on jobs it launched ("all of them": only when it launched
+        # all); in a review, only on a calibrated finding, as the watcher
+        return lambda a: (not review or review["calibrated"]) and bool(chosen(a, verb)[0]) and \
+            all(safety.is_owned(j["workdir"]) for j in chosen(a, verb)[0])
+
+    def awaiting(proposed: dict) -> dict | None:
+        # in a review an OK becomes an Apply in the chat: nothing is done now
+        confirming, interaction.confirming = getattr(interaction, "confirming", False), False
+        if not (review and confirming):
+            return None
+        review["proposed"] = proposed
+        return {"status": "awaiting_confirmation", "reason": "the user decides with Apply in the chat"}
+
+    def watch_run(ctx, job=None, run_dir=None, stop=False):
+        if not chat_id:
+            raise ValueError("this chat is not saved, so findings cannot be posted to it")
+        found, why = chosen({"job": job, "run_dir": run_dir}, "watch")
+        if why:
+            return {"status": "not_watched", "reason": why}
+        return {"status": "unwatched" if stop else "watching", "message": on_loop(_watch_line(found[0], chat_id, stop))}
 
     def stop_run(ctx, job=None, run_dir=None):
         if cancel.is_set():
@@ -338,6 +386,9 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         found, why = chosen({"job": job, "run_dir": run_dir}, "stop")
         if why:
             return {"status": "not_running", "reason": why}
+        wait = awaiting({"tool": "stop_run"})
+        if wait:
+            return wait
         done = []
         for j in found:
             try:
@@ -346,6 +397,8 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
             except StopError as exc:
                 done.append({"job": _name(j), "not_stopped": exc.detail})
         ok = sum("not_stopped" not in d for d in done)
+        if review and ok:
+            review["acted"] = {"applied": True, "message": f"the assistant stopped “{done[0]['job']}” (its run folder is kept)"}
         return {"status": "stopped" if ok == len(done) else "partly_stopped" if ok else "not_stopped", "jobs": done}
 
     def describe_relaunch(a: dict) -> str:
@@ -360,10 +413,17 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
         found, why = chosen({"job": job, "run_dir": run_dir}, "relaunch")
         if why:
             return {"status": "not_relaunched", "reason": why}
+        if review and restart == "resume" and review["kind"] == "diverged":
+            return {"status": "not_relaunched", "reason": "a diverged checkpoint is never resumed: restart from scratch"}
+        wait = awaiting({"tool": "relaunch_run", "restart": restart, "changes": dict(changes or {})})
+        if wait:
+            return wait
         try:
             done = on_loop(watch.relaunch(found[0], restart, changes))
         except watch.ApplyError as exc:
             return {"status": "not_relaunched", "reason": exc.detail}
+        if review and done["applied"]:
+            review["acted"] = {"applied": True, "message": done["message"], "new_job_id": done["job"]["id"]}
         return {"status": "relaunched" if done["applied"] else "not_applied", "message": done["message"],
                 "new_job": (done.get("job") or {}).get("name")}
 
@@ -382,6 +442,11 @@ def chat_tools(loop: asyncio.AbstractEventLoop, interaction, cancel, project_id:
                   {"project": {"type": "string", "description": "project name or id"},
                    "status": {"type": "string", "description": "only this status (running, queued, succeeded, "
                                                                "failed, cancelled), or active"}}, []), list_jobs),
+        Tool(spec("watch_run", "Watch a job of the GUI from this chat: the run monitor's findings for it are "
+                               "posted here (stop: true stops watching it). Changes it proposes still follow "
+                               "the autonomy level; a job the user started is never changed without their OK.",
+                  {"job": job, "run_dir": run_dir, "stop": {"type": "boolean", "description": "stop watching it"}},
+                  []), watch_run),
         Tool(spec("plan_workflow", "Plan a multi-step workflow (continuous motion, improve resolution, "
                                    "reconstruction) in one of the user's GUI projects or a new one: steps, "
                                    "parameters with reasons and pre-flight checks. Creates nothing.",

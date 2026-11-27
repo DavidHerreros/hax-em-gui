@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import assistant as assistant_bridge
-from .. import assistant_actions, assistant_tools, assistant_workflows
+from .. import assistant_actions, assistant_monitor, assistant_tools, assistant_workflows
 from .. import gpus as gpus_mod
 from .. import chats as chat_store
 from .. import ollama as ollama_manager_mod
@@ -115,6 +115,7 @@ class WorkflowCreate(WorkflowRequest):
     run: bool = False
     auto: bool = False      # the card acting on its own: refused unless autonomy is still auto
     fingerprint: str | None = Field(default=None, max_length=64)   # the previewed graph
+    chat_id: str | None = Field(default=None, max_length=64)       # where its jobs' findings are posted
 
 
 def _workflow_actions_allowed() -> None:
@@ -143,7 +144,8 @@ async def assistant_create_workflow(body: WorkflowCreate) -> dict[str, Any]:
     _workflow_actions_allowed()
     try:
         return await assistant_workflows.create(body.request, body.project_id, body.name, body.gpu,
-                                                run=body.run, auto=body.auto, fingerprint=body.fingerprint)
+                                                run=body.run, auto=body.auto, fingerprint=body.fingerprint,
+                                                chat_id=body.chat_id)
     except assistant_workflows.CreateError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail)
 
@@ -152,6 +154,17 @@ class StopJob(BaseModel):
     model_config = ConfigDict(extra="forbid")
     job_id: str = Field(min_length=1, max_length=64)
     auto: bool = False      # the card acting on its own: refused unless the decision is still proceed
+
+
+@router.post("/api/assistant/watch/{job_id}/apply-review", dependencies=[Depends(auth)])
+async def assistant_watch_apply_review(job_id: str, body: WatchApply) -> dict[str, Any]:
+    """Accept the change the assistant's review of finding ``kind`` proposed (read from the server's
+    record), with the same checks as the rule's Apply; one decision per finding."""
+    from .. import watch
+    try:
+        return await assistant_monitor.apply_review(job_id, body.kind)
+    except watch.ApplyError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
 
 
 @router.post("/api/assistant/actions/stop-job", dependencies=[Depends(auth)])
@@ -367,6 +380,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             allow_actions = assistant_actions.actions_enabled()
             project_id = req.get("project_id") or None      # the chat's project
             route_job_id = req.get("route_job_id") or None  # the job of the page the chat is on
+            chat_id = req.get("chat_id") or None            # what this turn launches or watches is linked to it
             last_user = next((m.get("content") or "" for m in reversed(messages)
                               if isinstance(m, dict) and m.get("role") == "user"), "")
 
@@ -388,7 +402,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             def _worker(messages=messages, grounded=grounded, run=run, job=job if run_job_id else None,
                         extra_jobs=extra_jobs, allow_actions=allow_actions, cancel=cancel, post=post,
                         interaction=interaction, project_id=project_id, last_user=last_user,
-                        route_job_id=route_job_id) -> None:
+                        route_job_id=route_job_id, chat_id=chat_id) -> None:
                 # EVERYTHING inside the try, including building the generator:
                 # session construction (docs index load, embedder init) can
                 # raise, and with it outside the try neither ("error") nor the
@@ -411,7 +425,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                                 run["facts"] = (run.get("facts") or "") + "\n\n" + _extra_run_facts(job, ej)
                             except Exception:  # noqa: BLE001
                                 pass
-                    tools = assistant_tools.chat_tools(loop, interaction, cancel, project_id)
+                    tools = assistant_tools.chat_tools(loop, interaction, cancel, project_id, chat_id)
                     gen = assistant_bridge.stream_events(messages, grounded=grounded, run=run,
                                                          allow_actions=allow_actions,
                                                          interaction=interaction, tools=tools)
@@ -421,6 +435,9 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
                         etype = ev.get("type")
                         if etype == "status":
                             payload = ("status", ev.get("text"))
+                        elif etype == "action" and (ev.get("action") or {}).get("kind") == "watch_run":
+                            payload = ("token", assistant_tools.watch_reply(ev["action"], last_user, route_job_id,
+                                                                            project_id, chat_id, loop))
                         elif etype == "action":
                             payload = ("action", assistant_tools.place(ev.get("action"), last_user,
                                                                        interaction, project_id, route_job_id))
@@ -439,6 +456,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
 
             # Its own thread, not the shared executor: abandoned workers must not hold up new turns.
             threading.Thread(target=_worker, daemon=True).start()
+            assistant_monitor.turn_started(chat_id)          # the assistant's reviews wait for it
 
             # Forward events while watching the inbox. An {"answer":…} frame answers the
             # question the worker waits on; any other frame ({"stop":…}, or a new turn,
@@ -470,6 +488,7 @@ async def assistant_chat_ws(websocket: WebSocket) -> None:
             finally:
                 cancel.set()          # an ended turn ignores it; an interrupted one stops acting
                 interaction.release()
+                assistant_monitor.turn_ended(chat_id)
                 get_task.cancel()
                 inbox_task.cancel()
             if disconnected:

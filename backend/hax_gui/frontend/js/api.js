@@ -292,10 +292,13 @@ api.assistantPreviewWorkflow = ({ request, projectId }) =>
     body: JSON.stringify({ request, project_id: projectId || null }) });
 // Save it (run=false: a draft), or save and start it; auto=true when the card acts on its own.
 // `fingerprint` is the previewed graph's: a plan that changed since is refused.
-api.assistantCreateWorkflow = ({ request, projectId, run, auto, fingerprint }) =>
+api.assistantCreateWorkflow = ({ request, projectId, run, auto, fingerprint, chatId }) =>
   req("/api/assistant/actions/create-workflow", { method: "POST",
     body: JSON.stringify({ request, project_id: projectId || null, run: !!run, auto: !!auto,
-                           fingerprint: fingerprint || null }) });
+                           fingerprint: fingerprint || null, chat_id: chatId || null }) });
+// The change the assistant's review of a monitor finding proposed (read and checked on the server).
+api.assistantApplyReview = (jobId, kind) =>
+  req(`/api/assistant/watch/${jobId}/apply-review`, { method: "POST", body: JSON.stringify({ kind }) });
 // Stop a job from the chat's stop card (checked again on the server); auto=true when the card acts on its own.
 api.assistantStopJob = (jobId, auto) =>
   req("/api/assistant/actions/stop-job", { method: "POST", body: JSON.stringify({ job_id: jobId, auto: !!auto }) });

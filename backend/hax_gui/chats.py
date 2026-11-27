@@ -4,6 +4,12 @@ Each chat stores its full message list (a JSON blob) plus a title and an optiona
 ``project_id`` so the UI can group chats under their project. Stored in the same
 SQLite database as jobs/workflows/labels. This is plain data and exists whether or
 not the optional assistant package is installed.
+
+The server may post messages into a chat (the run monitor's findings): they carry
+``posted`` and an ``id``, and ``after`` (how many of the chat's own messages came
+before). The client saves the whole list, so a save keeps the posted messages it has
+not seen yet, at their place, and the server's version of each (only ``seen`` is the
+client's).
 """
 
 from __future__ import annotations
@@ -20,6 +26,27 @@ from .config import settings
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _merge(client: list, stored: list) -> list:
+    """The client's list with the server's posted messages: its copies updated, the unseen ones placed."""
+    posted = {m["id"]: m for m in stored if isinstance(m, dict) and m.get("posted") and m.get("id")}
+    out = []
+    for m in client:
+        if isinstance(m, dict) and m.get("posted") and m.get("id") in posted:
+            m = {**posted.pop(m["id"]), "seen": bool(m.get("seen"))}
+        out.append(m)
+    for m in posted.values():
+        own, at = 0, len(out)
+        for i, x in enumerate(out):
+            if own == m.get("after", 0):
+                at = i
+                break
+            own += not (isinstance(x, dict) and x.get("posted"))
+        while at < len(out) and isinstance(out[at], dict) and out[at].get("posted"):
+            at += 1                       # after the posted messages already there
+        out.insert(at, m)
+    return out
 
 
 class ChatManager:
@@ -54,6 +81,7 @@ class ChatManager:
             "updated_at": row["updated_at"],
             "created_at": row["created_at"],
             "message_count": len(msgs),
+            "unread": any(isinstance(m, dict) and m.get("posted") and not m.get("seen") for m in msgs),
         }
 
     # -- CRUD --------------------------------------------------------------
@@ -98,13 +126,44 @@ class ChatManager:
                 return None
             new_title = title.strip() if isinstance(title, str) and title.strip() else row["title"]
             new_pid = project_id if project_id_set else row["project_id"]
-            new_msgs = json.dumps(messages) if messages is not None else row["messages"]
+            new_msgs = (json.dumps(_merge(messages, json.loads(row["messages"] or "[]")))
+                        if messages is not None else row["messages"])
             self._db.execute(
                 "UPDATE chats SET title=?, project_id=?, messages=?, updated_at=? WHERE id=?",
                 (new_title, new_pid, new_msgs, _now(), cid),
             )
             self._db.commit()
         return self.get(cid)
+
+    def post(self, cid: str, message: dict[str, Any]) -> dict[str, Any] | None:
+        """Append a server message (``posted``, ``id``) after the chat's current messages."""
+        with self._db.transaction():
+            row = self._db.execute("SELECT messages FROM chats WHERE id=?", (cid,)).fetchone()
+            if not row:
+                return None
+            msgs = json.loads(row["messages"] or "[]")
+            own = sum(1 for m in msgs if not (isinstance(m, dict) and m.get("posted")))
+            message = {**message, "after": own, "seen": False}
+            self._db.execute("UPDATE chats SET messages=?, updated_at=? WHERE id=?",
+                             (json.dumps(msgs + [message]), _now(), cid))
+            self._db.commit()
+        return message
+
+    def patch_posted(self, cid: str, mid: str, **fields: Any) -> dict[str, Any] | None:
+        """Update fields of a posted message (e.g. its finding was decided)."""
+        with self._db.transaction():
+            row = self._db.execute("SELECT messages FROM chats WHERE id=?", (cid,)).fetchone()
+            if not row:
+                return None
+            msgs = json.loads(row["messages"] or "[]")
+            hit = next((m for m in msgs if isinstance(m, dict) and m.get("posted") and m.get("id") == mid), None)
+            if hit is None:
+                return None
+            hit.update(fields)
+            self._db.execute("UPDATE chats SET messages=?, updated_at=? WHERE id=?",
+                             (json.dumps(msgs), _now(), cid))
+            self._db.commit()
+        return hit
 
     def delete(self, cid: str) -> bool:
         cur = self._db.execute("DELETE FROM chats WHERE id=?", (cid,))

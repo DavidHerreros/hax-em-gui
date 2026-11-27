@@ -19,7 +19,7 @@ from test_assistant_stop_card import _job, cancels, gate  # noqa: F401  (fixture
 from test_assistant_workflows import _set_autonomy, ask, data, isolated, no_destruction, schema  # noqa: F401
 
 from hax_gui import assistant as assistant_bridge
-from hax_gui import assistant_tools, assistant_workflows, projects
+from hax_gui import assistant_monitor, assistant_tools, projects
 from hax_gui.jobs import manager
 
 needs_assistant = pytest.mark.skipif(not assistant_bridge.available(),
@@ -125,4 +125,4 @@ def test_stop_card_names_a_project_like_the_tools(client, run, ready, md_file, g
         "jobs": [], "named": empty["id"]}                     # nothing running there: not some other job
     run(manager.cancel(job["id"]))
     wait_for_status(client, run, job["id"], {"cancelled", "failed"})
-    assert assistant_workflows.launched.get(job["id"]) is None
+    assert assistant_monitor.step_of(job["id"]) == {}

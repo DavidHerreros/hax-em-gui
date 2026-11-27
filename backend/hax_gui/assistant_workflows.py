@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import adapters, events, projects, registry, settings_store, watch
+from . import adapters, assistant_monitor, events, projects, registry, settings_store, watch
 from . import assistant as assistant_bridge
 from .command import ValidationError
 from .jobs import manager as jobs
@@ -30,7 +30,6 @@ UNBOUND_NOTE = ("not added: it needs the few representative states the assistant
                 "Decode states after the run, e.g. with the assistant's per-domain motion action.")
 _creating: set[tuple] = set()
 _tasks: set[asyncio.Task] = set()
-launched: dict[str, dict[str, str]] = {}    # job id -> its workflow and step, for the runs started here
 
 
 class CreateError(Exception):
@@ -150,21 +149,22 @@ def preview(request: str, project_id: str | None = None, name: str | None = None
 
 async def create(request: str, project_id: str | None = None, name: str | None = None,
                  gpu: str | None = None, *, run: bool = False, auto: bool = False,
-                 fingerprint: str | None = None) -> dict[str, Any]:
+                 fingerprint: str | None = None, chat_id: str | None = None) -> dict[str, Any]:
     """Save the planned workflow (and with ``run``, start it when autonomy allows). ``auto``: the
     client acts on its own, which only the ``auto`` level permits. ``fingerprint``: the graph the
-    user was shown; a re-plan that differs from it is refused."""
+    user was shown; a re-plan that differs from it is refused. ``chat_id``: the chat it was asked
+    from, where the monitor's findings for its jobs are posted."""
     key = (request, project_id, name, gpu)
     if key in _creating:                       # a double click must not create it twice
         raise CreateError(409, "this workflow is already being created")
     _creating.add(key)
     try:
-        return await _create(request, project_id, name, gpu, run, auto, fingerprint)
+        return await _create(request, project_id, name, gpu, run, auto, fingerprint, chat_id)
     finally:
         _creating.discard(key)
 
 
-async def _create(request, project_id, name, gpu, run, auto, fingerprint) -> dict[str, Any]:
+async def _create(request, project_id, name, gpu, run, auto, fingerprint, chat_id) -> dict[str, Any]:
     decision = await asyncio.to_thread(assistant_bridge.decide_launch)
     if run and decision == "propose":
         raise CreateError(403, "autonomy is advisory, so the assistant runs nothing: open the workflow "
@@ -198,33 +198,45 @@ async def _create(request, project_id, name, gpu, run, auto, fingerprint) -> dic
             return {**result, "run_error": "; ".join(exc.errors)}
         result["started"] = True
         origin = str(projects.dir_for(project_id))
-        task = asyncio.get_running_loop().create_task(_follow(wf["id"], out["steps"], origin))
-        _tasks.add(task)
-        task.add_done_callback(_tasks.discard)
+        assistant_monitor.remember_workflow(wf["id"], chat_id, origin, out["steps"])   # followed again after a restart
+        follow(wf["id"], out["steps"], origin, chat_id)
     return result
 
 
-async def _follow(wid: str, steps: list[dict[str, Any]], origin: str, every: float = 2.0) -> None:
-    """Follow a workflow started here to its end: as each step's job starts it is registered as launched
-    by the assistant (under auto it may then stop or relaunch it) and a training step is watched."""
-    todo = {s["node"]: s for s in steps}
+def follow(wid: str, steps: list[dict[str, Any]], origin: str, chat_id: str | None) -> None:
+    task = asyncio.get_running_loop().create_task(_follow(wid, steps, origin, chat_id))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+async def _follow(wid: str, steps: list[dict[str, Any]], origin: str, chat_id: str | None,
+                  every: float = 2.0) -> None:
+    """Follow a workflow started here to its end: each step's job is linked to the chat (its findings go
+    there) and, once it starts, registered as launched by the assistant (under auto it may then stop or
+    relaunch it); a training step is watched. Parked after a restart, it is followed until resumed."""
+    todo, linked = {s["node"]: s for s in steps}, set()
     while todo:
         wf = wf_manager.get(wid)
         if wf is None:
-            return
+            break
         state = wf.get("run_state") or {}
         for nid, step in list(todo.items()):
             job = jobs.get((state.get(nid) or {}).get("job_id") or "")
-            if job is not None:
-                launched[job["id"]] = {"workflow_id": wid, "workflow": wf["name"], "step": step["title"]}
-            if job is not None and job.get("pid"):
-                watch.register(job, origin)
+            if job is None:
+                continue
+            if job["id"] not in linked:
+                linked.add(job["id"])
+                assistant_monitor.link(job["id"], chat_id, workflow_id=wid, workflow=wf["name"], step=step["title"])
+            if job.get("pid"):
+                if not assistant_bridge.owned(job["workdir"]):
+                    watch.register(job, origin)
                 if step["watch"]:
                     watch.watch(job["id"])
                 del todo[nid]
-        if wf["status"] != "running":
-            return                             # finished, failed or stopped: no step starts any more
+        if wf["status"] not in ("running", "interrupted"):
+            break                              # finished, failed or stopped: no step starts any more
         await asyncio.sleep(every)
+    assistant_monitor.forget_workflow(wid)
 
 
 async def step_jobs(wid: str, wait: float = 3.0) -> list[dict[str, Any]]:

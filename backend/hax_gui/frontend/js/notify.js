@@ -14,6 +14,7 @@ const TERMINAL = {
 
 let pending = 0;
 const baseTitle = document.title;
+const open = new Map();   // "job:alert" -> its toast's dismiss: a decision made in the chat closes it
 
 function updateTitle() {
   document.title = pending > 0 ? `(${pending}) ${baseTitle}` : baseTitle;
@@ -48,6 +49,7 @@ function watchToast(m) {
   }
   dismiss = toast(body, { kind: m.level === "warn" ? "error" : "info",
                           timeout: m.needs_confirmation ? 0 : (m.proposal ? 30000 : 12000) });
+  open.set(`${m.job_id}:${m.alert}`, dismiss);
 }
 
 export function startNotifications() {
@@ -67,6 +69,11 @@ export function startNotifications() {
   });
 
   onJobEvent((m) => {
+    if (m.kind === "watch_resolved") {
+      const close = open.get(`${m.job_id}:${m.alert}`);
+      if (close) { open.delete(`${m.job_id}:${m.alert}`); close(); }
+      return;
+    }
     if (m.kind === "watch") {
       watchToast(m);
       if ("Notification" in window && Notification.permission === "granted") {

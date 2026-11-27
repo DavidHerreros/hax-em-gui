@@ -22,7 +22,8 @@ LLM anywhere — these are measured numbers; the assistant can be asked about th
 run afterwards, with the facts already attached.
 
 Watches live in memory: they are a monitoring preference of the person at the
-screen, not run state — a server restart simply forgets them.
+screen, not run state — a server restart simply forgets them, except for the jobs
+linked to a chat, which assistant_monitor watches again at startup.
 """
 
 from __future__ import annotations
@@ -85,6 +86,8 @@ async def _check(job_id: str) -> None:
     job = manager.get(job_id)
     if job is None or job["status"] not in ("running", "pending", "queued"):
         _watched.pop(job_id, None)             # finished: the normal notification covers it
+        from . import assistant_monitor
+        assistant_monitor.job_ended(job_id)
         return
     workdir = job.get("workdir")
     if not workdir or job["status"] != "running":
@@ -166,6 +169,8 @@ async def _assistant_alerts(job: dict[str, Any], fired: set[str], report: dict[s
         if proposal and proposal["kind"] == f["kind"]:
             event.update(await _offer(job, f, proposal))
         events.publish(event)
+        from . import assistant_monitor
+        assistant_monitor.post_finding(job, f, event)          # into the job's chat, when it has one
 
 
 async def _offer(job: dict[str, Any], finding: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
@@ -186,6 +191,8 @@ async def _offer(job: dict[str, Any], finding: dict[str, Any], proposal: dict[st
             out["blocked"] = reason
     elif decision == "confirm":
         out["needs_confirmation"] = True
+    elif decision == "proceed" and _reviewed(job["id"], finding["kind"]):
+        out["deferred"] = True                 # the assistant's review decides, through the same gates
     elif decision == "proceed":
         try:
             done = await apply_proposal(job["id"], finding["kind"], by="auto")
@@ -198,16 +205,28 @@ async def _offer(job: dict[str, Any], finding: dict[str, Any], proposal: dict[st
     return out
 
 
+def _reviewed(job_id: str, kind: str) -> bool:
+    from . import assistant_monitor
+    return assistant_monitor.will_review(job_id, kind)
+
+
 async def apply_proposal(job_id: str, kind: str, by: str = "user") -> dict[str, Any]:
     """Carry out the assistant's remedy for finding `kind` on a job, through the job
     manager. The remedy is re-derived here from the run's own signals."""
+    from . import assistant_monitor
     if job_id in _applying:                    # a double click must not relaunch twice
         raise ApplyError(409, "a restart of this job is already in progress")
+    if assistant_monitor.is_resolved(job_id, kind):   # decided in the chat or the notification
+        raise ApplyError(409, "this finding was already decided")
     _applying.add(job_id)
     try:
-        return await _apply(job_id, kind, by)
+        done = await _apply(job_id, kind, by)
     finally:
         _applying.discard(job_id)
+    if done["applied"]:
+        assistant_monitor.resolve(job_id, kind, {"applied": True, "message": done["message"], "by": by,
+                                                 "new_job_id": (done.get("job") or {}).get("id")})
+    return done
 
 
 async def _apply(job_id: str, kind: str, by: str) -> dict[str, Any]:
@@ -284,10 +303,25 @@ async def _relaunch(job: dict[str, Any], proposal: dict[str, Any], by: str, orig
     register(new, workdir)
     _watched[new["id"]] = {"fired": set()}     # keep watching the relaunched run, afresh
     _ensure_task()
+    from . import assistant_monitor
+    if assistant_monitor.chat_of(job["id"]):
+        assistant_monitor.link(new["id"], assistant_monitor.chat_of(job["id"]))   # its findings go to the same chat
     where = (f"relaunched from scratch as {new.get('name') or new['id']} in a new folder "
              "(the old run is kept)")
     return {"applied": True, "restart": proposal["restart"], "job": new,
-            "text": proposal["text"], "message": f"— the assistant {where}."}
+            "text": proposal["text"], "message": f"— the assistant {where}.{_blocked_steps(job, proposal)}"}
+
+
+def _blocked_steps(job: dict[str, Any], proposal: dict[str, Any]) -> str:
+    """A relaunched workflow step runs outside its workflow: say what that leaves blocked and how to go on."""
+    from . import assistant_monitor
+    step = assistant_monitor.step_of(job["id"])
+    if not step:
+        return ""
+    changes = ", ".join(f"--{k} {v}" for k, v in proposal["changes"].items()) or "no flag changes"
+    return (f" It was the “{step['step']}” step of the workflow “{step['workflow']}”: the new run is outside "
+            "that workflow, so the steps after it stay blocked. To continue them, open the workflow, make the "
+            f"same change ({changes}) on its “{step['step']}” step and run that step with the steps after it.")
 
 
 async def _scratch(job: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
